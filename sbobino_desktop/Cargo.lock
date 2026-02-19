@@ -1672,6 +1672,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1489f81ead4b71a09ddeab6850c0356c0932587637d753f21ee1010ab875b013"
 
 [[package]]
+name = "hound"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
+
+[[package]]
 name = "html5ever"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3870,6 +3876,7 @@ name = "sbobino-application"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hound",
  "sbobino-domain",
  "serde",
  "tempfile",

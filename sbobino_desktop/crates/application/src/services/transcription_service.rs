@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, future::Future, path::Path, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    path::Path,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
@@ -67,6 +73,8 @@ impl TranscriptionService {
             JobStage::PreparingAudio,
             "Preparing audio",
             10,
+            None,
+            None,
         );
         let job_id = request.job_id.clone();
 
@@ -88,13 +96,51 @@ impl TranscriptionService {
                 .await?;
             }
 
+            let total_audio_seconds = self.wav_duration_seconds(&wav_path);
+
             self.emit(
                 &emit_progress,
                 &request.job_id,
                 JobStage::Transcribing,
                 "Running Whisper transcription",
-                40,
+                0,
+                Some(0.0),
+                total_audio_seconds,
             );
+
+            let progress_callback = {
+                let emit_progress = emit_progress.clone();
+                let job_id = request.job_id.clone();
+                let total_audio_seconds = total_audio_seconds;
+                let last_emitted_seconds = Arc::new(Mutex::new(0_f32));
+                let last_emitted_seconds_ref = last_emitted_seconds.clone();
+
+                Arc::new(move |current_seconds: f32| {
+                    let sanitized_seconds = current_seconds.max(0.0);
+                    if let Ok(mut last) = last_emitted_seconds_ref.lock() {
+                        if sanitized_seconds <= *last + 0.05 {
+                            return;
+                        }
+                        *last = sanitized_seconds;
+                    }
+
+                    let percentage = match total_audio_seconds {
+                        Some(total) if total > 0.0 => {
+                            ((sanitized_seconds / total).clamp(0.0, 1.0) * 100.0).round() as u8
+                        }
+                        _ => 0,
+                    };
+
+                    emit_progress(JobProgress {
+                        job_id: job_id.clone(),
+                        stage: JobStage::Transcribing,
+                        message: "Running Whisper transcription".to_string(),
+                        percentage,
+                        current_seconds: Some(sanitized_seconds),
+                        total_seconds: total_audio_seconds,
+                    });
+                }) as Arc<dyn Fn(f32) + Send + Sync>
+            };
 
             let raw_transcript = self
                 .run_cancellable(
@@ -103,10 +149,24 @@ impl TranscriptionService {
                         &wav_path,
                         request.model.ggml_filename(),
                         request.language.as_whisper_code(),
+                        &request.whisper_options,
                         emit_delta.clone(),
+                        progress_callback,
                     ),
                 )
                 .await?;
+
+            if let Some(total) = total_audio_seconds {
+                self.emit(
+                    &emit_progress,
+                    &request.job_id,
+                    JobStage::Transcribing,
+                    "Running Whisper transcription",
+                    100,
+                    Some(total),
+                    Some(total),
+                );
+            }
 
             let (optimized, summary_faq) = if request.enable_ai {
                 self.emit(
@@ -115,6 +175,8 @@ impl TranscriptionService {
                     JobStage::Optimizing,
                     "Optimizing transcript with AI",
                     65,
+                    None,
+                    None,
                 );
 
                 let optimized = self
@@ -131,6 +193,8 @@ impl TranscriptionService {
                     JobStage::Summarizing,
                     "Generating summary and FAQs",
                     80,
+                    None,
+                    None,
                 );
 
                 let summary_faq = self
@@ -157,6 +221,8 @@ impl TranscriptionService {
                 JobStage::Persisting,
                 "Persisting transcription artifact",
                 90,
+                None,
+                None,
             );
 
             let mut metadata = BTreeMap::new();
@@ -195,6 +261,8 @@ impl TranscriptionService {
                 JobStage::Completed,
                 "Transcription completed",
                 100,
+                None,
+                None,
             );
 
             Ok(artifact)
@@ -218,6 +286,8 @@ impl TranscriptionService {
                     JobStage::Cancelled,
                     "Transcription cancelled",
                     100,
+                    None,
+                    None,
                 );
             }
             Err(error) => {
@@ -227,6 +297,8 @@ impl TranscriptionService {
                     JobStage::Failed,
                     &format!("Transcription failed: {error}"),
                     100,
+                    None,
+                    None,
                 );
             }
             Ok(_) => {}
@@ -277,13 +349,33 @@ impl TranscriptionService {
         stage: JobStage,
         message: &str,
         percentage: u8,
+        current_seconds: Option<f32>,
+        total_seconds: Option<f32>,
     ) {
         callback(JobProgress {
             job_id: job_id.to_string(),
             stage,
             message: message.to_string(),
             percentage,
+            current_seconds,
+            total_seconds,
         });
+    }
+
+    fn wav_duration_seconds(&self, wav_path: &Path) -> Option<f32> {
+        let reader = hound::WavReader::open(wav_path).ok()?;
+        let spec = reader.spec();
+        if spec.channels == 0 || spec.sample_rate == 0 {
+            return None;
+        }
+
+        let samples = reader.duration() as f32;
+        let frames = samples / f32::from(spec.channels);
+        if frames <= 0.0 {
+            return None;
+        }
+
+        Some(frames / (spec.sample_rate as f32))
     }
 
     async fn run_cancellable<T, F>(

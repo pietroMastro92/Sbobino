@@ -103,6 +103,40 @@ impl Default for GeneralSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct WhisperOptions {
+    pub translate_to_english: bool,
+    pub no_context: bool,
+    pub split_on_word: bool,
+    pub temperature: f32,
+    pub entropy_threshold: f32,
+    pub logprob_threshold: f32,
+    pub word_threshold: f32,
+    pub best_of: u8,
+    pub beam_size: u8,
+    pub threads: u8,
+    pub processors: u8,
+}
+
+impl Default for WhisperOptions {
+    fn default() -> Self {
+        Self {
+            translate_to_english: false,
+            no_context: false,
+            split_on_word: false,
+            temperature: 0.0,
+            entropy_threshold: 2.5,
+            logprob_threshold: -1.0,
+            word_threshold: 0.01,
+            best_of: 5,
+            beam_size: 1,
+            threads: 4,
+            processors: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TranscriptionSettings {
     pub model: SpeechModel,
     pub language: LanguageCode,
@@ -110,6 +144,7 @@ pub struct TranscriptionSettings {
     pub ffmpeg_path: String,
     pub models_dir: String,
     pub enable_ai_post_processing: bool,
+    pub whisper_options: WhisperOptions,
 }
 
 impl Default for TranscriptionSettings {
@@ -121,6 +156,7 @@ impl Default for TranscriptionSettings {
             ffmpeg_path: "ffmpeg".to_string(),
             models_dir: "models".to_string(),
             enable_ai_post_processing: false,
+            whisper_options: WhisperOptions::default(),
         }
     }
 }

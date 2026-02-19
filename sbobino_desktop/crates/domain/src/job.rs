@@ -34,6 +34,8 @@ pub struct JobProgress {
     pub stage: JobStage,
     pub message: String,
     pub percentage: u8,
+    pub current_seconds: Option<f32>,
+    pub total_seconds: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

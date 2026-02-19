@@ -160,8 +160,17 @@ export async function emptyDeletedArtifacts(): Promise<{ deleted: number }> {
 
 export async function exportArtifact(payload: {
   id: string;
-  format: "txt" | "docx" | "pdf";
+  format: "txt" | "docx" | "html" | "pdf" | "json";
   destination_path: string;
+  style?: "transcript" | "subtitles" | "segments";
+  options?: {
+    include_timestamps: boolean;
+    grouping: "none" | "speaker_paragraphs";
+  };
+  segments?: Array<{
+    time: string;
+    line: string;
+  }>;
   content_override?: string;
 }): Promise<{ path: string }> {
   return invoke<{ path: string }>("export_artifact", { payload });

@@ -5,6 +5,7 @@ use std::path::Path;
 use docx_rs::{Docx, Paragraph, Run};
 use printpdf::{ops::PdfPage, text::TextItem, units::Pt, BuiltinFont, Mm, Op, PdfDocument};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tauri::State;
 
 use sbobino_application::ArtifactQuery;
@@ -55,7 +56,47 @@ pub struct DeleteArtifactsPayload {
 pub enum ExportFormat {
     Txt,
     Docx,
+    Html,
     Pdf,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportStyle {
+    Transcript,
+    Subtitles,
+    Segments,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExportSegment {
+    pub time: String,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportGrouping {
+    None,
+    SpeakerParagraphs,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportOptions {
+    #[serde(default)]
+    pub include_timestamps: bool,
+    #[serde(default)]
+    pub grouping: Option<ExportGrouping>,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            include_timestamps: false,
+            grouping: Some(ExportGrouping::None),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +104,9 @@ pub struct ExportArtifactPayload {
     pub id: String,
     pub format: ExportFormat,
     pub destination_path: String,
+    pub style: Option<ExportStyle>,
+    pub options: Option<ExportOptions>,
+    pub segments: Option<Vec<ExportSegment>>,
     pub content_override: Option<String>,
 }
 
@@ -287,24 +331,6 @@ pub async fn export_artifact(
     payload: ExportArtifactPayload,
 ) -> Result<ExportArtifactResponse, CommandError> {
     let destination_path = Path::new(&payload.destination_path);
-
-    if let Some(content_override) = payload
-        .content_override
-        .as_ref()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        match payload.format {
-            ExportFormat::Txt => export_txt(destination_path, content_override)?,
-            ExportFormat::Docx => export_docx(destination_path, content_override)?,
-            ExportFormat::Pdf => export_pdf(destination_path, content_override)?,
-        }
-
-        return Ok(ExportArtifactResponse {
-            path: destination_path.to_string_lossy().to_string(),
-        });
-    }
-
     let artifact = state
         .artifact_service
         .get(&payload.id)
@@ -312,24 +338,54 @@ pub async fn export_artifact(
         .map_err(CommandError::from)?
         .ok_or_else(|| CommandError::new("not_found", "artifact not found"))?;
 
-    if artifact.optimized_transcript.trim().is_empty()
-        && artifact.raw_transcript.trim().is_empty()
-    {
+    let base_transcription = payload
+        .content_override
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            if artifact.optimized_transcript.trim().is_empty() {
+                artifact.raw_transcript.trim().to_string()
+            } else {
+                artifact.optimized_transcript.trim().to_string()
+            }
+        });
+
+    if base_transcription.trim().is_empty() {
         return Err(CommandError::new(
             "empty_content",
             "no transcription available to export",
         ));
     }
-    let transcription = if artifact.optimized_transcript.trim().is_empty() {
-        artifact.raw_transcript.as_str()
-    } else {
-        artifact.optimized_transcript.as_str()
-    };
+
+    let style = payload.style.unwrap_or(ExportStyle::Transcript);
+    let options = payload.options.unwrap_or_default();
+    let grouping = options.grouping.unwrap_or(ExportGrouping::None);
+    let segments = payload
+        .segments
+        .filter(|entries| !entries.is_empty())
+        .unwrap_or_else(|| build_segments_from_text(&base_transcription));
+    let export_content = build_export_content(
+        &base_transcription,
+        &segments,
+        style,
+        options.include_timestamps,
+    );
 
     match payload.format {
-        ExportFormat::Txt => export_txt(destination_path, transcription)?,
-        ExportFormat::Docx => export_docx(destination_path, transcription)?,
-        ExportFormat::Pdf => export_pdf(destination_path, transcription)?,
+        ExportFormat::Txt => export_txt(destination_path, &export_content)?,
+        ExportFormat::Docx => export_docx(destination_path, &export_content)?,
+        ExportFormat::Html => export_html(destination_path, &artifact.title, &export_content)?,
+        ExportFormat::Pdf => export_pdf(destination_path, &export_content)?,
+        ExportFormat::Json => export_json(
+            destination_path,
+            &artifact,
+            style,
+            grouping,
+            options.include_timestamps,
+            &segments,
+            &export_content,
+        )?,
     }
 
     Ok(ExportArtifactResponse {
@@ -384,7 +440,8 @@ fn export_txt(path: &Path, transcription: &str) -> Result<(), CommandError> {
 }
 
 fn export_docx(path: &Path, transcription: &str) -> Result<(), CommandError> {
-    let doc = Docx::new().add_paragraph(Paragraph::new().add_run(Run::new().add_text(transcription)));
+    let doc =
+        Docx::new().add_paragraph(Paragraph::new().add_run(Run::new().add_text(transcription)));
 
     let file = File::create(path)
         .map_err(|e| CommandError::new("export", format!("failed to create docx file: {e}")))?;
@@ -394,33 +451,79 @@ fn export_docx(path: &Path, transcription: &str) -> Result<(), CommandError> {
         .map_err(|e| CommandError::new("export", format!("failed to write docx: {e}")))
 }
 
+fn export_html(path: &Path, title: &str, transcription: &str) -> Result<(), CommandError> {
+    let escaped_title = escape_html(title);
+    let escaped_transcription = escape_html(transcription).replace('\n', "<br/>\n");
+    let html = format!(
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n<title>{}</title>\n<style>\nbody{{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:2rem;color:#1f2430;background:#f8fafc;}}\nmain{{max-width:880px;margin:0 auto;padding:1.5rem 1.75rem;background:#fff;border:1px solid #dbe2ee;border-radius:14px;}}\nh1{{font-size:1.35rem;margin:0 0 1rem;}}\n.content{{line-height:1.6;font-size:1rem;word-break:break-word;}}\n</style>\n</head>\n<body>\n<main>\n<h1>{}</h1>\n<div class=\"content\">{}</div>\n</main>\n</body>\n</html>\n",
+        escaped_title, escaped_title, escaped_transcription
+    );
+
+    std::fs::write(path, html)
+        .map_err(|e| CommandError::new("export", format!("failed to export html: {e}")))
+}
+
+fn export_json(
+    path: &Path,
+    artifact: &TranscriptArtifact,
+    style: ExportStyle,
+    grouping: ExportGrouping,
+    include_timestamps: bool,
+    segments: &[ExportSegment],
+    content: &str,
+) -> Result<(), CommandError> {
+    let payload = json!({
+        "id": artifact.id,
+        "job_id": artifact.job_id,
+        "title": artifact.title,
+        "kind": artifact.kind.as_str(),
+        "input_path": artifact.input_path,
+        "created_at": artifact.created_at.to_rfc3339(),
+        "updated_at": artifact.updated_at.to_rfc3339(),
+        "style": style,
+        "options": {
+            "include_timestamps": include_timestamps,
+            "grouping": grouping
+        },
+        "content": content,
+        "summary": artifact.summary,
+        "faqs": artifact.faqs,
+        "segments": segments,
+        "metadata": artifact.metadata,
+    });
+
+    let serialized = serde_json::to_string_pretty(&payload)
+        .map_err(|e| CommandError::new("export", format!("failed to encode json export: {e}")))?;
+
+    std::fs::write(path, serialized)
+        .map_err(|e| CommandError::new("export", format!("failed to export json: {e}")))
+}
+
 fn export_pdf(path: &Path, transcription: &str) -> Result<(), CommandError> {
     let mut doc = PdfDocument::new("Transcription");
-
-    let mut ops = vec![
-        Op::StartTextSection,
-        Op::SetFontSizeBuiltinFont {
-            size: Pt(20.0),
-            font: BuiltinFont::HelveticaBold,
-        },
-        Op::SetTextCursor {
-            pos: printpdf::graphics::Point {
-                x: Pt(28.0),
-                y: Pt(810.0),
-            },
-        },
-        Op::WriteTextBuiltinFont {
-            items: vec![TextItem::Text("Transcription".to_string())],
-            font: BuiltinFont::HelveticaBold,
-        },
-    ];
-
+    let mut pages = Vec::new();
+    let mut ops = start_pdf_page_ops(true);
     let mut y = 780.0_f32;
-    append_pdf_section(&mut ops, "Transcription", transcription, &mut y);
+
+    if transcription.trim().is_empty() {
+        write_pdf_line(&mut ops, "No content available for export.", y);
+    } else {
+        for line in transcription.lines() {
+            if y < 42.0 {
+                ops.push(Op::EndTextSection);
+                pages.push(PdfPage::new(Mm(210.0), Mm(297.0), ops));
+                ops = start_pdf_page_ops(false);
+                y = 810.0;
+            }
+
+            write_pdf_line(&mut ops, line, y);
+            y -= 14.0;
+        }
+    }
 
     ops.push(Op::EndTextSection);
-
-    doc.with_pages(vec![PdfPage::new(Mm(210.0), Mm(297.0), ops)]);
+    pages.push(PdfPage::new(Mm(210.0), Mm(297.0), ops));
+    doc.with_pages(pages);
 
     let mut warnings = Vec::new();
     let bytes = doc.save(
@@ -440,49 +543,161 @@ fn export_pdf(path: &Path, transcription: &str) -> Result<(), CommandError> {
         .map_err(|e| CommandError::new("export", format!("failed to write pdf: {e}")))
 }
 
-fn append_pdf_section(ops: &mut Vec<Op>, title: &str, text: &str, y: &mut f32) {
-    if text.trim().is_empty() {
-        return;
-    }
+fn start_pdf_page_ops(with_title: bool) -> Vec<Op> {
+    let mut ops = vec![Op::StartTextSection];
 
-    ops.push(Op::SetFontSizeBuiltinFont {
-        size: Pt(14.0),
-        font: BuiltinFont::HelveticaBold,
-    });
-    ops.push(Op::SetTextCursor {
-        pos: printpdf::graphics::Point {
-            x: Pt(28.0),
-            y: Pt(*y),
-        },
-    });
-    ops.push(Op::WriteTextBuiltinFont {
-        items: vec![TextItem::Text(title.to_string())],
-        font: BuiltinFont::HelveticaBold,
-    });
-
-    *y -= 20.0;
-
-    ops.push(Op::SetFontSizeBuiltinFont {
-        size: Pt(11.0),
-        font: BuiltinFont::Helvetica,
-    });
-
-    for line in text.lines() {
-        if *y < 40.0 {
-            break;
-        }
+    if with_title {
+        ops.push(Op::SetFontSizeBuiltinFont {
+            size: Pt(20.0),
+            font: BuiltinFont::HelveticaBold,
+        });
         ops.push(Op::SetTextCursor {
             pos: printpdf::graphics::Point {
                 x: Pt(28.0),
-                y: Pt(*y),
+                y: Pt(810.0),
             },
         });
         ops.push(Op::WriteTextBuiltinFont {
-            items: vec![TextItem::Text(line.to_string())],
+            items: vec![TextItem::Text("Transcription".to_string())],
+            font: BuiltinFont::HelveticaBold,
+        });
+
+        ops.push(Op::SetFontSizeBuiltinFont {
+            size: Pt(11.0),
             font: BuiltinFont::Helvetica,
         });
-        *y -= 14.0;
+    } else {
+        ops.push(Op::SetFontSizeBuiltinFont {
+            size: Pt(11.0),
+            font: BuiltinFont::Helvetica,
+        });
     }
 
-    *y -= 12.0;
+    ops
+}
+
+fn write_pdf_line(ops: &mut Vec<Op>, line: &str, y: f32) {
+    ops.push(Op::SetTextCursor {
+        pos: printpdf::graphics::Point {
+            x: Pt(28.0),
+            y: Pt(y),
+        },
+    });
+    ops.push(Op::WriteTextBuiltinFont {
+        items: vec![TextItem::Text(line.to_string())],
+        font: BuiltinFont::Helvetica,
+    });
+}
+
+fn build_segments_from_text(transcription: &str) -> Vec<ExportSegment> {
+    transcription
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+        .map(|(index, line)| {
+            let seconds = (index as u32) * 4;
+            let mm = seconds / 60;
+            let ss = seconds % 60;
+            ExportSegment {
+                time: format!("{:02}:{:02}", mm, ss),
+                line: line.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn parse_timestamp_to_seconds(value: &str) -> u32 {
+    let mut parts = value.trim().split(':').collect::<Vec<_>>();
+    if parts.len() < 2 || parts.len() > 3 {
+        return 0;
+    }
+
+    if parts.len() == 2 {
+        parts.insert(0, "0");
+    }
+
+    let hh = parts[0].parse::<u32>().unwrap_or(0);
+    let mm = parts[1].parse::<u32>().unwrap_or(0);
+    let ss = parts[2].parse::<u32>().unwrap_or(0);
+
+    hh * 3600 + mm * 60 + ss
+}
+
+fn format_srt_time(seconds: u32) -> String {
+    let hh = seconds / 3600;
+    let mm = (seconds % 3600) / 60;
+    let ss = seconds % 60;
+    format!("{:02}:{:02}:{:02},000", hh, mm, ss)
+}
+
+fn build_export_content(
+    transcription: &str,
+    segments: &[ExportSegment],
+    style: ExportStyle,
+    include_timestamps: bool,
+) -> String {
+    let normalized_transcription = transcription.trim();
+
+    match style {
+        ExportStyle::Subtitles => {
+            if segments.is_empty() {
+                return normalized_transcription.to_string();
+            }
+
+            segments
+                .iter()
+                .enumerate()
+                .map(|(index, segment)| {
+                    let start_seconds = parse_timestamp_to_seconds(&segment.time);
+                    let end_seconds = start_seconds + 4;
+                    format!(
+                        "{}\n{} --> {}\n{}",
+                        index + 1,
+                        format_srt_time(start_seconds),
+                        format_srt_time(end_seconds),
+                        segment.line.trim()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        }
+        ExportStyle::Segments => {
+            if segments.is_empty() {
+                return normalized_transcription.to_string();
+            }
+
+            segments
+                .iter()
+                .map(|segment| {
+                    if include_timestamps {
+                        format!("[{}] {}", segment.time, segment.line.trim())
+                    } else {
+                        segment.line.trim().to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        ExportStyle::Transcript => {
+            if !include_timestamps || segments.is_empty() {
+                normalized_transcription.to_string()
+            } else {
+                segments
+                    .iter()
+                    .map(|segment| format!("[{}] {}", segment.time, segment.line.trim()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }

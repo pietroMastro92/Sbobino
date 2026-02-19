@@ -43,7 +43,9 @@ function mimeFromPath(path: string): string {
 export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): JSX.Element | null {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const fallbackBlobUrlRef = useRef<string | null>(null);
-  const waitingForFallbackRef = useRef(false);
+  const fallbackAttemptedRef = useRef(false);
+  const pendingAutoPlayRef = useRef(false);
+  const sourceVersionRef = useRef(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -51,6 +53,7 @@ export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): 
   const [loadError, setLoadError] = useState<string | null>(null);
   const [src, setSrc] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [needsFallback, setNeedsFallback] = useState(false);
 
   const sourcePath = useMemo(() => {
     if (!inputPath || inputPath.trim().length === 0) {
@@ -69,7 +72,9 @@ export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): 
       setSrc(null);
       setLoadError(null);
       setIsLoading(false);
-      waitingForFallbackRef.current = false;
+      fallbackAttemptedRef.current = false;
+      pendingAutoPlayRef.current = false;
+      setNeedsFallback(false);
       onMetadataLoaded?.({ durationSeconds: 0 });
       return;
     }
@@ -78,50 +83,26 @@ export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): 
       setSrc(sourcePath);
       setLoadError(null);
       setIsLoading(false);
-      waitingForFallbackRef.current = false;
+      fallbackAttemptedRef.current = false;
+      pendingAutoPlayRef.current = false;
+      setNeedsFallback(false);
       return;
     }
 
     const primarySrc = isTauri() ? convertFileSrc(sourcePath) : sourcePath;
-
-    let disposed = false;
-    let objectUrl: string | null = null;
+    const sourceVersion = sourceVersionRef.current + 1;
+    sourceVersionRef.current = sourceVersion;
 
     setSrc(primarySrc);
     setLoadError(null);
-    setIsLoading(true);
-    waitingForFallbackRef.current = false;
-
-    void (async () => {
-      try {
-        const bytes = await readAudioFile(sourcePath);
-        if (disposed) return;
-
-        const blob = new Blob([new Uint8Array(bytes)], { type: mimeFromPath(sourcePath) });
-        objectUrl = URL.createObjectURL(blob);
-        fallbackBlobUrlRef.current = objectUrl;
-        if (waitingForFallbackRef.current) {
-          setSrc(objectUrl);
-          setLoadError("Using fallback audio stream.");
-          waitingForFallbackRef.current = false;
-        }
-      } catch (error) {
-        if (disposed) return;
-        setLoadError(`Cannot read audio bytes for fallback: ${String(error)}`);
-      } finally {
-        if (!disposed) {
-          setIsLoading(false);
-        }
-      }
-    })();
+    setIsLoading(false);
+    fallbackAttemptedRef.current = false;
+    pendingAutoPlayRef.current = false;
+    setNeedsFallback(false);
 
     return () => {
-      disposed = true;
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-        if (fallbackBlobUrlRef.current === objectUrl) {
-          fallbackBlobUrlRef.current = null;
-        }
+      if (sourceVersionRef.current === sourceVersion) {
+        sourceVersionRef.current += 1;
       }
     };
   }, [sourcePath]);
@@ -136,6 +117,7 @@ export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): 
     setCurrentTime(0);
     setDuration(0);
     setLoadError(null);
+    pendingAutoPlayRef.current = false;
   }, [src]);
 
   useEffect(() => {
@@ -148,11 +130,64 @@ export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): 
     return null;
   }
 
+  async function loadFallbackAudio(autoPlay: boolean): Promise<boolean> {
+    const currentSourcePath = sourcePath;
+    if (!currentSourcePath) {
+      return false;
+    }
+
+    if (fallbackBlobUrlRef.current) {
+      setSrc(fallbackBlobUrlRef.current);
+      setNeedsFallback(false);
+      pendingAutoPlayRef.current = autoPlay;
+      return true;
+    }
+
+    if (fallbackAttemptedRef.current) {
+      return false;
+    }
+
+    fallbackAttemptedRef.current = true;
+    const sourceVersion = sourceVersionRef.current;
+    setIsLoading(true);
+    setLoadError(null);
+
+    try {
+      const bytes = await readAudioFile(currentSourcePath);
+      if (sourceVersionRef.current !== sourceVersion) return false;
+
+      const blob = new Blob([new Uint8Array(bytes)], { type: mimeFromPath(currentSourcePath) });
+      const objectUrl = URL.createObjectURL(blob);
+      if (fallbackBlobUrlRef.current) {
+        URL.revokeObjectURL(fallbackBlobUrlRef.current);
+      }
+      fallbackBlobUrlRef.current = objectUrl;
+      pendingAutoPlayRef.current = autoPlay;
+      setSrc(objectUrl);
+      setNeedsFallback(false);
+      setLoadError(null);
+      return true;
+    } catch (error) {
+      if (sourceVersionRef.current !== sourceVersion) return false;
+      setLoadError(`Cannot load fallback audio: ${String(error)}`);
+      return false;
+    } finally {
+      if (sourceVersionRef.current === sourceVersion) {
+        setIsLoading(false);
+      }
+    }
+  }
+
   async function togglePlayback(): Promise<void> {
     const audio = audioRef.current;
     if (!audio) return;
 
     if (audio.paused) {
+      if (needsFallback && !fallbackBlobUrlRef.current) {
+        const prepared = await loadFallbackAudio(true);
+        if (prepared) return;
+      }
+
       try {
         await audio.play();
         setIsPlaying(true);
@@ -193,6 +228,12 @@ export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): 
           setDuration(durationSeconds);
           onMetadataLoaded?.({ durationSeconds });
           setLoadError(null);
+          if (pendingAutoPlayRef.current) {
+            pendingAutoPlayRef.current = false;
+            void event.currentTarget.play().catch(() => {
+              setIsPlaying(false);
+            });
+          }
         }}
         onTimeUpdate={(event) => {
           setCurrentTime(event.currentTarget.currentTime || 0);
@@ -203,16 +244,31 @@ export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): 
         onPause={() => setIsPlaying(false)}
         onPlay={() => setIsPlaying(true)}
         onError={() => {
-          const fallbackSrc = fallbackBlobUrlRef.current;
-          if (fallbackSrc && src !== fallbackSrc) {
-            setSrc(fallbackSrc);
-            setLoadError("Primary audio source failed. Using fallback stream.");
+          const audioPath = sourcePath;
+          if (!audioPath) {
+            setIsPlaying(false);
             return;
           }
 
-          waitingForFallbackRef.current = true;
-          setLoadError("Primary audio source failed. Preparing fallback stream...");
+          const fallbackSrc = fallbackBlobUrlRef.current;
+          if (fallbackSrc && src !== fallbackSrc) {
+            setSrc(fallbackSrc);
+            setNeedsFallback(false);
+            setLoadError(null);
+            return;
+          }
+
+          if (fallbackAttemptedRef.current) {
+            setLoadError("Unable to load audio source.");
+            setIsPlaying(false);
+            setIsLoading(false);
+            return;
+          }
+
+          setNeedsFallback(true);
+          setLoadError(null);
           setIsPlaying(false);
+          setIsLoading(false);
         }}
       />
 

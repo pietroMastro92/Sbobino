@@ -9,6 +9,7 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
+use sbobino_domain::WhisperOptions;
 
 #[derive(Debug, Clone)]
 pub struct WhisperCppEngine {
@@ -19,6 +20,11 @@ pub struct WhisperCppEngine {
 #[derive(Default)]
 struct TranscriptCollector {
     lines: Vec<String>,
+}
+
+struct ParsedCliLine {
+    text: String,
+    end_seconds: Option<f32>,
 }
 
 impl WhisperCppEngine {
@@ -48,7 +54,15 @@ impl WhisperCppEngine {
         )))
     }
 
-    fn parse_cli_line(raw_line: &str) -> Option<String> {
+    fn parse_timecode_seconds(value: &str) -> Option<f32> {
+        let mut parts = value.trim().split(':');
+        let hh = parts.next()?.parse::<f32>().ok()?;
+        let mm = parts.next()?.parse::<f32>().ok()?;
+        let ss = parts.next()?.parse::<f32>().ok()?;
+        Some((hh * 3600.0) + (mm * 60.0) + ss)
+    }
+
+    fn parse_cli_line(raw_line: &str) -> Option<ParsedCliLine> {
         let cleaned = raw_line
             .replace("\u{001b}[2K", "")
             .replace("\u{001b}[0m", "")
@@ -81,11 +95,16 @@ impl WhisperCppEngine {
             return None;
         }
 
+        let mut end_seconds = None;
+
         let without_timestamp = if cleaned.starts_with('[') {
             match cleaned.find(']') {
                 Some(end_index) => {
                     let bracket_content = cleaned[1..end_index].trim();
                     if bracket_content.contains("-->") {
+                        if let Some((_, end_value)) = bracket_content.split_once("-->") {
+                            end_seconds = Self::parse_timecode_seconds(end_value.trim());
+                        }
                         cleaned[end_index + 1..].trim().to_string()
                     } else {
                         cleaned
@@ -102,7 +121,10 @@ impl WhisperCppEngine {
             return None;
         }
 
-        Some(normalized)
+        Some(ParsedCliLine {
+            text: normalized,
+            end_seconds,
+        })
     }
 
     fn collect_line(
@@ -121,6 +143,7 @@ impl WhisperCppEngine {
         reader: R,
         collector: Arc<Mutex<TranscriptCollector>>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<Vec<String>, ApplicationError>
     where
         R: AsyncRead + Unpin,
@@ -149,7 +172,10 @@ impl WhisperCppEngine {
                         let raw = String::from_utf8_lossy(&pending[start..index]).to_string();
                         raw_lines.push(raw.clone());
                         if let Some(parsed_line) = Self::parse_cli_line(&raw) {
-                            Self::collect_line(&collector, &emit_partial, parsed_line);
+                            if let Some(end_seconds) = parsed_line.end_seconds {
+                                emit_progress_seconds(end_seconds);
+                            }
+                            Self::collect_line(&collector, &emit_partial, parsed_line.text);
                         }
                     }
 
@@ -174,11 +200,29 @@ impl WhisperCppEngine {
             let raw = String::from_utf8_lossy(&pending).to_string();
             raw_lines.push(raw.clone());
             if let Some(parsed_line) = Self::parse_cli_line(&raw) {
-                Self::collect_line(&collector, &emit_partial, parsed_line);
+                if let Some(end_seconds) = parsed_line.end_seconds {
+                    emit_progress_seconds(end_seconds);
+                }
+                Self::collect_line(&collector, &emit_partial, parsed_line.text);
             }
         }
 
         Ok(raw_lines)
+    }
+
+    fn normalized_options(options: &WhisperOptions) -> WhisperOptions {
+        let mut normalized = options.clone();
+
+        normalized.temperature = normalized.temperature.clamp(0.0, 1.0);
+        normalized.entropy_threshold = normalized.entropy_threshold.clamp(0.0, 10.0);
+        normalized.logprob_threshold = normalized.logprob_threshold.clamp(-10.0, 0.0);
+        normalized.word_threshold = normalized.word_threshold.clamp(0.0, 1.0);
+        normalized.best_of = normalized.best_of.clamp(1, 20);
+        normalized.beam_size = normalized.beam_size.clamp(1, 20);
+        normalized.threads = normalized.threads.clamp(1, 32);
+        normalized.processors = normalized.processors.clamp(1, 16);
+
+        normalized
     }
 
     async fn transcribe_with_cli(
@@ -186,7 +230,9 @@ impl WhisperCppEngine {
         input_wav: &Path,
         model_path: &Path,
         language_code: &str,
+        options: &WhisperOptions,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<String, ApplicationError> {
         let output_base = std::env::temp_dir().join(format!(
             "sbobino-whisper-{}-{}",
@@ -206,13 +252,42 @@ impl WhisperCppEngine {
             .arg("-f")
             .arg(input_wav);
 
+        let options = Self::normalized_options(options);
+
+        command
+            .arg("-t")
+            .arg(options.threads.to_string())
+            .arg("-p")
+            .arg(options.processors.to_string())
+            .arg("-tp")
+            .arg(options.temperature.to_string())
+            .arg("-et")
+            .arg(options.entropy_threshold.to_string())
+            .arg("-lpt")
+            .arg(options.logprob_threshold.to_string())
+            .arg("-wt")
+            .arg(options.word_threshold.to_string());
+
         if language_code != "auto" {
             command.arg("-l").arg(language_code);
         }
 
+        if options.translate_to_english {
+            command.arg("-tr");
+        }
+        if options.no_context {
+            command.arg("-mc").arg("0");
+        }
+        if options.split_on_word {
+            command.arg("-sow");
+        }
+        if options.beam_size > 1 {
+            command.arg("-bs").arg(options.beam_size.to_string());
+        } else if options.best_of > 1 {
+            command.arg("-bo").arg(options.best_of.to_string());
+        }
+
         command
-            .arg("-et")
-            .arg("2.5")
             .arg("-otxt")
             .arg("-of")
             .arg(&output_base)
@@ -236,15 +311,17 @@ impl WhisperCppEngine {
         let collected = Arc::new(Mutex::new(TranscriptCollector::default()));
 
         let stdout_emit = emit_partial.clone();
+        let stdout_progress = emit_progress_seconds.clone();
         let stdout_collector = collected.clone();
         let stdout_task = tokio::spawn(async move {
-            Self::consume_stream(stdout, stdout_collector, stdout_emit).await
+            Self::consume_stream(stdout, stdout_collector, stdout_emit, stdout_progress).await
         });
 
         let stderr_emit = emit_partial.clone();
+        let stderr_progress = emit_progress_seconds.clone();
         let stderr_collector = collected.clone();
         let stderr_task = tokio::spawn(async move {
-            Self::consume_stream(stderr, stderr_collector, stderr_emit).await
+            Self::consume_stream(stderr, stderr_collector, stderr_emit, stderr_progress).await
         });
 
         let status = match timeout(Duration::from_secs(900), child.wait()).await {
@@ -316,10 +393,19 @@ impl SpeechToTextEngine for WhisperCppEngine {
         input_wav: &Path,
         model_filename: &str,
         language_code: &str,
+        options: &WhisperOptions,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<String, ApplicationError> {
         let model_path = self.validate_model_exists(model_filename)?;
-        self.transcribe_with_cli(input_wav, &model_path, language_code, emit_partial)
-            .await
+        self.transcribe_with_cli(
+            input_wav,
+            &model_path,
+            language_code,
+            options,
+            emit_partial,
+            emit_progress_seconds,
+        )
+        .await
     }
 }

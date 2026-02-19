@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
+use sbobino_domain::WhisperOptions;
 use sbobino_infrastructure::adapters::whisper_cpp::WhisperCppEngine;
 
 fn write_executable_script(path: &Path, content: &str) {
@@ -55,9 +56,11 @@ exit 0
             &input_wav,
             "ggml-base.bin",
             "en",
+            &WhisperOptions::default(),
             Arc::new(move |line: String| {
                 emitted_clone.lock().expect("emit lock poisoned").push(line);
             }),
+            Arc::new(|_seconds: f32| {}),
         )
         .await
         .expect("transcription should succeed");
@@ -113,7 +116,9 @@ exit 0
             &input_wav,
             "ggml-base.bin",
             "en",
+            &WhisperOptions::default(),
             Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
         )
         .await
         .expect("transcription should succeed");
@@ -156,7 +161,9 @@ exit 2
             &input_wav,
             "ggml-base.bin",
             "en",
+            &WhisperOptions::default(),
             Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
         )
         .await
         .expect_err("transcription should fail");
@@ -207,9 +214,11 @@ exit 0
             &input_wav,
             "ggml-base.bin",
             "en",
+            &WhisperOptions::default(),
             Arc::new(move |line: String| {
                 emitted_clone.lock().expect("emit lock poisoned").push(line);
             }),
+            Arc::new(|_seconds: f32| {}),
         )
         .await
         .expect("transcription should succeed");
@@ -228,4 +237,101 @@ exit 0
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn transcribe_passes_whisper_options_to_cli() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+out=""
+translate=0
+split_on_word=0
+max_context=""
+threads=""
+processors=""
+temp=""
+entropy=""
+logprob=""
+word=""
+best_of=""
+beam_size=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -of) shift; out="$1" ;;
+    -tr) translate=1 ;;
+    -sow) split_on_word=1 ;;
+    -mc) shift; max_context="$1" ;;
+    -t) shift; threads="$1" ;;
+    -p) shift; processors="$1" ;;
+    -tp) shift; temp="$1" ;;
+    -et) shift; entropy="$1" ;;
+    -lpt) shift; logprob="$1" ;;
+    -wt) shift; word="$1" ;;
+    -bo) shift; best_of="$1" ;;
+    -bs) shift; beam_size="$1" ;;
+  esac
+  shift
+done
+
+if [ -n "$out" ]; then
+  printf "tr=%s sow=%s mc=%s t=%s p=%s tp=%s et=%s lpt=%s wt=%s bo=%s bs=%s\n" \
+    "$translate" "$split_on_word" "$max_context" "$threads" "$processors" \
+    "$temp" "$entropy" "$logprob" "$word" "$best_of" "$beam_size" > "${out}.txt"
+fi
+exit 0
+"#,
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            "it",
+            &WhisperOptions {
+                translate_to_english: true,
+                no_context: true,
+                split_on_word: true,
+                temperature: 0.35,
+                entropy_threshold: 2.2,
+                logprob_threshold: -0.9,
+                word_threshold: 0.2,
+                best_of: 7,
+                beam_size: 1,
+                threads: 6,
+                processors: 2,
+            },
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("transcription should succeed");
+
+    assert!(transcript.contains("tr=1"));
+    assert!(transcript.contains("sow=1"));
+    assert!(transcript.contains("mc=0"));
+    assert!(transcript.contains("t=6"));
+    assert!(transcript.contains("p=2"));
+    assert!(transcript.contains("tp=0.35"));
+    assert!(transcript.contains("et=2.2"));
+    assert!(transcript.contains("lpt=-0.9"));
+    assert!(transcript.contains("wt=0.2"));
+    assert!(transcript.contains("bo=7"));
+    assert!(transcript.contains("bs="));
 }

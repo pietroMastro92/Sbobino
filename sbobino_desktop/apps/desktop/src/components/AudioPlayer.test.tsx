@@ -22,7 +22,7 @@ describe("AudioPlayer", () => {
     expect(container.querySelector("footer.audio-player")).toBeNull();
   });
 
-  it("shows fallback loading state when primary source errors", () => {
+  it("loads fallback only after user presses play when primary source fails", () => {
     vi.mocked(readAudioFile).mockImplementation(() => new Promise<number[]>(() => {}));
 
     const { container } = render(<AudioPlayer inputPath="/tmp/sample.mp3" />);
@@ -30,6 +30,10 @@ describe("AudioPlayer", () => {
     expect(audio).not.toBeNull();
 
     fireEvent.error(audio as HTMLAudioElement);
-    expect(screen.getByText(/preparing fallback stream/i)).toBeInTheDocument();
+    expect(readAudioFile).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTitle("Play/Pause"));
+    expect(readAudioFile).toHaveBeenCalledWith("/tmp/sample.mp3");
+    expect(screen.getByText(/loading audio/i)).toBeInTheDocument();
   });
 });

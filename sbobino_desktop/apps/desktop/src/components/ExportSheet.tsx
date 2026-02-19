@@ -1,21 +1,34 @@
-import { Captions, Download, FileText, FileType2, FileType, List } from "lucide-react";
+import { Braces, Captions, Download, FileCode2, FileText, FileType, FileType2, List } from "lucide-react";
 import { useMemo, useState } from "react";
 
-export type ExportFormat = "txt" | "docx" | "pdf";
+export type ExportFormat = "txt" | "docx" | "html" | "pdf" | "json";
 export type ExportStyle = "transcript" | "subtitles" | "segments";
+export type ExportGrouping = "none" | "speaker_paragraphs";
 
-type ExportSegment = {
+export type ExportSegment = {
   time: string;
   line: string;
 };
 
+export type ExportOptions = {
+  includeTimestamps: boolean;
+  grouping: ExportGrouping;
+};
+
+export type ExportRequest = {
+  format: ExportFormat;
+  style: ExportStyle;
+  options: ExportOptions;
+  segments: ExportSegment[];
+  contentOverride?: string;
+};
+
 type ExportSheetProps = {
   open: boolean;
-  title: string;
   transcriptText: string;
   segments: ExportSegment[];
   onClose: () => void;
-  onExport: (format: ExportFormat, contentOverride: string) => Promise<void>;
+  onExport: (payload: ExportRequest) => Promise<void>;
 };
 
 const formatItems: Array<{
@@ -23,6 +36,7 @@ const formatItems: Array<{
   label: string;
   icon: JSX.Element;
   hint: string;
+  badge?: string;
 }> = [
   {
     value: "txt",
@@ -37,17 +51,31 @@ const formatItems: Array<{
     hint: "Word document",
   },
   {
+    value: "html",
+    label: ".html",
+    icon: <FileCode2 size={16} />,
+    hint: "Web page",
+  },
+  {
     value: "pdf",
     label: ".pdf",
     icon: <FileType size={16} />,
     hint: "Portable document",
   },
+  {
+    value: "json",
+    label: ".json",
+    icon: <Braces size={16} />,
+    hint: "Structured data",
+  },
 ];
 
 const styleItems: Array<{
-  value: ExportStyle;
+  value?: ExportStyle;
   label: string;
   icon: JSX.Element;
+  subtitle?: string;
+  badge?: string;
 }> = [
   {
     value: "transcript",
@@ -63,6 +91,18 @@ const styleItems: Array<{
     value: "segments",
     label: "Segments",
     icon: <List size={16} />,
+  },
+  {
+    label: "Whisper",
+    icon: <FileText size={16} />,
+    subtitle: "Coming soon",
+    badge: "PRO",
+  },
+  {
+    label: "Dote",
+    icon: <Captions size={16} />,
+    subtitle: "Coming soon",
+    badge: "PRO",
   },
 ];
 
@@ -125,7 +165,6 @@ function buildExportContent(params: {
 
 export function ExportSheet({
   open,
-  title,
   transcriptText,
   segments,
   onClose,
@@ -134,6 +173,7 @@ export function ExportSheet({
   const [format, setFormat] = useState<ExportFormat>("txt");
   const [style, setStyle] = useState<ExportStyle>("transcript");
   const [includeTimestamps, setIncludeTimestamps] = useState(false);
+  const [grouping, setGrouping] = useState<ExportGrouping>("none");
   const [isExporting, setIsExporting] = useState(false);
 
   const exportContent = useMemo(() => {
@@ -160,7 +200,15 @@ export function ExportSheet({
   async function onConfirm(): Promise<void> {
     setIsExporting(true);
     try {
-      await onExport(format, exportContent);
+      await onExport({
+        format,
+        style,
+        options: {
+          includeTimestamps,
+          grouping,
+        },
+        segments,
+      });
       onClose();
     } finally {
       setIsExporting(false);
@@ -169,12 +217,18 @@ export function ExportSheet({
 
   return (
     <div className="sheet-overlay" onClick={onClose}>
-      <section className="export-sheet" onClick={(event) => event.stopPropagation()}>
+      <section
+        className="export-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="export-sheet-title"
+        onClick={(event) => event.stopPropagation()}
+      >
         <div className="export-preview">
           <header className="export-preview-head">
-            <strong>Transcription Preview</strong>
+            <strong id="export-sheet-title">Export Preview</strong>
             <div className="export-tags">
-              <span>{title}</span>
+              <span>{style}</span>
               <span>{format}</span>
             </div>
           </header>
@@ -186,12 +240,21 @@ export function ExportSheet({
           <div className="export-style-grid">
             {styleItems.map((item) => (
               <button
-                key={item.value}
+                key={item.label}
                 className={style === item.value ? "format-card active" : "format-card"}
-                onClick={() => setStyle(item.value)}
+                onClick={() => {
+                  if (item.value) {
+                    setStyle(item.value);
+                  }
+                }}
+                disabled={!item.value}
               >
-                {item.icon}
+                <span className="format-card-top">
+                  <span className="format-card-icon">{item.icon}</span>
+                  {item.badge ? <span className="format-card-badge">{item.badge}</span> : null}
+                </span>
                 <strong>{item.label}</strong>
+                {item.subtitle ? <small>{item.subtitle}</small> : null}
               </button>
             ))}
           </div>
@@ -204,7 +267,10 @@ export function ExportSheet({
                 className={format === item.value ? "format-card active" : "format-card"}
                 onClick={() => setFormat(item.value)}
               >
-                {item.icon}
+                <span className="format-card-top">
+                  <span className="format-card-icon">{item.icon}</span>
+                  {item.badge ? <span className="format-card-badge">{item.badge}</span> : null}
+                </span>
                 <strong>{item.label}</strong>
                 <small>{item.hint}</small>
               </button>
@@ -213,8 +279,20 @@ export function ExportSheet({
 
           <div className="inspector-block export-options-block">
             <h4>Options</h4>
+            <div className="property-line">
+              <span>Grouping</span>
+              <select
+                value={grouping}
+                onChange={(event) => setGrouping(event.target.value as ExportGrouping)}
+              >
+                <option value="none">None</option>
+                <option value="speaker_paragraphs" disabled>
+                  Speaker paragraphs
+                </option>
+              </select>
+            </div>
             <label className="toggle-row">
-              <span>Show timestamp</span>
+              <span>Show Timestamps</span>
               <input
                 type="checkbox"
                 checked={includeTimestamps}
@@ -226,7 +304,7 @@ export function ExportSheet({
 
           <div className="export-actions">
             <button className="secondary-button" onClick={onClose} disabled={isExporting}>
-              Cancel
+              Close
             </button>
             <button className="primary-button" onClick={() => void onConfirm()} disabled={isExporting}>
               <Download size={14} />

@@ -27,6 +27,20 @@ export type GeneralSettings = {
   auto_update_repo: string;
 };
 
+export type WhisperOptions = {
+  translate_to_english: boolean;
+  no_context: boolean;
+  split_on_word: boolean;
+  temperature: number;
+  entropy_threshold: number;
+  logprob_threshold: number;
+  word_threshold: number;
+  best_of: number;
+  beam_size: number;
+  threads: number;
+  processors: number;
+};
+
 export type TranscriptionSettings = {
   model: SpeechModel;
   language: LanguageCode;
@@ -34,6 +48,7 @@ export type TranscriptionSettings = {
   ffmpeg_path: string;
   models_dir: string;
   enable_ai_post_processing: boolean;
+  whisper_options: WhisperOptions;
 };
 
 export type FoundationProviderSettings = {
@@ -112,6 +127,8 @@ export type JobProgress = {
   stage: JobStage;
   message: string;
   percentage: number;
+  current_seconds?: number | null;
+  total_seconds?: number | null;
 };
 
 export type TranscriptionDelta = {
@@ -140,6 +157,7 @@ export type StartTranscriptionPayload = {
   language: LanguageCode;
   model: SpeechModel;
   enable_ai: boolean;
+  whisper_options: WhisperOptions;
 };
 
 export type RealtimeDeltaKind = "append_final" | "update_preview";

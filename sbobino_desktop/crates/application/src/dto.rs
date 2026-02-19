@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use sbobino_domain::{ArtifactKind, LanguageCode, SpeechModel};
+use sbobino_domain::{ArtifactKind, LanguageCode, SpeechModel, WhisperOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunTranscriptionRequest {
@@ -9,6 +9,7 @@ pub struct RunTranscriptionRequest {
     pub language: LanguageCode,
     pub model: SpeechModel,
     pub enable_ai: bool,
+    pub whisper_options: WhisperOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

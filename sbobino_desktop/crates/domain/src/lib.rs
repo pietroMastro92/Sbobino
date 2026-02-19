@@ -9,5 +9,5 @@ pub use job::{JobProgress, JobStage, JobStatus, TranscriptionJob};
 pub use settings::{
     default_prompt_templates, AiProvider, AiSettings, AppSettings, GeneralSettings, LanguageCode,
     PromptBindings, PromptCategory, PromptSettings, PromptTask, PromptTemplate, SpeechModel,
-    TranscriptionSettings,
+    TranscriptionSettings, WhisperOptions,
 };

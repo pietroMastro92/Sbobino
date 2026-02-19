@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RunTranscriptionRequest};
-use sbobino_domain::{JobProgress, LanguageCode, SpeechModel};
+use sbobino_domain::{JobProgress, LanguageCode, SpeechModel, WhisperOptions};
 
 use crate::{
     error::CommandError,
@@ -20,6 +20,8 @@ pub struct StartTranscriptionPayload {
     pub language: LanguageCode,
     pub model: SpeechModel,
     pub enable_ai: bool,
+    #[serde(default)]
+    pub whisper_options: WhisperOptions,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +61,7 @@ pub async fn start_transcription(
         language: payload.language,
         model: payload.model,
         enable_ai: payload.enable_ai,
+        whisper_options: payload.whisper_options,
     };
 
     let transcription_service = state

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use sbobino_domain::{AppSettings, ArtifactKind, TranscriptArtifact};
+use sbobino_domain::{AppSettings, ArtifactKind, TranscriptArtifact, WhisperOptions};
 
 use crate::{dto::SummaryFaq, ApplicationError};
 
@@ -18,7 +18,9 @@ pub trait SpeechToTextEngine: Send + Sync {
         input_wav: &Path,
         model_filename: &str,
         language_code: &str,
+        options: &WhisperOptions,
         emit_partial: std::sync::Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: std::sync::Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<String, ApplicationError>;
 }
 

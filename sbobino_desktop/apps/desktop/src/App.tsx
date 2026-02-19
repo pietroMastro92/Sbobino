@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { confirm as confirmDialog, open, save } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
   AudioLines,
@@ -13,6 +13,7 @@ import {
   Languages,
   List,
   ListChecks,
+  ListFilter,
   MessageSquareText,
   Mic,
   PanelLeftClose,
@@ -24,8 +25,10 @@ import {
   Save,
   Settings2,
   Sparkles,
+  Search,
   Trash2,
   Upload,
+  X,
 } from "lucide-react";
 import {
   cancelTranscription,
@@ -81,9 +84,10 @@ import type {
   SpeechModel,
   TranscriptArtifact,
   UpdateCheckResponse,
+  WhisperOptions,
 } from "./types";
 import { AudioPlayer } from "./components/AudioPlayer";
-import { ExportSheet, type ExportFormat } from "./components/ExportSheet";
+import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 
 type Section =
@@ -96,7 +100,13 @@ type Section =
   | "settings";
 type DetailMode = "transcript" | "segments" | "summary" | "chat";
 type InspectorMode = "details" | "info";
-type SettingsPane = "general" | "local_models" | "ai_services" | "prompts" | "advanced";
+type SettingsPane =
+  | "general"
+  | "transcription"
+  | "local_models"
+  | "ai_services"
+  | "prompts"
+  | "advanced";
 type ChatMessage = { role: "user" | "assistant"; text: string };
 
 type PromptTestState = {
@@ -132,6 +142,32 @@ const promptTaskOptions: Array<{ value: PromptTask; label: string }> = [
 ];
 
 const defaultPromptTestInput = "This is an example of some transcribed text.";
+const defaultWhisperOptions: WhisperOptions = {
+  translate_to_english: false,
+  no_context: false,
+  split_on_word: false,
+  temperature: 0,
+  entropy_threshold: 2.5,
+  logprob_threshold: -1,
+  word_threshold: 0.01,
+  best_of: 5,
+  beam_size: 1,
+  threads: 4,
+  processors: 1,
+};
+
+const settingsPaneDefinitions: Array<{
+  key: SettingsPane;
+  label: string;
+  description: string;
+}> = [
+  { key: "transcription", label: "Transcription", description: "Whisper decoding and defaults" },
+  { key: "local_models", label: "Local Models", description: "Model downloads and health" },
+  { key: "advanced", label: "Advanced", description: "Runtime binary paths" },
+  { key: "general", label: "General", description: "Updates and app basics" },
+  { key: "ai_services", label: "AI Services", description: "Provider configuration" },
+  { key: "prompts", label: "Prompts", description: "Template management" },
+];
 
 function fileLabel(path: string): string {
   const parts = path.split(/[/\\]/);
@@ -144,6 +180,21 @@ function formatDate(value: string): string {
     return value;
   }
   return date.toLocaleString();
+}
+
+function dayGroupLabel(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "recent";
+  }
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const dayMs = 24 * 60 * 60 * 1000;
+  const diffDays = Math.round((startToday.getTime() - startDate.getTime()) / dayMs);
+  if (diffDays === 0) return "oggi";
+  if (diffDays === 1) return "ieri";
+  return date.toLocaleDateString();
 }
 
 function previewSnippet(value: string, maxLength = 170): string {
@@ -182,6 +233,44 @@ function formatShortDuration(seconds: number): string {
   return `${mm}:${ss}`;
 }
 
+function clampPercentage(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 100) return 100;
+  return value;
+}
+
+function percentageFromJobProgress(progress: JobProgress | null | undefined): number {
+  if (!progress) return 0;
+  const currentSeconds = progress.current_seconds ?? null;
+  const totalSeconds = progress.total_seconds ?? null;
+  if (currentSeconds !== null && totalSeconds !== null && totalSeconds > 0) {
+    return clampPercentage((currentSeconds / totalSeconds) * 100);
+  }
+  return clampPercentage(progress.percentage);
+}
+
+function formatJobStageLabel(stage: string): string {
+  return stage
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function ProgressRing({ percentage, size = 18 }: { percentage: number; size?: number }): JSX.Element {
+  const clamped = clampPercentage(percentage);
+  const ringStyle = {
+    width: `${size}px`,
+    height: `${size}px`,
+    backgroundImage: `conic-gradient(from -90deg, var(--accent) ${clamped}%, var(--line-soft) ${clamped}% 100%)`,
+  } satisfies CSSProperties;
+
+  return (
+    <span className="progress-ring" style={ringStyle} aria-hidden>
+      <span className="progress-ring-core" />
+    </span>
+  );
+}
+
 function readStoredFlag(key: string, fallback: boolean): boolean {
   if (typeof window === "undefined") {
     return fallback;
@@ -193,6 +282,11 @@ function readStoredFlag(key: string, fallback: boolean): boolean {
 }
 
 function normalizeSettings(settings: AppSettings): AppSettings {
+  const normalizedWhisperOptions = sanitizeWhisperOptions({
+    ...defaultWhisperOptions,
+    ...settings.transcription.whisper_options,
+  });
+
   const normalized: AppSettings = {
     ...settings,
     general: {
@@ -200,6 +294,7 @@ function normalizeSettings(settings: AppSettings): AppSettings {
     },
     transcription: {
       ...settings.transcription,
+      whisper_options: normalizedWhisperOptions,
     },
     ai: {
       ...settings.ai,
@@ -236,6 +331,25 @@ function normalizeSettings(settings: AppSettings): AppSettings {
   normalized.gemini_api_key = normalized.ai.providers.gemini.api_key;
 
   return normalized;
+}
+
+function sanitizeWhisperOptions(options: WhisperOptions): WhisperOptions {
+  const clamp = (value: number, min: number, max: number): number =>
+    Math.min(max, Math.max(min, value));
+
+  return {
+    translate_to_english: options.translate_to_english,
+    no_context: options.no_context,
+    split_on_word: options.split_on_word,
+    temperature: clamp(options.temperature, 0, 1),
+    entropy_threshold: clamp(options.entropy_threshold, 0, 10),
+    logprob_threshold: clamp(options.logprob_threshold, -10, 0),
+    word_threshold: clamp(options.word_threshold, 0, 1),
+    best_of: Math.round(clamp(options.best_of, 1, 20)),
+    beam_size: Math.round(clamp(options.beam_size, 1, 20)),
+    threads: Math.round(clamp(options.threads, 1, 32)),
+    processors: Math.round(clamp(options.processors, 1, 16)),
+  };
 }
 
 type DetailCenterModeControlProps = {
@@ -287,6 +401,7 @@ type DetailToolbarProps = {
   title: string;
   hasArtifact: boolean;
   hasActiveJob: boolean;
+  transcriptionProgress: number;
   onShowSidebar: () => void;
   onBack: () => void;
   onSelectMode: (mode: "transcript" | "summary" | "chat") => void;
@@ -302,6 +417,7 @@ function DetailToolbar({
   title,
   hasArtifact,
   hasActiveJob,
+  transcriptionProgress,
   onShowSidebar,
   onBack,
   onSelectMode,
@@ -344,7 +460,10 @@ function DetailToolbar({
         ) : null}
         {!hasArtifact && hasActiveJob ? (
           <>
-            <span className="kind-chip">Transcribing</span>
+            <span className="transcribing-pill">
+              <ProgressRing percentage={transcriptionProgress} size={16} />
+              <span>Transcribing</span>
+            </span>
             <button className="secondary-button" onClick={onCancel}>
               Cancel
             </button>
@@ -449,7 +568,8 @@ export function App() {
   } = useAppStore();
 
   const [section, setSection] = useState<Section>("home");
-  const [settingsPane, setSettingsPane] = useState<SettingsPane>("general");
+  const [settingsPane, setSettingsPane] = useState<SettingsPane>("transcription");
+  const [settingsQuery, setSettingsQuery] = useState("");
   const [showModelManager, setShowModelManager] = useState(false);
   const [detailMode, setDetailMode] = useState<DetailMode>("transcript");
   const [inspectorMode, setInspectorMode] = useState<InspectorMode>("details");
@@ -472,6 +592,9 @@ export function App() {
   const [draftSummary, setDraftSummary] = useState("");
   const [draftFaqs, setDraftFaqs] = useState("");
   const [showExportSheet, setShowExportSheet] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<TranscriptArtifact | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [isRenamingArtifact, setIsRenamingArtifact] = useState(false);
 
   const [chatInput, setChatInput] = useState("");
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
@@ -844,6 +967,34 @@ export function App() {
     });
   }, [deletedArtifacts, deletedSearch]);
 
+  const groupedHistoryArtifacts = useMemo(() => {
+    const groups: Array<{ label: string; items: TranscriptArtifact[] }> = [];
+    for (const artifact of filteredArtifacts) {
+      const label = dayGroupLabel(artifact.updated_at);
+      const existing = groups[groups.length - 1];
+      if (!existing || existing.label !== label) {
+        groups.push({ label, items: [artifact] });
+      } else {
+        existing.items.push(artifact);
+      }
+    }
+    return groups;
+  }, [filteredArtifacts]);
+
+  const groupedRecentArtifacts = useMemo(() => {
+    const groups: Array<{ label: string; items: TranscriptArtifact[] }> = [];
+    for (const artifact of artifacts.slice(0, 6)) {
+      const label = dayGroupLabel(artifact.updated_at);
+      const existing = groups[groups.length - 1];
+      if (!existing || existing.label !== label) {
+        groups.push({ label, items: [artifact] });
+      } else {
+        existing.items.push(artifact);
+      }
+    }
+    return groups;
+  }, [artifacts]);
+
   const canStartFileTranscription = useMemo(() => {
     if (!settings || !selectedFile || isStarting || Boolean(activeJobId)) {
       return false;
@@ -909,13 +1060,20 @@ export function App() {
     [draftTranscript],
   );
 
+  const activeQueueJob = useMemo(
+    () => (activeJobId ? queueItems.find((item) => item.job_id === activeJobId) ?? null : null),
+    [activeJobId, queueItems],
+  );
+
+  const activeTranscriptionPercentage = useMemo(() => {
+    return percentageFromJobProgress(activeQueueJob ?? progress);
+  }, [activeQueueJob, progress]);
+
   const queueActiveItems = useMemo(
     () =>
       queueItems.filter((entry) => !["completed", "cancelled", "failed"].includes(entry.stage)),
     [queueItems],
   );
-
-  const recentArtifacts = useMemo(() => artifacts.slice(0, 6), [artifacts]);
 
   const exportPreviewText = useMemo(() => {
     const transcript = draftTranscript.trim();
@@ -930,9 +1088,28 @@ export function App() {
     return settings.prompts.templates.find((template) => template.id === activePromptId) ?? null;
   }, [activePromptId, settings]);
 
+  const visibleSettingsPanes = useMemo(() => {
+    const query = settingsQuery.trim().toLowerCase();
+    if (!query) return settingsPaneDefinitions;
+
+    return settingsPaneDefinitions.filter((pane) => {
+      return (
+        pane.label.toLowerCase().includes(query) ||
+        pane.description.toLowerCase().includes(query)
+      );
+    });
+  }, [settingsQuery]);
+
   useEffect(() => {
     setAudioDurationSeconds(0);
   }, [detailAudioInputPath]);
+
+  useEffect(() => {
+    if (visibleSettingsPanes.length === 0) return;
+    if (!visibleSettingsPanes.some((pane) => pane.key === settingsPane)) {
+      setSettingsPane(visibleSettingsPanes[0].key);
+    }
+  }, [settingsPane, visibleSettingsPanes]);
 
   function setProvisioningState(status: {
     ready: boolean;
@@ -1098,6 +1275,20 @@ export function App() {
     }));
   }
 
+  async function onPatchWhisperOptions(
+    mutator: (current: WhisperOptions) => WhisperOptions,
+  ): Promise<void> {
+    await patchSettings((current) => ({
+      ...current,
+      transcription: {
+        ...current.transcription,
+        whisper_options: sanitizeWhisperOptions(
+          mutator(current.transcription.whisper_options ?? defaultWhisperOptions),
+        ),
+      },
+    }));
+  }
+
   async function onStartTranscription(): Promise<void> {
     if (!settings || !selectedFile) return;
 
@@ -1109,6 +1300,9 @@ export function App() {
         language: settings.transcription.language,
         model: settings.transcription.model,
         enable_ai: settings.transcription.enable_ai_post_processing,
+        whisper_options: sanitizeWhisperOptions(
+          settings.transcription.whisper_options ?? defaultWhisperOptions,
+        ),
       });
 
       setJobStarted(job_id);
@@ -1150,6 +1344,30 @@ export function App() {
     } catch (artifactError) {
       setError(`Failed to open transcript: ${String(artifactError)}`);
     }
+  }
+
+  function onFocusQueueJob(item: JobProgress): void {
+    const switchingJob = activeJobIdRef.current !== item.job_id;
+    setJobStarted(item.job_id);
+    setProgress(item);
+    activeJobIdRef.current = item.job_id;
+    if (switchingJob) {
+      setActiveJobPreviewText("");
+      activeJobDeltaSequenceRef.current = -1;
+      setActiveJobTitle(activeJobTitle || "Transcribing");
+    }
+    setActiveArtifact(null);
+    setDetailMode("transcript");
+    setInspectorMode("details");
+    setSection("detail");
+    setError(null);
+  }
+
+  function onCloseOpenedArtifact(): void {
+    setShowExportSheet(false);
+    setActiveArtifact(null);
+    setSection("history");
+    setError(null);
   }
 
   async function onSaveArtifact(): Promise<void> {
@@ -1194,22 +1412,50 @@ export function App() {
     }
   }
 
-  async function onRenameArtifact(artifact: TranscriptArtifact): Promise<void> {
-    const newTitle = window.prompt("Rename transcript", artifact.title)?.trim();
-    if (!newTitle || newTitle === artifact.title) {
+  function onRenameArtifact(artifact: TranscriptArtifact): void {
+    setRenameTarget(artifact);
+    setRenameDraft(artifact.title);
+  }
+
+  function closeRenameDialog(): void {
+    if (isRenamingArtifact) return;
+    setRenameTarget(null);
+    setRenameDraft("");
+  }
+
+  async function confirmRenameArtifact(): Promise<void> {
+    if (!renameTarget || isRenamingArtifact) return;
+
+    const newTitle = renameDraft.trim();
+    if (!newTitle) {
+      setError("Title cannot be empty.");
       return;
     }
 
+    if (newTitle === renameTarget.title) {
+      closeRenameDialog();
+      return;
+    }
+
+    setIsRenamingArtifact(true);
     try {
-      const updated = await renameArtifact({ id: artifact.id, new_title: newTitle });
-      if (updated) {
-        upsertArtifact(updated);
-        if (activeArtifact?.id === updated.id) {
-          hydrateDetail(updated);
-        }
+      const updated = await renameArtifact({ id: renameTarget.id, new_title: newTitle });
+      if (!updated) {
+        setError("Transcript not found while renaming.");
+        return;
       }
+
+      upsertArtifact(updated);
+      if (activeArtifact?.id === updated.id) {
+        hydrateDetail(updated);
+      }
+
+      setError(null);
+      closeRenameDialog();
     } catch (renameError) {
       setError(`Rename failed: ${String(renameError)}`);
+    } finally {
+      setIsRenamingArtifact(false);
     }
   }
 
@@ -1228,8 +1474,9 @@ export function App() {
             .map((artifact) => `- ${artifact.title}`)
             .join("\n")}${targets.length > 5 ? "\n- ..." : ""}`;
 
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
       `Move ${details} to Recently Deleted?\n\nYou can restore these items later from Recently Deleted.`,
+      { title: "Move to Recently Deleted", kind: "warning" },
     );
     if (!confirmed) return;
 
@@ -1262,10 +1509,11 @@ export function App() {
     const uniqueIds = Array.from(new Set(ids));
     if (uniqueIds.length === 0) return;
 
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
       uniqueIds.length === 1
         ? "Restore this transcription from Recently Deleted?"
         : `Restore ${uniqueIds.length} transcriptions from Recently Deleted?`,
+      { title: "Restore transcription" },
     );
     if (!confirmed) return;
 
@@ -1287,10 +1535,11 @@ export function App() {
     const uniqueIds = Array.from(new Set(ids));
     if (uniqueIds.length === 0) return;
 
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
       uniqueIds.length === 1
         ? "Permanently delete this transcription from Recently Deleted? This action cannot be undone."
         : `Permanently delete ${uniqueIds.length} transcriptions from Recently Deleted? This action cannot be undone.`,
+      { title: "Permanent delete", kind: "warning" },
     );
     if (!confirmed) return;
 
@@ -1310,8 +1559,9 @@ export function App() {
   }
 
   async function onEmptyTrash(): Promise<void> {
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
       "Empty Recently Deleted? This permanently deletes all trashed transcriptions.",
+      { title: "Empty Recently Deleted", kind: "warning" },
     );
     if (!confirmed) return;
 
@@ -1337,7 +1587,7 @@ export function App() {
     return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
-  async function onExport(format: ExportFormat, contentOverride: string): Promise<void> {
+  async function onExport(payload: ExportRequest): Promise<void> {
     if (!activeArtifact) return;
 
     let artifactForExport = activeArtifact;
@@ -1366,7 +1616,7 @@ export function App() {
     }
 
     const destination = await save({
-      defaultPath: `${artifactForExport.title.replace(/\s+/g, "_")}.${format}`,
+      defaultPath: `${artifactForExport.title.replace(/\s+/g, "_")}.${payload.format}`,
     });
 
     if (!destination) {
@@ -1376,9 +1626,15 @@ export function App() {
     try {
       await exportArtifact({
         id: artifactForExport.id,
-        format,
+        format: payload.format,
         destination_path: destination,
-        content_override: contentOverride,
+        style: payload.style,
+        options: {
+          include_timestamps: payload.options.includeTimestamps,
+          grouping: payload.options.grouping,
+        },
+        segments: payload.segments,
+        content_override: payload.contentOverride,
       });
       setError(null);
     } catch (exportError) {
@@ -1617,7 +1873,7 @@ export function App() {
 
   function renderHome(): JSX.Element {
     return (
-      <div className="view-body">
+      <div className="view-body home-view">
         <section className="file-picker-card">
           <div className="file-chip">
             <AudioLines size={15} />
@@ -1671,52 +1927,48 @@ export function App() {
         </div>
 
         <section className="panel-card">
-          <div className="panel-head">
-            <h3>Recent Transcriptions</h3>
-            <div className="panel-head-actions">
-              <button className="secondary-button" onClick={() => setSection("history")}>Open History</button>
-            </div>
-          </div>
-
-          {recentArtifacts.length === 0 ? (
+          {groupedRecentArtifacts.length === 0 ? (
             <div className="center-empty compact">
               <h3>No transcripts yet</h3>
               <p>Open a file and start transcription to begin.</p>
             </div>
           ) : (
-            <div className="history-list">
-              {recentArtifacts.map((artifact) => (
-                <article
-                  key={artifact.id}
-                  className="history-item home-history-item"
-                >
-                  <button
-                    className="home-history-main"
-                    onClick={() => void onOpenArtifact(artifact.id)}
-                  >
-                    <div>
-                      <div className="home-history-head">
-                        <strong>{artifact.title}</strong>
-                        <span className="history-inline-time">{formatHomeTime(artifact.updated_at)}</span>
-                      </div>
-                      <p className="history-preview">
-                        {previewSnippet(artifact.optimized_transcript || artifact.raw_transcript)}
-                      </p>
-                    </div>
-                  </button>
-
-                  <button
-                    className="icon-button danger-icon-button home-history-delete"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void onDeleteArtifact(artifact);
-                    }}
-                    title="Delete transcript"
-                    aria-label={`Delete ${artifact.title}`}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </article>
+            <div className="history-groups">
+              {groupedRecentArtifacts.map((group) => (
+                <section key={group.label} className="history-group">
+                  <h3 className="history-group-label">{group.label}</h3>
+                  <div className="history-list">
+                    {group.items.map((artifact) => (
+                      <article key={artifact.id} className="history-item home-history-item">
+                        <button className="home-history-main" onClick={() => void onOpenArtifact(artifact.id)}>
+                          <span className="history-audio-dot">
+                            <AudioLines size={12} />
+                          </span>
+                          <div className="home-history-copy">
+                            <div className="home-history-head">
+                              <strong>{artifact.title}</strong>
+                              <span className="history-inline-time">{formatHomeTime(artifact.updated_at)}</span>
+                            </div>
+                            <p className="history-preview">
+                              {previewSnippet(artifact.optimized_transcript || artifact.raw_transcript, 210)}
+                            </p>
+                          </div>
+                        </button>
+                        <button
+                          className="icon-button danger-icon-button home-history-delete"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void onDeleteArtifact(artifact);
+                          }}
+                          title="Move to trash"
+                          aria-label={`Move ${artifact.title} to trash`}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </article>
+                    ))}
+                  </div>
+                </section>
               ))}
             </div>
           )}
@@ -1748,18 +2000,42 @@ export function App() {
           </div>
         ) : (
           <div className="queue-list">
-            {queueActiveItems.map((item) => (
-              <article key={item.job_id} className="queue-card">
-                <div className="queue-card-head">
-                  <strong>{item.job_id.slice(0, 8)}</strong>
-                  <small>{item.stage}</small>
-                </div>
-                <p>{item.message}</p>
-                <div className="queue-progress">
-                  <div style={{ width: `${item.percentage}%` }} />
-                </div>
-              </article>
-            ))}
+            {queueActiveItems.map((item) => {
+              const displayPercentage =
+                item.job_id === activeJobId
+                  ? activeTranscriptionPercentage
+                  : percentageFromJobProgress(item);
+
+              return (
+                <article
+                  key={item.job_id}
+                  className="queue-card queue-card-clickable"
+                  onClick={() => onFocusQueueJob(item)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onFocusQueueJob(item);
+                    }
+                  }}
+                >
+                  <div className="queue-card-head">
+                    <strong>
+                      {item.job_id === activeJobId && activeJobTitle ? activeJobTitle : "Transcription in progress"}
+                    </strong>
+                    <span className="queue-stage">
+                      <ProgressRing percentage={displayPercentage} size={18} />
+                      <small>{formatJobStageLabel(item.stage)}</small>
+                    </span>
+                  </div>
+                  <p>{item.message}</p>
+                  <div className="queue-progress">
+                    <div style={{ width: `${displayPercentage}%` }} />
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
       </div>
@@ -1768,67 +2044,49 @@ export function App() {
 
   function renderHistory(): JSX.Element {
     return (
-      <div className="view-body">
-        <div className="view-toolbar">
-          <h2>Transcriptions</h2>
-          <div className="toolbar-actions">
-            <div className="segmented-control">
-              <button
-                className={historyKind === "all" ? "seg active" : "seg"}
-                onClick={() => setHistoryKind("all")}
-              >
-                All
-              </button>
-              <button
-                className={historyKind === "file" ? "seg active" : "seg"}
-                onClick={() => setHistoryKind("file")}
-              >
-                Files
-              </button>
-              <button
-                className={historyKind === "realtime" ? "seg active" : "seg"}
-                onClick={() => setHistoryKind("realtime")}
-              >
-                Live
-              </button>
-            </div>
-            <input
-              className="toolbar-search"
-              placeholder="Search history..."
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-            />
-          </div>
-        </div>
-
-        {filteredArtifacts.length === 0 ? (
+      <div className="view-body history-view">
+        {groupedHistoryArtifacts.length === 0 ? (
           <div className="center-empty">
             <div className="center-empty-icon"><Clock3 size={28} /></div>
             <h3>No Transcriptions Yet</h3>
           </div>
         ) : (
-          <div className="history-list">
-            {filteredArtifacts.map((artifact) => (
-              <article key={artifact.id} className="history-item">
-                <button className="history-main" onClick={() => void onOpenArtifact(artifact.id)}>
-                  <div>
-                    <strong>{artifact.title}</strong>
-                    <p>{previewSnippet(artifact.optimized_transcript || artifact.raw_transcript, 220)}</p>
-                  </div>
-                  <small>{formatDate(artifact.updated_at)}</small>
-                </button>
-                <div className="history-actions">
-                  <span className="kind-chip">{artifact.kind === "realtime" ? "Live" : "File"}</span>
-                  <button className="secondary-button history-action-button" onClick={() => void onRenameArtifact(artifact)}>
-                    <Pencil size={14} />
-                    Rename
-                  </button>
-                  <button className="secondary-button history-action-button history-action-danger" onClick={() => void onDeleteArtifact(artifact)}>
-                    <Trash2 size={14} />
-                    Move to Trash
-                  </button>
+          <div className="history-groups">
+            {groupedHistoryArtifacts.map((group) => (
+              <section key={group.label} className="history-group">
+                <h3 className="history-group-label">{group.label}</h3>
+                <div className="history-list">
+                  {group.items.map((artifact) => (
+                    <article key={artifact.id} className="history-item">
+                      <button className="history-main history-main-rich" onClick={() => void onOpenArtifact(artifact.id)}>
+                        <span className="history-audio-dot">
+                          <AudioLines size={12} />
+                        </span>
+                        <div className="history-main-copy">
+                          <div className="home-history-head">
+                            <strong>{artifact.title}</strong>
+                            <span className="history-inline-time">{formatHomeTime(artifact.updated_at)}</span>
+                          </div>
+                          <p className="history-preview">
+                            {previewSnippet(artifact.optimized_transcript || artifact.raw_transcript, 220)}
+                          </p>
+                        </div>
+                      </button>
+                      <div className="history-actions">
+                        <span className="kind-chip">{artifact.kind === "realtime" ? "Live" : "File"}</span>
+                        <button className="secondary-button history-action-button" onClick={() => void onRenameArtifact(artifact)}>
+                          <Pencil size={14} />
+                          Rename
+                        </button>
+                        <button className="secondary-button history-action-button history-action-danger" onClick={() => void onDeleteArtifact(artifact)}>
+                          <Trash2 size={14} />
+                          Move to Trash
+                        </button>
+                      </div>
+                    </article>
+                  ))}
                 </div>
-              </article>
+              </section>
             ))}
           </div>
         )}
@@ -1839,22 +2097,6 @@ export function App() {
   function renderDeletedHistory(): JSX.Element {
     return (
       <div className="view-body">
-        <div className="view-toolbar">
-          <h2>Recently Deleted</h2>
-          <div className="toolbar-actions">
-            <input
-              className="toolbar-search"
-              placeholder="Search history..."
-              value={deletedSearch}
-              onChange={(event) => setDeletedSearch(event.target.value)}
-            />
-            <button className="secondary-button history-action-button" onClick={() => void onEmptyTrash()}>
-              <Trash2 size={14} />
-              Empty Trash
-            </button>
-          </div>
-        </div>
-
         {filteredDeletedArtifacts.length === 0 ? (
           <div className="center-empty">
             <div className="center-empty-icon"><Trash2 size={28} /></div>
@@ -2337,14 +2579,7 @@ export function App() {
 
   function renderDetail(): JSX.Element {
     return (
-      <div
-        className={rightSidebarOpen ? "detail-layout" : "detail-layout right-collapsed"}
-        style={{
-          gridTemplateColumns: rightSidebarOpen
-            ? "minmax(0, 1fr) clamp(300px, 24vw, 380px)"
-            : "minmax(0, 1fr)",
-        }}
-      >
+      <div className={rightSidebarOpen ? "detail-layout" : "detail-layout right-collapsed"}>
         <section className="detail-main">
           <DetailToolbar
             leftSidebarOpen={leftSidebarOpen}
@@ -2353,6 +2588,7 @@ export function App() {
             title={activeArtifact ? activeArtifact.title : (activeJobTitle || "Transcribing")}
             hasArtifact={Boolean(activeArtifact)}
             hasActiveJob={Boolean(activeJobId)}
+            transcriptionProgress={activeTranscriptionPercentage}
             onShowSidebar={() => setLeftSidebarOpen(true)}
             onBack={() => setSection("history")}
             onSelectMode={(mode) => {
@@ -2447,11 +2683,18 @@ export function App() {
     }
 
     return (
-      <div className="settings-form-grid">
-        <section className="settings-card-block">
-          <h3>General</h3>
-          <label className="toggle-row">
-            <span>Enable auto update checks</span>
+      <div className="settings-stack">
+        <section className="settings-panel">
+          <header>
+            <h3>General</h3>
+            <p>Application-level defaults and update behavior.</p>
+          </header>
+
+          <div className="settings-row">
+            <div>
+              <strong>Enable auto update checks</strong>
+              <small>Checks GitHub releases in the background.</small>
+            </div>
             <input
               type="checkbox"
               checked={settings.general.auto_update_enabled}
@@ -2465,10 +2708,13 @@ export function App() {
                 }));
               }}
             />
-          </label>
+          </div>
 
-          <label>
-            Updates repository
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Updates repository</strong>
+              <small>GitHub repository used for update checks.</small>
+            </div>
             <input
               value={settings.general.auto_update_repo}
               onChange={(event) => {
@@ -2481,9 +2727,9 @@ export function App() {
                 }));
               }}
             />
-          </label>
+          </div>
 
-          <div className="update-row">
+          <div className="settings-actions-row">
             <button className="secondary-button" onClick={() => void onRefreshUpdates()} disabled={checkingUpdates}>
               {checkingUpdates ? "Checking..." : "Check Updates"}
             </button>
@@ -2501,11 +2747,29 @@ export function App() {
             </a>
           ) : null}
         </section>
+      </div>
+    );
+  }
 
-        <section className="settings-card-block">
-          <h3>Transcription Defaults</h3>
-          <label>
-            Default model
+  function renderSettingsTranscription(): JSX.Element {
+    if (!settings) {
+      return <div className="settings-placeholder">Settings unavailable.</div>;
+    }
+
+    const whisperOptions = settings.transcription.whisper_options ?? defaultWhisperOptions;
+
+    return (
+      <div className="settings-stack">
+        <section className="settings-panel">
+          <header>
+            <h3>Transcription Defaults</h3>
+            <p>Used for every new transcription job.</p>
+          </header>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Default model</strong>
+            </div>
             <select
               value={settings.transcription.model}
               onChange={(event) => {
@@ -2518,10 +2782,12 @@ export function App() {
                 </option>
               ))}
             </select>
-          </label>
+          </div>
 
-          <label>
-            Default language
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Default language</strong>
+            </div>
             <select
               value={settings.transcription.language}
               onChange={(event) => {
@@ -2534,10 +2800,13 @@ export function App() {
                 </option>
               ))}
             </select>
-          </label>
+          </div>
 
-          <label className="toggle-row">
-            <span>Enable AI post-processing after transcription</span>
+          <div className="settings-row">
+            <div>
+              <strong>Enable AI post-processing</strong>
+              <small>Run optimize/summary prompts after transcription.</small>
+            </div>
             <input
               type="checkbox"
               checked={settings.transcription.enable_ai_post_processing}
@@ -2545,7 +2814,222 @@ export function App() {
                 void onToggleAi(event.target.checked);
               }}
             />
-          </label>
+          </div>
+        </section>
+
+        <section className="settings-panel">
+          <header>
+            <h3>Whisper Settings</h3>
+            <p>Direct decoding controls from whisper.cpp.</p>
+          </header>
+
+          <div className="settings-row">
+            <div>
+              <strong>Translate transcript to English</strong>
+              <small>Equivalent to `--translate`.</small>
+            </div>
+            <input
+              type="checkbox"
+              checked={whisperOptions.translate_to_english}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  translate_to_english: event.target.checked,
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row">
+            <div>
+              <strong>No context between windows</strong>
+              <small>Equivalent to `--max-context 0`.</small>
+            </div>
+            <input
+              type="checkbox"
+              checked={whisperOptions.no_context}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  no_context: event.target.checked,
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row">
+            <div>
+              <strong>Split on word</strong>
+              <small>Use word boundaries when producing segments (`--split-on-word`).</small>
+            </div>
+            <input
+              type="checkbox"
+              checked={whisperOptions.split_on_word}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  split_on_word: event.target.checked,
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Threads</strong>
+              <small>`--threads`</small>
+            </div>
+            <input
+              type="number"
+              min={1}
+              max={32}
+              value={whisperOptions.threads}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  threads: Number(event.target.value),
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Processors</strong>
+              <small>`--processors`</small>
+            </div>
+            <input
+              type="number"
+              min={1}
+              max={16}
+              value={whisperOptions.processors}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  processors: Number(event.target.value),
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Beam size</strong>
+              <small>`--beam-size` (when &gt; 1, best-of is ignored).</small>
+            </div>
+            <input
+              type="number"
+              min={1}
+              max={20}
+              value={whisperOptions.beam_size}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  beam_size: Number(event.target.value),
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Best of</strong>
+              <small>`--best-of` (used when beam size is 1).</small>
+            </div>
+            <input
+              type="number"
+              min={1}
+              max={20}
+              disabled={whisperOptions.beam_size > 1}
+              value={whisperOptions.best_of}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  best_of: Number(event.target.value),
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Temperature</strong>
+              <small>`--temperature`</small>
+            </div>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              value={whisperOptions.temperature}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  temperature: Number(event.target.value),
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Entropy threshold</strong>
+              <small>`--entropy-thold`</small>
+            </div>
+            <input
+              type="number"
+              min={0}
+              max={10}
+              step={0.1}
+              value={whisperOptions.entropy_threshold}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  entropy_threshold: Number(event.target.value),
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Logprob threshold</strong>
+              <small>`--logprob-thold`</small>
+            </div>
+            <input
+              type="number"
+              min={-10}
+              max={0}
+              step={0.1}
+              value={whisperOptions.logprob_threshold}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  logprob_threshold: Number(event.target.value),
+                }));
+              }}
+            />
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>Word threshold</strong>
+              <small>`--word-thold`</small>
+            </div>
+            <input
+              type="number"
+              min={0}
+              max={1}
+              step={0.01}
+              value={whisperOptions.word_threshold}
+              onChange={(event) => {
+                void onPatchWhisperOptions((current) => ({
+                  ...current,
+                  word_threshold: Number(event.target.value),
+                }));
+              }}
+            />
+          </div>
         </section>
       </div>
     );
@@ -2557,8 +3041,8 @@ export function App() {
     }
 
     return (
-      <div className="settings-form-grid">
-        <section className="settings-card-block">
+      <div className="settings-stack">
+        <section className="settings-panel">
           <div className="settings-card-head">
             <h3>Local Models</h3>
             <button className="secondary-button" onClick={() => void refreshProvisioningModels()}>
@@ -2665,8 +3149,8 @@ export function App() {
     }
 
     return (
-      <div className="settings-form-grid">
-        <section className="settings-card-block">
+      <div className="settings-stack">
+        <section className="settings-panel">
           <h3>AI Services</h3>
 
           <label>
@@ -2954,8 +3438,8 @@ export function App() {
     }
 
     return (
-      <div className="settings-form-grid">
-        <section className="settings-card-block">
+      <div className="settings-stack">
+        <section className="settings-panel">
           <h3>Advanced</h3>
 
           <label>
@@ -3020,44 +3504,38 @@ export function App() {
     return (
       <div className="settings-layout">
         <aside className="settings-sidebar">
-          <button
-            className={settingsPane === "general" ? "settings-nav-item active" : "settings-nav-item"}
-            onClick={() => setSettingsPane("general")}
-          >
-            General
-          </button>
-          <button
-            className={settingsPane === "local_models" ? "settings-nav-item active" : "settings-nav-item"}
-            onClick={() => setSettingsPane("local_models")}
-          >
-            Local Models
-          </button>
-          <button
-            className={settingsPane === "ai_services" ? "settings-nav-item active" : "settings-nav-item"}
-            onClick={() => setSettingsPane("ai_services")}
-          >
-            AI Services
-          </button>
-          <button
-            className={settingsPane === "prompts" ? "settings-nav-item active" : "settings-nav-item"}
-            onClick={() => setSettingsPane("prompts")}
-          >
-            Prompts
-          </button>
-          <button
-            className={settingsPane === "advanced" ? "settings-nav-item active" : "settings-nav-item"}
-            onClick={() => setSettingsPane("advanced")}
-          >
-            Advanced
-          </button>
+          <label className="settings-search">
+            <Search size={14} />
+            <input
+              placeholder="Search settings..."
+              value={settingsQuery}
+              onChange={(event) => setSettingsQuery(event.target.value)}
+            />
+          </label>
+          <div className="settings-nav-list">
+            {visibleSettingsPanes.map((pane) => (
+              <button
+                key={pane.key}
+                className={settingsPane === pane.key ? "settings-nav-item active" : "settings-nav-item"}
+                onClick={() => setSettingsPane(pane.key)}
+              >
+                <span>{pane.label}</span>
+                <small>{pane.description}</small>
+              </button>
+            ))}
+            {visibleSettingsPanes.length === 0 ? (
+              <div className="settings-nav-empty">No section matches your search.</div>
+            ) : null}
+          </div>
         </aside>
 
         <section className="settings-content">
-          {settingsPane === "general" ? renderSettingsGeneral() : null}
+          {settingsPane === "transcription" ? renderSettingsTranscription() : null}
           {settingsPane === "local_models" ? renderSettingsLocalModels() : null}
+          {settingsPane === "advanced" ? renderSettingsAdvanced() : null}
+          {settingsPane === "general" ? renderSettingsGeneral() : null}
           {settingsPane === "ai_services" ? renderSettingsAiServices() : null}
           {settingsPane === "prompts" ? renderSettingsPrompts() : null}
-          {settingsPane === "advanced" ? renderSettingsAdvanced() : null}
         </section>
       </div>
     );
@@ -3075,12 +3553,7 @@ export function App() {
 
   return (
     <main className="app-shell">
-      <section
-        className={leftSidebarOpen ? "window-frame" : "window-frame left-collapsed"}
-        style={{
-          gridTemplateColumns: leftSidebarOpen ? "248px minmax(0, 1fr)" : "minmax(0, 1fr)",
-        }}
-      >
+      <section className={leftSidebarOpen ? "window-frame" : "window-frame left-collapsed"}>
         {leftSidebarOpen ? (
           <aside className="left-sidebar">
             <div className="sidebar-header">
@@ -3110,10 +3583,30 @@ export function App() {
             {activeArtifact ? (
               <div className="sidebar-section">
                 <h4>Open</h4>
-                <button className="sidebar-item sidebar-open-item active" title={activeArtifact.title}>
-                  <FileAudio size={16} />
-                  <span className="sidebar-item-label">{activeArtifact.title}</span>
-                </button>
+                <div className="sidebar-open-row" title={activeArtifact.title}>
+                  <button
+                    className="sidebar-item sidebar-open-item"
+                    onClick={() => {
+                      setSection("detail");
+                      setDetailMode("transcript");
+                      setInspectorMode("details");
+                    }}
+                  >
+                    <FileAudio size={16} />
+                    <span className="sidebar-item-label">{activeArtifact.title}</span>
+                  </button>
+                  <button
+                    className="sidebar-open-close"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onCloseOpenedArtifact();
+                    }}
+                    title="Close opened transcription"
+                    aria-label="Close opened transcription"
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
               </div>
             ) : null}
 
@@ -3157,23 +3650,23 @@ export function App() {
                     <PanelLeftOpen size={16} />
                   </button>
                 ) : null}
-                <h1>
-                  {section === "home"
-                    ? "Sbobino Desktop"
-                    : section === "queue"
+                {section === "home" ? null : (
+                  <h1>
+                    {section === "queue"
                       ? "Queue"
-                  : section === "realtime"
+                      : section === "realtime"
                         ? "Live"
                         : section === "settings"
                           ? "Settings"
                           : section === "deleted_history"
                             ? "Recently Deleted"
-                          : "Transcriptions"}
-                </h1>
+                            : "Transcriptions"}
+                  </h1>
+                )}
               </div>
 
               {section === "home" || section === "queue" || section === "realtime" ? (
-                <div className="topbar-controls">
+                <div className="topbar-controls home-topbar-controls">
                   <label className="select-chip">
                     <span className="chip-label">
                       <Mic size={12} />
@@ -3203,7 +3696,47 @@ export function App() {
                       ))}
                     </select>
                   </label>
+                </div>
+              ) : null}
 
+              {section === "history" ? (
+                <div className="topbar-controls history-topbar-controls">
+                  <label className="history-filter-chip">
+                    <ListFilter size={13} />
+                    <select
+                      value={historyKind}
+                      onChange={(event) => setHistoryKind(event.target.value as "all" | ArtifactKind)}
+                    >
+                      <option value="all">All</option>
+                      <option value="file">Files</option>
+                      <option value="realtime">Live</option>
+                    </select>
+                  </label>
+                  <label className="search-chip history-top-search">
+                    <Search size={14} />
+                    <input
+                      placeholder="Search history..."
+                      value={search}
+                      onChange={(event) => setSearch(event.target.value)}
+                    />
+                  </label>
+                </div>
+              ) : null}
+
+              {section === "deleted_history" ? (
+                <div className="topbar-controls deleted-topbar-controls">
+                  <button className="secondary-button history-action-button" onClick={() => void onEmptyTrash()}>
+                    <Trash2 size={14} />
+                    Empty Trash
+                  </button>
+                  <label className="search-chip history-top-search">
+                    <Search size={14} />
+                    <input
+                      placeholder="Search history..."
+                      value={deletedSearch}
+                      onChange={(event) => setDeletedSearch(event.target.value)}
+                    />
+                  </label>
                 </div>
               ) : null}
             </header>
@@ -3211,16 +3744,53 @@ export function App() {
 
           <div className="main-content">{renderContent()}</div>
 
-          {activeJobId ? (
-            <div className="active-job-chip">
-              <span>Job: {activeJobId}</span>
-              <span>{progress?.message ?? "Running..."}</span>
-            </div>
-          ) : null}
-
           {error ? <p className="error-banner">{error}</p> : null}
         </section>
       </section>
+
+      {renameTarget ? (
+        <div className="sheet-overlay" role="presentation">
+          <section
+            className="rename-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Rename transcription"
+          >
+            <header className="rename-sheet-head">
+              <h3>Rename transcription</h3>
+            </header>
+            <input
+              className="rename-sheet-input"
+              value={renameDraft}
+              onChange={(event) => setRenameDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void confirmRenameArtifact();
+                }
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  closeRenameDialog();
+                }
+              }}
+              autoFocus
+              placeholder="Transcription title"
+            />
+            <div className="rename-sheet-actions">
+              <button className="secondary-button" onClick={closeRenameDialog} disabled={isRenamingArtifact}>
+                Cancel
+              </button>
+              <button
+                className="primary-button"
+                onClick={() => void confirmRenameArtifact()}
+                disabled={isRenamingArtifact || renameDraft.trim().length === 0}
+              >
+                {isRenamingArtifact ? "Saving..." : "Save"}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       <ModelManagerSheet
         open={showModelManager}
@@ -3238,7 +3808,6 @@ export function App() {
 
       <ExportSheet
         open={showExportSheet}
-        title={activeArtifact?.title ?? "Transcription"}
         transcriptText={exportPreviewText}
         segments={detailSegments}
         onClose={() => setShowExportSheet(false)}

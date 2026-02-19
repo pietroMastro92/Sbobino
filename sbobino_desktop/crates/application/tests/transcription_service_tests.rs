@@ -14,6 +14,7 @@ use sbobino_application::{
 };
 use sbobino_domain::{
     ArtifactKind, JobProgress, JobStage, LanguageCode, SpeechModel, TranscriptArtifact,
+    WhisperOptions,
 };
 
 #[derive(Default)]
@@ -41,7 +42,9 @@ impl SpeechToTextEngine for MockSpeechEngine {
         _input_wav: &Path,
         _model_filename: &str,
         _language_code: &str,
+        _options: &WhisperOptions,
         _emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        _emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<String, ApplicationError> {
         Ok(self.transcript.clone())
     }
@@ -322,6 +325,7 @@ async fn run_file_transcription_without_ai_emits_expected_stages_and_persists() 
                 language: LanguageCode::En,
                 model: SpeechModel::Base,
                 enable_ai: false,
+                whisper_options: WhisperOptions::default(),
             },
             Arc::new(move |event| {
                 emitted_clone
@@ -411,6 +415,7 @@ async fn run_file_transcription_with_ai_runs_enhancer_steps() {
                 language: LanguageCode::En,
                 model: SpeechModel::Small,
                 enable_ai: true,
+                whisper_options: WhisperOptions::default(),
             },
             Arc::new(move |event| {
                 emitted_clone
@@ -473,6 +478,7 @@ async fn run_file_transcription_rejects_missing_input_path() {
                 language: LanguageCode::En,
                 model: SpeechModel::Base,
                 enable_ai: false,
+                whisper_options: WhisperOptions::default(),
             },
             Arc::new(|_| {}),
             Arc::new(|_text: String| {}),
