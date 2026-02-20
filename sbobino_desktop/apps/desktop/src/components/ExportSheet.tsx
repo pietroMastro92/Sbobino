@@ -1,5 +1,5 @@
-import { Braces, Captions, Download, FileCode2, FileText, FileType, FileType2, List } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Braces, Captions, Copy, Download, FileCode2, FileText, FileType, FileType2, List, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 
 export type ExportFormat = "txt" | "docx" | "html" | "pdf" | "json";
 export type ExportStyle = "transcript" | "subtitles" | "segments";
@@ -193,6 +193,21 @@ export function ExportSheet({
     return normalized;
   }, [exportContent]);
 
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose, open]);
+
   if (!open) {
     return null;
   }
@@ -208,10 +223,19 @@ export function ExportSheet({
           grouping,
         },
         segments,
+        contentOverride: exportContent,
       });
       onClose();
     } finally {
       setIsExporting(false);
+    }
+  }
+
+  async function onCopyContent(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(exportContent);
+    } catch {
+      // Keep the export sheet responsive even if clipboard fails.
     }
   }
 
@@ -224,6 +248,15 @@ export function ExportSheet({
         aria-labelledby="export-sheet-title"
         onClick={(event) => event.stopPropagation()}
       >
+        <button
+          className="export-close-button"
+          aria-label="Close export preview"
+          onClick={onClose}
+          disabled={isExporting}
+        >
+          <X size={14} />
+        </button>
+
         <div className="export-preview">
           <header className="export-preview-head">
             <strong id="export-sheet-title">Export Preview</strong>
@@ -236,75 +269,85 @@ export function ExportSheet({
         </div>
 
         <aside className="export-controls">
-          <h3>Style</h3>
-          <div className="export-style-grid">
-            {styleItems.map((item) => (
-              <button
-                key={item.label}
-                className={style === item.value ? "format-card active" : "format-card"}
-                onClick={() => {
-                  if (item.value) {
-                    setStyle(item.value);
-                  }
-                }}
-                disabled={!item.value}
-              >
-                <span className="format-card-top">
-                  <span className="format-card-icon">{item.icon}</span>
-                  {item.badge ? <span className="format-card-badge">{item.badge}</span> : null}
-                </span>
-                <strong>{item.label}</strong>
-                {item.subtitle ? <small>{item.subtitle}</small> : null}
-              </button>
-            ))}
-          </div>
-
-          <h3>Format</h3>
-          <div className="export-format-grid">
-            {formatItems.map((item) => (
-              <button
-                key={item.value}
-                className={format === item.value ? "format-card active" : "format-card"}
-                onClick={() => setFormat(item.value)}
-              >
-                <span className="format-card-top">
-                  <span className="format-card-icon">{item.icon}</span>
-                  {item.badge ? <span className="format-card-badge">{item.badge}</span> : null}
-                </span>
-                <strong>{item.label}</strong>
-                <small>{item.hint}</small>
-              </button>
-            ))}
-          </div>
-
-          <div className="inspector-block export-options-block">
-            <h4>Options</h4>
-            <div className="property-line">
-              <span>Grouping</span>
-              <select
-                value={grouping}
-                onChange={(event) => setGrouping(event.target.value as ExportGrouping)}
-              >
-                <option value="none">None</option>
-                <option value="speaker_paragraphs" disabled>
-                  Speaker paragraphs
-                </option>
-              </select>
+          <div className="export-controls-scroll">
+            <h3>Style</h3>
+            <div className="export-style-grid">
+              {styleItems.map((item) => (
+                <button
+                  key={item.label}
+                  className={style === item.value ? "format-card active" : "format-card"}
+                  onClick={() => {
+                    if (item.value) {
+                      setStyle(item.value);
+                    }
+                  }}
+                  disabled={!item.value}
+                >
+                  <span className="format-card-top">
+                    <span className="format-card-icon">{item.icon}</span>
+                    {item.badge ? <span className="format-card-badge">{item.badge}</span> : null}
+                  </span>
+                  <strong>{item.label}</strong>
+                  {item.subtitle ? <small>{item.subtitle}</small> : null}
+                </button>
+              ))}
             </div>
-            <label className="toggle-row">
-              <span>Show Timestamps</span>
-              <input
-                type="checkbox"
-                checked={includeTimestamps}
-                onChange={(event) => setIncludeTimestamps(event.target.checked)}
-                disabled={style === "subtitles"}
-              />
-            </label>
+
+            <h3>Format</h3>
+            <div className="export-format-grid">
+              {formatItems.map((item) => (
+                <button
+                  key={item.value}
+                  className={format === item.value ? "format-card active" : "format-card"}
+                  onClick={() => setFormat(item.value)}
+                >
+                  <span className="format-card-top">
+                    <span className="format-card-icon">{item.icon}</span>
+                    {item.badge ? <span className="format-card-badge">{item.badge}</span> : null}
+                  </span>
+                  <strong>{item.label}</strong>
+                  <small>{item.hint}</small>
+                </button>
+              ))}
+            </div>
+
+            <div className="inspector-block export-options-block">
+              <h4>Options</h4>
+              <div className="property-line">
+                <span>Grouping</span>
+                <select
+                  value={grouping}
+                  onChange={(event) => setGrouping(event.target.value as ExportGrouping)}
+                >
+                  <option value="none">None</option>
+                  <option value="speaker_paragraphs" disabled>
+                    Speaker paragraphs
+                  </option>
+                </select>
+              </div>
+              <label className="toggle-row">
+                <span>Show Timestamps</span>
+                <input
+                  type="checkbox"
+                  checked={includeTimestamps}
+                  onChange={(event) => setIncludeTimestamps(event.target.checked)}
+                  disabled={style === "subtitles"}
+                />
+              </label>
+            </div>
           </div>
 
           <div className="export-actions">
             <button className="secondary-button" onClick={onClose} disabled={isExporting}>
               Close
+            </button>
+            <button
+              className="secondary-button"
+              onClick={() => void onCopyContent()}
+              disabled={isExporting}
+            >
+              <Copy size={14} />
+              Copy
             </button>
             <button className="primary-button" onClick={() => void onConfirm()} disabled={isExporting}>
               <Download size={14} />

@@ -7,16 +7,24 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use sbobino_application::{
     ArtifactService, SettingsService, TranscriptEnhancer, TranscriptionService,
 };
-use sbobino_domain::{AiProvider, AppSettings, PromptTask, TranscriptionEngine};
+use sbobino_domain::{
+    AiProvider, AppSettings, PromptTask, RemoteServiceConfig, RemoteServiceKind,
+    TranscriptionEngine,
+};
 
 use adapters::{
-    ffmpeg::FfmpegAdapter, foundation_apple::FoundationAppleEnhancer, gemini::GeminiEnhancer,
-    noop_enhancer::NoopEnhancer, whisper_cpp::WhisperCppEngine, whisper_kit::WhisperKitEngine,
+    ffmpeg::FfmpegAdapter,
+    foundation_apple::FoundationAppleEnhancer,
+    gemini::GeminiEnhancer,
+    noop_enhancer::NoopEnhancer,
+    openai_compatible::{AuthStyle, OpenAiCompatibleEnhancer},
+    whisper_cpp::WhisperCppEngine,
+    whisper_kit::WhisperKitEngine,
     whisper_stream::WhisperStreamEngine,
 };
 use repositories::{
@@ -94,7 +102,7 @@ impl RuntimeTranscriptionFactory {
     }
 
     pub fn build_service(&self) -> Result<Arc<TranscriptionService>, String> {
-        let settings = self.load_settings()?;
+        let mut settings = self.load_settings()?;
 
         let ffmpeg_path = self.resolve_binary_path(&settings.transcription.ffmpeg_path, "ffmpeg");
         let whisper_cli_path =
@@ -112,7 +120,27 @@ impl RuntimeTranscriptionFactory {
                     Arc::new(WhisperCppEngine::new(whisper_cli_path, models_dir))
                 }
                 TranscriptionEngine::WhisperKit => {
-                    Arc::new(WhisperKitEngine::new(whisperkit_cli_path, models_dir))
+                    if self.binary_path_is_available(&whisperkit_cli_path) {
+                        Arc::new(WhisperKitEngine::new(whisperkit_cli_path, models_dir))
+                    } else if self.binary_path_is_available(&whisper_cli_path) {
+                        warn!(
+                            "WhisperKit selected but CLI is unavailable ({}). Falling back to Whisper.cpp ({})",
+                            whisperkit_cli_path, whisper_cli_path
+                        );
+                        settings.transcription.engine = TranscriptionEngine::WhisperCpp;
+                        settings.transcription_engine = TranscriptionEngine::WhisperCpp;
+                        settings.sync_sections_from_legacy();
+                        settings.sync_legacy_from_sections();
+                        self.settings_repo
+                            .save_sync(&settings)
+                            .map_err(|e| format!("failed to persist engine fallback: {e}"))?;
+                        Arc::new(WhisperCppEngine::new(whisper_cli_path, models_dir))
+                    } else {
+                        return Err(format!(
+                            "WhisperKit CLI not found at '{}', and Whisper.cpp CLI not found at '{}'. Configure CLI paths in Settings > Local Models.",
+                            whisperkit_cli_path, whisper_cli_path
+                        ));
+                    }
                 }
             };
 
@@ -198,6 +226,26 @@ impl RuntimeTranscriptionFactory {
 
     pub fn build_active_enhancer(&self) -> Result<Option<Arc<dyn TranscriptEnhancer>>, String> {
         let settings = self.load_settings()?;
+        if settings.ai.active_provider == AiProvider::FoundationApple {
+            let enhancer = self.build_foundation_enhancer_with_overrides(
+                settings.prompt_for_task(PromptTask::Optimize),
+                settings.prompt_for_task(PromptTask::Summary),
+            )?;
+            if enhancer.is_some() {
+                return Ok(enhancer.map(|value| Arc::new(value) as Arc<dyn TranscriptEnhancer>));
+            }
+        }
+
+        if let Some(active_id) = settings.ai.active_remote_service_id.as_ref() {
+            if let Some(enhancer) = self.build_remote_service_enhancer(&settings, active_id)? {
+                let enhancer: Arc<dyn TranscriptEnhancer> = enhancer.into();
+                return Ok(Some(enhancer));
+            }
+            return Err(format!(
+                "Active AI service '{active_id}' is missing or disabled. Reconfigure it in Settings > AI Services."
+            ));
+        }
+
         match settings.ai.active_provider {
             AiProvider::Gemini => {
                 let enhancer = self.build_gemini_enhancer_with_overrides(
@@ -207,15 +255,135 @@ impl RuntimeTranscriptionFactory {
                 )?;
                 Ok(enhancer.map(|value| Arc::new(value) as Arc<dyn TranscriptEnhancer>))
             }
-            AiProvider::FoundationApple => {
-                let enhancer = self.build_foundation_enhancer_with_overrides(
-                    settings.prompt_for_task(PromptTask::Optimize),
-                    settings.prompt_for_task(PromptTask::Summary),
-                )?;
-                Ok(enhancer.map(|value| Arc::new(value) as Arc<dyn TranscriptEnhancer>))
-            }
-            AiProvider::None => Ok(None),
+            AiProvider::FoundationApple | AiProvider::None => Ok(None),
         }
+    }
+
+    fn build_remote_service_enhancer(
+        &self,
+        settings: &AppSettings,
+        active_id: &str,
+    ) -> Result<Option<Box<dyn TranscriptEnhancer>>, String> {
+        let Some(service) = settings
+            .ai
+            .remote_services
+            .iter()
+            .find(|entry| entry.id == active_id && entry.enabled)
+        else {
+            return Ok(None);
+        };
+
+        if service.kind == RemoteServiceKind::Google {
+            let enhancer = self.build_gemini_for_service(settings, service)?;
+            return Ok(enhancer.map(|value| Box::new(value) as Box<dyn TranscriptEnhancer>));
+        }
+
+        let enhancer = self.build_openai_compatible_for_service(settings, service)?;
+        Ok(enhancer.map(|value| Box::new(value) as Box<dyn TranscriptEnhancer>))
+    }
+
+    fn build_gemini_for_service(
+        &self,
+        settings: &AppSettings,
+        service: &RemoteServiceConfig,
+    ) -> Result<Option<GeminiEnhancer>, String> {
+        let api_key = service
+            .api_key
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                settings
+                    .ai
+                    .providers
+                    .gemini
+                    .api_key
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            });
+        let Some(api_key) = api_key else {
+            return Err("Google service requires a Gemini API key".to_string());
+        };
+
+        let model = service
+            .model
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| settings.ai.providers.gemini.model.clone());
+
+        Ok(Some(GeminiEnhancer::new(
+            api_key,
+            model,
+            settings.prompt_for_task(PromptTask::Optimize),
+            settings.prompt_for_task(PromptTask::Summary),
+        )))
+    }
+
+    fn build_openai_compatible_for_service(
+        &self,
+        settings: &AppSettings,
+        service: &RemoteServiceConfig,
+    ) -> Result<Option<OpenAiCompatibleEnhancer>, String> {
+        let Some(base_url) = service
+            .base_url
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                default_base_url_for_service_kind(&service.kind).map(|value| value.to_string())
+            })
+        else {
+            return Err(format!("{} service requires a base URL", service.label));
+        };
+
+        let Some(model) = service
+            .model
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                default_model_for_service_kind(&service.kind).map(|value| value.to_string())
+            })
+        else {
+            return Err(format!("{} service requires a model name", service.label));
+        };
+
+        let auth_style = match &service.kind {
+            RemoteServiceKind::LmStudio | RemoteServiceKind::Ollama | RemoteServiceKind::Custom => {
+                if service
+                    .api_key
+                    .as_ref()
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    AuthStyle::None
+                } else {
+                    AuthStyle::Bearer
+                }
+            }
+            RemoteServiceKind::Azure => AuthStyle::ApiKeyHeader,
+            RemoteServiceKind::OpenAi
+            | RemoteServiceKind::OpenRouter
+            | RemoteServiceKind::Xai
+            | RemoteServiceKind::Anthropic
+            | RemoteServiceKind::HuggingFace => AuthStyle::Bearer,
+            RemoteServiceKind::Google => {
+                return Ok(None);
+            }
+        };
+
+        let enhancer = OpenAiCompatibleEnhancer::new(
+            base_url,
+            model,
+            service.api_key.clone(),
+            auth_style,
+            settings.prompt_for_task(PromptTask::Optimize),
+            settings.prompt_for_task(PromptTask::Summary),
+        )
+        .map_err(|error| format!("{error}"))?;
+        Ok(Some(enhancer))
     }
 
     pub fn build_whisper_stream_engine(&self) -> Result<WhisperStreamEngine, String> {
@@ -387,6 +555,15 @@ impl RuntimeTranscriptionFactory {
             .find(|candidate| candidate.is_file())
     }
 
+    fn binary_path_is_available(&self, resolved_path: &str) -> bool {
+        let candidate = PathBuf::from(resolved_path);
+        if candidate.is_absolute() || resolved_path.contains('/') || resolved_path.contains('\\') {
+            return candidate.is_file();
+        }
+
+        self.find_binary_candidate(resolved_path).is_some()
+    }
+
     fn migrate_models_dir_if_needed(&self, settings: &mut AppSettings) -> Result<(), String> {
         let current_models_dir =
             PathBuf::from(self.resolve_models_dir(&settings.transcription.models_dir));
@@ -444,6 +621,36 @@ pub fn bootstrap(data_dir: &Path) -> Result<InfrastructureBundle, String> {
         settings_service,
         runtime_factory,
     })
+}
+
+fn default_base_url_for_service_kind(kind: &RemoteServiceKind) -> Option<&'static str> {
+    match kind {
+        RemoteServiceKind::Google => Some("https://generativelanguage.googleapis.com/v1beta"),
+        RemoteServiceKind::OpenAi => Some("https://api.openai.com/v1"),
+        RemoteServiceKind::OpenRouter => Some("https://openrouter.ai/api/v1"),
+        RemoteServiceKind::LmStudio => Some("http://127.0.0.1:1234/v1"),
+        RemoteServiceKind::Ollama => Some("http://127.0.0.1:11434"),
+        RemoteServiceKind::Xai => Some("https://api.x.ai/v1"),
+        RemoteServiceKind::HuggingFace => Some("https://router.huggingface.co/v1"),
+        RemoteServiceKind::Anthropic => Some("https://api.anthropic.com/v1"),
+        RemoteServiceKind::Azure => Some("https://{resource}.openai.azure.com"),
+        RemoteServiceKind::Custom => None,
+    }
+}
+
+fn default_model_for_service_kind(kind: &RemoteServiceKind) -> Option<&'static str> {
+    match kind {
+        RemoteServiceKind::Google => Some("gemini-2.5-flash"),
+        RemoteServiceKind::OpenAi => Some("gpt-4.1-mini"),
+        RemoteServiceKind::OpenRouter => Some("openai/gpt-4.1-mini"),
+        RemoteServiceKind::LmStudio => None,
+        RemoteServiceKind::Ollama => Some("llama3.1"),
+        RemoteServiceKind::Xai => Some("grok-2-latest"),
+        RemoteServiceKind::HuggingFace => None,
+        RemoteServiceKind::Anthropic => Some("claude-3-7-sonnet-latest"),
+        RemoteServiceKind::Azure => None,
+        RemoteServiceKind::Custom => None,
+    }
 }
 
 fn missing_models(models_dir: &Path) -> Vec<String> {

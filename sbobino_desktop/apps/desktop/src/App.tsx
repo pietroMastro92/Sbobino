@@ -376,6 +376,9 @@ const settingsPaneDefinitions: SettingsPaneDefinition[] = [
   },
 ];
 
+const AI_SERVICE_NONE = "__none";
+const AI_SERVICE_FOUNDATION = "__foundation";
+
 function fileLabel(path: string): string {
   const parts = path.split(/[/\\]/);
   return parts[parts.length - 1] ?? path;
@@ -571,6 +574,7 @@ function normalizeSettings(settings: AppSettings): AppSettings {
     },
     ai: {
       ...settings.ai,
+      active_remote_service_id: settings.ai.active_remote_service_id ?? null,
       providers: {
         ...settings.ai.providers,
         foundation_apple: {
@@ -1078,6 +1082,16 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     if (settings.ai.active_provider !== "none") {
       return;
     }
+    const hasActiveRemote =
+      settings.ai.active_remote_service_id !== null
+      && settings.ai.remote_services.some(
+        (service) =>
+          service.id === settings.ai.active_remote_service_id
+          && service.enabled,
+      );
+    if (hasActiveRemote) {
+      return;
+    }
     const hasGoogleService = (settings.ai.remote_services ?? []).some(
       (service) => service.kind === "google",
     );
@@ -1089,9 +1103,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       return;
     }
     if (hasGoogleService && settings.ai.providers.gemini.api_key?.trim()) {
+      const googleServiceId =
+        settings.ai.remote_services.find((service) => service.kind === "google")?.id ?? null;
       void patchAiSettings((current) => ({
         ...current,
         active_provider: "gemini",
+        active_remote_service_id: googleServiceId,
       }));
     }
   }, [
@@ -1103,41 +1120,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   ]);
 
   useEffect(() => {
-    if (settings?.ai.active_provider === "gemini") {
-      setAiServiceConfigOpen("gemini");
-    }
-  }, [settings?.ai.active_provider]);
-
-  useEffect(() => {
-    if (!settings || settings.ai.active_provider !== "gemini") {
-      return;
-    }
-    const hasGoogleService = (settings.ai.remote_services ?? []).some(
-      (service) => service.kind === "google",
-    );
-    if (hasGoogleService) {
-      return;
-    }
-
-    void patchAiSettings((current) => ({
-      ...current,
-      remote_services: [
-        ...(current.remote_services ?? []),
-        {
-          id: createRemoteServiceId("google"),
-          kind: "google",
-          label: "Google",
-          enabled: true,
-          api_key: current.providers.gemini.api_key ?? null,
-          model: current.providers.gemini.model,
-          base_url: "https://generativelanguage.googleapis.com/v1beta",
-        },
-      ],
-    }));
-  }, [settings?.ai.active_provider, settings?.ai.remote_services]);
-
-  useEffect(() => {
-    if (aiServiceConfigOpen !== "gemini") {
+    const googleServiceId =
+      settings?.ai.remote_services?.find((service) => service.kind === "google")?.id ?? null;
+    if (!googleServiceId || aiServiceConfigOpen !== googleServiceId) {
       return;
     }
     const apiKey = settings?.ai.providers.gemini.api_key?.trim();
@@ -1180,6 +1165,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     geminiModelFetchNonce,
     settings?.ai.providers.gemini.api_key,
     settings?.ai.providers.gemini.model,
+    settings?.ai.remote_services,
   ]);
 
   useEffect(() => {
@@ -1232,13 +1218,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         setQueueItems((previous) => pushOrReplaceQueueItem(previous, event));
         if (event.job_id === activeJobIdRef.current) {
           setProgress(event);
-        }
-        if (event.stage === "cancelled" || event.stage === "failed") {
-          clearActiveJob();
-          activeJobIdRef.current = null;
-          setActiveJobPreviewText("");
-          setActiveJobTitle("");
-          activeJobDeltaSequenceRef.current = -1;
+          if (event.stage === "cancelled") {
+            clearActiveJob();
+            activeJobIdRef.current = null;
+            setActiveJobPreviewText("");
+            setActiveJobTitle("");
+            activeJobDeltaSequenceRef.current = -1;
+          }
         }
       });
 
@@ -1577,6 +1563,60 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return Array.from(groups.entries()).map(([group, panes]) => ({ group, panes }));
   }, [visibleSettingsPanes]);
 
+  const enabledRemoteServices = useMemo(() => {
+    return (settings?.ai.remote_services ?? []).filter((service) => service.enabled);
+  }, [settings?.ai.remote_services]);
+
+  const activeAiServiceSelectValue = useMemo(() => {
+    if (!settings) return AI_SERVICE_NONE;
+    if (settings.ai.active_provider === "foundation_apple") {
+      return AI_SERVICE_FOUNDATION;
+    }
+
+    const activeRemoteId = settings.ai.active_remote_service_id;
+    if (activeRemoteId && enabledRemoteServices.some((service) => service.id === activeRemoteId)) {
+      return `remote:${activeRemoteId}`;
+    }
+
+    if (settings.ai.active_provider === "gemini") {
+      const googleService = enabledRemoteServices.find((service) => service.kind === "google");
+      if (googleService) {
+        return `remote:${googleService.id}`;
+      }
+    }
+
+    return AI_SERVICE_NONE;
+  }, [enabledRemoteServices, settings]);
+
+  const aiServiceSelectOptions = useMemo(() => {
+    const options: Array<{ value: string; label: string; disabled?: boolean }> = [
+      { value: AI_SERVICE_NONE, label: "No AI provider" },
+      {
+        value: AI_SERVICE_FOUNDATION,
+        label: "Foundation Model",
+        disabled: !isMacOS || !settings?.ai.providers.foundation_apple.enabled,
+      },
+    ];
+
+    for (const service of enabledRemoteServices) {
+      const label = service.kind === "google"
+        ? `Google (${service.model?.trim() || settings?.ai.providers.gemini.model || "Gemini"})`
+        : service.label || formatProviderLabel(service.kind);
+
+      options.push({
+        value: `remote:${service.id}`,
+        label,
+      });
+    }
+
+    return options;
+  }, [
+    enabledRemoteServices,
+    isMacOS,
+    settings?.ai.providers.foundation_apple.enabled,
+    settings?.ai.providers.gemini.model,
+  ]);
+
   useEffect(() => {
     setAudioDurationSeconds(0);
   }, [detailAudioInputPath]);
@@ -1712,6 +1752,50 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     setArtifacts(activeArtifactsSnapshot);
   }
 
+  async function onSelectAiService(value: string): Promise<void> {
+    if (!settings) return;
+
+    if (value === AI_SERVICE_NONE) {
+      await patchAiSettings((current) => ({
+        ...current,
+        active_provider: "none",
+        active_remote_service_id: null,
+      }));
+      return;
+    }
+
+    if (value === AI_SERVICE_FOUNDATION) {
+      await patchAiSettings((current) => ({
+        ...current,
+        active_provider: "foundation_apple",
+        providers: {
+          ...current.providers,
+          foundation_apple: {
+            ...current.providers.foundation_apple,
+            enabled: true,
+          },
+        },
+      }));
+      return;
+    }
+
+    if (!value.startsWith("remote:")) {
+      return;
+    }
+
+    const targetId = value.slice("remote:".length);
+    await patchAiSettings((current) => {
+      const targetService = (current.remote_services ?? []).find((service) => service.id === targetId);
+      if (!targetService) return current;
+
+      return {
+        ...current,
+        active_provider: targetService.kind === "google" ? "gemini" : "none",
+        active_remote_service_id: targetId,
+      };
+    });
+  }
+
   async function refreshDeletedArtifactsList(): Promise<void> {
     const deletedArtifactsSnapshot = await listDeletedArtifacts({ limit: 200 });
     setDeletedArtifacts(deletedArtifactsSnapshot);
@@ -1823,6 +1907,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setActiveJobTitle(fileLabel(selectedFile));
       setActiveJobPreviewText("");
       activeJobDeltaSequenceRef.current = -1;
+      setActiveArtifact(null);
+      setShowExportSheet(false);
       setSection("detail");
       setDetailMode("transcript");
       setInspectorMode("details");
@@ -2131,7 +2217,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setActiveArtifact(updated);
         }
       } catch (syncError) {
-        setError(`Could not sync changes before export: ${String(syncError)}`);
+        setError(`Could not sync changes before export: ${formatAppError(syncError)}`);
         return;
       }
     }
@@ -2159,7 +2245,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       });
       setError(null);
     } catch (exportError) {
-      setError(`Export failed: ${String(exportError)}`);
+      setError(`Export failed: ${formatAppError(exportError)}`);
       throw exportError;
     }
   }
@@ -2735,18 +2821,16 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               onChange={(event) => setChatInput(event.target.value)}
             />
             <select
-              value={settings?.ai.active_provider ?? "none"}
+              value={activeAiServiceSelectValue}
               onChange={(event) => {
-                const provider = event.target.value as AppSettings["ai"]["active_provider"];
-                void patchAiSettings((current) => ({
-                  ...current,
-                  active_provider: provider,
-                }));
+                void onSelectAiService(event.target.value);
               }}
             >
-              <option value="none">No AI provider</option>
-              <option value="foundation_apple" disabled={!isMacOS}>Foundation Model</option>
-              <option value="gemini">Gemini</option>
+              {aiServiceSelectOptions.map((option) => (
+                <option key={option.value} value={option.value} disabled={option.disabled}>
+                  {option.label}
+                </option>
+              ))}
             </select>
             <button className="primary-button" onClick={() => void onSendChat()} disabled={isAskingChat}>
               {isAskingChat ? "..." : "Submit"}
@@ -2869,18 +2953,16 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           AI Service
           <select
             className="inspector-select"
-            value={settings?.ai.active_provider ?? "none"}
+            value={activeAiServiceSelectValue}
             onChange={(event) => {
-              const provider = event.target.value as AppSettings["ai"]["active_provider"];
-              void patchAiSettings((current) => ({
-                ...current,
-                active_provider: provider,
-              }));
+              void onSelectAiService(event.target.value);
             }}
           >
-            <option value="none">No AI provider</option>
-            <option value="foundation_apple" disabled={!isMacOS}>Foundation Model</option>
-            <option value="gemini">Gemini</option>
+            {aiServiceSelectOptions.map((option) => (
+              <option key={option.value} value={option.value} disabled={option.disabled}>
+                {option.label}
+              </option>
+            ))}
           </select>
         </label>
 
@@ -3893,13 +3975,20 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     const foundationAvailable = isMacOS;
     const foundationEnabled = settings.ai.providers.foundation_apple.enabled;
     const foundationActive = settings.ai.active_provider === "foundation_apple";
-    const geminiActive = settings.ai.active_provider === "gemini";
+    const geminiActive =
+      settings.ai.active_provider === "gemini"
+      && Boolean(settings.ai.active_remote_service_id)
+      && settings.ai.remote_services.some(
+        (service) =>
+          service.id === settings.ai.active_remote_service_id
+          && service.kind === "google",
+      );
     const geminiConfigured = Boolean(settings.ai.providers.gemini.api_key?.trim());
     const remoteServices = settings.ai.remote_services ?? [];
     const googleService = remoteServices.find((service) => service.kind === "google");
     const hasGoogleService = Boolean(googleService);
     const showGeminiService = hasGoogleService;
-    const showGeminiConfig = aiServiceConfigOpen === "gemini";
+    const showGeminiConfig = aiServiceConfigOpen === googleService?.id;
     const configuredKinds = new Set(remoteServices.map((service) => service.kind));
 
     const createRemoteServiceEntry = (kind: RemoteServiceKind): RemoteServiceConfig | null => {
@@ -3914,15 +4003,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         model: kind === "google" ? settings.ai.providers.gemini.model : catalog.defaultModel,
         base_url: catalog.defaultBaseUrl,
       };
-    };
-
-    const ensureGoogleService = (services: RemoteServiceConfig[]): RemoteServiceConfig[] => {
-      if (services.some((service) => service.kind === "google")) {
-        return services;
-      }
-      const googleEntry = createRemoteServiceEntry("google");
-      if (!googleEntry) return services;
-      return [...services, googleEntry];
     };
 
     const activateFoundation = (): void => {
@@ -3940,10 +4020,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     };
 
     const activateGemini = (): void => {
+      if (!googleService) {
+        return;
+      }
+
       void patchAiSettings((current) => ({
         ...current,
         active_provider: "gemini",
-        remote_services: ensureGoogleService(current.remote_services ?? []),
+        active_remote_service_id: googleService.id,
       }));
     };
 
@@ -3953,7 +4037,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       if (configuredKinds.has(kind)) {
         const existing = remoteServices.find((service) => service.kind === kind);
         if (existing) {
-          setAiServiceConfigOpen(kind === "google" ? "gemini" : existing.id);
+          setAiServiceConfigOpen(existing.id);
         }
         return;
       }
@@ -3962,13 +4046,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         ...current,
         remote_services: [...(current.remote_services ?? []), entry],
       }));
-      setAiServiceConfigOpen(kind === "google" ? "gemini" : entry.id);
+      setAiServiceConfigOpen(entry.id);
     };
 
     const removeRemoteService = (id: string): void => {
       void patchAiSettings((current) => {
         const target = (current.remote_services ?? []).find((service) => service.id === id);
         const nextServices = (current.remote_services ?? []).filter((service) => service.id !== id);
+        const removingActiveRemote = current.active_remote_service_id === id;
         const shouldDeactivateGemini =
           target?.kind === "google" && current.active_provider === "gemini";
 
@@ -3979,6 +4064,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               ? "foundation_apple"
               : "none"
             : current.active_provider,
+          active_remote_service_id: removingActiveRemote ? null : current.active_remote_service_id,
           remote_services: nextServices,
         };
       });
@@ -4076,7 +4162,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               <div className="ai-service-actions">
                 <button
                   className="secondary-button"
-                  onClick={() => setAiServiceConfigOpen(showGeminiConfig ? null : "gemini")}
+                  onClick={() => setAiServiceConfigOpen(showGeminiConfig ? null : googleService?.id ?? null)}
                 >
                   {showGeminiConfig ? "Done" : "Configure"}
                 </button>
@@ -4109,6 +4195,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                             api_key: value.length > 0 ? event.target.value : null,
                           },
                         },
+                        remote_services: (current.remote_services ?? []).map((service) => (
+                          service.kind === "google"
+                            ? {
+                                ...service,
+                                api_key: value.length > 0 ? event.target.value : null,
+                              }
+                            : service
+                        )),
                       }));
                     }}
                   />
@@ -4129,6 +4223,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                               model: event.target.value,
                             },
                           },
+                          remote_services: (current.remote_services ?? []).map((service) => (
+                            service.kind === "google"
+                              ? {
+                                  ...service,
+                                  model: event.target.value,
+                                }
+                              : service
+                          )),
                         }));
                       }}
                     >
@@ -4173,6 +4275,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                         return {
                           ...current,
                           active_provider: nextProvider,
+                          active_remote_service_id:
+                            current.active_remote_service_id === googleService?.id
+                              ? null
+                              : current.active_remote_service_id,
                           providers: {
                             ...current.providers,
                             gemini: {
@@ -4202,9 +4308,15 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             const catalog = serviceCatalog.find((item) => item.kind === service.kind);
             const ServiceIcon = catalog?.icon ?? Settings2;
             const isOpen = aiServiceConfigOpen === service.id;
+            const isActiveRemote =
+              settings.ai.active_remote_service_id === service.id
+              && settings.ai.active_provider !== "foundation_apple";
 
             return (
-              <article key={service.id} className="ai-service-card">
+              <article
+                key={service.id}
+                className={isActiveRemote ? "ai-service-card active" : "ai-service-card"}
+              >
                 <div className="ai-service-row">
                   <span className={`ai-service-icon ${catalog?.tone ?? "custom"}`}>
                     <ServiceIcon size={13} />
@@ -4219,12 +4331,32 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                       <input
                         type="checkbox"
                         checked={service.enabled}
-                        onChange={(event) =>
-                          patchRemoteService(service.id, (current) => ({
-                            ...current,
-                            enabled: event.target.checked,
-                          }))
-                        }
+                        onChange={(event) => {
+                          const enabled = event.target.checked;
+                          void patchAiSettings((current) => {
+                            const nextServices = (current.remote_services ?? []).map((entry) => (
+                              entry.id === service.id
+                                ? {
+                                    ...entry,
+                                    enabled,
+                                  }
+                                : entry
+                            ));
+                            const disablingActive = !enabled && current.active_remote_service_id === service.id;
+                            const nextProvider = disablingActive
+                              ? current.providers.foundation_apple.enabled && isMacOS
+                                ? "foundation_apple"
+                                : "none"
+                              : current.active_provider;
+
+                            return {
+                              ...current,
+                              active_provider: nextProvider,
+                              active_remote_service_id: disablingActive ? null : current.active_remote_service_id,
+                              remote_services: nextServices,
+                            };
+                          });
+                        }}
                       />
                     </label>
                     <button
@@ -4232,6 +4364,19 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                       onClick={() => setAiServiceConfigOpen(isOpen ? null : service.id)}
                     >
                       {isOpen ? "Done" : "Configure"}
+                    </button>
+                    <button
+                      className="secondary-button"
+                      disabled={!service.enabled || isActiveRemote}
+                      onClick={() => {
+                        void patchAiSettings((current) => ({
+                          ...current,
+                          active_provider: service.kind === "google" ? "gemini" : "none",
+                          active_remote_service_id: service.id,
+                        }));
+                      }}
+                    >
+                      {isActiveRemote ? "Active" : "Use"}
                     </button>
                   </div>
                 </div>

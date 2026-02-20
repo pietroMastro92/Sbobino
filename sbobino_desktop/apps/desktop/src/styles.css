@@ -1743,8 +1743,8 @@ code {
 }
 
 .export-sheet {
-  width: min(1020px, 95vw);
-  max-height: min(720px, 90vh);
+  width: min(1080px, calc(100vw - 56px));
+  max-height: min(780px, calc(100vh - 56px));
   background: var(--panel-soft);
   border: 1px solid var(--line);
   border-radius: 18px;
@@ -1752,6 +1752,28 @@ code {
   grid-template-columns: minmax(0, 1fr) 326px;
   overflow: hidden;
   box-shadow: 0 30px 80px rgba(12, 18, 28, 0.24);
+  position: relative;
+}
+
+.export-close-button {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--detail-control-bg);
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+}
+
+.export-close-button:hover {
+  color: var(--text);
+  border-color: var(--detail-control-border);
 }
 
 .export-preview {
@@ -1809,13 +1831,20 @@ code {
 }
 
 .export-controls {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--panel-soft);
+}
+
+.export-controls-scroll {
   padding: 14px;
   display: grid;
   gap: 12px;
   align-content: start;
   min-height: 0;
   overflow: auto;
-  background: var(--panel-soft);
 }
 
 .export-controls h3 {
@@ -1931,7 +1960,10 @@ code {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  margin-top: 2px;
+  margin-top: 0;
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--panel-soft);
 }
 
 .model-sheet {
@@ -2987,7 +3019,7 @@ code {
     max-height: 34vh;
   }
 
-  .export-controls {
+  .export-controls-scroll {
     max-height: 44vh;
   }
 
@@ -3097,7 +3129,7 @@ code {
   }
 
   .export-preview-head,
-  .export-controls {
+  .export-controls-scroll {
     padding: 12px;
   }
 
@@ -3108,13 +3140,6 @@ code {
 
   .format-card {
     min-height: 70px;
-  }
-
-  .export-actions {
-    position: sticky;
-    bottom: 0;
-    background: inherit;
-    padding-top: 8px;
   }
 
   .main-topbar {

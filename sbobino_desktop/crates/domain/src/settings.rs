@@ -57,9 +57,9 @@ impl SpeechModel {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptionEngine {
-    WhisperCpp,
-    #[default]
     WhisperKit,
+    #[default]
+    WhisperCpp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -270,6 +270,7 @@ pub struct AiProviderSettings {
 #[serde(default)]
 pub struct AiSettings {
     pub active_provider: AiProvider,
+    pub active_remote_service_id: Option<String>,
     pub providers: AiProviderSettings,
     pub remote_services: Vec<RemoteServiceConfig>,
 }
@@ -278,6 +279,7 @@ impl Default for AiSettings {
     fn default() -> Self {
         Self {
             active_provider: AiProvider::None,
+            active_remote_service_id: None,
             providers: AiProviderSettings::default(),
             remote_services: Vec::new(),
         }
@@ -397,6 +399,26 @@ impl AppSettings {
         if self.ai.active_provider == AiProvider::None && self.gemini_api_key.is_some() {
             self.ai.active_provider = AiProvider::Gemini;
         }
+        if self.ai.active_remote_service_id.is_none()
+            && self.ai.active_provider == AiProvider::Gemini
+        {
+            self.ai.active_remote_service_id = self
+                .ai
+                .remote_services
+                .iter()
+                .find(|service| service.kind == RemoteServiceKind::Google)
+                .map(|service| service.id.clone());
+        }
+        if let Some(active_id) = self.ai.active_remote_service_id.clone() {
+            let exists = self
+                .ai
+                .remote_services
+                .iter()
+                .any(|service| service.id == active_id);
+            if !exists {
+                self.ai.active_remote_service_id = None;
+            }
+        }
 
         self.ensure_prompt_integrity();
     }
@@ -416,6 +438,26 @@ impl AppSettings {
 
         self.gemini_model = self.ai.providers.gemini.model.clone();
         self.gemini_api_key = self.ai.providers.gemini.api_key.clone();
+        if self.ai.active_provider == AiProvider::Gemini
+            && self.ai.active_remote_service_id.is_none()
+        {
+            self.ai.active_remote_service_id = self
+                .ai
+                .remote_services
+                .iter()
+                .find(|service| service.kind == RemoteServiceKind::Google)
+                .map(|service| service.id.clone());
+        }
+        if let Some(active_id) = self.ai.active_remote_service_id.clone() {
+            let exists = self
+                .ai
+                .remote_services
+                .iter()
+                .any(|service| service.id == active_id);
+            if !exists {
+                self.ai.active_remote_service_id = None;
+            }
+        }
 
         self.ensure_prompt_integrity();
     }

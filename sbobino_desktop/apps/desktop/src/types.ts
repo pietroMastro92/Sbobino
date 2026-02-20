@@ -102,6 +102,7 @@ export type AiProviderSettings = {
 
 export type AiSettings = {
   active_provider: AiProvider;
+  active_remote_service_id: string | null;
   providers: AiProviderSettings;
   remote_services: RemoteServiceConfig[];
 };

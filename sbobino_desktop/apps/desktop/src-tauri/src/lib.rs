@@ -40,6 +40,25 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                if window.label() == "main" {
+                    let app = window.app_handle();
+                    let secondary_labels = app
+                        .webview_windows()
+                        .keys()
+                        .filter(|label| label.as_str() != "main")
+                        .cloned()
+                        .collect::<Vec<_>>();
+
+                    for label in secondary_labels {
+                        if let Some(secondary) = app.get_webview_window(label.as_str()) {
+                            let _ = secondary.close();
+                        }
+                    }
+                }
+            }
+        })
         .setup(|app| {
             let data_dir = app
                 .path()
