@@ -172,6 +172,10 @@ pub struct WhisperOptions {
 
 impl Default for WhisperOptions {
     fn default() -> Self {
+        // Use half of logical CPUs (clamped 4–16) for optimal throughput on Intel & Apple Silicon
+        let logical_cpus = num_cpus::get() as u8;
+        let optimal_threads = (logical_cpus / 2).clamp(4, 16);
+
         Self {
             translate_to_english: false,
             no_context: false,
@@ -185,8 +189,8 @@ impl Default for WhisperOptions {
             no_speech_threshold: 0.6,
             word_threshold: 0.01,
             best_of: 5,
-            beam_size: 1,
-            threads: 4,
+            beam_size: 5,
+            threads: optimal_threads,
             processors: 1,
             use_prefill_prompt: true,
             use_prefill_cache: true,

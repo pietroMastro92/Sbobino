@@ -34,7 +34,7 @@ pub async fn open_settings_window(
         settings_url.push_str(target_pane);
     }
 
-    tauri::WebviewWindowBuilder::new(
+    let settings_window = tauri::WebviewWindowBuilder::new(
         &app,
         "settings",
         tauri::WebviewUrl::App(settings_url.into()),
@@ -47,6 +47,18 @@ pub async fn open_settings_window(
     .map_err(|error| {
         CommandError::new("window", format!("failed to open settings window: {error}"))
     })?;
+
+    // Apply the same macOS vibrancy effect as the main window
+    #[cfg(target_os = "macos")]
+    {
+        use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+        let _ = apply_vibrancy(
+            &settings_window,
+            NSVisualEffectMaterial::Sidebar,
+            Some(NSVisualEffectState::Active),
+            None,
+        );
+    }
 
     Ok(true)
 }

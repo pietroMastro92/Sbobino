@@ -282,32 +282,40 @@ const serviceCatalog: ServiceCatalogItem[] = [
 ];
 
 const defaultPromptTestInput = "This is an example of some transcribed text.";
-const defaultWhisperOptions: WhisperOptions = {
-  translate_to_english: false,
-  no_context: false,
-  split_on_word: false,
-  temperature: 0,
-  temperature_increment_on_fallback: 0.2,
-  temperature_fallback_count: 5,
-  entropy_threshold: 2.5,
-  logprob_threshold: -1,
-  first_token_logprob_threshold: -1.5,
-  no_speech_threshold: 0.6,
-  word_threshold: 0.01,
-  best_of: 5,
-  beam_size: 1,
-  threads: 4,
-  processors: 1,
-  use_prefill_prompt: true,
-  use_prefill_cache: true,
-  without_timestamps: false,
-  word_timestamps: false,
-  prompt: null,
-  concurrent_worker_count: 4,
-  chunking_strategy: "vad",
-  audio_encoder_compute_units: "cpu_and_neural_engine",
-  text_decoder_compute_units: "cpu_and_neural_engine",
-};
+function getDefaultWhisperOptions(): WhisperOptions {
+  // On Intel Macs: use more CPU threads, greedy beam search, and CPU-only compute units
+  // (no Neural Engine or CoreML acceleration available)
+  const threads = isAppleSilicon
+    ? 4
+    : Math.max(4, Math.min(8, Math.floor((navigator.hardwareConcurrency ?? 8) / 2)));
+
+  return {
+    translate_to_english: false,
+    no_context: false,
+    split_on_word: false,
+    temperature: 0,
+    temperature_increment_on_fallback: 0.2,
+    temperature_fallback_count: 5,
+    entropy_threshold: 2.5,
+    logprob_threshold: -1,
+    first_token_logprob_threshold: -1.5,
+    no_speech_threshold: 0.6,
+    word_threshold: 0.01,
+    best_of: isAppleSilicon ? 5 : 1,
+    beam_size: isAppleSilicon ? 1 : 5,
+    threads,
+    processors: 1,
+    use_prefill_prompt: true,
+    use_prefill_cache: true,
+    without_timestamps: false,
+    word_timestamps: false,
+    prompt: null,
+    concurrent_worker_count: 4,
+    chunking_strategy: "vad",
+    audio_encoder_compute_units: isAppleSilicon ? "cpu_and_neural_engine" : "cpu_only",
+    text_decoder_compute_units: isAppleSilicon ? "cpu_and_neural_engine" : "cpu_only",
+  };
+}
 
 type SettingsPaneDefinition = {
   key: SettingsPane;
@@ -317,7 +325,9 @@ type SettingsPaneDefinition = {
   icon: LucideIcon;
 };
 
-const settingsPaneDefinitions: SettingsPaneDefinition[] = [
+const isAppleSilicon = navigator.userAgent.toLowerCase().includes("mac") && !navigator.userAgent.includes("Intel");
+
+const _settingsPaneDefinitions: SettingsPaneDefinition[] = [
   {
     key: "general",
     label: "General",
@@ -375,6 +385,10 @@ const settingsPaneDefinitions: SettingsPaneDefinition[] = [
     icon: MessageSquareText,
   },
 ];
+
+const settingsPaneDefinitions = _settingsPaneDefinitions.filter(
+  (pane) => isAppleSilicon || pane.key !== "whisper_kit"
+);
 
 const AI_SERVICE_NONE = "__none";
 const AI_SERVICE_FOUNDATION = "__foundation";
@@ -559,7 +573,7 @@ function createRemoteServiceId(kind: RemoteServiceKind): string {
 
 function normalizeSettings(settings: AppSettings): AppSettings {
   const normalizedWhisperOptions = sanitizeWhisperOptions({
-    ...defaultWhisperOptions,
+    ...getDefaultWhisperOptions(),
     ...settings.transcription.whisper_options,
   });
 
@@ -1095,7 +1109,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     const hasGoogleService = (settings.ai.remote_services ?? []).some(
       (service) => service.kind === "google",
     );
-    if (isMacOS && settings.ai.providers.foundation_apple.enabled) {
+    if (isAppleSilicon && settings.ai.providers.foundation_apple.enabled) {
       void patchAiSettings((current) => ({
         ...current,
         active_provider: "foundation_apple",
@@ -1112,7 +1126,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       }));
     }
   }, [
-    isMacOS,
+    isAppleSilicon,
     settings?.ai.active_provider,
     settings?.ai.remote_services,
     settings?.ai.providers.foundation_apple.enabled,
@@ -1594,7 +1608,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       {
         value: AI_SERVICE_FOUNDATION,
         label: "Foundation Model",
-        disabled: !isMacOS || !settings?.ai.providers.foundation_apple.enabled,
+        disabled: !isAppleSilicon || !settings?.ai.providers.foundation_apple.enabled,
       },
     ];
 
@@ -1880,7 +1894,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       transcription: {
         ...current.transcription,
         whisper_options: sanitizeWhisperOptions(
-          mutator(current.transcription.whisper_options ?? defaultWhisperOptions),
+          mutator(current.transcription.whisper_options ?? getDefaultWhisperOptions()),
         ),
       },
     }));
@@ -1898,7 +1912,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         model: settings.transcription.model,
         enable_ai: settings.transcription.enable_ai_post_processing,
         whisper_options: sanitizeWhisperOptions(
-          settings.transcription.whisper_options ?? defaultWhisperOptions,
+          settings.transcription.whisper_options ?? getDefaultWhisperOptions(),
         ),
       });
 
@@ -2492,14 +2506,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   function renderHome(): JSX.Element {
     return (
       <div className="view-body home-view">
-        <section className="file-picker-card">
-          <div className="file-chip">
-            <AudioLines size={15} />
-            <span>{selectedFile ? fileLabel(selectedFile) : "No file selected"}</span>
-          </div>
-          <button className="secondary-button" onClick={() => void onPickFile()}>
-            <Upload size={15} />
-            Open File
+        <section className="main-input-bar">
+          <input type="text" placeholder="Audio file" />
+          <button className="icon-button" onClick={() => void onPickFile()} title="Open Local File">
+            <Upload size={16} />
           </button>
         </section>
 
@@ -2509,11 +2519,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             onClick={() => void onStartTranscription()}
             disabled={!canStartFileTranscription}
           >
-            <FileAudio size={16} />
+            <FileAudio size={18} strokeWidth={2.5} />
             {isStarting ? "Starting..." : "Start Transcription"}
           </button>
           <button className="quick-action" onClick={() => void onStartRealtime()} disabled={!canStartRealtime}>
-            <Mic size={16} />
+            <Mic size={18} strokeWidth={2.5} />
             Start Live
           </button>
           <button
@@ -2521,15 +2531,15 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             onClick={() => void onStopRealtime(true)}
             disabled={realtimeState === "idle" || isStoppingRealtime}
           >
-            <Radio size={16} />
+            <Radio size={18} strokeWidth={2.5} />
             {isStoppingRealtime ? "Stopping..." : "Stop Live & Save"}
           </button>
           <button className="quick-action" onClick={() => setSection("queue")}>
-            <ListChecks size={16} />
+            <ListChecks size={18} strokeWidth={2.5} />
             Queue
           </button>
           <button className="quick-action" onClick={() => setSection("history")}>
-            <HistoryIcon size={16} />
+            <HistoryIcon size={18} strokeWidth={2.5} />
             History
           </button>
           <button
@@ -2538,7 +2548,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               void onOpenStandaloneSettingsWindow("local_models");
             }}
           >
-            <Settings2 size={16} />
+            <Cpu size={18} strokeWidth={2.5} />
             Manage Models
           </button>
         </div>
@@ -3448,7 +3458,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       return <div className="settings-placeholder">Settings unavailable.</div>;
     }
 
-    const whisperOptions = settings.transcription.whisper_options ?? defaultWhisperOptions;
+    const whisperOptions = settings.transcription.whisper_options ?? getDefaultWhisperOptions();
 
     return (
       <div className="settings-stack">
@@ -3675,7 +3685,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       return <div className="settings-placeholder">Settings unavailable.</div>;
     }
 
-    const whisperOptions = settings.transcription.whisper_options ?? defaultWhisperOptions;
+    const whisperOptions = settings.transcription.whisper_options ?? getDefaultWhisperOptions();
 
     return (
       <div className="settings-stack">
@@ -3725,49 +3735,55 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             />
           </div>
 
-          <div className="settings-row settings-row-block">
-            <div>
-              <strong>Audio encoder compute units</strong>
+          {isAppleSilicon && (
+            <div className="settings-row settings-row-block">
+              <div>
+                <strong>Audio encoder compute units</strong>
+                <small>CoreML execution unit for the audio encoder (Apple Silicon only).</small>
+              </div>
+              <select
+                value={whisperOptions.audio_encoder_compute_units}
+                onChange={(event) => {
+                  void onPatchWhisperOptions((current) => ({
+                    ...current,
+                    audio_encoder_compute_units: event.target
+                      .value as WhisperOptions["audio_encoder_compute_units"],
+                  }));
+                }}
+              >
+                {computeUnitOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             </div>
-            <select
-              value={whisperOptions.audio_encoder_compute_units}
-              onChange={(event) => {
-                void onPatchWhisperOptions((current) => ({
-                  ...current,
-                  audio_encoder_compute_units: event.target
-                    .value as WhisperOptions["audio_encoder_compute_units"],
-                }));
-              }}
-            >
-              {computeUnitOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </div>
+          )}
 
-          <div className="settings-row settings-row-block">
-            <div>
-              <strong>Text decoder compute units</strong>
+          {isAppleSilicon && (
+            <div className="settings-row settings-row-block">
+              <div>
+                <strong>Text decoder compute units</strong>
+                <small>CoreML execution unit for the text decoder (Apple Silicon only).</small>
+              </div>
+              <select
+                value={whisperOptions.text_decoder_compute_units}
+                onChange={(event) => {
+                  void onPatchWhisperOptions((current) => ({
+                    ...current,
+                    text_decoder_compute_units: event.target
+                      .value as WhisperOptions["text_decoder_compute_units"],
+                  }));
+                }}
+              >
+                {computeUnitOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             </div>
-            <select
-              value={whisperOptions.text_decoder_compute_units}
-              onChange={(event) => {
-                void onPatchWhisperOptions((current) => ({
-                  ...current,
-                  text_decoder_compute_units: event.target
-                    .value as WhisperOptions["text_decoder_compute_units"],
-                }));
-              }}
-            >
-              {computeUnitOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </div>
+          )}
 
           <div className="settings-row">
             <div>
@@ -3878,46 +3894,45 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           </p>
 
           {runtimeHealth ? (
-            <div className="inspector-block">
+            <div className="settings-health-block">
               <h4>Transcription Runtime Health</h4>
-              <p className="muted">
-                Whisper CLI:{" "}
-                <code>{runtimeHealth.whisper_cli_resolved || runtimeHealth.whisper_cli_path}</code>
-              </p>
-              <p className="muted">
-                WhisperKit CLI:{" "}
-                <code>{runtimeHealth.whisperkit_cli_resolved || runtimeHealth.whisperkit_cli_path}</code>
-              </p>
-              <p className="muted">
-                Whisper Stream:{" "}
-                <code>{runtimeHealth.whisper_stream_resolved || runtimeHealth.whisper_stream_path}</code>
-              </p>
-              <p className="muted">
-                Active model: <code>{runtimeHealth.model_filename}</code>{" "}
-                {runtimeHealth.model_present ? (
-                  <span className="kind-chip">Installed</span>
-                ) : (
-                  <span className="missing-chip">Missing</span>
+              <div className="settings-health-rows">
+                <div className="settings-health-row">
+                  <span className="settings-health-label">Whisper CLI</span>
+                  <code className="settings-health-value">{runtimeHealth.whisper_cli_resolved || runtimeHealth.whisper_cli_path}</code>
+                </div>
+                {isAppleSilicon && (
+                  <div className="settings-health-row">
+                    <span className="settings-health-label">WhisperKit CLI</span>
+                    <code className="settings-health-value">{runtimeHealth.whisperkit_cli_resolved || runtimeHealth.whisperkit_cli_path}</code>
+                  </div>
                 )}
-              </p>
-              <p className="muted">
-                CoreML encoder{" "}
-                {runtimeHealth.coreml_encoder_present ? (
-                  <span className="kind-chip">Installed</span>
-                ) : (
-                  <span className="missing-chip">Missing</span>
+                <div className="settings-health-row">
+                  <span className="settings-health-label">Whisper Stream</span>
+                  <code className="settings-health-value">{runtimeHealth.whisper_stream_resolved || runtimeHealth.whisper_stream_path}</code>
+                </div>
+                <div className="settings-health-row">
+                  <span className="settings-health-label">Active model</span>
+                  <span className="settings-health-value-inline">
+                    <code>{runtimeHealth.model_filename}</code>
+                    {runtimeHealth.model_present ? (
+                      <span className="kind-chip">Installed</span>
+                    ) : (
+                      <span className="missing-chip">Missing</span>
+                    )}
+                  </span>
+                </div>
+                {isAppleSilicon && (
+                  <div className="settings-health-row">
+                    <span className="settings-health-label">CoreML encoder</span>
+                    {runtimeHealth.coreml_encoder_present ? (
+                      <span className="kind-chip">Installed</span>
+                    ) : (
+                      <span className="missing-chip">Missing</span>
+                    )}
+                  </div>
                 )}
-              </p>
-              {runtimeHealth.missing_models.length > 0 ? (
-                <p className="muted">
-                  Missing models: <code>{runtimeHealth.missing_models.join(", ")}</code>
-                </p>
-              ) : null}
-              {runtimeHealth.missing_encoders.length > 0 ? (
-                <p className="muted">
-                  Missing encoders: <code>{runtimeHealth.missing_encoders.join(", ")}</code>
-                </p>
-              ) : null}
+              </div>
             </div>
           ) : null}
 
@@ -3932,15 +3947,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   <span className={model.installed ? "kind-chip" : "missing-chip"}>
                     {model.installed ? "Installed" : "Missing"}
                   </span>
-                  <span className={model.coreml_installed ? "kind-chip" : "missing-chip"}>
-                    {model.coreml_installed ? "CoreML Ready" : "CoreML Missing"}
-                  </span>
+                  {isAppleSilicon && (
+                    <span className={model.coreml_installed ? "kind-chip" : "missing-chip"}>
+                      {model.coreml_installed ? "CoreML Ready" : "CoreML Missing"}
+                    </span>
+                  )}
                   <button
                     className="secondary-button"
-                    disabled={provisioning.running || (model.installed && model.coreml_installed)}
+                    disabled={provisioning.running || (model.installed && (!isAppleSilicon || model.coreml_installed))}
                     onClick={() => void onDownloadModel(model.key)}
                   >
-                    {model.installed && model.coreml_installed ? "Installed" : "Download"}
+                    {model.installed && (!isAppleSilicon || model.coreml_installed) ? "Installed" : "Download"}
                   </button>
                 </div>
               </div>
@@ -3972,7 +3989,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       return <div className="settings-placeholder">Settings unavailable.</div>;
     }
 
-    const foundationAvailable = isMacOS;
+    const foundationAvailable = isAppleSilicon;
     const foundationEnabled = settings.ai.providers.foundation_apple.enabled;
     const foundationActive = settings.ai.active_provider === "foundation_apple";
     const geminiActive =
@@ -4060,7 +4077,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         return {
           ...current,
           active_provider: shouldDeactivateGemini
-            ? current.providers.foundation_apple.enabled && isMacOS
+            ? current.providers.foundation_apple.enabled && isAppleSilicon
               ? "foundation_apple"
               : "none"
             : current.active_provider,
@@ -4108,7 +4125,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               <span className="ai-service-icon foundation"></span>
               <div className="ai-service-title">
                 <strong>Foundation Model</strong>
-                <small>{foundationAvailable ? "Apple" : "Available only on macOS"}</small>
+                <small>{foundationAvailable ? "Apple" : "Requires Apple Silicon"}</small>
               </div>
               <div className="ai-service-actions">
                 <label className="toggle-row compact">
@@ -4267,7 +4284,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                       void patchAiSettings((current) => {
                         const nextProvider =
                           current.active_provider === "gemini"
-                            ? current.providers.foundation_apple.enabled && isMacOS
+                            ? current.providers.foundation_apple.enabled && isAppleSilicon
                               ? "foundation_apple"
                               : "none"
                             : current.active_provider;
@@ -4344,7 +4361,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                             ));
                             const disablingActive = !enabled && current.active_remote_service_id === service.id;
                             const nextProvider = disablingActive
-                              ? current.providers.foundation_apple.enabled && isMacOS
+                              ? current.providers.foundation_apple.enabled && isAppleSilicon
                                 ? "foundation_apple"
                                 : "none"
                               : current.active_provider;
@@ -4851,9 +4868,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 <ListChecks size={16} />
                 Queue
               </button>
-              <button className={section === "realtime" ? "sidebar-item active" : "sidebar-item"} onClick={() => setSection("realtime")}>
-                <Radio size={16} />
-                Live
+              <button className={section === "history" ? "sidebar-item active" : "sidebar-item"} onClick={() => setSection("history")}>
+                <HistoryIcon size={16} />
+                History
               </button>
             </div>
 
@@ -4888,14 +4905,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             ) : null}
 
             <div className="sidebar-section">
-              <h4>History</h4>
-              <button
-                className={section === "history" ? "sidebar-item active" : "sidebar-item"}
-                onClick={() => setSection("history")}
-              >
-                <HistoryIcon size={16} />
-                Transcriptions
-              </button>
               <button
                 className={section === "deleted_history" ? "sidebar-item active" : "sidebar-item"}
                 onClick={() => setSection("deleted_history")}
@@ -4941,11 +4950,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               </div>
 
               {section === "home" || section === "queue" || section === "realtime" ? (
-                <div className="topbar-controls home-topbar-controls">
+                <div className="topbar-controls">
+                  <button className="icon-button" onClick={() => {}}>
+                    <Search size={16} />
+                  </button>
                   <label className="select-chip">
                     <span className="chip-label">
                       <Mic size={12} />
-                      Model
                     </span>
                     <select
                       value={settings?.transcription.model ?? "base"}
@@ -4960,7 +4971,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   <label className="select-chip">
                     <span className="chip-label">
                       <Languages size={12} />
-                      Language
                     </span>
                     <select
                       value={settings?.transcription.language ?? "auto"}

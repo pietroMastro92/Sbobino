@@ -25,7 +25,7 @@ uuid.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
 docx-rs = "0.4"
 printpdf = "0.8"
@@ -33,3 +33,4 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 sbobino-domain = { path = "../../../crates/domain" }
 sbobino-application = { path = "../../../crates/application" }
 sbobino-infrastructure = { path = "../../../crates/infrastructure" }
+window-vibrancy = "0.7.1"

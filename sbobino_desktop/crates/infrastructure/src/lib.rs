@@ -535,6 +535,12 @@ impl RuntimeTranscriptionFactory {
                 candidates.push(path);
             }
         } else {
+            // Tauri sidecar: binaries are placed next to the app executable
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(exe_dir) = exe.parent() {
+                    candidates.push(exe_dir.join(trimmed));
+                }
+            }
             candidates.push(self.data_dir.join("bin").join(trimmed));
             candidates.push(self.data_dir.join(trimmed));
             candidates.push(PathBuf::from("/opt/homebrew/bin").join(trimmed));

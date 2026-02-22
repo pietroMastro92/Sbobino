@@ -245,6 +245,34 @@ impl WhisperCppEngine {
         let output_txt_path = output_base.with_extension("txt");
 
         let mut command = Command::new(&self.binary_path);
+
+        // Homebrew-installed whisper-cli links against @rpath/libggml.0.dylib but
+        // ships with no embedded rpath. We resolve this by setting DYLD_LIBRARY_PATH
+        // to the sibling libexec/lib directory where the dylibs actually live.
+        if let Some(binary_dir) = Path::new(&self.binary_path)
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            let libexec_lib = binary_dir.join("../libexec/lib");
+            let sibling_lib = binary_dir.join("../lib");
+
+            let mut dyld_paths = Vec::new();
+            if libexec_lib.exists() {
+                dyld_paths.push(libexec_lib.to_string_lossy().to_string());
+            }
+            if sibling_lib.exists() {
+                dyld_paths.push(sibling_lib.to_string_lossy().to_string());
+            }
+            // Also preserve any existing DYLD_LIBRARY_PATH
+            if let Ok(existing) = std::env::var("DYLD_LIBRARY_PATH") {
+                dyld_paths.push(existing);
+            }
+            if !dyld_paths.is_empty() {
+                command.env("DYLD_LIBRARY_PATH", dyld_paths.join(":"));
+            }
+        }
+
         command
             .kill_on_drop(true)
             .arg("-m")
