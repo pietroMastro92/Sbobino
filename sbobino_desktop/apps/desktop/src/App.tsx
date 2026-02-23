@@ -1,5 +1,6 @@
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { confirm as confirmDialog, open, save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   ArrowLeft,
   AudioLines,
@@ -107,6 +108,25 @@ import { AudioPlayer } from "./components/AudioPlayer";
 import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 
+function HighlightMatch({ text, search }: { text: string; search: string }) {
+  if (!search.trim() || !text) return <>{text}</>;
+  const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const parts = text.split(new RegExp(`(${escapedSearch})`, "gi"));
+  return (
+    <>
+      {parts.map((part, index) =>
+        part.toLowerCase() === search.toLowerCase() ? (
+          <mark key={index} className="highlight-text">
+            {part}
+          </mark>
+        ) : (
+          part
+        ),
+      )}
+    </>
+  );
+}
+
 type Section =
   | "home"
   | "queue"
@@ -153,10 +173,14 @@ const modelOptions: Array<{ value: SpeechModel; label: string }> = [
   { value: "large_turbo", label: "Large Turbo" },
 ];
 
+const isAppleSilicon = navigator.userAgent.toLowerCase().includes("mac") && !navigator.userAgent.includes("Intel");
+
 const transcriptionEngineOptions: Array<{ value: TranscriptionEngine; label: string }> = [
-  { value: "whisper_kit", label: "WhisperKit" },
   { value: "whisper_cpp", label: "Whisper C++" },
 ];
+if (isAppleSilicon) {
+  transcriptionEngineOptions.unshift({ value: "whisper_kit", label: "WhisperKit" });
+}
 
 const chunkingOptions: Array<{ value: WhisperOptions["chunking_strategy"]; label: string }> = [
   { value: "vad", label: "Voice Activity Detection" },
@@ -324,8 +348,6 @@ type SettingsPaneDefinition = {
   group: "General" | "Transcription" | "AI";
   icon: LucideIcon;
 };
-
-const isAppleSilicon = navigator.userAgent.toLowerCase().includes("mac") && !navigator.userAgent.includes("Intel");
 
 const _settingsPaneDefinitions: SettingsPaneDefinition[] = [
   {
@@ -736,13 +758,11 @@ function DetailToolbar({
   onCancel,
 }: DetailToolbarProps): JSX.Element {
   return (
-    <header className="detail-toolbar">
+    <header className={`detail-toolbar ${!leftSidebarOpen ? "sidebar-closed" : ""}`}>
       <div className="detail-toolbar-left">
-        {!leftSidebarOpen ? (
-          <button className="icon-button" onClick={onShowSidebar} title="Show sidebar">
-            <PanelLeftOpen size={16} />
-          </button>
-        ) : null}
+        <button className="icon-button" onClick={() => onShowSidebar()} title={leftSidebarOpen ? "Hide sidebar" : "Show sidebar"}>
+          {leftSidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
+        </button>
         <button className="icon-button" onClick={onBack} title="Back to history">
           <ArrowLeft size={16} />
         </button>
@@ -862,6 +882,17 @@ type AppProps = {
 };
 
 export function App({ standaloneSettingsWindow = false }: AppProps) {
+  // Synchronize OS theme to the DOM so Tauri windows consistently style glassmorphism
+  useEffect(() => {
+    const updateTheme = (e: MediaQueryListEvent | MediaQueryList) => {
+      document.documentElement.dataset.theme = e.matches ? "dark" : "light";
+    };
+    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    updateTheme(mediaQuery);
+    mediaQuery.addEventListener("change", updateTheme);
+    return () => mediaQuery.removeEventListener("change", updateTheme);
+  }, []);
+
   const {
     settings,
     selectedFile,
@@ -900,7 +931,33 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
   const [isStarting, setIsStarting] = useState(false);
   const [isSavingArtifact, setIsSavingArtifact] = useState(false);
-  const [activeArtifact, setActiveArtifact] = useState<TranscriptArtifact | null>(null);
+
+  const [openArtifacts, setOpenArtifacts] = useState<TranscriptArtifact[]>([]);
+  const [activeArtifactId, setActiveArtifactId] = useState<string | null>(null);
+
+  const activeArtifact = useMemo(
+    () => openArtifacts.find((a) => a.id === activeArtifactId) || null,
+    [openArtifacts, activeArtifactId]
+  );
+  
+  const setActiveArtifact = (artifact: TranscriptArtifact | null) => {
+    if (!artifact) {
+      // Clear all
+      setOpenArtifacts([]);
+      setActiveArtifactId(null);
+      return;
+    }
+    setOpenArtifacts((prev) => {
+      const exists = prev.some((a) => a.id === artifact.id);
+      if (exists) {
+        return prev.map((a) => (a.id === artifact.id ? artifact : a));
+      }
+      return [...prev, artifact];
+    });
+    setActiveArtifactId(artifact.id);
+  };
+
+  const draftTitleActiveInstance = activeArtifact?.title || "";
   const [draftTitle, setDraftTitle] = useState("");
   const [draftTranscript, setDraftTranscript] = useState("");
   const [draftSummary, setDraftSummary] = useState("");
@@ -1216,7 +1273,46 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     };
   }, [setSettings]);
 
+  // Tauri native drag-and-drop: auto-load + transcribe dropped audio files
   useEffect(() => {
+    const audioExtensions = ["wav", "mp3", "m4a", "flac", "ogg", "aac", "opus", "webm", "mp4", "mov", "mkv", "wma", "aiff"];
+    let unlisten: (() => void) | undefined;
+
+    void (async () => {
+      try {
+        unlisten = await getCurrentWebview().onDragDropEvent((event) => {
+          if (event.payload.type === "drop") {
+            const paths = event.payload.paths;
+            if (!paths || paths.length === 0) return;
+
+            const audioFile = paths.find((p) => {
+              const ext = p.split(".").pop()?.toLowerCase() ?? "";
+              return audioExtensions.includes(ext);
+            });
+
+            if (audioFile) {
+              setSelectedFile(audioFile);
+              setSection("home");
+              setError(null);
+              // Defer briefly to let React flush states, then start transcription
+              setTimeout(() => {
+                void onStartTranscription(audioFile);
+              }, 100);
+            }
+          }
+        });
+      } catch {
+        // Drag-drop not available (e.g. running in browser)
+      }
+    })();
+
+    return () => {
+      unlisten?.();
+    };
+  }, [setSelectedFile, setError]);
+
+  useEffect(() => {
+    let unmounted = false;
     let unsubProgress: (() => void) | undefined;
     let unsubCompleted: (() => void) | undefined;
     let unsubFailed: (() => void) | undefined;
@@ -1228,7 +1324,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     let unsubProvisioningStatus: (() => void) | undefined;
 
     void (async () => {
-      unsubProgress = await subscribeJobProgress((event) => {
+      const uProgress = await subscribeJobProgress((event) => {
         setQueueItems((previous) => pushOrReplaceQueueItem(previous, event));
         if (event.job_id === activeJobIdRef.current) {
           setProgress(event);
@@ -1241,8 +1337,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           }
         }
       });
+      if (unmounted) { uProgress(); } else { unsubProgress = uProgress; }
 
-      unsubCompleted = await subscribeJobCompleted((artifact) => {
+      const uCompleted = await subscribeJobCompleted((artifact) => {
         prependArtifact(artifact);
         setQueueItems((previous) => previous.filter((entry) => entry.job_id !== artifact.job_id));
         setActiveJobPreviewText("");
@@ -1257,8 +1354,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setError(null);
         }
       });
+      if (unmounted) { uCompleted(); } else { unsubCompleted = uCompleted; }
 
-      unsubFailed = await subscribeJobFailed((payload) => {
+      const uFailed = await subscribeJobFailed((payload) => {
         setQueueItems((previous) =>
           previous.map((entry) =>
             entry.job_id === payload.job_id
@@ -1281,8 +1379,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setError(payload.message);
         }
       });
+      if (unmounted) { uFailed(); } else { unsubFailed = uFailed; }
 
-      unsubTranscriptionDelta = await subscribeTranscriptionDelta((delta) => {
+      const uTranscriptionDelta = await subscribeTranscriptionDelta((delta) => {
         if (delta.job_id !== activeJobIdRef.current) {
           return;
         }
@@ -1299,8 +1398,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           return `${previous}\n${nextLine}`;
         });
       });
+      if (unmounted) { uTranscriptionDelta(); } else { unsubTranscriptionDelta = uTranscriptionDelta; }
 
-      unsubRealtimeDelta = await subscribeRealtimeDelta((delta: RealtimeDelta) => {
+      const uRealtimeDelta = await subscribeRealtimeDelta((delta: RealtimeDelta) => {
         if (delta.kind === "append_final") {
           setRealtimeFinalLines((previous) => [...previous, delta.text]);
           setRealtimePreview("");
@@ -1310,8 +1410,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setRealtimePreview(delta.text);
         }
       });
+      if (unmounted) { uRealtimeDelta(); } else { unsubRealtimeDelta = uRealtimeDelta; }
 
-      unsubRealtimeStatus = await subscribeRealtimeStatus((event) => {
+      const uRealtimeStatus = await subscribeRealtimeStatus((event) => {
         setRealtimeMessage(event.message);
         if (event.state === "running") {
           setRealtimeState("running");
@@ -1321,12 +1422,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setRealtimeState("idle");
         }
       });
+      if (unmounted) { uRealtimeStatus(); } else { unsubRealtimeStatus = uRealtimeStatus; }
 
-      unsubRealtimeSaved = await subscribeRealtimeSaved((artifact) => {
+      const uRealtimeSaved = await subscribeRealtimeSaved((artifact) => {
         prependArtifact(artifact);
       });
+      if (unmounted) { uRealtimeSaved(); } else { unsubRealtimeSaved = uRealtimeSaved; }
 
-      unsubProvisioningProgress = await subscribeProvisioningProgress((event) => {
+      const uProvisioningProgress = await subscribeProvisioningProgress((event) => {
         setProvisioning((previous) => ({
           ...previous,
           running: true,
@@ -1334,8 +1437,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           statusMessage: `Downloading ${event.asset} (${event.current}/${event.total})`,
         }));
       });
+      if (unmounted) { uProvisioningProgress(); } else { unsubProvisioningProgress = uProvisioningProgress; }
 
-      unsubProvisioningStatus = await subscribeProvisioningStatus((event) => {
+      const uProvisioningStatus = await subscribeProvisioningStatus((event) => {
         setProvisioning((previous) => ({
           ...previous,
           running: false,
@@ -1349,9 +1453,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           void refreshProvisioningModels();
         }
       });
+      if (unmounted) { uProvisioningStatus(); } else { unsubProvisioningStatus = uProvisioningStatus; }
     })();
 
     return () => {
+      unmounted = true;
       unsubProgress?.();
       unsubCompleted?.();
       unsubFailed?.();
@@ -1408,10 +1514,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       }
 
       return (
-        artifact.title.toLowerCase().includes(needle) ||
-        artifact.input_path.toLowerCase().includes(needle) ||
-        artifact.optimized_transcript.toLowerCase().includes(needle) ||
-        artifact.raw_transcript.toLowerCase().includes(needle)
+        artifact.title?.toLowerCase().includes(needle) ||
+        artifact.input_path?.toLowerCase().includes(needle) ||
+        artifact.optimized_transcript?.toLowerCase().includes(needle) ||
+        artifact.raw_transcript?.toLowerCase().includes(needle)
       );
     });
   }, [artifacts, historyKind, search]);
@@ -1421,10 +1527,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return deletedArtifacts.filter((artifact) => {
       if (!needle) return true;
       return (
-        artifact.title.toLowerCase().includes(needle) ||
-        artifact.input_path.toLowerCase().includes(needle) ||
-        artifact.optimized_transcript.toLowerCase().includes(needle) ||
-        artifact.raw_transcript.toLowerCase().includes(needle)
+        artifact.title?.toLowerCase().includes(needle) ||
+        artifact.input_path?.toLowerCase().includes(needle) ||
+        artifact.optimized_transcript?.toLowerCase().includes(needle) ||
+        artifact.raw_transcript?.toLowerCase().includes(needle)
       );
     });
   }, [deletedArtifacts, deletedSearch]);
@@ -1605,12 +1711,15 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const aiServiceSelectOptions = useMemo(() => {
     const options: Array<{ value: string; label: string; disabled?: boolean }> = [
       { value: AI_SERVICE_NONE, label: "No AI provider" },
-      {
+    ];
+
+    if (isAppleSilicon) {
+      options.push({
         value: AI_SERVICE_FOUNDATION,
         label: "Foundation Model",
-        disabled: !isAppleSilicon || !settings?.ai.providers.foundation_apple.enabled,
-      },
-    ];
+        disabled: !settings?.ai.providers.foundation_apple.enabled,
+      });
+    }
 
     for (const service of enabledRemoteServices) {
       const label = service.kind === "google"
@@ -1900,14 +2009,15 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     }));
   }
 
-  async function onStartTranscription(): Promise<void> {
-    if (!settings || !selectedFile) return;
+  async function onStartTranscription(fileToProcess?: string): Promise<void> {
+    const targetFile = fileToProcess && typeof fileToProcess === "string" ? fileToProcess : selectedFile;
+    if (!settings || !targetFile) return;
 
     setIsStarting(true);
     setError(null);
     try {
       const { job_id } = await startTranscription({
-        input_path: selectedFile,
+        input_path: targetFile,
         language: settings.transcription.language,
         model: settings.transcription.model,
         enable_ai: settings.transcription.enable_ai_post_processing,
@@ -1918,7 +2028,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
       setJobStarted(job_id);
       activeJobIdRef.current = job_id;
-      setActiveJobTitle(fileLabel(selectedFile));
+      setActiveJobTitle(fileLabel(targetFile));
       setActiveJobPreviewText("");
       activeJobDeltaSequenceRef.current = -1;
       setActiveArtifact(null);
@@ -2507,7 +2617,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return (
       <div className="view-body home-view">
         <section className="main-input-bar">
-          <input type="text" placeholder="Audio file" />
+          <input
+            type="text"
+            placeholder="Audio file"
+            value={selectedFile ? fileLabel(selectedFile) : ""}
+            readOnly
+          />
           <button className="icon-button" onClick={() => void onPickFile()} title="Open Local File">
             <Upload size={16} />
           </button>
@@ -2865,12 +2980,43 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     }
 
     return (
-      <textarea
-        className="detail-editor"
-        value={draftTranscript}
-        onChange={(event) => setDraftTranscript(event.target.value)}
-        style={{ fontSize: `${fontSize}px` }}
-      />
+      <div className="transcript-container" style={{ position: "relative", height: "100%" }}>
+        {search.trim() ? (
+          <div
+            className="detail-editor highlight-layer"
+            style={{
+              fontSize: `${fontSize}px`,
+              position: "absolute",
+              top: 0,
+              left: 0,
+              width: "100%",
+              height: "100%",
+              pointerEvents: "none",
+              whiteSpace: "pre-wrap",
+              wordWrap: "break-word",
+              color: "transparent",
+            }}
+          >
+            <HighlightMatch text={draftTranscript} search={search} />
+          </div>
+        ) : null}
+        <textarea
+          className="detail-editor"
+          value={draftTranscript}
+          onChange={(event) => setDraftTranscript(event.target.value)}
+          style={{
+            fontSize: `${fontSize}px`,
+            position: search.trim() ? "absolute" : "relative",
+            top: 0,
+            left: 0,
+            width: "100%",
+            height: "100%",
+            background: search.trim() ? "transparent" : undefined,
+            color: search.trim() ? "black" : undefined,
+            opacity: search.trim() ? 0.7 : 1,
+          }}
+        />
+      </div>
     );
   }
 
@@ -4689,21 +4835,23 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             />
           </label>
 
-          <label>
-            WhisperKit CLI path
-            <input
-              value={settings.transcription.whisperkit_cli_path}
-              onChange={(event) => {
-                void patchSettings((current) => ({
-                  ...current,
-                  transcription: {
-                    ...current.transcription,
-                    whisperkit_cli_path: event.target.value,
-                  },
-                }));
-              }}
-            />
-          </label>
+          {isAppleSilicon ? (
+            <label>
+              WhisperKit CLI path
+              <input
+                value={settings.transcription.whisperkit_cli_path}
+                onChange={(event) => {
+                  void patchSettings((current) => ({
+                    ...current,
+                    transcription: {
+                      ...current.transcription,
+                      whisperkit_cli_path: event.target.value,
+                    },
+                  }));
+                }}
+              />
+            </label>
+          ) : null}
 
           <label>
             FFmpeg path
@@ -4822,7 +4970,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       <main className="settings-window-shell">
         <section className="settings-window-frame">
           <header className="settings-window-header">
-            <h1>Settings</h1>
           </header>
           {renderSettings()}
           {error ? <p className="error-banner settings-window-error">{error}</p> : null}
@@ -4850,15 +4997,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       <section className={leftSidebarOpen ? "window-frame" : "window-frame left-collapsed"}>
         {leftSidebarOpen ? (
           <aside className="left-sidebar">
-            <div className="sidebar-header">
-              <button
-                className="icon-button"
-                onClick={() => setLeftSidebarOpen(false)}
-                title="Hide sidebar"
-              >
-                <PanelLeftClose size={16} />
-              </button>
-            </div>
             <div className="sidebar-section">
               <button className={section === "home" ? "sidebar-item active" : "sidebar-item"} onClick={() => setSection("home")}>
                 <House size={16} />
@@ -4874,33 +5012,42 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               </button>
             </div>
 
-            {activeArtifact ? (
+            {openArtifacts.length > 0 ? (
               <div className="sidebar-section">
                 <h4>Open</h4>
-                <div className="sidebar-open-row" title={activeArtifact.title}>
-                  <button
-                    className="sidebar-item sidebar-open-item"
-                    onClick={() => {
-                      setSection("detail");
-                      setDetailMode("transcript");
-                      setInspectorMode("details");
-                    }}
-                  >
-                    <FileAudio size={16} />
-                    <span className="sidebar-item-label">{activeArtifact.title}</span>
-                  </button>
-                  <button
-                    className="sidebar-open-close"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onCloseOpenedArtifact();
-                    }}
-                    title="Close opened transcription"
-                    aria-label="Close opened transcription"
-                  >
-                    <X size={12} />
-                  </button>
-                </div>
+                {openArtifacts.map((artifact) => (
+                  <div key={artifact.id} className="sidebar-open-row" title={artifact.title}>
+                    <button
+                      className={
+                        activeArtifactId === artifact.id
+                          ? "sidebar-item sidebar-open-item active"
+                          : "sidebar-item sidebar-open-item"
+                      }
+                      onClick={() => {
+                        hydrateDetail(artifact);
+                        setSection("detail");
+                      }}
+                    >
+                      <FileAudio size={16} />
+                      <span className="sidebar-item-label">{artifact.title}</span>
+                    </button>
+                    <button
+                      className="sidebar-open-close"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setOpenArtifacts((prev) => prev.filter((a) => a.id !== artifact.id));
+                        if (activeArtifactId === artifact.id) {
+                            setActiveArtifactId(null);
+                            setSection("home");
+                        }
+                      }}
+                      title="Close opened transcription"
+                      aria-label="Close opened transcription"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
               </div>
             ) : null}
 
@@ -4927,15 +5074,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           {section !== "detail" ? (
             <header className="main-topbar">
               <div className="topbar-title">
-                {!leftSidebarOpen ? (
-                  <button
-                    className="icon-button"
-                    onClick={() => setLeftSidebarOpen(true)}
-                    title="Show sidebar"
-                  >
-                    <PanelLeftOpen size={16} />
-                  </button>
-                ) : null}
+                <button
+                  className="icon-button"
+                  onClick={() => setLeftSidebarOpen(!leftSidebarOpen)}
+                  title={leftSidebarOpen ? "Hide sidebar" : "Show sidebar"}
+                >
+                  {leftSidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
+                </button>
                 {section === "home" ? null : (
                   <h1>
                     {section === "queue"
@@ -4951,9 +5096,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
               {section === "home" || section === "queue" || section === "realtime" ? (
                 <div className="topbar-controls">
-                  <button className="icon-button" onClick={() => {}}>
-                    <Search size={16} />
-                  </button>
                   <label className="select-chip">
                     <span className="chip-label">
                       <Mic size={12} />

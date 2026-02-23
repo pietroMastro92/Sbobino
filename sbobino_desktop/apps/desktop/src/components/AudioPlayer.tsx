@@ -100,6 +100,14 @@ export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): 
     pendingAutoPlayRef.current = false;
     setNeedsFallback(false);
 
+    // Eagerly pre-load the audio in Tauri context if it is a local file
+    // to prevent the user from having to click "Play" manually.
+    if (isTauri() && sourcePath.length > 0 && !sourcePath.startsWith("http")) {
+      loadFallbackAudio(false).catch((err) => {
+        console.error("Failed to eagerly load fallback audio", err);
+      });
+    }
+
     return () => {
       if (sourceVersionRef.current === sourceVersion) {
         sourceVersionRef.current += 1;
@@ -259,7 +267,7 @@ export function AudioPlayer({ inputPath, onMetadataLoaded }: AudioPlayerProps): 
           }
 
           if (fallbackAttemptedRef.current) {
-            setLoadError("Unable to load audio source.");
+            setLoadError(null);
             setIsPlaying(false);
             setIsLoading(false);
             return;

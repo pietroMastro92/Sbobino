@@ -190,8 +190,18 @@ export function ExportSheet({
     if (!normalized) {
       return "No content available for export.";
     }
+
+    if (format === "json") {
+      try {
+        const obj = { text: normalized };
+        return JSON.stringify(obj, null, 2);
+      } catch {
+        return normalized;
+      }
+    }
+
     return normalized;
-  }, [exportContent]);
+  }, [exportContent, format]);
 
   useEffect(() => {
     if (!open) return;

@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, TitleBarStyle};
 
 use crate::error::CommandError;
 
@@ -34,7 +34,7 @@ pub async fn open_settings_window(
         settings_url.push_str(target_pane);
     }
 
-    let settings_window = tauri::WebviewWindowBuilder::new(
+    let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
         "settings",
         tauri::WebviewUrl::App(settings_url.into()),
@@ -43,7 +43,15 @@ pub async fn open_settings_window(
     .inner_size(1024.0, 760.0)
     .min_inner_size(900.0, 620.0)
     .resizable(true)
-    .build()
+    .transparent(true)
+    .title_bar_style(TitleBarStyle::Overlay)
+    .hidden_title(true);
+
+    if let Some(main_window) = app.get_webview_window("main") {
+        builder = builder.parent(&main_window).unwrap();
+    }
+
+    let settings_window = builder.build()
     .map_err(|error| {
         CommandError::new("window", format!("failed to open settings window: {error}"))
     })?;

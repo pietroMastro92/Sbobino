@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use tokio::fs;
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::AsyncRead;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
@@ -55,11 +55,19 @@ impl WhisperCppEngine {
     }
 
     fn parse_timecode_seconds(value: &str) -> Option<f32> {
-        let mut parts = value.trim().split(':');
-        let hh = parts.next()?.parse::<f32>().ok()?;
-        let mm = parts.next()?.parse::<f32>().ok()?;
-        let ss = parts.next()?.parse::<f32>().ok()?;
-        Some((hh * 3600.0) + (mm * 60.0) + ss)
+        let parts: Vec<&str> = value.trim().split(':').collect();
+        if parts.len() == 3 {
+            let hh = parts[0].parse::<f32>().ok()?;
+            let mm = parts[1].parse::<f32>().ok()?;
+            let ss = parts[2].parse::<f32>().ok()?;
+            Some((hh * 3600.0) + (mm * 60.0) + ss)
+        } else if parts.len() == 2 {
+            let mm = parts[0].parse::<f32>().ok()?;
+            let ss = parts[1].parse::<f32>().ok()?;
+            Some((mm * 60.0) + ss)
+        } else {
+            None
+        }
     }
 
     fn parse_cli_line(raw_line: &str) -> Option<ParsedCliLine> {
@@ -148,56 +156,12 @@ impl WhisperCppEngine {
     where
         R: AsyncRead + Unpin,
     {
-        let mut reader = BufReader::new(reader);
-        let mut chunk = [0_u8; 4096];
-        let mut pending = Vec::<u8>::new();
+        use tokio::io::AsyncBufReadExt;
+
+        let mut lines = tokio::io::BufReader::new(reader).lines();
         let mut raw_lines = Vec::<String>::new();
 
-        loop {
-            let read = reader.read(&mut chunk).await.map_err(|e| {
-                ApplicationError::SpeechToText(format!("failed to read whisper-cli stream: {e}"))
-            })?;
-
-            if read == 0 {
-                break;
-            }
-
-            pending.extend_from_slice(&chunk[..read]);
-            let mut start = 0_usize;
-            let mut index = 0_usize;
-
-            while index < pending.len() {
-                if pending[index] == b'\n' || pending[index] == b'\r' {
-                    if index > start {
-                        let raw = String::from_utf8_lossy(&pending[start..index]).to_string();
-                        raw_lines.push(raw.clone());
-                        if let Some(parsed_line) = Self::parse_cli_line(&raw) {
-                            if let Some(end_seconds) = parsed_line.end_seconds {
-                                emit_progress_seconds(end_seconds);
-                            }
-                            Self::collect_line(&collector, &emit_partial, parsed_line.text);
-                        }
-                    }
-
-                    index += 1;
-                    while index < pending.len()
-                        && (pending[index] == b'\n' || pending[index] == b'\r')
-                    {
-                        index += 1;
-                    }
-                    start = index;
-                    continue;
-                }
-                index += 1;
-            }
-
-            if start > 0 {
-                pending.drain(..start);
-            }
-        }
-
-        if !pending.is_empty() {
-            let raw = String::from_utf8_lossy(&pending).to_string();
+        while let Ok(Some(raw)) = lines.next_line().await {
             raw_lines.push(raw.clone());
             if let Some(parsed_line) = Self::parse_cli_line(&raw) {
                 if let Some(end_seconds) = parsed_line.end_seconds {
@@ -258,6 +222,9 @@ impl WhisperCppEngine {
             let sibling_lib = binary_dir.join("../lib");
 
             let mut dyld_paths = Vec::new();
+            // Always include the binary's own directory first — covers Tauri
+            // bundled deployments where dylibs sit right next to whisper-cli.
+            dyld_paths.push(binary_dir.to_string_lossy().to_string());
             if libexec_lib.exists() {
                 dyld_paths.push(libexec_lib.to_string_lossy().to_string());
             }
