@@ -257,7 +257,6 @@ code {
   justify-content: space-between;
   background: transparent;
   gap: 12px;
-  -webkit-app-region: drag;
 }
 
 .main-topbar h1 {
@@ -298,7 +297,6 @@ code {
   background: transparent;
   border: 0;
   color: var(--text);
-  -webkit-app-region: no-drag;
 }
 .main-topbar .icon-button:hover {
   background: var(--topbar-control-bg);
@@ -706,7 +704,6 @@ code {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  -webkit-app-region: no-drag;
 }
 
 .primary-button {
@@ -1222,7 +1219,6 @@ code {
   gap: 12px;
   background: transparent;
   min-height: 48px;
-  -webkit-app-region: drag;
   backdrop-filter: blur(10px);
 }
 
@@ -1504,7 +1500,6 @@ code {
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   min-height: 48px;
-  -webkit-app-region: drag;
 }
 
 .inspector-view-toggle {
@@ -2216,7 +2211,6 @@ code {
   background: var(--topbar-bg);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  -webkit-app-region: drag;
 }
 
 .settings-window-header h1 {

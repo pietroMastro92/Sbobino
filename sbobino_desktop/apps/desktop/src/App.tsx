@@ -758,8 +758,8 @@ function DetailToolbar({
   onCancel,
 }: DetailToolbarProps): JSX.Element {
   return (
-    <header className={`detail-toolbar ${!leftSidebarOpen ? "sidebar-closed" : ""}`}>
-      <div className="detail-toolbar-left">
+    <header className={`detail-toolbar ${!leftSidebarOpen ? "sidebar-closed" : ""}`} data-tauri-drag-region>
+      <div className="detail-toolbar-left" data-tauri-drag-region>
         <button className="icon-button" onClick={() => onShowSidebar()} title={leftSidebarOpen ? "Hide sidebar" : "Show sidebar"}>
           {leftSidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
         </button>
@@ -816,7 +816,7 @@ function DetailInspectorHeader({
   onHideDetailsPanel,
 }: DetailInspectorHeaderProps): JSX.Element {
   return (
-    <header className="inspector-header">
+    <header className="inspector-header" data-tauri-drag-region>
       <div className="segmented-control inspector-view-toggle">
         <button
           className={inspectorMode === "details" ? "seg active" : "seg"}
@@ -930,6 +930,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [deletedArtifacts, setDeletedArtifacts] = useState<TranscriptArtifact[]>([]);
 
   const [isStarting, setIsStarting] = useState(false);
+  const [isModalLocked, setIsModalLocked] = useState(false);
   const [isSavingArtifact, setIsSavingArtifact] = useState(false);
 
   const [openArtifacts, setOpenArtifacts] = useState<TranscriptArtifact[]>([]);
@@ -1322,6 +1323,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     let unsubRealtimeSaved: (() => void) | undefined;
     let unsubProvisioningProgress: (() => void) | undefined;
     let unsubProvisioningStatus: (() => void) | undefined;
+    let unsubSettingsOpened: (() => void) | undefined;
+    let unsubSettingsClosed: (() => void) | undefined;
 
     void (async () => {
       const uProgress = await subscribeJobProgress((event) => {
@@ -1454,6 +1457,16 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         }
       });
       if (unmounted) { uProvisioningStatus(); } else { unsubProvisioningStatus = uProvisioningStatus; }
+
+      const uSettingsOpened = await listen("settings_opened", () => {
+        setIsModalLocked(true);
+      });
+      if (unmounted) { uSettingsOpened(); } else { unsubSettingsOpened = uSettingsOpened; }
+
+      const uSettingsClosed = await listen("settings_closed", () => {
+        setIsModalLocked(false);
+      });
+      if (unmounted) { uSettingsClosed(); } else { unsubSettingsClosed = uSettingsClosed; }
     })();
 
     return () => {
@@ -1467,6 +1480,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       unsubRealtimeSaved?.();
       unsubProvisioningProgress?.();
       unsubProvisioningStatus?.();
+      unsubSettingsOpened?.();
+      unsubSettingsClosed?.();
     };
   }, [clearActiveJob, prependArtifact, setError, setProgress]);
 
@@ -4345,7 +4360,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   API Key
                   <input
                     type="password"
-                    placeholder="AIza..."
+                    placeholder="Inserisci API Key..."
                     value={settings.ai.providers.gemini.api_key ?? ""}
                     onChange={(event) => {
                       const value = event.target.value.trim();
@@ -4969,7 +4984,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return (
       <main className="settings-window-shell">
         <section className="settings-window-frame">
-          <header className="settings-window-header">
+          <header className="settings-window-header" data-tauri-drag-region>
+            <div className="drag-layer" data-tauri-drag-region style={{ width: "100%", height: "100%" }} />
           </header>
           {renderSettings()}
           {error ? <p className="error-banner settings-window-error">{error}</p> : null}
@@ -4994,6 +5010,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
   return (
     <main className="app-shell">
+      {isModalLocked && (
+        <div style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          zIndex: 999999,
+          background: "transparent"
+        }} />
+      )}
       <section className={leftSidebarOpen ? "window-frame" : "window-frame left-collapsed"}>
         {leftSidebarOpen ? (
           <aside className="left-sidebar">
@@ -5072,8 +5099,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
         <section className="main-area">
           {section !== "detail" ? (
-            <header className="main-topbar">
-              <div className="topbar-title">
+            <header className="main-topbar" data-tauri-drag-region>
+              <div className="topbar-title" data-tauri-drag-region>
                 <button
                   className="icon-button"
                   onClick={() => setLeftSidebarOpen(!leftSidebarOpen)}

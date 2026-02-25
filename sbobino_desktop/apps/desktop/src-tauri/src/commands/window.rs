@@ -34,7 +34,7 @@ pub async fn open_settings_window(
         settings_url.push_str(target_pane);
     }
 
-    let mut builder = tauri::WebviewWindowBuilder::new(
+    let builder = tauri::WebviewWindowBuilder::new(
         &app,
         "settings",
         tauri::WebviewUrl::App(settings_url.into()),
@@ -47,14 +47,23 @@ pub async fn open_settings_window(
     .title_bar_style(TitleBarStyle::Overlay)
     .hidden_title(true);
 
-    if let Some(main_window) = app.get_webview_window("main") {
-        builder = builder.parent(&main_window).unwrap();
-    }
-
     let settings_window = builder.build()
     .map_err(|error| {
         CommandError::new("window", format!("failed to open settings window: {error}"))
     })?;
+
+    if let Some(main_window) = app.get_webview_window("main") {
+        let _ = main_window.emit("settings_opened", ());
+        let app_handle = app.clone();
+        settings_window.on_window_event(move |event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(main) = app_handle.get_webview_window("main") {
+                    let _ = main.emit("settings_closed", ());
+                }
+            }
+        });
+    }
+
 
     // Apply the same macOS vibrancy effect as the main window
     #[cfg(target_os = "macos")]
