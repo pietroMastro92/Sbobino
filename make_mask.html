@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<body>
+    <canvas id="canvas" width="1024" height="1024"></canvas>
+    <textarea id="b64"></textarea>
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        // Black background = Transparent
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, 1024, 1024);
+        
+        const width = 1024;
+        // The icon is centered, approximately 78% of the full width
+        const cropSize = width * 0.78; 
+        const radius = cropSize * 0.225;
+        const dx = (width - cropSize) / 2;
+        const dy = (width - cropSize) / 2;
+        
+        // White foreground = Opaque
+        ctx.fillStyle = 'white';
+        ctx.beginPath();
+        ctx.moveTo(dx + radius, dy);
+        ctx.lineTo(dx + cropSize - radius, dy);
+        ctx.quadraticCurveTo(dx + cropSize, dy, dx + cropSize, dy + radius);
+        ctx.lineTo(dx + cropSize, dy + cropSize - radius);
+        ctx.quadraticCurveTo(dx + cropSize, dy + cropSize, dx + cropSize - radius, dy + cropSize);
+        ctx.lineTo(dx + radius, dy + cropSize);
+        ctx.quadraticCurveTo(dx, dy + cropSize, dx, dy + cropSize - radius);
+        ctx.lineTo(dx, dy + radius);
+        ctx.quadraticCurveTo(dx, dy, dx + radius, dy);
+        ctx.closePath();
+        ctx.fill(); 
+        
+        const b64 = canvas.toDataURL('image/png').split(',')[1];
+        document.getElementById('b64').value = b64;
+    </script>
+</body>
+</html>
