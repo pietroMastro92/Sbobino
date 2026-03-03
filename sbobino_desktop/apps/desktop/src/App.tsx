@@ -2818,7 +2818,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         return;
       }
       upsertArtifact(updated);
-      hydrateDetail(updated);
+      // Update artifact data without resetting detailMode (hydrateDetail
+      // would switch back to "transcript", losing the user's current view).
+      setActiveArtifact(updated);
+      setDraftTitle(updated.title);
+      setDraftTranscript(updated.optimized_transcript || updated.raw_transcript);
+      setDraftSummary(updated.summary);
+      setDraftFaqs(updated.faqs);
       setError(null);
     } catch (assignError) {
       setError(`Failed to assign speaker: ${formatAppError(assignError)}`);
@@ -3248,19 +3254,59 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   async function onGenerateSummary(): Promise<void> {
     if (!activeArtifact || isGeneratingSummary) return;
 
-    const optionLines = [
-      summarySections ? "Use sections." : "Use a single section.",
-      summaryBulletPoints ? "Use bullet points." : "Avoid bullet points.",
-      summaryActionItems ? "Include action items." : "Do not include action items.",
-      summaryKeyPointsOnly ? "Keep only key points." : "Provide full detail.",
-      summaryIncludeTimestamps ? "Include timestamps when available." : "Do not include timestamps.",
-      summaryIncludeSpeakers ? "Include speaker names when available." : "Do not include speaker names.",
-      `Write the output in ${summaryLanguage}.`,
-    ];
+    const languageNameMap: Record<string, string> = {
+      auto: "the same language as the transcript",
+      en: "English",
+      it: "Italian",
+      fr: "French",
+      de: "German",
+      es: "Spanish",
+      pt: "Portuguese",
+      zh: "Chinese",
+      ja: "Japanese",
+    };
+    const languageName = languageNameMap[summaryLanguage] ?? summaryLanguage;
+
+    const structureLines: string[] = [];
+    if (summarySections) {
+      structureLines.push("Organize the summary into clearly titled sections (e.g. ## Section Title) that group related topics together.");
+    } else {
+      structureLines.push("Write the summary as a single continuous section without sub-headings.");
+    }
+    if (summaryBulletPoints) {
+      structureLines.push("Use bullet points within sections where appropriate to list specific facts or items.");
+    } else {
+      structureLines.push("Write in flowing, narrative prose — avoid bullet-point lists. Use paragraphs and complete sentences.");
+    }
+    if (summaryKeyPointsOnly) {
+      structureLines.push("Focus on the most important points, key takeaways, and core arguments. Omit minor details and tangential remarks.");
+    } else {
+      structureLines.push("Provide a thorough and detailed summary that covers all significant topics discussed, including supporting details, examples, and nuances.");
+    }
+    if (summaryActionItems) {
+      structureLines.push("At the end, include a dedicated section listing any action items, tasks, decisions, or next steps that were mentioned or implied.");
+    }
+    if (summaryIncludeTimestamps) {
+      structureLines.push("Where timestamps are available in the transcript, include them in parentheses next to the relevant point (e.g. (12:34)).");
+    }
+    if (summaryIncludeSpeakers) {
+      structureLines.push("Attribute statements and ideas to specific speakers by name when speaker labels are available in the transcript.");
+    }
+
+    const defaultPrompt = [
+      `Write a comprehensive, well-structured summary of the following transcript in ${languageName}.`,
+      "",
+      "The summary must be substantive and informative — not a superficial list of topics. It should read as a complete document that someone who has not heard the original audio would find useful and self-contained.",
+      "",
+      "Guidelines:",
+      ...structureLines.map((line) => `- ${line}`),
+      "",
+      "Important: output ONLY the final summary text. Do not include meta-commentary about the summarization process.",
+    ].join("\n");
 
     const prompt = summaryCustomPrompt.trim().length > 0
-      ? summaryCustomPrompt.trim()
-      : `Summarize this transcript.\n${optionLines.join("\n")}`;
+      ? `${summaryCustomPrompt.trim()}\n\nIMPORTANT: Write the entire output in ${languageName}.`
+      : defaultPrompt;
 
     setIsGeneratingSummary(true);
     try {
@@ -4607,8 +4653,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           />
         </section>
 
-        {rightSidebarOpen ? (
-          <aside className="detail-inspector">
+        <aside className={`detail-inspector ${rightSidebarOpen ? "" : "collapsed"}`}>
             <DetailInspectorHeader
               inspectorMode={inspectorMode}
               onInspectorModeChange={setInspectorMode}
@@ -4616,7 +4661,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             />
             {renderInspector()}
           </aside>
-        ) : null}
 
       </div>
     );
@@ -6321,8 +6365,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   return (
     <main className="app-shell">
       <section className={leftSidebarOpen ? "window-frame" : "window-frame left-collapsed"}>
-        {leftSidebarOpen ? (
-          <aside className="left-sidebar">
+        <aside className={`left-sidebar ${leftSidebarOpen ? "" : "collapsed"}`}>
             <div className="sidebar-section">
               <button className={section === "home" ? "sidebar-item active" : "sidebar-item"} onClick={() => setSection("home")}>
                 <House size={16} />
@@ -6394,7 +6437,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               </button>
             </div>
           </aside>
-        ) : null}
 
         <section className="main-area">
           {section !== "detail" ? (

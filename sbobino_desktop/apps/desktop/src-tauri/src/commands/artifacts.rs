@@ -744,12 +744,19 @@ async fn summarize_with_rag(
 
     for (index, chunk) in chunks.iter().enumerate() {
         let chunk_prompt = format!(
-            "You are preparing intermediate notes for a transcript summary.\n\
-             Follow the user instructions exactly.\n\n\
-             User instructions:\n{user_instructions}\n\n\
-             Analyze chunk {}/{} and return concise notes only.\n\
-             Include key facts, decisions, action items, names, and numeric details when present.\n\
-             Keep output compact and avoid filler.\n\n\
+            "You are extracting detailed notes from a transcript chunk to support a comprehensive summary.\n\
+             Your goal is to capture ALL substantive content — not just bullet-point keywords.\n\n\
+             User instructions (follow these exactly):\n{user_instructions}\n\n\
+             This is chunk {}/{} of the full transcript.\n\n\
+             Extract the following from this chunk:\n\
+             - Main topics and arguments discussed, with enough context to understand them\n\
+             - Key facts, statistics, names, dates, and specific claims\n\
+             - Explanations, reasoning, and cause-effect relationships\n\
+             - Decisions made, action items, or next steps mentioned\n\
+             - Notable quotes or strong statements\n\
+             - Any speaker attributions if present\n\n\
+             Write thorough, self-contained notes (not single-word bullets). \
+             Each note should be understandable on its own without the original transcript.\n\n\
              Transcript chunk:\n{}",
             index + 1,
             total,
@@ -775,11 +782,17 @@ async fn summarize_with_rag(
         .map(|budget| {
             let clipped_notes = truncate_chars(&merged_notes, *budget);
             format!(
-                "You are creating the final transcript summary from chunk notes.\n\
-                 Follow user instructions exactly.\n\n\
-                 User instructions:\n{user_instructions}\n\n\
-                 Produce the final summary now.\n\
-                 Return only the final text.\n\n\
+                "You are writing the final summary of a transcript from the extracted chunk notes below.\n\n\
+                 User instructions (follow these exactly — including language, structure, and formatting preferences):\n\
+                 {user_instructions}\n\n\
+                 Requirements for the final summary:\n\
+                 - Produce a substantive, polished document — not an abbreviated list of topics.\n\
+                 - Cover all major subjects discussed in the transcript with enough depth that a reader \
+                 who has not heard the original audio would gain a clear understanding.\n\
+                 - Maintain logical flow between topics: use transitions and group related ideas together.\n\
+                 - Preserve specific details (names, numbers, examples) that support the main points.\n\
+                 - Respect the user's language, structural, and formatting preferences exactly.\n\
+                 - Output ONLY the summary text. Do not add meta-commentary or labels like \"Summary:\".\n\n\
                  Chunk notes:\n{clipped_notes}"
             )
         })
