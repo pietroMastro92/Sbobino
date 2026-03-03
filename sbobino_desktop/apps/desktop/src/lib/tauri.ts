@@ -206,6 +206,15 @@ export async function summarizeArtifact(payload: {
   return invoke<string>("summarize_artifact", { payload });
 }
 
+export type OptimizeArtifactPayload = {
+  id: string;
+  text: string;
+};
+
+export async function optimizeArtifact(payload: OptimizeArtifactPayload): Promise<string> {
+  return invoke<string>("optimize_artifact", { payload });
+}
+
 export async function startRealtime(payload?: {
   model?: AppSettings["model"];
   language?: AppSettings["language"];

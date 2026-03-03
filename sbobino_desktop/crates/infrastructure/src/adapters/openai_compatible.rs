@@ -84,7 +84,10 @@ impl OpenAiCompatibleEnhancer {
         }
 
         Ok(Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
             endpoint,
             model,
             headers,

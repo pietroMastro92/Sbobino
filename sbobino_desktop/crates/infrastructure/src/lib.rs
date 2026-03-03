@@ -925,7 +925,7 @@ fn default_base_url_for_service_kind(kind: &RemoteServiceKind) -> Option<&'stati
         RemoteServiceKind::OpenAi => Some("https://api.openai.com/v1"),
         RemoteServiceKind::OpenRouter => Some("https://openrouter.ai/api/v1"),
         RemoteServiceKind::LmStudio => Some("http://127.0.0.1:1234/v1"),
-        RemoteServiceKind::Ollama => Some("http://127.0.0.1:11434"),
+        RemoteServiceKind::Ollama => Some("http://127.0.0.1:11434/v1"),
         RemoteServiceKind::Xai => Some("https://api.x.ai/v1"),
         RemoteServiceKind::HuggingFace => Some("https://router.huggingface.co/v1"),
         RemoteServiceKind::Anthropic => Some("https://api.anthropic.com/v1"),
@@ -938,7 +938,7 @@ fn default_model_for_service_kind(kind: &RemoteServiceKind) -> Option<&'static s
     match kind {
         RemoteServiceKind::Google => Some("gemini-2.5-flash"),
         RemoteServiceKind::OpenAi => Some("gpt-4.1-mini"),
-        RemoteServiceKind::OpenRouter => Some("openai/gpt-4.1-mini"),
+        RemoteServiceKind::OpenRouter => Some("google/gemini-2.5-flash-lite-preview:free"),
         RemoteServiceKind::LmStudio => None,
         RemoteServiceKind::Ollama => Some("llama3.1"),
         RemoteServiceKind::Xai => Some("grok-2-latest"),

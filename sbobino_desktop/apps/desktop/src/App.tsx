@@ -12,6 +12,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { check as checkAppUpdate, type Update as TauriUpdate } from "@tauri-apps/plugin-updater";
 import {
   ArrowLeft,
+  ArrowUp,
   AudioLines,
   Bot,
   Check,
@@ -78,6 +79,7 @@ import {
   saveSettings,
   saveSettingsPartial,
   summarizeArtifact,
+  optimizeArtifact,
   startRealtime,
   startTranscription,
   stopRealtime,
@@ -121,6 +123,7 @@ import type {
 import { AudioPlayer } from "./components/AudioPlayer";
 import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
+import { LoadingAnimation } from "./components/LoadingAnimation";
 
 function HighlightMatch({ text, search }: { text: string; search: string }) {
   if (!search.trim() || !text) return <>{text}</>;
@@ -309,14 +312,14 @@ const serviceCatalog: ServiceCatalogItem[] = [
     icon: Cpu,
     tone: "ollama",
     defaultModel: "llama3.1",
-    defaultBaseUrl: "http://127.0.0.1:11434",
+    defaultBaseUrl: "http://127.0.0.1:11434/v1",
   },
   {
     kind: "open_router",
     label: "OpenRouter",
     icon: Globe,
     tone: "openrouter",
-    defaultModel: "openai/gpt-4.1-mini",
+    defaultModel: "google/gemini-2.5-flash-lite-preview:free",
     defaultBaseUrl: "https://openrouter.ai/api/v1",
   },
   {
@@ -333,7 +336,7 @@ const serviceCatalog: ServiceCatalogItem[] = [
     icon: Bot,
     tone: "huggingface",
     defaultModel: null,
-    defaultBaseUrl: "https://api-inference.huggingface.co",
+    defaultBaseUrl: "https://router.huggingface.co/v1",
   },
   {
     kind: "custom",
@@ -954,6 +957,8 @@ type DetailToolbarProps = {
   onShowDetailsPanel: () => void;
   onHideDetailsPanel: () => void;
   onCancel: () => void;
+  isImprovingText?: boolean;
+  onImproveText?: () => void;
 };
 
 function DetailToolbar({
@@ -971,6 +976,8 @@ function DetailToolbar({
   onShowDetailsPanel,
   onHideDetailsPanel,
   onCancel,
+  isImprovingText,
+  onImproveText,
 }: DetailToolbarProps): JSX.Element {
   return (
     <header
@@ -978,8 +985,13 @@ function DetailToolbar({
       data-tauri-drag-region
     >
       <div className="detail-toolbar-left" data-tauri-drag-region>
-        <button className="icon-button" onClick={onToggleSidebar} title={leftSidebarOpen ? "Hide sidebar" : "Show sidebar"}>
-          {leftSidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
+        <button
+          className={`icon-button sidebar-toggle-btn sidebar-toggle-left ${leftSidebarOpen ? "is-open" : ""}`}
+          onClick={onToggleSidebar}
+          title={leftSidebarOpen ? "Hide sidebar" : "Show sidebar"}
+        >
+          <PanelLeftClose className="icon-close" size={16} />
+          <PanelLeftOpen className="icon-open" size={16} />
         </button>
         <button className="icon-button" onClick={onBack} title="Back to history">
           <ArrowLeft size={16} />
@@ -987,7 +999,19 @@ function DetailToolbar({
         <strong className="detail-title" data-tauri-drag-region>{title}</strong>
       </div>
 
-      <div>
+      <div style={{ display: "flex", alignItems: "center" }}>
+        {detailMode === "transcript" && onImproveText && (
+          <button
+            className="optimize-hover-button"
+            onClick={() => void onImproveText()}
+            disabled={isImprovingText || !hasArtifact}
+            title="Improve Text"
+          >
+            <div className="button-content">
+              <Sparkles size={14} /> Optimize
+            </div>
+          </button>
+        )}
         <DetailCenterModeControl
           detailMode={detailMode}
           summaryDisabled={!hasArtifact}
@@ -1003,21 +1027,25 @@ function DetailToolbar({
             <ChevronDown size={14} />
           </button>
         ) : null}
-        {!rightSidebarOpen ? (
-          <button className="icon-button" onClick={onShowDetailsPanel} title="Show details panel">
-            <PanelRightOpen size={16} />
-          </button>
-        ) : null}
+        <button
+          className={`icon-button sidebar-toggle-btn sidebar-toggle-right ${rightSidebarOpen ? "is-open" : ""}`}
+          onClick={() => (rightSidebarOpen ? onHideDetailsPanel() : onShowDetailsPanel())}
+          title={rightSidebarOpen ? "Hide details panel" : "Show details panel"}
+        >
+          <PanelRightClose className="icon-close" size={16} />
+          <PanelRightOpen className="icon-open" size={16} />
+        </button>
         {!hasArtifact && hasActiveJob ? (
-          <>
-            <span className="transcribing-pill">
+          <button className="transcribing-cancel-pill" onClick={onCancel} title="Cancel transcription">
+            <span className="pill-content default-content">
               <ProgressRing percentage={transcriptionProgress} size={16} />
               <span>Transcribing</span>
             </span>
-            <button className="secondary-button" onClick={onCancel}>
-              Cancel
-            </button>
-          </>
+            <span className="pill-content hover-content">
+              <X size={16} />
+              <span>Cancel transcription</span>
+            </span>
+          </button>
         ) : null}
       </div>
     </header>
@@ -1055,9 +1083,6 @@ function DetailInspectorHeader({
           <Info size={15} />
         </button>
       </div>
-      <button className="icon-button" onClick={onHideDetailsPanel} title="Hide details panel">
-        <PanelRightClose size={16} />
-      </button>
     </header>
   );
 }
@@ -1178,7 +1203,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [deletedSearch, setDeletedSearch] = useState("");
   const [historyKind, setHistoryKind] = useState<"all" | ArtifactKind>("all");
   const [deletedArtifacts, setDeletedArtifacts] = useState<TranscriptArtifact[]>([]);
-  const [selectionMode, setSelectionMode] = useState(false);
   const [selectedArtifactIds, setSelectedArtifactIds] = useState<string[]>([]);
 
   const [isStarting, setIsStarting] = useState(false);
@@ -1220,8 +1244,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [isRenamingArtifact, setIsRenamingArtifact] = useState(false);
 
   const [chatInput, setChatInput] = useState("");
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
   const [isAskingChat, setIsAskingChat] = useState(false);
+  const [isImprovingText, setIsImprovingText] = useState(false);
   const [activeJobPreviewText, setActiveJobPreviewText] = useState("");
   const [activeJobTitle, setActiveJobTitle] = useState("");
   const [selectedSegmentSourceIndex, setSelectedSegmentSourceIndex] = useState<number | null>(null);
@@ -1912,6 +1937,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     [selectedArtifactIds],
   );
 
+  const isSelectionMode = selectedArtifactIds.length > 0;
+
   const homeVisibleArtifactIds = useMemo(
     () => groupedRecentArtifacts.flatMap((group) => group.items.map((artifact) => artifact.id)),
     [groupedRecentArtifacts],
@@ -1945,7 +1972,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     if (section === "home" || section === "history") {
       return;
     }
-    setSelectionMode(false);
     setSelectedArtifactIds([]);
   }, [section]);
 
@@ -2044,6 +2070,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [segmentContextMenu]);
+
+  useEffect(() => {
+    if (!error) return;
+    const timer = setTimeout(() => {
+      setError(null);
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [error]);
 
   const detailAudioInputPath = useMemo(
     () =>
@@ -2575,7 +2609,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         setError(
           "Transcription is not starting correctly. Check Whisper CLI/Whisper Stream paths in Settings > Local Models.",
         );
-      }, 8_000);
+      }, 120_000);
     } catch (startError) {
       const friendlyError = formatAppError(startError);
       setError(`Failed to start transcription: ${friendlyError}`);
@@ -2991,14 +3025,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     await onDeleteArtifactsWithConsent([artifact.id]);
   }
 
-  function toggleSelectionMode(): void {
-    setSelectionMode((previous) => {
-      if (previous) {
-        setSelectedArtifactIds([]);
-      }
-      return !previous;
-    });
-  }
 
   function toggleArtifactSelection(id: string): void {
     setSelectedArtifactIds((previous) => {
@@ -3252,6 +3278,31 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       }
     } finally {
       setIsGeneratingSummary(false);
+    }
+  }
+
+  async function onImproveText(): Promise<void> {
+    if (!activeArtifact || isImprovingText) return;
+
+    if (draftTranscript.trim() === "") {
+        return;
+    }
+
+    setIsImprovingText(true);
+    try {
+      const optimizedText = await optimizeArtifact({ id: activeArtifact.id, text: draftTranscript });
+      setDraftTranscript(optimizedText);
+      setError(null);
+    } catch (optimizeError) {
+      const code = formatAppErrorCode(optimizeError);
+      const message = formatAppError(optimizeError);
+      if (code === "missing_ai_provider" || code === "missing_api_key") {
+        setError("Improve text failed: configure an AI provider in Settings > AI Services.");
+      } else {
+        setError(`Improve text failed: ${message}`);
+      }
+    } finally {
+      setIsImprovingText(false);
     }
   }
 
@@ -3566,48 +3617,30 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             <HistoryIcon size={18} strokeWidth={2.5} />
             History
           </button>
-          <button
-            className="quick-action quick-action-models"
-            onClick={() => {
-              void onOpenStandaloneSettingsWindow("local_models");
-            }}
-          >
-            <Cpu size={18} strokeWidth={2.5} />
-            Manage Models
-          </button>
         </div>
 
         <section className="panel-card">
-          <div className="history-selection-toolbar">
-            <button className="secondary-button" onClick={toggleSelectionMode}>
-              {selectionMode ? "Done" : "Select"}
-            </button>
-            {selectionMode ? (
-              <>
-                <button
-                  className="secondary-button"
-                  onClick={selectAllVisibleArtifacts}
-                  disabled={homeVisibleArtifactIds.length === 0}
-                >
-                  Select all
-                </button>
-                <button
-                  className="secondary-button"
-                  onClick={clearArtifactSelection}
-                  disabled={selectedArtifactIds.length === 0}
-                >
-                  Clear
-                </button>
-                <button
-                  className="secondary-button history-action-danger"
-                  onClick={() => void onDeleteSelectedArtifacts()}
-                  disabled={selectedArtifactIds.length === 0}
-                >
-                  Delete selected ({selectedArtifactIds.length})
-                </button>
-              </>
-            ) : null}
-          </div>
+          {isSelectionMode ? (
+            <div className="history-selection-toolbar">
+              <button className="secondary-button" onClick={() => setSelectedArtifactIds([])}>
+                Cancel
+              </button>
+              <button
+                className="secondary-button"
+                onClick={selectAllVisibleArtifacts}
+                disabled={homeVisibleArtifactIds.length === 0}
+              >
+                Select all
+              </button>
+              <button
+                className="secondary-button history-action-danger"
+                onClick={() => void onDeleteSelectedArtifacts()}
+                disabled={selectedArtifactIds.length === 0}
+              >
+                Delete selected ({selectedArtifactIds.length})
+              </button>
+            </div>
+          ) : null}
           {groupedRecentArtifacts.length === 0 ? (
             <div className="center-empty compact">
               <h3>No transcripts yet</h3>
@@ -3618,7 +3651,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               {groupedRecentArtifacts.map((group) => (
                 <section key={group.label} className="history-group">
                   <h3 className="history-group-label">{group.label}</h3>
-                  <div className="history-list">
+                  <div className={`history-list ${isSelectionMode ? "selection-active" : ""}`}>
                     {group.items.map((artifact) => (
                       <article
                         key={artifact.id}
@@ -3627,7 +3660,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                         <button
                           className="home-history-main"
                           onClick={() => {
-                            if (selectionMode) {
+                            if (isSelectionMode) {
                               toggleArtifactSelection(artifact.id);
                               return;
                             }
@@ -3653,15 +3686,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                           </div>
                         </button>
                         <div className="home-history-actions">
-                          {selectionMode ? (
-                            <label className="home-history-select" title="Select transcription">
-                              <input
-                                type="checkbox"
-                                checked={selectedArtifactIdSet.has(artifact.id)}
-                                onChange={() => toggleArtifactSelection(artifact.id)}
-                              />
-                            </label>
-                          ) : (
+                          <label className="home-history-select" title="Select transcription" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              type="checkbox"
+                              checked={selectedArtifactIdSet.has(artifact.id)}
+                              onChange={() => toggleArtifactSelection(artifact.id)}
+                            />
+                          </label>
+                          {!isSelectionMode ? (
                             <button
                               className="icon-button danger-icon-button home-history-delete"
                               onClick={(event) => {
@@ -3673,7 +3705,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                             >
                               <Trash2 size={14} />
                             </button>
-                          )}
+                          ) : null}
                         </div>
                       </article>
                     ))}
@@ -3755,36 +3787,27 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   function renderHistory(): JSX.Element {
     return (
       <div className="view-body history-view">
-        <div className="history-selection-toolbar">
-          <button className="secondary-button" onClick={toggleSelectionMode}>
-            {selectionMode ? "Done" : "Select"}
-          </button>
-          {selectionMode ? (
-            <>
-              <button
-                className="secondary-button"
-                onClick={selectAllVisibleArtifacts}
-                disabled={historyVisibleArtifactIds.length === 0}
-              >
-                Select all
-              </button>
-              <button
-                className="secondary-button"
-                onClick={clearArtifactSelection}
-                disabled={selectedArtifactIds.length === 0}
-              >
-                Clear
-              </button>
-              <button
-                className="secondary-button history-action-danger"
-                onClick={() => void onDeleteSelectedArtifacts()}
-                disabled={selectedArtifactIds.length === 0}
-              >
-                Delete selected ({selectedArtifactIds.length})
-              </button>
-            </>
-          ) : null}
-        </div>
+        {isSelectionMode ? (
+          <div className="history-selection-toolbar">
+            <button className="secondary-button" onClick={() => setSelectedArtifactIds([])}>
+              Cancel
+            </button>
+            <button
+              className="secondary-button"
+              onClick={selectAllVisibleArtifacts}
+              disabled={historyVisibleArtifactIds.length === 0}
+            >
+              Select all
+            </button>
+            <button
+              className="secondary-button history-action-danger"
+              onClick={() => void onDeleteSelectedArtifacts()}
+              disabled={selectedArtifactIds.length === 0}
+            >
+              Delete selected ({selectedArtifactIds.length})
+            </button>
+          </div>
+        ) : null}
         {groupedHistoryArtifacts.length === 0 ? (
           <div className="center-empty">
             <div className="center-empty-icon"><Clock3 size={28} /></div>
@@ -3795,7 +3818,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             {groupedHistoryArtifacts.map((group) => (
               <section key={group.label} className="history-group">
                 <h3 className="history-group-label">{group.label}</h3>
-                <div className="history-list">
+                <div className={`history-list ${isSelectionMode ? "selection-active" : ""}`}>
                   {group.items.map((artifact) => (
                     <article
                       key={artifact.id}
@@ -3804,7 +3827,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                       <button
                         className="history-main history-main-rich"
                         onClick={() => {
-                          if (selectionMode) {
+                          if (isSelectionMode) {
                             toggleArtifactSelection(artifact.id);
                             return;
                           }
@@ -3830,27 +3853,29 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                         </div>
                       </button>
                       <div className="history-actions">
-                        {selectionMode ? (
-                          <label className="home-history-select" title="Select transcription">
-                            <input
-                              type="checkbox"
-                              checked={selectedArtifactIdSet.has(artifact.id)}
-                              onChange={() => toggleArtifactSelection(artifact.id)}
-                            />
-                          </label>
-                        ) : (
+                        <label className="home-history-select history-select" title="Select transcription" onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            checked={selectedArtifactIdSet.has(artifact.id)}
+                            onChange={() => toggleArtifactSelection(artifact.id)}
+                          />
+                        </label>
+                        {!isSelectionMode ? (
                           <>
                             <span className="kind-chip">{artifact.kind === "realtime" ? "Live" : "File"}</span>
                             <button className="secondary-button history-action-button" onClick={() => void onRenameArtifact(artifact)}>
                               <Pencil size={14} />
                               Rename
                             </button>
-                            <button className="secondary-button history-action-button history-action-danger" onClick={() => void onDeleteArtifact(artifact)}>
+                            <button className="secondary-button history-action-button history-action-danger" onClick={(event) => {
+                                event.stopPropagation();
+                                void onDeleteArtifact(artifact);
+                            }}>
                               <Trash2 size={14} />
                               Move to Trash
                             </button>
                           </>
-                        )}
+                        ) : null}
                       </div>
                     </article>
                   ))}
@@ -3913,10 +3938,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       </div>
     );
   }
-
   function renderDetailMain(): JSX.Element {
     if (!activeArtifact) {
       if (activeJobId) {
+        if (!activeJobPreviewText) {
+          return <LoadingAnimation />;
+        }
         return (
           <textarea
             ref={activeJobPreviewTextareaRef}
@@ -3937,6 +3964,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     }
 
     if (detailMode === "summary") {
+      if (isGeneratingSummary) {
+        return (
+          <LoadingAnimation
+            icon={Sparkles}
+            title="Summarizing..."
+            description="Generating a summary from your transcript..."
+            variant="summarizing"
+          />
+        );
+      }
+
       if (!draftSummary) {
         return (
           <div className="detail-empty">
@@ -3960,14 +3998,21 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       return (
         <div className="chat-view">
           <div className="chat-thread">
-            {chatHistory.length === 0 ? (
+            {isAskingChat ? (
+              <LoadingAnimation
+                icon={MessageSquareText}
+                title="Thinking..."
+                description="AI is analyzing your transcript and generating a response..."
+                variant="chat"
+              />
+            ) : chatHistory.length === 0 ? (
               <div className="detail-empty">
                 <div className="center-empty-icon"><MessageSquareText size={28} /></div>
                 <h2>AI Chat</h2>
                 <p>Ask questions on the current transcript.</p>
               </div>
             ) : null}
-            {chatHistory.map((message, index) => (
+            {!isAskingChat && chatHistory.map((message, index) => (
               <article key={`${message.role}-${index}`} className={`chat-bubble ${message.role}`}>
                 {message.text}
               </article>
@@ -3979,6 +4024,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               placeholder="Chat with your transcript..."
               value={chatInput}
               onChange={(event) => setChatInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  if (!isAskingChat && chatInput.trim().length > 0) {
+                    void onSendChat();
+                  }
+                }
+              }}
             />
             <select
               value={activeAiServiceSelectValue}
@@ -3992,8 +4045,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 </option>
               ))}
             </select>
-            <button className="primary-button" onClick={() => void onSendChat()} disabled={isAskingChat}>
-              {isAskingChat ? "..." : "Submit"}
+            <button 
+              className="chat-submit-button" 
+              onClick={() => void onSendChat()} 
+              disabled={isAskingChat || chatInput.trim().length === 0}
+              aria-label="Submit Chat"
+            >
+              <ArrowUp size={20} />
             </button>
           </div>
         </div>
@@ -4031,6 +4089,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             </article>
           ))}
         </div>
+      );
+    }
+
+    if (isImprovingText) {
+      return (
+        <LoadingAnimation
+          icon={Sparkles}
+          title="Improving Text..."
+          description="AI is optimizing semantics and punctuation..."
+          variant="transcribing"
+        />
       );
     }
 
@@ -4478,6 +4547,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             onShowDetailsPanel={() => setRightSidebarOpen(true)}
             onHideDetailsPanel={() => setRightSidebarOpen(false)}
             onCancel={() => void onCancel()}
+            isImprovingText={isImprovingText}
+            onImproveText={onImproveText}
           />
 
           <div className="detail-body">{renderDetailMain()}</div>
@@ -6220,7 +6291,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         <section className="settings-window-frame">
           <header className="settings-window-header" data-tauri-drag-region />
           {renderSettings()}
-          {error ? <p className="error-banner settings-window-error">{error}</p> : null}
+          {error ? (
+            <div className="error-banner settings-window-error">
+              <p>{error}</p>
+              <button className="error-close" onClick={() => setError(null)} title="Dismiss">
+                <X size={14} />
+              </button>
+            </div>
+          ) : null}
         </section>
 
         <ModelManagerSheet
@@ -6323,11 +6401,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             <header className="main-topbar" data-tauri-drag-region>
               <div className="topbar-title" data-tauri-drag-region>
                 <button
-                  className="icon-button"
+                  className={`icon-button sidebar-toggle-btn sidebar-toggle-left ${leftSidebarOpen ? "is-open" : ""}`}
                   onClick={() => setLeftSidebarOpen(!leftSidebarOpen)}
                   title={leftSidebarOpen ? "Hide sidebar" : "Show sidebar"}
                 >
-                  {leftSidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
+                  <PanelLeftClose className="icon-close" size={16} />
+                  <PanelLeftOpen className="icon-open" size={16} />
                 </button>
                 {section === "home" ? null : (
                   <h1 data-tauri-drag-region>
@@ -6419,7 +6498,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
           <div className="main-content">{renderContent()}</div>
 
-          {error ? <p className="error-banner">{error}</p> : null}
+          {error ? (
+            <div className="error-banner">
+              <p>{error}</p>
+              <button className="error-close" onClick={() => setError(null)} title="Dismiss">
+                <X size={14} />
+              </button>
+            </div>
+          ) : null}
         </section>
       </section>
 

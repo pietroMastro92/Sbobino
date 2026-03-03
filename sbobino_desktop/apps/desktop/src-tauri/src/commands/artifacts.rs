@@ -44,10 +44,16 @@ pub struct SummarizeArtifactPayload {
     pub prompt: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct OptimizeArtifactPayload {
+    pub id: String,
+    pub text: String,
+}
+
 const CHAT_CONTEXT_BUDGETS: &[(usize, usize)] = &[(8, 7600), (6, 5200), (4, 3400), (2, 2000)];
 const CHAT_CHUNK_TARGET_CHARS: usize = 900;
 const CHAT_CHUNK_OVERLAP_WORDS: usize = 24;
-const SUMMARY_CHUNK_TARGET_CHARS: usize = 1700;
+const SUMMARY_CHUNK_TARGET_CHARS: usize = 4000;
 const SUMMARY_CHUNK_OVERLAP_WORDS: usize = 30;
 const SUMMARY_SYNTHESIS_BUDGETS: &[usize] = &[12_000, 8_000, 5_000, 3_000];
 
@@ -457,6 +463,44 @@ pub async fn chat_artifact(
 
     let candidates = build_chat_context_candidates(&artifact, prompt);
     ask_with_overflow_fallback(enhancer.as_ref(), candidates)
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn optimize_artifact(
+    state: State<'_, AppState>,
+    payload: OptimizeArtifactPayload,
+) -> Result<String, CommandError> {
+    let artifact = state
+        .artifact_service
+        .get(&payload.id)
+        .await
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::new("not_found", "artifact not found"))?;
+
+    let enhancer = state
+        .runtime_factory
+        .build_active_enhancer()
+        .map_err(|e| CommandError::new("runtime_factory", e))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "missing_ai_provider",
+                "No AI provider is configured in Settings > AI Services.",
+            )
+        })?;
+
+    let text = payload.text.trim();
+    if text.is_empty() {
+        return Err(CommandError::new(
+            "validation",
+            "cannot optimize empty text",
+        ));
+    }
+
+    // Default to the artifact's original language, or "en" if not directly available (though the enhancer usually handles empty language code gracefully or ignores it)
+    enhancer
+        .optimize(text, "")
         .await
         .map_err(CommandError::from)
 }

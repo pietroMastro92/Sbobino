@@ -92,18 +92,6 @@ const styleItems: Array<{
     label: "Segments",
     icon: <List size={16} />,
   },
-  {
-    label: "Whisper",
-    icon: <FileText size={16} />,
-    subtitle: "Coming soon",
-    badge: "PRO",
-  },
-  {
-    label: "Dote",
-    icon: <Captions size={16} />,
-    subtitle: "Coming soon",
-    badge: "PRO",
-  },
 ];
 
 function parseMmSsToSeconds(value: string): number {

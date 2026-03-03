@@ -229,9 +229,54 @@ code {
   pointer-events: auto;
 }
 
-.sidebar-open-close:hover {
-  background: var(--sidebar-hover);
-  color: var(--text);
+.sidebar-toggle-btn {
+  position: relative;
+  overflow: hidden;
+}
+
+.sidebar-toggle-btn svg {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  margin-top: -8px;
+  margin-left: -8px;
+  transition: transform 0.45s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.4s ease;
+}
+
+/* Left button styles */
+.sidebar-toggle-left .icon-close {
+  opacity: 0;
+  transform: translateX(-16px) rotate(-90deg);
+}
+.sidebar-toggle-left .icon-open {
+  opacity: 1;
+  transform: translateX(0) rotate(0deg);
+}
+.sidebar-toggle-left.is-open .icon-close {
+  opacity: 1;
+  transform: translateX(0) rotate(0deg);
+}
+.sidebar-toggle-left.is-open .icon-open {
+  opacity: 0;
+  transform: translateX(16px) rotate(90deg);
+}
+
+/* Right button styles */
+.sidebar-toggle-right .icon-close {
+  opacity: 0;
+  transform: translateX(16px) rotate(90deg);
+}
+.sidebar-toggle-right .icon-open {
+  opacity: 1;
+  transform: translateX(0) rotate(0deg);
+}
+.sidebar-toggle-right.is-open .icon-close {
+  opacity: 1;
+  transform: translateX(0) rotate(0deg);
+}
+.sidebar-toggle-right.is-open .icon-open {
+  opacity: 0;
+  transform: translateX(-16px) rotate(-90deg);
 }
 
 .main-area {
@@ -866,6 +911,15 @@ code {
   gap: 10px;
   align-self: start;
   height: auto;
+  border: 1px solid transparent;
+  transition: transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 0.25s ease, background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.history-item:hover {
+  background: var(--surface);
+  border-color: var(--line-soft);
+  box-shadow: 0 4px 16px rgba(12, 18, 28, 0.04);
+  transform: translateY(-2px);
 }
 
 .home-history-item {
@@ -895,6 +949,20 @@ code {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s;
+}
+
+.history-select {
+  margin-right: 8px;
+}
+
+.history-item:hover .home-history-select,
+.history-item.selected .home-history-select,
+.history-list.selection-active .home-history-select {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .home-history-select input {
@@ -1338,17 +1406,144 @@ code {
   justify-content: flex-end;
 }
 
-.transcribing-pill {
+.transcribing-cancel-pill {
+  position: relative;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   border: 1px solid #c6d8ee;
   background: #edf6ff;
   color: #3f79ab;
   border-radius: 999px;
-  padding: 4px 10px 4px 8px;
+  padding: 4px 14px;
   font-size: 0.82rem;
   font-weight: 600;
+  cursor: pointer;
+  overflow: hidden;
+  height: 30px;
+  min-width: 130px;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  outline: none;
+}
+
+.transcribing-cancel-pill:hover {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #dc2626;
+  min-width: 170px;
+  padding: 4px 18px;
+}
+
+.transcribing-cancel-pill:active {
+  transform: scale(0.96);
+}
+
+.optimize-hover-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 32px;
+  padding: 0 12px;
+  background: var(--topbar-control-bg);
+  border: 1px solid transparent;
+  border-radius: 16px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  outline: none;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  margin-right: 8px; /* spacing from the mode selector */
+  overflow: hidden;
+  /* Start collapsed as a small dot */
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border-radius: 6px;
+  /* Add pulsing animation to the dot state */
+  animation: pulse-dot 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(109, 148, 197, 0.4);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(0.9);
+    box-shadow: 0 0 0 4px rgba(109, 148, 197, 0);
+  }
+}
+
+.optimize-hover-button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  animation: none;
+}
+
+.optimize-hover-button:hover:not(:disabled) {
+  /* Expand into a full button */
+  width: 140px;
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 16px;
+  background: var(--sidebar-active);
+  border-color: var(--detail-control-border);
+  color: var(--detail-active-text);
+  animation: none;
+}
+
+.optimize-hover-button .button-content {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  opacity: 0;
+  transform: scale(0.8);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+}
+
+.optimize-hover-button:hover:not(:disabled) .button-content {
+  opacity: 1;
+  transform: scale(1);
+  transition-delay: 0.1s; /* wait for expansion */
+}
+
+.transcribing-cancel-pill .pill-content {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.transcribing-cancel-pill .default-content {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.transcribing-cancel-pill .hover-content {
+  opacity: 0;
+  transform: translateY(100%);
+}
+
+.transcribing-cancel-pill:hover .default-content {
+  opacity: 0;
+  transform: translateY(-100%);
+}
+
+.transcribing-cancel-pill:hover .hover-content {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .detail-toolbar .icon-button,
@@ -1551,10 +1746,40 @@ code {
 
 .chat-input-bar {
   display: grid;
-  grid-template-columns: 1fr 190px auto;
+  grid-template-columns: 1fr 190px 44px;
   gap: 10px;
   padding: 12px;
   border-top: 1px solid var(--line-soft);
+}
+
+.chat-submit-button {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  border: none;
+  background: var(--accent-strong);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(109, 148, 197, 0.3);
+  transition: all 0.15s ease;
+  padding: 0;
+}
+
+.chat-submit-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: var(--accent);
+  box-shadow: 0 4px 10px rgba(109, 148, 197, 0.4);
+}
+
+.chat-submit-button:disabled {
+  background: var(--detail-control-bg);
+  color: var(--muted);
+  box-shadow: none;
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .chat-input-bar input {
@@ -1920,7 +2145,50 @@ code {
   background: #fff2f5;
   color: var(--danger);
   padding: 10px 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  justify-content: space-between;
+  animation: fadeIn 0.15s ease-out forwards;
+}
+
+.error-banner p {
+  margin: 0;
+  flex: 1;
   white-space: pre-wrap;
+  font-size: 0.9rem;
+}
+
+.error-banner .error-close {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 2px;
+  border-radius: 4px;
+  color: var(--danger);
+  opacity: 0.6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.error-banner .error-close:hover {
+  opacity: 1;
+  background: rgba(220, 38, 38, 0.1);
+}
+
+[data-theme="dark"] .error-banner {
+  border-color: rgba(220, 38, 38, 0.4);
+  background: rgba(220, 38, 38, 0.15);
+  color: #fca5a5;
+}
+
+[data-theme="dark"] .error-banner .error-close {
+  color: #fca5a5;
+}
+
+[data-theme="dark"] .error-banner .error-close:hover {
+  background: rgba(248, 113, 113, 0.2);
 }
 
 .active-job-chip {
@@ -3188,6 +3456,18 @@ code {
     border-color: rgba(223, 208, 184, 0.12);
   }
 
+  [data-theme="dark"] .chat-submit-button {
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+  }
+
+  [data-theme="dark"] .chat-submit-button:hover:not(:disabled) {
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.6);
+  }
+
+  [data-theme="dark"] .chat-submit-button:disabled {
+    background: var(--detail-control-bg);
+  }
+
   [data-theme="dark"] .select-chip select,
   [data-theme="dark"] .search-chip input,
   [data-theme="dark"] .toolbar-search {
@@ -3484,10 +3764,16 @@ code {
     outline-color: #948979;
   }
 
-  [data-theme="dark"] .transcribing-pill {
-    border-color: rgba(148, 137, 121, 0.35);
-    background: rgba(57, 62, 70, 0.6);
-    color: #DFD0B8;
+  [data-theme="dark"] .transcribing-cancel-pill {
+    border-color: #1e3a5f;
+    background: #0f1f33;
+    color: #7ab8f5;
+  }
+
+  [data-theme="dark"] .transcribing-cancel-pill:hover {
+    background: rgba(220, 38, 38, 0.15);
+    border-color: rgba(220, 38, 38, 0.4);
+    color: #fca5a5;
   }
 
   [data-theme="dark"] .export-sheet {
