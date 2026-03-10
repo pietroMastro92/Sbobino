@@ -913,7 +913,11 @@ pub async fn write_trimmed_audio(
     let output_path = temp_dir.join(&output_filename);
 
     let mut sorted_regions = payload.regions;
-    sorted_regions.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_regions.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     if sorted_regions.len() == 1 {
         // Single region: direct ffmpeg extraction
@@ -936,9 +940,7 @@ pub async fn write_trimmed_audio(
             .arg(&output_path)
             .output()
             .await
-            .map_err(|e| {
-                CommandError::new("trim", format!("ffmpeg failed to start: {e}"))
-            })?;
+            .map_err(|e| CommandError::new("trim", format!("ffmpeg failed to start: {e}")))?;
 
         if !result.status.success() {
             return Err(CommandError::new(
@@ -975,9 +977,7 @@ pub async fn write_trimmed_audio(
                 .arg(&part_path)
                 .output()
                 .await
-                .map_err(|e| {
-                    CommandError::new("trim", format!("ffmpeg failed to start: {e}"))
-                })?;
+                .map_err(|e| CommandError::new("trim", format!("ffmpeg failed to start: {e}")))?;
 
             if !result.status.success() {
                 // Clean up any parts created so far

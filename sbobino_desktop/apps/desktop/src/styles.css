@@ -109,7 +109,7 @@ code {
 }
 
 .left-sidebar {
-  width: clamp(188px, 22vw, 248px);
+  width: clamp(160px, 18vw, 232px);
   min-width: 0;
   overflow: hidden;
   background: var(--sidebar-bg);
@@ -1367,8 +1367,8 @@ code {
   z-index: 2;
   padding: 10px 16px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  grid-template-areas: "left center right";
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-areas: "edge-left primary controls edge-right";
   align-items: center;
   gap: 12px;
   background: transparent;
@@ -1381,19 +1381,47 @@ code {
   z-index: 1;
 }
 
-.detail-toolbar-left {
-  grid-area: left;
+.detail-toolbar-edge {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.detail-toolbar-edge-left {
+  grid-area: edge-left;
+  justify-self: start;
+}
+
+.detail-toolbar-edge-right {
+  grid-area: edge-right;
+  justify-self: end;
+}
+
+.detail-toolbar-primary {
+  grid-area: primary;
   display: inline-flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.detail-toolbar-controls {
+  grid-area: controls;
+  display: inline-flex;
+  align-items: center;
+  justify-self: end;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
 }
 
 .detail-toolbar-center {
-  grid-area: center;
   display: inline-flex;
   align-items: center;
-  justify-self: center;
   justify-content: center;
   gap: 8px;
   min-width: 0;
@@ -1401,6 +1429,7 @@ code {
 }
 
 .detail-title {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1417,6 +1446,8 @@ code {
   gap: 2px;
   border-color: var(--detail-control-border);
   background: var(--detail-control-bg);
+  min-width: 0;
+  max-width: 100%;
 }
 
 .detail-mode-slider .seg {
@@ -1439,15 +1470,20 @@ code {
   transform: translateY(0.5px);
 }
 
-.detail-toolbar-right {
-  grid-area: right;
-  justify-self: end;
-  display: flex;
+.detail-toolbar-actions {
+  display: inline-flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
   min-width: 0;
+  max-width: 100%;
+}
+
+.detail-toolbar-edge .icon-button,
+.detail-toolbar-center > *,
+.detail-toolbar-actions > * {
+  flex: 0 0 auto;
 }
 
 /* History Children Grouping Graph UI */
@@ -2535,7 +2571,7 @@ code {
 }
 
 .detail-inspector {
-  width: clamp(240px, 22vw, 340px);
+  width: clamp(188px, 20vw, 280px);
   background: var(--detail-glass-soft);
   display: grid;
   grid-template-rows: auto 1fr;
@@ -4699,21 +4735,7 @@ code {
   }
 
   .detail-toolbar {
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas:
-      "left right"
-      "center center";
     padding: 8px 12px;
-  }
-
-  .detail-toolbar-center {
-    justify-self: stretch;
-    justify-content: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .detail-toolbar-right {
-    flex-wrap: nowrap;
   }
 }
 
@@ -4722,8 +4744,20 @@ code {
     grid-template-columns: clamp(172px, 27vw, 196px) minmax(0, 1fr);
   }
 
+  .window-frame:not(.left-collapsed) .main-topbar,
+  .window-frame:not(.left-collapsed) .detail-toolbar {
+    padding-left: 72px;
+    padding-top: 24px;
+  }
+
+  .window-frame:not(.left-collapsed) .main-topbar,
+  .window-frame:not(.left-collapsed) .detail-toolbar {
+    min-height: 64px;
+  }
+
   .left-sidebar {
     padding: 10px 8px;
+    padding-top: 36px;
   }
 
   .export-sheet {
@@ -4740,6 +4774,17 @@ code {
   .window-frame:not(.left-collapsed) {
     min-height: 100vh;
     grid-template-columns: minmax(168px, 42vw) minmax(0, 1fr);
+  }
+
+  .window-frame:not(.left-collapsed) .main-topbar,
+  .window-frame:not(.left-collapsed) .detail-toolbar {
+    padding-left: 64px;
+    padding-top: 22px;
+  }
+
+  .window-frame:not(.left-collapsed) .main-topbar,
+  .window-frame:not(.left-collapsed) .detail-toolbar {
+    min-height: 62px;
   }
 
   .export-sheet {
@@ -4886,83 +4931,56 @@ code {
 
 @container detail-main (max-width: 860px) {
   .detail-toolbar {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: auto minmax(0, 1fr) auto;
     grid-template-areas:
-      "left right"
-      "center center";
+      "edge-left primary edge-right"
+      ". controls .";
     align-items: start;
   }
 
-  .detail-toolbar-center {
-    justify-self: stretch;
-    justify-content: space-between;
-    flex-wrap: wrap;
+  .detail-toolbar-controls {
+    justify-self: center;
+    justify-content: center;
   }
 
-  .detail-toolbar-right {
-    flex-wrap: nowrap;
+  .detail-toolbar-actions {
+    justify-content: center;
+    flex-wrap: wrap;
   }
 }
 
 @container detail-main (max-width: 640px) {
   .detail-toolbar {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: auto minmax(0, 1fr) auto;
     grid-template-areas:
-      "left"
-      "center"
-      "right";
+      "edge-left primary edge-right"
+      ". controls .";
     gap: 8px;
   }
 
-  .detail-toolbar-left,
-  .detail-toolbar-center,
-  .detail-toolbar-right {
+  .detail-toolbar-primary,
+  .detail-toolbar-controls {
     justify-self: stretch;
   }
 
-  .detail-toolbar-center {
-    justify-content: space-between;
+  .detail-toolbar-controls {
+    flex-direction: column;
+    justify-content: center;
     gap: 6px;
   }
 
-  .detail-toolbar-right {
-    justify-content: flex-start;
+  .detail-toolbar-center,
+  .detail-toolbar-actions {
+    justify-content: center;
+    flex-wrap: wrap;
   }
 
   .detail-title {
     font-size: 0.92rem;
   }
 
-  .detail-action-label {
-    display: none;
-  }
-
-  .optimize-hover-button,
-  .retranscribe-hover-button {
-    width: 32px;
-    min-width: 32px;
-    height: 32px;
-    padding: 0;
-    border-radius: 999px;
-    animation: none;
-    background: var(--topbar-control-bg);
-    border: 1px solid var(--detail-control-border);
-  }
-
-  .optimize-hover-button .button-content,
-  .optimize-hover-button:hover:not(:disabled) .button-content,
-  .retranscribe-hover-button .button-content,
-  .retranscribe-hover-button:hover:not(:disabled) .button-content {
-    opacity: 1;
-    transform: none;
-    transition: none;
-  }
-
-  .optimize-hover-button:hover:not(:disabled),
-  .retranscribe-hover-button:hover:not(:disabled) {
-    width: 32px;
-    padding: 0;
-    border-radius: 999px;
+  .detail-mode-slider {
+    margin-left: 0;
   }
 
   .chat-input-bar {
@@ -4984,6 +5002,16 @@ code {
 
   .chat-submit-button {
     grid-area: submit;
+  }
+}
+
+@media (max-width: 1120px) {
+  .left-sidebar {
+    width: clamp(152px, 16vw, 196px);
+  }
+
+  .detail-inspector {
+    width: clamp(176px, 19vw, 228px);
   }
 }
 
