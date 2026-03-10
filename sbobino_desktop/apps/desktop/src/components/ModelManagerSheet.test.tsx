@@ -34,7 +34,7 @@ describe("ModelManagerSheet", () => {
       />,
     );
 
-    expect(screen.getByText("1 model missing")).toBeInTheDocument();
+    expect(screen.getByText("1 model(s) missing")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /download missing/i }));
     expect(onDownloadAll).toHaveBeenCalledTimes(1);
 

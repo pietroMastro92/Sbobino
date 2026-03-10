@@ -85,31 +85,31 @@ code {
 }
 
 .window-frame {
+  --left-sidebar-width: clamp(160px, 18vw, 232px);
+  --window-controls-clearance: 92px;
   width: 100%;
   height: 100%;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: var(--left-sidebar-width) minmax(0, 1fr);
   min-width: 0;
   background: transparent;
   border: 0;
   overflow: hidden;
 }
 
+.window-frame.left-collapsed {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
 /* Offset top-left elements if the sidebar is closed to make room for macOS red/yellow/green buttons */
 .window-frame.left-collapsed .main-topbar,
 .window-frame.left-collapsed .view-toolbar,
 .window-frame.left-collapsed .detail-toolbar {
-  padding-left: 80px;
-}
-
-@media (max-width: 1180px) {
-  .window-frame.left-collapsed .detail-toolbar {
-    padding-left: 52px;
-  }
+  padding-left: var(--window-controls-clearance);
 }
 
 .left-sidebar {
-  width: clamp(160px, 18vw, 232px);
+  width: var(--left-sidebar-width);
   min-width: 0;
   overflow: hidden;
   background: var(--sidebar-bg);
@@ -124,6 +124,12 @@ code {
               padding 0.5s cubic-bezier(0.2, 0.8, 0.2, 1),
               border-width 0.5s cubic-bezier(0.2, 0.8, 0.2, 1),
               opacity 0.3s ease;
+}
+
+.sidebar-drag-cap {
+  min-height: 28px;
+  flex: 0 0 auto;
+  border-radius: 12px;
 }
 
 .left-sidebar.collapsed {
@@ -316,13 +322,8 @@ code {
   -webkit-backdrop-filter: blur(26px) saturate(1.12);
 }
 
-[data-tauri-drag-region] {
+[data-tauri-drag-region]:not([data-tauri-drag-region="false"]) {
   user-select: none;
-}
-
-.main-topbar[data-tauri-drag-region],
-.detail-toolbar[data-tauri-drag-region],
-.settings-window-header[data-tauri-drag-region] {
   -webkit-app-region: drag;
 }
 
@@ -378,6 +379,12 @@ code {
   gap: 12px;
   flex: 1 1 auto;
   min-width: 0;
+}
+
+.topbar-drag-spacer {
+  flex: 1 1 auto;
+  min-width: 24px;
+  min-height: 24px;
 }
 
 .topbar-controls {
@@ -2990,11 +2997,9 @@ code {
 }
 
 .export-close-button {
-  position: absolute;
-  top: 8px;
-  right: 8px;
   width: 24px;
   height: 24px;
+  flex: 0 0 auto;
   border-radius: 999px;
   border: 1px solid var(--line);
   background: var(--detail-control-bg);
@@ -3032,8 +3037,18 @@ code {
   background: var(--detail-glass-soft);
 }
 
+.export-preview-head-actions {
+  display: inline-flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
 .export-preview-head strong {
   font-size: 0.95rem;
+  min-width: 0;
 }
 
 .export-tags {
@@ -3041,6 +3056,7 @@ code {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 6px;
+  min-width: 0;
 }
 
 .export-tags span {
@@ -4702,10 +4718,6 @@ code {
   }
 
 @media (max-width: 1220px) {
-  .window-frame:not(.left-collapsed) {
-    grid-template-columns: clamp(180px, 24vw, 220px) minmax(0, 1fr);
-  }
-
   .export-sheet {
     grid-template-columns: 1fr;
     height: min(760px, 92vh);
@@ -4740,13 +4752,8 @@ code {
 }
 
 @media (max-width: 900px) {
-  .window-frame:not(.left-collapsed) {
-    grid-template-columns: clamp(172px, 27vw, 196px) minmax(0, 1fr);
-  }
-
   .window-frame:not(.left-collapsed) .main-topbar,
   .window-frame:not(.left-collapsed) .detail-toolbar {
-    padding-left: 72px;
     padding-top: 24px;
   }
 
@@ -4771,14 +4778,13 @@ code {
 }
 
 @media (max-width: 760px) {
-  .window-frame:not(.left-collapsed) {
+  .window-frame {
+    --left-sidebar-width: 168px;
     min-height: 100vh;
-    grid-template-columns: minmax(168px, 42vw) minmax(0, 1fr);
   }
 
   .window-frame:not(.left-collapsed) .main-topbar,
   .window-frame:not(.left-collapsed) .detail-toolbar {
-    padding-left: 64px;
     padding-top: 22px;
   }
 
@@ -4796,6 +4802,14 @@ code {
   .export-preview-head,
   .export-controls-scroll {
     padding: 12px;
+  }
+
+  .export-preview-head {
+    align-items: flex-start;
+  }
+
+  .export-preview-head-actions {
+    gap: 6px;
   }
 
   .export-style-grid,
@@ -4904,10 +4918,6 @@ code {
 }
 
 @media (max-width: 620px) {
-  .window-frame:not(.left-collapsed) {
-    grid-template-columns: 168px minmax(0, 1fr);
-  }
-
   .home-topbar-controls {
     gap: 6px;
   }
@@ -5006,8 +5016,8 @@ code {
 }
 
 @media (max-width: 1120px) {
-  .left-sidebar {
-    width: clamp(152px, 16vw, 196px);
+  .window-frame {
+    --left-sidebar-width: clamp(152px, 16vw, 196px);
   }
 
   .detail-inspector {

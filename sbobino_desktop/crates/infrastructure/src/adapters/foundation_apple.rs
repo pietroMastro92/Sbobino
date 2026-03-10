@@ -157,6 +157,7 @@ fn build_optimize_prompt(
     prompt_override: Option<&str>,
     default_override: Option<&str>,
 ) -> String {
+    let language_instruction = optimize_language_instruction(language_code);
     if let Some(template) = prompt_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -167,13 +168,22 @@ fn build_optimize_prompt(
         })
     {
         return format!(
-            "{template}\n\nLanguage: {language_code}\n\nTranscript:\n{text}\n\nReturn only the optimized text."
+            "{template}\n\nLanguage: {language_instruction}\n\nTranscript:\n{text}\n\nReturn only the optimized text."
         );
     }
 
     format!(
-        "Clean and optimize this transcript while preserving language {language_code}. Return only optimized text.\n\n{text}"
+        "Clean and optimize this transcript while preserving the same language as the source text ({language_instruction}). Return only optimized text.\n\n{text}"
     )
+}
+
+fn optimize_language_instruction(language_code: &str) -> &str {
+    let normalized = language_code.trim();
+    if normalized.is_empty() || normalized == "auto" {
+        "the same language as the transcript"
+    } else {
+        normalized
+    }
 }
 
 fn build_summary_prompt(
@@ -257,6 +267,18 @@ fn run_foundation_bridge(
             "failed to decode Foundation bridge response: {error}"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_optimize_prompt;
+
+    #[test]
+    fn optimize_prompt_defaults_to_source_language_when_auto() {
+        let prompt = build_optimize_prompt("ciao", "auto", None, None);
+        assert!(prompt.contains("the same language as the source text"));
+        assert!(prompt.contains("the same language as the transcript"));
+    }
 }
 
 fn ensure_bridge_script() -> Result<PathBuf, ApplicationError> {

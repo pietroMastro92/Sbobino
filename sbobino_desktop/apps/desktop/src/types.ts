@@ -215,6 +215,26 @@ export type TranscriptArtifact = {
   updated_at: string;
 };
 
+export type ArtifactAiContextOptions = {
+  include_timestamps: boolean;
+  include_speakers: boolean;
+};
+
+export type ChatArtifactPayload = ArtifactAiContextOptions & {
+  id: string;
+  prompt: string;
+};
+
+export type SummarizeArtifactPayload = ArtifactAiContextOptions & {
+  id: string;
+  language: LanguageCode;
+  sections: boolean;
+  bullet_points: boolean;
+  action_items: boolean;
+  key_points_only: boolean;
+  custom_prompt?: string | null;
+};
+
 export type TimelineV2Word = {
   text: string;
   start_seconds?: number;

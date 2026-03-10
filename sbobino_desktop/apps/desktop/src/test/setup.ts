@@ -25,3 +25,14 @@ Object.defineProperty(HTMLMediaElement.prototype, "pause", {
   value: () => {},
   writable: true,
 });
+
+Object.defineProperty(HTMLCanvasElement.prototype, "getContext", {
+  configurable: true,
+  value: () => ({
+    clearRect: () => {},
+    fillRect: () => {},
+    setTransform: () => {},
+    fillStyle: "",
+  }),
+  writable: true,
+});

@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   AiSettings,
   AppSettings,
+  ChatArtifactPayload,
   ArtifactKind,
   EnsureRuntimeResponse,
   JobProgress,
@@ -19,6 +20,7 @@ import type {
   TranscriptionStartPreflight,
   TranscriptionDelta,
   TranscriptArtifact,
+  SummarizeArtifactPayload,
   UpdateAiProvidersPayload,
   UpdateCheckResponse,
   UpdateSettingsPartialPayload,
@@ -192,17 +194,11 @@ export async function exportArtifact(payload: {
   return invoke<{ path: string }>("export_artifact", { payload });
 }
 
-export async function chatArtifact(payload: {
-  id: string;
-  prompt: string;
-}): Promise<string> {
+export async function chatArtifact(payload: ChatArtifactPayload): Promise<string> {
   return invoke<string>("chat_artifact", { payload });
 }
 
-export async function summarizeArtifact(payload: {
-  id: string;
-  prompt: string;
-}): Promise<string> {
+export async function summarizeArtifact(payload: SummarizeArtifactPayload): Promise<string> {
   return invoke<string>("summarize_artifact", { payload });
 }
 

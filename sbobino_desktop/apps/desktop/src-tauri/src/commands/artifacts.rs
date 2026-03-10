@@ -14,6 +14,43 @@ use sbobino_domain::{ArtifactKind, TranscriptArtifact};
 
 use crate::{error::CommandError, state::AppState};
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_summary_language() -> String {
+    "en".to_string()
+}
+
+fn default_summary_sections() -> bool {
+    true
+}
+
+fn default_summary_action_items() -> bool {
+    true
+}
+
+fn default_summary_key_points_only() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ArtifactAiContextOptions {
+    #[serde(default = "default_true")]
+    pub include_timestamps: bool,
+    #[serde(default)]
+    pub include_speakers: bool,
+}
+
+impl Default for ArtifactAiContextOptions {
+    fn default() -> Self {
+        Self {
+            include_timestamps: true,
+            include_speakers: false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GetArtifactPayload {
     pub id: String,
@@ -37,12 +74,27 @@ pub struct UpdateArtifactTimelinePayload {
 pub struct ChatArtifactPayload {
     pub id: String,
     pub prompt: String,
+    #[serde(flatten)]
+    pub context: ArtifactAiContextOptions,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SummarizeArtifactPayload {
     pub id: String,
-    pub prompt: String,
+    #[serde(default = "default_summary_language")]
+    pub language: String,
+    #[serde(flatten)]
+    pub context: ArtifactAiContextOptions,
+    #[serde(default = "default_summary_sections")]
+    pub sections: bool,
+    #[serde(default)]
+    pub bullet_points: bool,
+    #[serde(default = "default_summary_action_items")]
+    pub action_items: bool,
+    #[serde(default = "default_summary_key_points_only")]
+    pub key_points_only: bool,
+    #[serde(default)]
+    pub custom_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +109,43 @@ const CHAT_CHUNK_OVERLAP_WORDS: usize = 24;
 const SUMMARY_CHUNK_TARGET_CHARS: usize = 4000;
 const SUMMARY_CHUNK_OVERLAP_WORDS: usize = 30;
 const SUMMARY_SYNTHESIS_BUDGETS: &[usize] = &[12_000, 8_000, 5_000, 3_000];
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TimelineV2Document {
+    #[serde(default)]
+    segments: Vec<TimelineV2Segment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TimelineV2Segment {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    start_seconds: Option<f32>,
+    #[serde(default)]
+    end_seconds: Option<f32>,
+    #[serde(default)]
+    speaker_id: Option<String>,
+    #[serde(default)]
+    speaker_label: Option<String>,
+    #[serde(default)]
+    words: Vec<TimelineV2Word>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct TimelineV2Word {
+    #[serde(default)]
+    start_seconds: Option<f32>,
+    #[serde(default)]
+    end_seconds: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct TimelineContextSegment {
+    text: String,
+    time_label: Option<String>,
+    speaker_label: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ListArtifactsPayload {
@@ -462,7 +551,7 @@ pub async fn chat_artifact(
         ));
     }
 
-    let candidates = build_chat_context_candidates(&artifact, prompt);
+    let candidates = build_chat_context_candidates(&artifact, prompt, payload.context);
     ask_with_overflow_fallback(enhancer.as_ref(), candidates)
         .await
         .map_err(CommandError::from)
@@ -473,7 +562,7 @@ pub async fn optimize_artifact(
     state: State<'_, AppState>,
     payload: OptimizeArtifactPayload,
 ) -> Result<String, CommandError> {
-    let _artifact = state
+    let artifact = state
         .artifact_service
         .get(&payload.id)
         .await
@@ -499,9 +588,16 @@ pub async fn optimize_artifact(
         ));
     }
 
-    // Default to the artifact's original language, or "en" if not directly available (though the enhancer usually handles empty language code gracefully or ignores it)
+    let language_code = artifact
+        .metadata
+        .get("language")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+
     enhancer
-        .optimize(text, "")
+        .optimize(text, language_code)
         .await
         .map_err(CommandError::from)
 }
@@ -529,7 +625,7 @@ pub async fn summarize_artifact(
             )
         })?;
 
-    let transcript = effective_transcript(&artifact);
+    let transcript = build_artifact_context_transcript(&artifact, payload.context);
     if transcript.trim().is_empty() {
         return Err(CommandError::new(
             "empty_content",
@@ -537,14 +633,9 @@ pub async fn summarize_artifact(
         ));
     }
 
-    let user_prompt = payload.prompt.trim();
-    let instructions = if user_prompt.is_empty() {
-        "Summarize this transcript clearly and concisely."
-    } else {
-        user_prompt
-    };
+    let instructions = build_summary_instructions(&payload);
 
-    summarize_with_rag(enhancer.as_ref(), &transcript, instructions)
+    summarize_with_rag(enhancer.as_ref(), &transcript, &instructions)
         .await
         .map_err(CommandError::from)
 }
@@ -555,6 +646,121 @@ fn effective_transcript(artifact: &TranscriptArtifact) -> String {
         return optimized.to_string();
     }
     artifact.raw_transcript.trim().to_string()
+}
+
+fn build_artifact_context_transcript(
+    artifact: &TranscriptArtifact,
+    context: ArtifactAiContextOptions,
+) -> String {
+    let timeline_segments = parse_timeline_context_segments(artifact);
+    if timeline_segments.is_empty() {
+        return effective_transcript(artifact);
+    }
+
+    timeline_segments
+        .iter()
+        .map(|segment| render_timeline_context_segment(segment, context))
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_timeline_context_segments(artifact: &TranscriptArtifact) -> Vec<TimelineContextSegment> {
+    let raw = artifact
+        .metadata
+        .get("timeline_v2")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+
+    let parsed = match serde_json::from_str::<TimelineV2Document>(raw) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+
+    parsed
+        .segments
+        .into_iter()
+        .filter_map(|segment| {
+            let text = segment.text.trim();
+            if text.is_empty() {
+                return None;
+            }
+
+            let time_label = resolve_timeline_segment_seconds(&segment).map(format_mm_ss);
+            let speaker_label = normalize_optional_text(segment.speaker_label)
+                .or_else(|| normalize_optional_text(segment.speaker_id));
+
+            Some(TimelineContextSegment {
+                text: text.to_string(),
+                time_label,
+                speaker_label,
+            })
+        })
+        .collect()
+}
+
+fn resolve_timeline_segment_seconds(segment: &TimelineV2Segment) -> Option<f32> {
+    if let Some(start) = segment.start_seconds.filter(|value| value.is_finite()) {
+        return Some(start.max(0.0));
+    }
+    if let Some(end) = segment.end_seconds.filter(|value| value.is_finite()) {
+        return Some(end.max(0.0));
+    }
+
+    for word in &segment.words {
+        if let Some(start) = word.start_seconds.filter(|value| value.is_finite()) {
+            return Some(start.max(0.0));
+        }
+        if let Some(end) = word.end_seconds.filter(|value| value.is_finite()) {
+            return Some(end.max(0.0));
+        }
+    }
+
+    None
+}
+
+fn render_timeline_context_segment(
+    segment: &TimelineContextSegment,
+    context: ArtifactAiContextOptions,
+) -> String {
+    let mut prefix = String::new();
+
+    if context.include_timestamps {
+        if let Some(time_label) = segment.time_label.as_deref() {
+            prefix.push_str(&format!("[{time_label}] "));
+        }
+    }
+
+    if context.include_speakers {
+        if let Some(speaker_label) = segment.speaker_label.as_deref() {
+            prefix.push_str(speaker_label);
+            prefix.push_str(": ");
+        }
+    }
+
+    format!("{prefix}{}", segment.text.trim())
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn format_mm_ss(seconds: f32) -> String {
+    let total_seconds = seconds.floor().max(0.0) as u32;
+    let mm = total_seconds / 60;
+    let ss = total_seconds % 60;
+    format!("{mm:02}:{ss:02}")
 }
 
 fn chunk_text_by_words(text: &str, target_chars: usize, overlap_words: usize) -> Vec<String> {
@@ -637,8 +843,12 @@ fn score_chunk(chunk_lower: &str, query_lower: &str, query_tokens: &[String]) ->
     score
 }
 
-fn build_chat_context_candidates(artifact: &TranscriptArtifact, prompt: &str) -> Vec<String> {
-    let transcript = effective_transcript(artifact);
+fn build_chat_context_candidates(
+    artifact: &TranscriptArtifact,
+    prompt: &str,
+    context: ArtifactAiContextOptions,
+) -> Vec<String> {
+    let transcript = build_artifact_context_transcript(artifact, context);
     let normalized_prompt = normalize_whitespace(prompt);
     let query_lower = normalized_prompt.to_lowercase();
     let query_tokens = tokenize_for_search(&normalized_prompt);
@@ -709,10 +919,23 @@ fn build_chat_context_candidates(artifact: &TranscriptArtifact, prompt: &str) ->
             let summary = truncate_chars(artifact.summary.trim(), 1400);
             let faqs = truncate_chars(artifact.faqs.trim(), 1400);
             let title = artifact.title.trim();
+            let timestamp_instruction = if context.include_timestamps {
+                "When a relevant snippet includes a timestamp, cite it in the answer."
+            } else {
+                "Do not mention timestamps unless the user explicitly asks for unavailable timing."
+            };
+            let speaker_instruction = if context.include_speakers {
+                "When speaker labels are present, attribute statements to the relevant speaker."
+            } else {
+                "Do not infer or invent speaker attributions."
+            };
 
             format!(
                 "You are an assistant for transcript analysis.\n\
-                 Answer using the provided transcript snippets. If you cannot infer the answer, state what is missing.\n\n\
+                 Answer using the provided transcript snippets. If you cannot infer the answer, state what is missing.\n\
+                 Reply in the same language as the user's question unless the user explicitly asks for a different language.\n\
+                 {timestamp_instruction}\n\
+                 {speaker_instruction}\n\n\
                  Artifact title: {title}\n\n\
                  Existing summary:\n{summary}\n\n\
                  Existing FAQs:\n{faqs}\n\n\
@@ -721,6 +944,109 @@ fn build_chat_context_candidates(artifact: &TranscriptArtifact, prompt: &str) ->
             )
         })
         .collect()
+}
+
+fn build_summary_instructions(payload: &SummarizeArtifactPayload) -> String {
+    let mut lines = vec![
+        format!(
+            "Write a comprehensive, self-contained summary in {}.",
+            language_display_name(&payload.language)
+        ),
+        format!(
+            "The entire output must be in {}.",
+            language_display_name(&payload.language)
+        ),
+        "Produce only the final summary text. Do not add meta-commentary about the summarization process.".to_string(),
+    ];
+
+    match (payload.sections, payload.bullet_points) {
+        (true, true) => lines.push(
+            "Organize the summary into clearly titled sections and use bullet points within sections when they improve clarity."
+                .to_string(),
+        ),
+        (true, false) => lines.push(
+            "Organize the summary into clearly titled sections and write each section in polished prose paragraphs."
+                .to_string(),
+        ),
+        (false, true) => lines.push(
+            "Write the summary as a single untitled bullet list without section headings."
+                .to_string(),
+        ),
+        (false, false) => lines.push(
+            "Write the summary as a single continuous section without headings or bullet lists."
+                .to_string(),
+        ),
+    }
+
+    if payload.key_points_only {
+        lines.push(
+            "Focus on the most important points, decisions, and takeaways. Omit minor tangents."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "Be thorough and cover all major topics with supporting details, examples, and context."
+                .to_string(),
+        );
+    }
+
+    if payload.action_items {
+        lines.push(
+            "Include a dedicated final section for action items, tasks, decisions, or next steps when they appear in the transcript."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "Do not add a dedicated action-items section. Integrate next steps into the summary only when they are genuinely discussed."
+                .to_string(),
+        );
+    }
+
+    if payload.context.include_timestamps {
+        lines.push(
+            "Where timestamps are available in the transcript, keep them next to the relevant point."
+                .to_string(),
+        );
+    } else {
+        lines.push("Do not include timestamps in the final summary.".to_string());
+    }
+
+    if payload.context.include_speakers {
+        lines.push(
+            "Attribute statements to named speakers when speaker labels are available."
+                .to_string(),
+        );
+    } else {
+        lines.push("Do not include speaker attributions in the final summary.".to_string());
+    }
+
+    if let Some(custom_prompt) = payload
+        .custom_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        lines.push(format!(
+            "Additional user instructions (apply these unless they conflict with the required language and formatting rules above):\n{custom_prompt}"
+        ));
+    }
+
+    lines.join("\n\n")
+}
+
+fn language_display_name(language_code: &str) -> &str {
+    match language_code.trim() {
+        "auto" => "the same language as the transcript",
+        "en" => "English",
+        "it" => "Italian",
+        "fr" => "French",
+        "de" => "German",
+        "es" => "Spanish",
+        "pt" => "Portuguese",
+        "zh" => "Chinese",
+        "ja" => "Japanese",
+        _ => "the requested language",
+    }
 }
 
 async fn summarize_with_rag(
@@ -1323,10 +1649,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::Utc;
+    use serde_json::json;
 
     use super::{
-        build_chat_context_candidates, chunk_text_by_words, is_context_window_error,
-        ApplicationError, ArtifactKind, TranscriptArtifact,
+        build_artifact_context_transcript, build_chat_context_candidates,
+        build_summary_instructions, chunk_text_by_words, is_context_window_error,
+        ApplicationError, ArtifactAiContextOptions, ArtifactKind, SummarizeArtifactPayload,
+        TranscriptArtifact,
     };
 
     fn sample_artifact(text: &str) -> TranscriptArtifact {
@@ -1346,6 +1675,30 @@ mod tests {
         }
     }
 
+    fn sample_artifact_with_timeline(text: &str) -> TranscriptArtifact {
+        let mut artifact = sample_artifact(text);
+        artifact.metadata.insert(
+            "timeline_v2".to_string(),
+            json!({
+                "version": 2,
+                "segments": [
+                    {
+                        "text": "Alice opens the meeting.",
+                        "start_seconds": 12.4,
+                        "speaker_label": "Alice"
+                    },
+                    {
+                        "text": "Bob confirms the next step.",
+                        "start_seconds": 24.9,
+                        "speaker_label": "Bob"
+                    }
+                ]
+            })
+            .to_string(),
+        );
+        artifact
+    }
+
     #[test]
     fn chunker_splits_and_progresses() {
         let input =
@@ -1359,11 +1712,66 @@ mod tests {
     fn chat_context_candidates_are_created() {
         let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
         let artifact = sample_artifact(text);
-        let candidates = build_chat_context_candidates(&artifact, "what about gamma and sigma?");
+        let candidates = build_chat_context_candidates(
+            &artifact,
+            "what about gamma and sigma?",
+            ArtifactAiContextOptions::default(),
+        );
         assert!(!candidates.is_empty());
         assert!(candidates
             .iter()
             .all(|value| value.contains("User question:")));
+        assert!(candidates
+            .iter()
+            .all(|value| value.contains("Reply in the same language as the user's question")));
+    }
+
+    #[test]
+    fn timeline_context_respects_timestamp_and_speaker_toggles() {
+        let artifact = sample_artifact_with_timeline("fallback transcript");
+
+        let transcript = build_artifact_context_transcript(
+            &artifact,
+            ArtifactAiContextOptions {
+                include_timestamps: true,
+                include_speakers: true,
+            },
+        );
+        assert!(transcript.contains("[00:12] Alice: Alice opens the meeting."));
+        assert!(transcript.contains("[00:24] Bob: Bob confirms the next step."));
+
+        let transcript_without_labels = build_artifact_context_transcript(
+            &artifact,
+            ArtifactAiContextOptions {
+                include_timestamps: false,
+                include_speakers: false,
+            },
+        );
+        assert!(!transcript_without_labels.contains("[00:12]"));
+        assert!(!transcript_without_labels.contains("Alice:"));
+        assert!(transcript_without_labels.contains("Alice opens the meeting."));
+    }
+
+    #[test]
+    fn summary_instructions_keep_required_controls_even_with_custom_prompt() {
+        let instructions = build_summary_instructions(&SummarizeArtifactPayload {
+            id: "artifact-1".to_string(),
+            language: "it".to_string(),
+            context: ArtifactAiContextOptions {
+                include_timestamps: false,
+                include_speakers: true,
+            },
+            sections: true,
+            bullet_points: false,
+            action_items: true,
+            key_points_only: true,
+            custom_prompt: Some("Focus on hiring decisions.".to_string()),
+        });
+
+        assert!(instructions.contains("The entire output must be in Italian."));
+        assert!(instructions.contains("Do not include timestamps in the final summary."));
+        assert!(instructions.contains("Attribute statements to named speakers"));
+        assert!(instructions.contains("Focus on hiring decisions."));
     }
 
     #[test]

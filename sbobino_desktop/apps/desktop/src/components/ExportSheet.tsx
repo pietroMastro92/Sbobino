@@ -378,21 +378,22 @@ export function ExportSheet({
         aria-labelledby="export-sheet-title"
         onClick={(event) => event.stopPropagation()}
       >
-        <button
-          className="export-close-button"
-          aria-label={t("export.closePreview", "Close export preview")}
-          onClick={onClose}
-          disabled={isExporting}
-        >
-          <X size={14} />
-        </button>
-
         <div className="export-preview">
           <header className="export-preview-head">
             <strong id="export-sheet-title">{t("export.preview", "Export Preview")}</strong>
-            <div className="export-tags">
-              <span>{styleLabelCapitalized}</span>
-              <span>.{format}</span>
+            <div className="export-preview-head-actions">
+              <div className="export-tags">
+                <span>{styleLabelCapitalized}</span>
+                <span>.{format}</span>
+              </div>
+              <button
+                className="export-close-button"
+                aria-label={t("export.closePreview", "Close export preview")}
+                onClick={onClose}
+                disabled={isExporting}
+              >
+                <X size={14} />
+              </button>
             </div>
           </header>
           <div className="export-preview-body">

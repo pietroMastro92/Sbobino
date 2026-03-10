@@ -128,6 +128,12 @@ import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 import { LoadingAnimation } from "./components/LoadingAnimation";
 import { t, useTranslation, changeLanguage, type AppLanguage } from "./i18n";
+import { shouldStartWindowDrag } from "./lib/windowDrag";
+import {
+  buildChatArtifactPayload,
+  buildSummaryArtifactPayload,
+  shouldAutostartSummary,
+} from "./lib/artifactAi";
 
 function HighlightMatch({ text, search }: { text: string; search: string }) {
   if (!search.trim() || !text) return <>{text}</>;
@@ -189,10 +195,19 @@ type TrimmedAudioDraft = {
   regions: TrimRegion[];
 };
 
+type ActiveDetailContext = {
+  title: string;
+  inputPath: string | null;
+  sourceArtifact: TranscriptArtifact | null;
+  trimmedAudioDraft: TrimmedAudioDraft | null;
+  restoreArtifactOnFailure: boolean;
+};
+
 type PendingTranscriptionContext = {
   inputPath: string;
   parentId?: string;
   title?: string;
+  detailContext?: ActiveDetailContext | null;
 };
 
 const languageOptions: Array<{ value: LanguageCode; label: string }> = [
@@ -557,6 +572,35 @@ function buildTrimArtifactTitle(sourceLabel: string, regions: TrimRegion[]): str
   const sortedRegions = [...regions].sort((left, right) => left.startTime - right.startTime);
   const ranges = sortedRegions.map(formatTrimRangeLabel).join(", ");
   return ranges ? `${sourceLabel} - Trim ${ranges}` : `${sourceLabel} - Trim`;
+}
+
+function buildActiveDetailContext(params: {
+  inputPath: string | null;
+  requestedTitle?: string;
+  sourceArtifact?: TranscriptArtifact | null;
+  trimmedAudioDraft?: TrimmedAudioDraft | null;
+  restoreArtifactOnFailure?: boolean;
+}): ActiveDetailContext {
+  const {
+    inputPath,
+    requestedTitle,
+    sourceArtifact = null,
+    trimmedAudioDraft = null,
+    restoreArtifactOnFailure = false,
+  } = params;
+  const title =
+    requestedTitle?.trim()
+    || trimmedAudioDraft?.title
+    || sourceArtifact?.title
+    || (inputPath ? fileLabel(inputPath) : "Transcribing");
+
+  return {
+    title,
+    inputPath,
+    sourceArtifact,
+    trimmedAudioDraft,
+    restoreArtifactOnFailure,
+  };
 }
 
 function parseTimelineV2Segments(timelineV2Json: string | null | undefined): DetailSegment[] {
@@ -1446,16 +1490,20 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [audioDurationSeconds, setAudioDurationSeconds] = useState(0);
   const [trimRegions, setTrimRegions] = useState<TrimRegion[]>([]);
   const [trimmedAudioDraft, setTrimmedAudioDraft] = useState<TrimmedAudioDraft | null>(null);
+  const [activeDetailContext, setActiveDetailContext] = useState<ActiveDetailContext | null>(null);
 
   const activeJobIdRef = useRef<string | null>(activeJobId);
   const activeJobDeltaSequenceRef = useRef<number>(-1);
   const activeJobPreviewTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const detailMainRef = useRef<HTMLElement | null>(null);
+  const mainAreaRef = useRef<HTMLElement | null>(null);
+  const leftSidebarRef = useRef<HTMLElement | null>(null);
   const peopleSpeakerInputRef = useRef<HTMLInputElement | null>(null);
   const failedJobMessagesRef = useRef<Map<string, string>>(new Map());
   const pendingTranscriptionContextRef = useRef<Map<string, PendingTranscriptionContext>>(new Map());
   const startupWatchdogRef = useRef<number | null>(null);
   const settingsSaveSequenceRef = useRef(0);
+  const summaryAutostartedArtifactIdsRef = useRef<Set<string>>(new Set());
   const clearStartupWatchdog = useCallback(() => {
     if (startupWatchdogRef.current !== null) {
       window.clearTimeout(startupWatchdogRef.current);
@@ -1466,6 +1514,54 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   useEffect(() => {
     activeJobIdRef.current = activeJobId;
   }, [activeJobId]);
+
+  useEffect(() => {
+    const surfaces = [mainAreaRef.current, leftSidebarRef.current].filter(
+      (surface): surface is HTMLElement => Boolean(surface),
+    );
+    if (surfaces.length === 0) {
+      return;
+    }
+
+    const hasTauriRuntime = Boolean(
+      (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__,
+    );
+    if (!hasTauriRuntime) {
+      return;
+    }
+
+    let disposed = false;
+    let startDragging: (() => Promise<void>) | null = null;
+
+    void import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
+      if (!disposed) {
+        const currentWindow = getCurrentWindow();
+        startDragging = () => currentWindow.startDragging();
+      }
+    }).catch(() => {
+      startDragging = null;
+    });
+
+    const handleMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0 || event.defaultPrevented) {
+        return;
+      }
+      if (!shouldStartWindowDrag(event.target, { requireExplicitArea: true })) {
+        return;
+      }
+      if (window.getSelection()?.type === "Range") {
+        return;
+      }
+      void startDragging?.();
+    };
+
+    surfaces.forEach((surface) => surface.addEventListener("mousedown", handleMouseDown));
+
+    return () => {
+      disposed = true;
+      surfaces.forEach((surface) => surface.removeEventListener("mousedown", handleMouseDown));
+    };
+  }, []);
 
   useEffect(() => {
     if (!trimmedAudioDraft || !activeArtifact) {
@@ -1819,14 +1915,20 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setProgress(event);
           if (event.stage === "cancelled" || event.stage === "failed") {
             clearStartupWatchdog();
+            const failedContext = pendingTranscriptionContextRef.current.get(event.job_id);
             pendingTranscriptionContextRef.current.delete(event.job_id);
             clearActiveJob();
             activeJobIdRef.current = null;
             setActiveJobPreviewText("");
             setActiveJobTitle("");
             activeJobDeltaSequenceRef.current = -1;
+            setActiveDetailContext(null);
             if (event.stage === "failed") {
               setError(event.message || "Transcription failed.");
+              if (!restoreDetailAfterFailedTranscription(failedContext?.detailContext)) {
+                setSection("home");
+              }
+            } else if (!restoreDetailAfterFailedTranscription(failedContext?.detailContext)) {
               setSection("home");
             }
           }
@@ -1860,6 +1962,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           clearStartupWatchdog();
           clearActiveJob();
           activeJobIdRef.current = null;
+          setActiveDetailContext(null);
           hydrateDetail(hydratedArtifact);
           setSection("detail");
           setError(null);
@@ -1869,6 +1972,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
       const uFailed = await subscribeJobFailed((payload) => {
         failedJobMessagesRef.current.set(payload.job_id, payload.message);
+        const failedContext = pendingTranscriptionContextRef.current.get(payload.job_id);
         pendingTranscriptionContextRef.current.delete(payload.job_id);
         setQueueItems((previous) =>
           previous.map((entry) =>
@@ -1891,8 +1995,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setActiveJobPreviewText("");
           setActiveJobTitle("");
           activeJobDeltaSequenceRef.current = -1;
+          setActiveDetailContext(null);
           setError(payload.message);
-          setSection("home");
+          if (!restoreDetailAfterFailedTranscription(failedContext?.detailContext)) {
+            setSection("home");
+          }
         }
       });
       if (unmounted) { uFailed(); } else { unsubFailed = uFailed; }
@@ -2264,20 +2371,45 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return trimmedAudioDraft.parentArtifactId === activeArtifact.id ? trimmedAudioDraft : null;
   }, [activeArtifact, trimmedAudioDraft]);
 
+  const effectiveDetailContext = useMemo(() => {
+    if (activeTrimmedAudioDraft) {
+      return buildActiveDetailContext({
+        inputPath: activeTrimmedAudioDraft.path,
+        requestedTitle: activeTrimmedAudioDraft.title,
+        sourceArtifact: activeArtifact,
+        trimmedAudioDraft: activeTrimmedAudioDraft,
+        restoreArtifactOnFailure: false,
+      });
+    }
+
+    if (activeArtifact) {
+      return buildActiveDetailContext({
+        inputPath: activeArtifact.input_path,
+        requestedTitle: activeArtifact.title,
+        sourceArtifact: activeArtifact,
+        restoreArtifactOnFailure: false,
+      });
+    }
+
+    return activeDetailContext;
+  }, [activeArtifact, activeDetailContext, activeTrimmedAudioDraft]);
+
+  const effectiveTrimmedAudioDraft = useMemo(
+    () => effectiveDetailContext?.trimmedAudioDraft ?? activeTrimmedAudioDraft ?? null,
+    [activeTrimmedAudioDraft, effectiveDetailContext],
+  );
+
   const detailAudioInputPath = useMemo(
     () => {
-      if (activeTrimmedAudioDraft) {
-        return activeTrimmedAudioDraft.path;
-      }
-      if (activeArtifact && activeArtifact.kind === "file") {
-        return activeArtifact.input_path;
+      if (effectiveDetailContext?.inputPath) {
+        return effectiveDetailContext.inputPath;
       }
       if (activeJobId) {
         return selectedFile;
       }
       return null;
     },
-    [activeArtifact, activeJobId, activeTrimmedAudioDraft, selectedFile],
+    [activeJobId, effectiveDetailContext, selectedFile],
   );
 
   const detailAudioFileLabel = useMemo(
@@ -2459,6 +2591,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
   function hydrateDetail(artifact: TranscriptArtifact): void {
     setActiveArtifact(artifact);
+    setActiveDetailContext(null);
     setDraftTitle(artifact.title);
     setDraftTranscript(artifact.optimized_transcript || artifact.raw_transcript);
     setDraftSummary(artifact.summary);
@@ -2467,6 +2600,50 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     setChatHistory([]);
     setDetailMode("transcript");
     setInspectorMode("details");
+  }
+
+  useEffect(() => {
+    const artifactId = activeArtifact?.id ?? null;
+    const persistedSummary = activeArtifact?.summary ?? "";
+    if (!shouldAutostartSummary({
+      enabled: summaryAutostart,
+      artifactId,
+      persistedSummary,
+      draftSummary,
+      hasActiveJob: Boolean(activeJobId),
+      isGeneratingSummary,
+      triggeredArtifactIds: summaryAutostartedArtifactIdsRef.current,
+    })) {
+      return;
+    }
+
+    if (artifactId) {
+      summaryAutostartedArtifactIdsRef.current.add(artifactId);
+    }
+    void onGenerateSummary(false);
+  }, [
+    activeArtifact?.id,
+    activeArtifact?.summary,
+    activeJobId,
+    draftSummary,
+    isGeneratingSummary,
+    summaryAutostart,
+  ]);
+
+  function restoreDetailAfterFailedTranscription(
+    detailContext: ActiveDetailContext | null | undefined,
+  ): boolean {
+    if (!detailContext?.restoreArtifactOnFailure || !detailContext.sourceArtifact) {
+      return false;
+    }
+
+    if (detailContext.trimmedAudioDraft) {
+      setTrimmedAudioDraft(detailContext.trimmedAudioDraft);
+      setTrimRegions(detailContext.trimmedAudioDraft.regions);
+    }
+    hydrateDetail(detailContext.sourceArtifact);
+    setSection("detail");
+    return true;
   }
 
   async function persistSettings(updated: AppSettings, previous: AppSettings | null): Promise<void> {
@@ -2718,6 +2895,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     const isTrimRetranscription =
       trimmedAudioDraft?.path === targetFile
       && trimmedAudioDraft.parentArtifactId === parentId;
+    const nextDetailContext = buildActiveDetailContext({
+      inputPath: targetFile,
+      requestedTitle,
+      sourceArtifact: activeArtifact,
+      trimmedAudioDraft: isTrimRetranscription ? trimmedAudioDraft : null,
+      restoreArtifactOnFailure: isTrimRetranscription,
+    });
 
     if (!isTrimRetranscription) {
       setTrimmedAudioDraft(null);
@@ -2781,19 +2965,25 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         inputPath: targetFile,
         parentId,
         title: requestedTitle,
+        detailContext: nextDetailContext,
       });
+      setActiveDetailContext(nextDetailContext);
 
       if (failedJobMessagesRef.current.has(job_id)) {
         const earlyFailure =
           failedJobMessagesRef.current.get(job_id) ?? "Transcription failed.";
         failedJobMessagesRef.current.delete(job_id);
+        const failedContext = pendingTranscriptionContextRef.current.get(job_id);
         pendingTranscriptionContextRef.current.delete(job_id);
         clearActiveJob();
         activeJobIdRef.current = null;
         setActiveJobPreviewText("");
         setActiveJobTitle("");
         activeJobDeltaSequenceRef.current = -1;
-        setSection("home");
+        setActiveDetailContext(null);
+        if (!restoreDetailAfterFailedTranscription(failedContext?.detailContext)) {
+          setSection("home");
+        }
         setError(earlyFailure);
         return;
       }
@@ -2823,13 +3013,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         if (activeJobIdRef.current !== job_id) {
           return;
         }
+        const stalledContext = pendingTranscriptionContextRef.current.get(job_id);
         pendingTranscriptionContextRef.current.delete(job_id);
         clearActiveJob();
         activeJobIdRef.current = null;
         setActiveJobPreviewText("");
         setActiveJobTitle("");
         activeJobDeltaSequenceRef.current = -1;
-        setSection("home");
+        setActiveDetailContext(null);
+        if (!restoreDetailAfterFailedTranscription(stalledContext?.detailContext)) {
+          setSection("home");
+        }
         setError(
           "Transcription is not starting correctly. Check Whisper CLI/Whisper Stream paths in Settings > Local Models.",
         );
@@ -2838,7 +3032,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       const friendlyError = formatAppError(startError);
       setError(`Failed to start transcription: ${friendlyError}`);
       clearStartupWatchdog();
-      setSection("home");
+      setActiveDetailContext(null);
+      if (!restoreDetailAfterFailedTranscription(nextDetailContext)) {
+        setSection("home");
+      }
     } finally {
       setIsStarting(false);
     }
@@ -2881,6 +3078,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   function onFocusQueueJob(item: JobProgress): void {
     clearStartupWatchdog();
     const switchingJob = activeJobIdRef.current !== item.job_id;
+    const pendingContext = pendingTranscriptionContextRef.current.get(item.job_id);
     setJobStarted(item.job_id);
     setProgress(item);
     activeJobIdRef.current = item.job_id;
@@ -2889,6 +3087,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       activeJobDeltaSequenceRef.current = -1;
       setActiveJobTitle(activeJobTitle || "Transcribing");
     }
+    setActiveDetailContext(pendingContext?.detailContext ?? null);
     setActiveArtifact(null);
     setDetailMode("transcript");
     setInspectorMode("details");
@@ -2899,6 +3098,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   function onCloseOpenedArtifact(): void {
     setShowExportSheet(false);
     setActiveArtifact(null);
+    setActiveDetailContext(null);
     setSection("history");
     setError(null);
   }
@@ -3242,6 +3442,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
       if (activeArtifact && uniqueIds.includes(activeArtifact.id)) {
         setActiveArtifact(null);
+        setActiveDetailContext(null);
         setSection("history");
       }
 
@@ -3475,68 +3676,26 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     }
   }
 
-  async function onGenerateSummary(): Promise<void> {
+  async function onGenerateSummary(revealOnSuccess = true): Promise<void> {
     if (!activeArtifact || isGeneratingSummary) return;
-
-    const languageNameMap: Record<string, string> = {
-      auto: "the same language as the transcript",
-      en: "English",
-      it: "Italian",
-      fr: "French",
-      de: "German",
-      es: "Spanish",
-      pt: "Portuguese",
-      zh: "Chinese",
-      ja: "Japanese",
-    };
-    const languageName = languageNameMap[summaryLanguage] ?? summaryLanguage;
-
-    const structureLines: string[] = [];
-    if (summarySections) {
-      structureLines.push("Organize the summary into clearly titled sections (e.g. ## Section Title) that group related topics together.");
-    } else {
-      structureLines.push("Write the summary as a single continuous section without sub-headings.");
-    }
-    if (summaryBulletPoints) {
-      structureLines.push("Use bullet points within sections where appropriate to list specific facts or items.");
-    } else {
-      structureLines.push("Write in flowing, narrative prose — avoid bullet-point lists. Use paragraphs and complete sentences.");
-    }
-    if (summaryKeyPointsOnly) {
-      structureLines.push("Focus on the most important points, key takeaways, and core arguments. Omit minor details and tangential remarks.");
-    } else {
-      structureLines.push("Provide a thorough and detailed summary that covers all significant topics discussed, including supporting details, examples, and nuances.");
-    }
-    if (summaryActionItems) {
-      structureLines.push("At the end, include a dedicated section listing any action items, tasks, decisions, or next steps that were mentioned or implied.");
-    }
-    if (summaryIncludeTimestamps) {
-      structureLines.push("Where timestamps are available in the transcript, include them in parentheses next to the relevant point (e.g. (12:34)).");
-    }
-    if (summaryIncludeSpeakers) {
-      structureLines.push("Attribute statements and ideas to specific speakers by name when speaker labels are available in the transcript.");
-    }
-
-    const defaultPrompt = [
-      `Write a comprehensive, well-structured summary of the following transcript in ${languageName}.`,
-      "",
-      "The summary must be substantive and informative — not a superficial list of topics. It should read as a complete document that someone who has not heard the original audio would find useful and self-contained.",
-      "",
-      "Guidelines:",
-      ...structureLines.map((line) => `- ${line}`),
-      "",
-      "Important: output ONLY the final summary text. Do not include meta-commentary about the summarization process.",
-    ].join("\n");
-
-    const prompt = summaryCustomPrompt.trim().length > 0
-      ? `${summaryCustomPrompt.trim()}\n\nIMPORTANT: Write the entire output in ${languageName}.`
-      : defaultPrompt;
 
     setIsGeneratingSummary(true);
     try {
-      const answer = await summarizeArtifact({ id: activeArtifact.id, prompt });
+      const answer = await summarizeArtifact(buildSummaryArtifactPayload({
+        id: activeArtifact.id,
+        language: summaryLanguage,
+        includeTimestamps: summaryIncludeTimestamps,
+        includeSpeakers: summaryIncludeSpeakers,
+        sections: summarySections,
+        bulletPoints: summaryBulletPoints,
+        actionItems: summaryActionItems,
+        keyPointsOnly: summaryKeyPointsOnly,
+        customPrompt: summaryCustomPrompt,
+      }));
       setDraftSummary(answer);
-      setDetailMode("summary");
+      if (revealOnSuccess) {
+        setDetailMode("summary");
+      }
       setError(null);
     } catch (summaryError) {
       const code = formatAppErrorCode(summaryError);
@@ -3590,7 +3749,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     setChatHistory((previous) => [...previous, { role: "user", text: prompt }]);
 
     try {
-      const answer = await chatArtifact({ id: activeArtifact.id, prompt });
+      const answer = await chatArtifact(buildChatArtifactPayload({
+        id: activeArtifact.id,
+        prompt,
+        includeTimestamps: chatIncludeTimestamps,
+        includeSpeakers: chatIncludeSpeakers,
+      }));
       setChatHistory((previous) => [...previous, { role: "assistant", text: answer }]);
     } catch (chatError) {
       const code = formatAppErrorCode(chatError);
@@ -4839,7 +5003,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             rightSidebarOpen={effectiveRightSidebarOpen}
             rightSidebarForcedCollapsed={rightSidebarForcedCollapsed}
             detailMode={detailMode}
-            title={activeArtifact ? activeArtifact.title : (activeJobTitle || "Transcribing")}
+            title={effectiveDetailContext?.title ?? activeJobTitle ?? "Transcribing"}
             hasArtifact={Boolean(activeArtifact)}
             hasActiveJob={Boolean(activeJobId)}
             transcriptionProgress={activeTranscriptionPercentage}
@@ -4861,12 +5025,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             onCancel={() => void onCancel()}
             isImprovingText={isImprovingText}
             onImproveText={onImproveText}
-            showRetranscribe={Boolean(activeTrimmedAudioDraft && !activeJobId)}
+            showRetranscribe={Boolean(effectiveTrimmedAudioDraft && !activeJobId)}
             onRetranscribeTrimmedAudio={() => {
-              if (activeTrimmedAudioDraft) {
-                void onStartTranscription(activeTrimmedAudioDraft.path, {
-                  parentId: activeTrimmedAudioDraft.parentArtifactId,
-                  title: activeTrimmedAudioDraft.title,
+              if (effectiveTrimmedAudioDraft) {
+                void onStartTranscription(effectiveTrimmedAudioDraft.path, {
+                  parentId: effectiveTrimmedAudioDraft.parentArtifactId,
+                  title: effectiveTrimmedAudioDraft.title,
                 });
               }
             }}
@@ -4922,7 +5086,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
           <div className="detail-audio-stack">
             <div className="detail-audio-player-group">
-              {activeTrimmedAudioDraft ? (
+              {effectiveTrimmedAudioDraft ? (
                 <div className="detail-audio-player-label">Trimmed audio</div>
               ) : null}
               <AudioPlayer
@@ -4933,13 +5097,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 }}
                 onTrimRegionsChange={setTrimRegions}
                 onTrimApplied={(path) => {
-                  if (!activeArtifact) {
+                  const trimSourceArtifact = activeArtifact ?? effectiveDetailContext?.sourceArtifact;
+                  if (!trimSourceArtifact) {
                     return;
                   }
-                  const sourceLabel = fileLabel(activeArtifact.input_path);
+                  const sourceLabel = fileLabel(trimSourceArtifact.input_path);
                   setTrimmedAudioDraft({
                     path,
-                    parentArtifactId: activeArtifact.id,
+                    parentArtifactId: trimSourceArtifact.id,
                     title: buildTrimArtifactTitle(sourceLabel, trimRegions),
                     regions: [...trimRegions],
                   });
@@ -6713,7 +6878,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   return (
     <main className="app-shell">
       <section className={leftSidebarOpen ? "window-frame" : "window-frame left-collapsed"}>
-        <aside className={`left-sidebar ${leftSidebarOpen ? "" : "collapsed"}`}>
+        <aside
+          ref={leftSidebarRef}
+          className={`left-sidebar ${leftSidebarOpen ? "" : "collapsed"}`}
+        >
+            <div className="sidebar-drag-cap" data-tauri-drag-region aria-hidden="true" />
+
             <div className="sidebar-section">
               <button className={section === "home" ? "sidebar-item active" : "sidebar-item"} onClick={() => setSection("home")}>
                 <House size={16} />
@@ -6759,6 +6929,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                         setOpenArtifacts((prev) => prev.filter((a) => a.id !== artifact.id));
                         if (activeArtifactId === artifact.id) {
                             setActiveArtifactId(null);
+                            setActiveDetailContext(null);
                             setSection("home");
                         }
                       }}
@@ -6790,7 +6961,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             </div>
           </aside>
 
-        <section className="main-area">
+        <section ref={mainAreaRef} className="main-area">
           {section !== "detail" ? (
             <header className="main-topbar" data-tauri-drag-region>
               <div className="topbar-title" data-tauri-drag-region>
@@ -6813,6 +6984,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                             : t("topbar.transcriptions", "Transcriptions")}
                   </h1>
                 )}
+                <div className="topbar-drag-spacer" data-tauri-drag-region aria-hidden="true" />
               </div>
 
               {section === "home" || section === "queue" || section === "realtime" ? (

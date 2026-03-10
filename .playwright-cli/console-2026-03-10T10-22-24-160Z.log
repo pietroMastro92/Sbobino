@@ -1,0 +1,45 @@
+[     200ms] TypeError: Cannot read properties of undefined (reading 'transformCallback')
+    at transformCallback (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-G7S6KQDI.js?v=42fe1946:22:37)
+    at listen (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-LDCDX4M5.js?v=42fe1946:37:14)
+    at subscribeSettingsUpdated (http://127.0.0.1:1420/src/lib/tauri.ts:165:26)
+    at http://127.0.0.1:1420/src/App.tsx:1811:24
+    at http://127.0.0.1:1420/src/App.tsx:1818:7
+    at commitHookEffectListMount (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:16963:34)
+    at commitPassiveMountOnFiber (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18206:19)
+    at commitPassiveMountEffects_complete (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18179:17)
+    at commitPassiveMountEffects_begin (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18169:15)
+    at commitPassiveMountEffects (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18159:11)
+[     201ms] TypeError: Cannot read properties of undefined (reading 'transformCallback')
+    at transformCallback (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-G7S6KQDI.js?v=42fe1946:22:37)
+    at listen (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-LDCDX4M5.js?v=42fe1946:37:14)
+    at subscribeJobProgress (http://127.0.0.1:1420/src/lib/tauri.ts:177:26)
+    at http://127.0.0.1:1420/src/App.tsx:1865:31
+    at http://127.0.0.1:1420/src/App.tsx:2057:7
+    at commitHookEffectListMount (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:16963:34)
+    at commitPassiveMountOnFiber (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18206:19)
+    at commitPassiveMountEffects_complete (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18179:17)
+    at commitPassiveMountEffects_begin (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18169:15)
+    at commitPassiveMountEffects (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18159:11)
+[     206ms] TypeError: Cannot read properties of undefined (reading 'transformCallback')
+    at transformCallback (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-G7S6KQDI.js?v=42fe1946:22:37)
+    at listen (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-LDCDX4M5.js?v=42fe1946:37:14)
+    at subscribeSettingsUpdated (http://127.0.0.1:1420/src/lib/tauri.ts:165:26)
+    at http://127.0.0.1:1420/src/App.tsx:1811:24
+    at http://127.0.0.1:1420/src/App.tsx:1818:7
+    at commitHookEffectListMount (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:16963:34)
+    at invokePassiveEffectMountInDEV (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18374:19)
+    at invokeEffectsInDev (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:19754:19)
+    at commitDoubleInvokeEffectsInDEV (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:19739:15)
+    at flushPassiveEffectsImpl (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:19556:13)
+[     206ms] TypeError: Cannot read properties of undefined (reading 'transformCallback')
+    at transformCallback (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-G7S6KQDI.js?v=42fe1946:22:37)
+    at listen (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-LDCDX4M5.js?v=42fe1946:37:14)
+    at subscribeJobProgress (http://127.0.0.1:1420/src/lib/tauri.ts:177:26)
+    at http://127.0.0.1:1420/src/App.tsx:1865:31
+    at http://127.0.0.1:1420/src/App.tsx:2057:7
+    at commitHookEffectListMount (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:16963:34)
+    at invokePassiveEffectMountInDEV (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:18374:19)
+    at invokeEffectsInDev (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:19754:19)
+    at commitDoubleInvokeEffectsInDEV (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:19739:15)
+    at flushPassiveEffectsImpl (http://127.0.0.1:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=42fe1946:19556:13)
+[     201ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://127.0.0.1:1420/favicon.ico:0

@@ -114,6 +114,22 @@ describe("AudioPlayer", () => {
     expect(readAudioFile).toHaveBeenCalledTimes(1);
   });
 
+  it("can rerender from a valid source to no source without crashing hooks", async () => {
+    vi.mocked(readAudioFile).mockResolvedValue([1, 2, 3, 4]);
+
+    const { container, rerender } = render(<AudioPlayer inputPath="/tmp/sample.mp3" />);
+
+    await vi.waitFor(() => {
+      expect(container.querySelector("audio")?.getAttribute("src")).toBeTruthy();
+    });
+
+    expect(() => {
+      rerender(<AudioPlayer inputPath={null} />);
+    }).not.toThrow();
+
+    expect(container.querySelector("footer.audio-player")).toBeNull();
+  });
+
   it("can render as a playback-only preview without trim controls", () => {
     const { container } = render(<AudioPlayer inputPath="/tmp/sample.mp3" trimEnabled={false} />);
     expect(container.querySelector(".trim-toggle")).toBeNull();

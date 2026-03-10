@@ -539,8 +539,6 @@ export function AudioPlayer({
 
   // ── Fallback audio loading ─────────────────────────────────
 
-  if (!sourcePath) return null;
-
   const loadFallbackAudio = useCallback(async (autoPlay: boolean, background = false): Promise<boolean> => {
     const currentSourcePath = sourcePath;
     if (!currentSourcePath) return false;
@@ -864,6 +862,8 @@ export function AudioPlayer({
   } : null;
 
   // ── Render ─────────────────────────────────────────────────
+
+  if (!sourcePath) return null;
 
   return (
     <footer className={`audio-player ${trimMode ? "audio-player--trim" : ""}`}>

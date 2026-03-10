@@ -1,0 +1,73 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - complementary [ref=e5]:
+      - generic [ref=e7]:
+        - button "Home" [ref=e8] [cursor=pointer]:
+          - img [ref=e9]
+          - text: Home
+        - button "Queue" [ref=e12] [cursor=pointer]:
+          - img [ref=e13]
+          - text: Queue
+        - button "History" [ref=e16] [cursor=pointer]:
+          - img [ref=e17]
+          - text: History
+      - button "Recently Deleted" [ref=e22] [cursor=pointer]:
+        - img [ref=e23]
+        - text: Recently Deleted
+      - button "Settings" [ref=e27] [cursor=pointer]:
+        - img [ref=e28]
+        - text: Settings
+    - generic [ref=e31]:
+      - generic [ref=e32]:
+        - button "Hide sidebar" [ref=e34] [cursor=pointer]:
+          - img [ref=e35]
+          - img [ref=e38]
+        - generic [ref=e42]:
+          - generic [ref=e43]:
+            - img [ref=e45]
+            - combobox [ref=e48]:
+              - option "Tiny"
+              - option "Base" [selected]
+              - option "Small"
+              - option "Medium"
+              - option "Large Turbo"
+          - generic [ref=e49]:
+            - img [ref=e51]
+            - combobox [ref=e55]:
+              - option "Auto Detect" [selected]
+              - option "English"
+              - option "Italian"
+              - option "French"
+              - option "German"
+              - option "Spanish"
+              - option "Portuguese"
+              - option "Chinese"
+              - option "Japanese"
+      - generic [ref=e57]:
+        - generic [ref=e58]:
+          - textbox "Audio file" [ref=e59]
+          - button "Open Local File" [ref=e60] [cursor=pointer]:
+            - img [ref=e61]
+        - generic [ref=e64]:
+          - button "Start Transcription" [disabled] [ref=e65]:
+            - img [ref=e66]
+            - text: Start Transcription
+          - button "Start Live" [disabled] [ref=e70]:
+            - img [ref=e71]
+            - text: Start Live
+          - button "Stop Live & Save" [disabled] [ref=e74]:
+            - img [ref=e75]
+            - text: Stop Live & Save
+          - button "Queue" [ref=e81] [cursor=pointer]:
+            - img [ref=e82]
+            - text: Queue
+          - button "History" [ref=e85] [cursor=pointer]:
+            - img [ref=e86]
+            - text: History
+        - generic [ref=e91]:
+          - heading "No transcripts yet" [level=3] [ref=e92]
+          - paragraph [ref=e93]: Open a file and start transcription to begin.
+      - generic [ref=e94]:
+        - paragraph [ref=e95]: "Bootstrap failed: Cannot read properties of undefined (reading 'invoke')"
+        - button "Dismiss" [ref=e96] [cursor=pointer]:
+          - img [ref=e97]

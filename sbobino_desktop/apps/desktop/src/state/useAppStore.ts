@@ -1,6 +1,21 @@
 import { create } from "zustand";
 import type { AppSettings, JobProgress, TranscriptArtifact } from "../types";
 
+function dedupeArtifactsById(artifacts: TranscriptArtifact[]): TranscriptArtifact[] {
+  const seen = new Set<string>();
+  const uniqueArtifacts: TranscriptArtifact[] = [];
+
+  for (const artifact of artifacts) {
+    if (seen.has(artifact.id)) {
+      continue;
+    }
+    seen.add(artifact.id);
+    uniqueArtifacts.push(artifact);
+  }
+
+  return uniqueArtifacts;
+}
+
 type AppState = {
   settings: AppSettings | null;
   selectedFile: string | null;
@@ -34,17 +49,21 @@ export const useAppStore = create<AppState>((set) => ({
   clearActiveJob: () => set({ activeJobId: null }),
   setProgress: (progress) => set({ progress }),
   setError: (error) => set({ error }),
-  setArtifacts: (artifacts) => set({ artifacts }),
+  setArtifacts: (artifacts) => set({ artifacts: dedupeArtifactsById(artifacts) }),
   prependArtifact: (artifact) =>
-    set((state) => ({ artifacts: [artifact, ...state.artifacts] })),
+    set((state) => ({
+      artifacts: [artifact, ...state.artifacts.filter((item) => item.id !== artifact.id)],
+    })),
   upsertArtifact: (artifact) =>
     set((state) => {
-      const exists = state.artifacts.some((item) => item.id === artifact.id);
-      if (!exists) {
-        return { artifacts: [artifact, ...state.artifacts] };
+      const existingIndex = state.artifacts.findIndex((item) => item.id === artifact.id);
+      const dedupedArtifacts = state.artifacts.filter((item) => item.id !== artifact.id);
+      if (existingIndex === -1) {
+        return { artifacts: [artifact, ...dedupedArtifacts] };
       }
+      dedupedArtifacts.splice(existingIndex, 0, artifact);
       return {
-        artifacts: state.artifacts.map((item) => (item.id === artifact.id ? artifact : item)),
+        artifacts: dedupedArtifacts,
       };
     }),
   removeArtifacts: (ids) =>
