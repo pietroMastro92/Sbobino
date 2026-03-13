@@ -1,6 +1,8 @@
 pub mod adapters;
 pub mod repositories;
 
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     env,
@@ -64,6 +66,42 @@ const REQUIRED_COREML_ENCODERS: [(&str, &str); 5] = [
     ),
 ];
 
+pub const PYANNOTE_MANIFEST_FILENAME: &str = "manifest.json";
+pub const PYANNOTE_STATUS_FILENAME: &str = "status.json";
+const PYANNOTE_BUNDLED_OVERRIDE_SOURCE: &str = "bundled_override";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedPyannoteManifest {
+    pub source: String,
+    pub app_version: String,
+    pub runtime_asset: String,
+    pub runtime_sha256: String,
+    pub model_asset: String,
+    pub model_sha256: String,
+    pub runtime_arch: String,
+    pub installed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedPyannoteStatus {
+    pub reason_code: String,
+    pub message: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PyannoteRuntimeHealth {
+    pub enabled: bool,
+    pub ready: bool,
+    pub runtime_installed: bool,
+    pub model_installed: bool,
+    pub arch: String,
+    pub device: String,
+    pub source: String,
+    pub reason_code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeHealth {
     pub host_os: String,
@@ -84,6 +122,7 @@ pub struct RuntimeHealth {
     pub coreml_encoder_present: bool,
     pub missing_models: Vec<String>,
     pub missing_encoders: Vec<String>,
+    pub pyannote: PyannoteRuntimeHealth,
 }
 
 #[derive(Debug, Clone)]
@@ -180,13 +219,7 @@ impl RuntimeTranscriptionFactory {
         let transcoder = Arc::new(FfmpegAdapter::new(ffmpeg_path));
         let speech_engine: Arc<dyn sbobino_application::SpeechToTextEngine> =
             Arc::new(WhisperCppEngine::new(whisper_cli_path, models_dir));
-        let speaker_diarizer = match self.build_speaker_diarizer(&settings) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!("speaker diarization disabled for this run: {error}");
-                None
-            }
-        };
+        let speaker_diarizer = self.build_speaker_diarizer(&settings)?;
 
         let enhancer = self
             .build_active_enhancer()
@@ -458,11 +491,16 @@ impl RuntimeTranscriptionFactory {
             return Ok(None);
         }
 
-        let Some(python_path) = self.managed_pyannote_python_path() else {
-            return Err(format!(
-                "Pyannote diarization is enabled, but the managed Python runtime is unavailable. Bundle the diarization runtime or ensure 'python3' is installed."
-            ));
-        };
+        self.install_bundled_pyannote_override_if_available()?;
+        let pyannote_health = self.pyannote_health(settings);
+        if !pyannote_health.ready {
+            return Err(pyannote_health.message);
+        }
+
+        let python_path = self.managed_pyannote_python_path().ok_or_else(|| {
+            "Pyannote diarization is enabled, but the managed Python runtime is unavailable."
+                .to_string()
+        })?;
 
         let script_path = self.ensure_embedded_pyannote_script()?;
 
@@ -473,11 +511,10 @@ impl RuntimeTranscriptionFactory {
             ));
         }
 
-        let Some(model_path) = self.ensure_managed_pyannote_model_dir()? else {
-            return Err(format!(
-                "Pyannote diarization is enabled, but the managed offline model is unavailable. Add the pyannote model bundle to the app-managed runtime."
-            ));
-        };
+        let model_path = self.ensure_managed_pyannote_model_dir()?.ok_or_else(|| {
+            "Pyannote diarization is enabled, but the managed offline model is unavailable."
+                .to_string()
+        })?;
 
         Ok(Some(Arc::new(PyannoteSpeakerDiarizationEngine::new(
             python_path,
@@ -499,6 +536,7 @@ impl RuntimeTranscriptionFactory {
 
     pub fn runtime_health(&self) -> Result<RuntimeHealth, String> {
         let settings = self.load_settings()?;
+        self.install_bundled_pyannote_override_if_available()?;
         let configured_models_dir = if settings.transcription.models_dir.trim().is_empty() {
             settings.models_dir.clone()
         } else {
@@ -531,6 +569,7 @@ impl RuntimeTranscriptionFactory {
         } else {
             models_dir.join(coreml_encoder).is_dir()
         };
+        let pyannote = self.pyannote_health(&settings);
 
         Ok(RuntimeHealth {
             host_os: env::consts::OS.to_string(),
@@ -551,6 +590,7 @@ impl RuntimeTranscriptionFactory {
             coreml_encoder_present,
             missing_models: missing_models(&models_dir),
             missing_encoders: missing_encoders(&models_dir),
+            pyannote,
         })
     }
 
@@ -605,87 +645,79 @@ impl RuntimeTranscriptionFactory {
         Ok(script_path.to_string_lossy().to_string())
     }
 
-    fn managed_pyannote_runtime_dir(&self) -> PathBuf {
+    pub fn managed_pyannote_runtime_dir(&self) -> PathBuf {
         self.data_dir.join("runtime").join("pyannote")
     }
 
-    fn managed_pyannote_python_path(&self) -> Option<String> {
+    pub fn managed_pyannote_python_dir(&self) -> PathBuf {
+        self.managed_pyannote_runtime_dir().join("python")
+    }
+
+    pub fn managed_pyannote_model_dir(&self) -> PathBuf {
+        self.managed_pyannote_runtime_dir().join("model")
+    }
+
+    pub fn managed_pyannote_manifest_path(&self) -> PathBuf {
+        self.managed_pyannote_runtime_dir()
+            .join(PYANNOTE_MANIFEST_FILENAME)
+    }
+
+    pub fn managed_pyannote_status_path(&self) -> PathBuf {
+        self.managed_pyannote_runtime_dir()
+            .join(PYANNOTE_STATUS_FILENAME)
+    }
+
+    pub fn read_managed_pyannote_manifest(&self) -> Option<ManagedPyannoteManifest> {
+        let path = self.managed_pyannote_manifest_path();
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<ManagedPyannoteManifest>(&content).ok()
+    }
+
+    pub fn write_managed_pyannote_manifest(
+        &self,
+        manifest: &ManagedPyannoteManifest,
+    ) -> Result<(), String> {
         let runtime_dir = self.managed_pyannote_runtime_dir();
-        let mut bundled_candidates = Vec::new();
+        std::fs::create_dir_all(&runtime_dir)
+            .map_err(|e| format!("failed to create pyannote runtime directory: {e}"))?;
+        let body = serde_json::to_string_pretty(manifest)
+            .map_err(|e| format!("failed to serialize pyannote manifest: {e}"))?;
+        std::fs::write(self.managed_pyannote_manifest_path(), body)
+            .map_err(|e| format!("failed to write pyannote manifest: {e}"))
+    }
 
-        if let Some(resources_dir) = self.bundle_resources_dir.as_ref() {
-            bundled_candidates.extend([
-                resources_dir
-                    .join("pyannote")
-                    .join("python")
-                    .join(target_triple_suffix())
-                    .join("bin")
-                    .join("python3"),
-                resources_dir
-                    .join("pyannote")
-                    .join("python")
-                    .join(target_triple_suffix())
-                    .join("bin")
-                    .join("python"),
-                resources_dir
-                    .join("pyannote")
-                    .join("python")
-                    .join("bin")
-                    .join("python3"),
-                resources_dir
-                    .join("pyannote")
-                    .join("python")
-                    .join("bin")
-                    .join("python"),
-            ]);
-        }
+    pub fn read_managed_pyannote_status(&self) -> Option<ManagedPyannoteStatus> {
+        let path = self.managed_pyannote_status_path();
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<ManagedPyannoteStatus>(&content).ok()
+    }
 
-        let dev_resources_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../apps/desktop/src-tauri/resources");
-        bundled_candidates.extend([
-            dev_resources_dir
-                .join("pyannote")
-                .join("python")
-                .join(target_triple_suffix())
-                .join("bin")
-                .join("python3"),
-            dev_resources_dir
-                .join("pyannote")
-                .join("python")
-                .join(target_triple_suffix())
-                .join("bin")
-                .join("python"),
-            dev_resources_dir
-                .join("pyannote")
-                .join("python")
-                .join("bin")
-                .join("python3"),
-            dev_resources_dir
-                .join("pyannote")
-                .join("python")
-                .join("bin")
-                .join("python"),
-        ]);
+    pub fn write_managed_pyannote_status(
+        &self,
+        reason_code: &str,
+        message: &str,
+    ) -> Result<(), String> {
+        let runtime_dir = self.managed_pyannote_runtime_dir();
+        std::fs::create_dir_all(&runtime_dir)
+            .map_err(|e| format!("failed to create pyannote runtime directory: {e}"))?;
+        let status = ManagedPyannoteStatus {
+            reason_code: reason_code.trim().to_string(),
+            message: message.trim().to_string(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let body = serde_json::to_string_pretty(&status)
+            .map_err(|e| format!("failed to serialize pyannote status: {e}"))?;
+        std::fs::write(self.managed_pyannote_status_path(), body)
+            .map_err(|e| format!("failed to write pyannote status: {e}"))
+    }
 
-        bundled_candidates.extend([
-            runtime_dir.join("python").join("bin").join("python3"),
-            runtime_dir.join("python").join("bin").join("python"),
-            runtime_dir.join("venv").join("bin").join("python3"),
-            runtime_dir.join("venv").join("bin").join("python"),
-        ]);
-
-        for candidate in bundled_candidates {
+    fn managed_pyannote_python_path(&self) -> Option<String> {
+        for candidate in self.managed_pyannote_python_candidates() {
             if is_runnable_binary_file(&candidate) {
                 return Some(candidate.to_string_lossy().to_string());
             }
         }
-
-        let resolved = self.resolve_binary_path("python3", "python3");
-        if self.binary_path_is_runnable(&resolved) {
-            Some(resolved)
-        } else {
-            None
-        }
+        None
     }
 
     fn ensure_managed_pyannote_model_dir(&self) -> Result<Option<String>, String> {
@@ -693,7 +725,7 @@ impl RuntimeTranscriptionFactory {
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|e| format!("failed to create pyannote runtime directory: {e}"))?;
 
-        let destination = runtime_dir.join("model");
+        let destination = self.managed_pyannote_model_dir();
         if is_pyannote_model_dir(&destination) {
             return Ok(Some(destination.to_string_lossy().to_string()));
         }
@@ -710,6 +742,190 @@ impl RuntimeTranscriptionFactory {
         }
 
         Ok(None)
+    }
+
+    fn managed_pyannote_python_candidates(&self) -> Vec<PathBuf> {
+        let runtime_dir = self.managed_pyannote_runtime_dir();
+        vec![
+            self.managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            self.managed_pyannote_python_dir()
+                .join("bin")
+                .join("python"),
+            runtime_dir.join("venv").join("bin").join("python3"),
+            runtime_dir.join("venv").join("bin").join("python"),
+        ]
+    }
+
+    fn install_bundled_pyannote_override_if_available(&self) -> Result<(), String> {
+        let runtime_dir = self.managed_pyannote_runtime_dir();
+        std::fs::create_dir_all(&runtime_dir)
+            .map_err(|e| format!("failed to create pyannote runtime directory: {e}"))?;
+
+        let runtime_missing = self.managed_pyannote_python_path().is_none();
+        let model_missing = !is_pyannote_model_dir(&self.managed_pyannote_model_dir());
+        let mut copied_assets = false;
+
+        if runtime_missing {
+            if let Some(source) = self.find_bundled_pyannote_python_source() {
+                copy_directory_recursive(&source, &self.managed_pyannote_python_dir()).map_err(
+                    |e| {
+                        format!(
+                            "failed to install bundled pyannote runtime from '{}' to '{}': {e}",
+                            source.display(),
+                            self.managed_pyannote_python_dir().display()
+                        )
+                    },
+                )?;
+                copied_assets = true;
+            }
+        }
+
+        if model_missing {
+            if let Some(source) = self.find_bundled_pyannote_model_source() {
+                copy_directory_recursive(&source, &self.managed_pyannote_model_dir()).map_err(
+                    |e| {
+                        format!(
+                            "failed to install bundled pyannote model from '{}' to '{}': {e}",
+                            source.display(),
+                            self.managed_pyannote_model_dir().display()
+                        )
+                    },
+                )?;
+                copied_assets = true;
+            }
+        }
+
+        if copied_assets
+            && self.managed_pyannote_python_path().is_some()
+            && is_pyannote_model_dir(&self.managed_pyannote_model_dir())
+        {
+            let manifest = ManagedPyannoteManifest {
+                source: PYANNOTE_BUNDLED_OVERRIDE_SOURCE.to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                runtime_asset: "bundled-override".to_string(),
+                runtime_sha256: String::new(),
+                model_asset: "bundled-override".to_string(),
+                model_sha256: String::new(),
+                runtime_arch: target_triple_suffix().to_string(),
+                installed_at: Utc::now().to_rfc3339(),
+            };
+            self.write_managed_pyannote_manifest(&manifest)?;
+            self.write_managed_pyannote_status("ok", "Bundled pyannote override installed.")?;
+        }
+
+        Ok(())
+    }
+
+    fn pyannote_health(&self, settings: &AppSettings) -> PyannoteRuntimeHealth {
+        let diarization = &settings.transcription.speaker_diarization;
+        let runtime_installed = self.managed_pyannote_python_path().is_some();
+        let model_installed = is_pyannote_model_dir(&self.managed_pyannote_model_dir());
+        let manifest = self.read_managed_pyannote_manifest();
+        let status = self.read_managed_pyannote_status();
+        let arch = manifest
+            .as_ref()
+            .map(|value| value.runtime_arch.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| target_triple_suffix().to_string());
+        let source = manifest
+            .as_ref()
+            .map(|value| value.source.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "managed".to_string());
+        let device = diarization.device.trim().to_string();
+
+        let status_override = status.as_ref().and_then(|value| {
+            let code = value.reason_code.trim();
+            if code.is_empty() || code == "ok" {
+                None
+            } else {
+                Some((code.to_string(), value.message.trim().to_string()))
+            }
+        });
+
+        let (ready, reason_code, message) = if let Some((code, message)) = status_override {
+            let fallback = match code.as_str() {
+                "pyannote_checksum_invalid" => {
+                    "Pyannote asset verification failed. Reinstall the diarization runtime from Local Models."
+                }
+                "pyannote_install_incomplete" => {
+                    "Pyannote installation is incomplete. Repair the diarization runtime from Local Models."
+                }
+                _ => "Pyannote diarization is not ready.",
+            };
+            (
+                false,
+                code,
+                if message.is_empty() {
+                    fallback.to_string()
+                } else {
+                    message
+                },
+            )
+        } else if !runtime_installed {
+            (
+                false,
+                "pyannote_runtime_missing".to_string(),
+                "Pyannote diarization runtime is not installed. Install it from Settings > Local Models.".to_string(),
+            )
+        } else if !model_installed {
+            (
+                false,
+                "pyannote_model_missing".to_string(),
+                "Pyannote diarization model is not installed. Install it from Settings > Local Models.".to_string(),
+            )
+        } else if let Some(manifest) = manifest.as_ref() {
+            if manifest.runtime_arch.trim() != target_triple_suffix() {
+                (
+                    false,
+                    "pyannote_install_incomplete".to_string(),
+                    format!(
+                        "Pyannote runtime arch mismatch: installed '{}' but host requires '{}'. Reinstall from Settings > Local Models.",
+                        manifest.runtime_arch.trim(),
+                        target_triple_suffix()
+                    ),
+                )
+            } else if manifest.source != PYANNOTE_BUNDLED_OVERRIDE_SOURCE
+                && manifest.app_version.trim() != env!("CARGO_PKG_VERSION")
+            {
+                (
+                    false,
+                    "pyannote_install_incomplete".to_string(),
+                    format!(
+                        "Pyannote runtime targets app version '{}' but this build is '{}'. Reinstall from Settings > Local Models.",
+                        manifest.app_version.trim(),
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                )
+            } else {
+                (
+                    true,
+                    "ok".to_string(),
+                    "Pyannote diarization runtime is installed.".to_string(),
+                )
+            }
+        } else {
+            (
+                false,
+                "pyannote_install_incomplete".to_string(),
+                "Pyannote installation is incomplete. Repair it from Settings > Local Models."
+                    .to_string(),
+            )
+        };
+
+        PyannoteRuntimeHealth {
+            enabled: diarization.enabled,
+            ready,
+            runtime_installed,
+            model_installed,
+            arch,
+            device,
+            source,
+            reason_code,
+            message,
+        }
     }
 
     fn find_bundled_pyannote_model_source(&self) -> Option<PathBuf> {
@@ -733,12 +949,42 @@ impl RuntimeTranscriptionFactory {
             }
         }
 
-        let dev_resource_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/desktop/src-tauri/resources");
+        let dev_resource_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/desktop/src-tauri/resources");
         candidates.push(dev_resource_dir.join("pyannote").join("model"));
         candidates.push(dev_resource_dir.join("pyannote-community-1"));
 
-        candidates.into_iter().find(|path| is_pyannote_model_dir(path))
+        candidates
+            .into_iter()
+            .find(|path| is_pyannote_model_dir(path))
+    }
+
+    fn find_bundled_pyannote_python_source(&self) -> Option<PathBuf> {
+        let mut candidates = Vec::new();
+
+        if let Some(resources_dir) = self.bundle_resources_dir.as_ref() {
+            candidates.push(
+                resources_dir
+                    .join("pyannote")
+                    .join("python")
+                    .join(target_triple_suffix()),
+            );
+            candidates.push(resources_dir.join("pyannote").join("python"));
+        }
+
+        let dev_resource_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/desktop/src-tauri/resources");
+        candidates.push(
+            dev_resource_dir
+                .join("pyannote")
+                .join("python")
+                .join(target_triple_suffix()),
+        );
+        candidates.push(dev_resource_dir.join("pyannote").join("python"));
+
+        candidates
+            .into_iter()
+            .find(|path| is_pyannote_runtime_dir(path))
     }
 
     fn resolve_binary_details(&self, configured: &str, fallback: &str) -> BinaryResolution {
@@ -1250,6 +1496,11 @@ fn is_pyannote_model_dir(path: &Path) -> bool {
     path.is_dir() && path.join("config.yaml").is_file()
 }
 
+fn is_pyannote_runtime_dir(path: &Path) -> bool {
+    path.is_dir()
+        && (path.join("bin").join("python3").is_file() || path.join("bin").join("python").is_file())
+}
+
 fn expand_home(path: &str) -> String {
     if let Some(stripped) = path.strip_prefix("~/") {
         if let Some(home) = env::var_os("HOME") {
@@ -1260,4 +1511,129 @@ fn expand_home(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ManagedPyannoteManifest, RuntimeTranscriptionFactory, PYANNOTE_STATUS_FILENAME};
+    use sbobino_domain::AppSettings;
+    use tempfile::tempdir;
+
+    fn build_factory() -> (tempfile::TempDir, RuntimeTranscriptionFactory) {
+        let temp = tempdir().expect("failed to create tempdir");
+        let factory =
+            RuntimeTranscriptionFactory::new(temp.path(), None).expect("factory should build");
+        (temp, factory)
+    }
+
+    fn persist_enabled_diarization(factory: &RuntimeTranscriptionFactory) {
+        let mut settings = AppSettings::default();
+        settings.transcription.speaker_diarization.enabled = true;
+        factory
+            .settings_repo
+            .save_sync(&settings)
+            .expect("settings should persist");
+    }
+
+    fn write_executable_file(path: &std::path::Path, contents: &str) {
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("executable file should have parent directory"),
+        )
+        .expect("parent directory should exist");
+        std::fs::write(path, contents).expect("failed to write executable file");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path)
+                .expect("metadata should exist")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("failed to chmod executable");
+        }
+    }
+
+    #[test]
+    fn runtime_health_reports_missing_pyannote_runtime_when_enabled() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        let health = factory
+            .runtime_health()
+            .expect("runtime health should load");
+        assert!(health.pyannote.enabled);
+        assert!(!health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "pyannote_runtime_missing");
+    }
+
+    #[test]
+    fn runtime_health_prefers_checksum_status_when_present() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        let runtime_dir = factory.managed_pyannote_runtime_dir();
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+        std::fs::write(
+            runtime_dir.join(PYANNOTE_STATUS_FILENAME),
+            r#"{"reason_code":"pyannote_checksum_invalid","message":"checksum mismatch","updated_at":"2026-03-13T00:00:00Z"}"#,
+        )
+        .expect("status file should write");
+
+        let health = factory
+            .runtime_health()
+            .expect("runtime health should load");
+        assert_eq!(health.pyannote.reason_code, "pyannote_checksum_invalid");
+        assert!(health.pyannote.message.contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn runtime_health_reports_ready_when_manifest_runtime_and_model_exist() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "abc".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "def".to_string(),
+                runtime_arch: super::target_triple_suffix().to_string(),
+                installed_at: "2026-03-13T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status("ok", "ready")
+            .expect("status should write");
+
+        let health = factory
+            .runtime_health()
+            .expect("runtime health should load");
+        assert!(health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "ok");
+    }
+
+    #[test]
+    fn build_service_fails_when_enabled_pyannote_is_not_ready() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        let error = match factory.build_service() {
+            Ok(_) => panic!("service should fail when pyannote is required but missing"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Pyannote diarization runtime is not installed"));
+    }
 }

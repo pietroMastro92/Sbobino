@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{instrument, warn};
 
 use sbobino_domain::{
-    ArtifactKind, JobProgress, JobStage, SpeakerTurn, TimedSegment, TranscriptArtifact,
-    TranscriptionOutput,
+    constrain_transcript_edit, minimize_transcript_repetitions, ArtifactKind, JobProgress,
+    JobStage, SpeakerTurn, TimedSegment, TranscriptArtifact, TranscriptionOutput,
 };
 
 use crate::{
@@ -20,6 +20,8 @@ use crate::{
     ApplicationError, ArtifactRepository, AudioTranscoder, SpeakerDiarizationEngine,
     SpeechToTextEngine, TranscriptEnhancer,
 };
+
+const HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY: &str = "has_optimized_transcript";
 
 #[derive(Clone)]
 pub struct TranscriptionService {
@@ -170,12 +172,16 @@ impl TranscriptionService {
                     ),
                 )
                 .await?;
-            let raw_transcript = Self::select_raw_transcript(&transcription_output);
+            let raw_transcript = minimize_transcript_repetitions(&Self::select_raw_transcript(
+                &transcription_output,
+            ));
             if raw_transcript.is_empty() {
                 return Err(ApplicationError::SpeechToText(
                     "speech-to-text engine produced empty output".to_string(),
                 ));
             }
+
+            emit_delta(raw_transcript.clone());
 
             if let Some(total) = total_audio_seconds {
                 self.emit(
@@ -189,12 +195,24 @@ impl TranscriptionService {
                 );
             }
 
+            let mut diarization_status: Option<String> = None;
+            let mut diarization_error: Option<String> = None;
             if let Some(speaker_diarizer) = &self.speaker_diarizer {
+                self.emit(
+                    &emit_progress,
+                    &request.job_id,
+                    JobStage::Diarizing,
+                    "Assigning speakers with pyannote",
+                    60,
+                    None,
+                    None,
+                );
                 match self
                     .run_cancellable(&cancellation_token, speaker_diarizer.diarize(&wav_path))
                     .await
                 {
                     Ok(turns) => {
+                        diarization_status = Some("completed".to_string());
                         if !turns.is_empty() && !transcription_output.segments.is_empty() {
                             transcription_output.segments = Self::assign_speakers_to_segments(
                                 &transcription_output.segments,
@@ -204,12 +222,14 @@ impl TranscriptionService {
                     }
                     Err(ApplicationError::Cancelled) => return Err(ApplicationError::Cancelled),
                     Err(error) => {
+                        diarization_status = Some("failed".to_string());
+                        diarization_error = Some(error.to_string());
                         warn!("speaker diarization skipped after transcription: {error}");
                     }
                 }
             }
 
-            let (optimized, summary_faq) = if request.enable_ai {
+            let (optimized, summary_faq, has_optimized_transcript) = if request.enable_ai {
                 self.emit(
                     &emit_progress,
                     &request.job_id,
@@ -229,6 +249,8 @@ impl TranscriptionService {
                     .await
                 {
                     Ok(optimized) => {
+                        let constrained_optimized =
+                            constrain_transcript_edit(&raw_transcript, &optimized);
                         self.emit(
                             &emit_progress,
                             &request.job_id,
@@ -243,7 +265,7 @@ impl TranscriptionService {
                             .run_cancellable(
                                 &cancellation_token,
                                 self.enhancer.summarize_and_faq(
-                                    &optimized,
+                                    &constrained_optimized,
                                     request.language.as_whisper_code(),
                                 ),
                             )
@@ -262,27 +284,29 @@ impl TranscriptionService {
                             }
                         };
 
-                        (optimized, summary_faq)
+                        (constrained_optimized, summary_faq, true)
                     }
                     Err(ApplicationError::Cancelled) => return Err(ApplicationError::Cancelled),
                     Err(error) => {
                         warn!("ai optimization skipped; keeping raw transcript: {error}");
                         (
-                            raw_transcript.clone(),
+                            String::new(),
                             SummaryFaq {
                                 summary: String::new(),
                                 faqs: String::new(),
                             },
+                            false,
                         )
                     }
                 }
             } else {
                 (
-                    raw_transcript.clone(),
+                    String::new(),
                     SummaryFaq {
                         summary: String::new(),
                         faqs: String::new(),
                     },
+                    false,
                 )
             };
 
@@ -309,9 +333,21 @@ impl TranscriptionService {
                 "timeline_v2".to_string(),
                 transcription_output.timeline_v2_metadata_json(),
             );
+            if let Some(status) = diarization_status {
+                metadata.insert("speaker_diarization_status".to_string(), status);
+            }
+            if let Some(error) = diarization_error {
+                metadata.insert("speaker_diarization_error".to_string(), error);
+            }
 
             if let Some(pid) = &request.parent_id {
                 metadata.insert("parent_id".to_string(), pid.clone());
+            }
+            if has_optimized_transcript {
+                metadata.insert(
+                    HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                );
             }
 
             let final_title = request.title.clone().unwrap_or_else(|| {
@@ -535,8 +571,7 @@ impl TranscriptionService {
                     };
 
                     if overlap > best_overlap + 0.001
-                        || ((overlap - best_overlap).abs() <= 0.001
-                            && distance < best_distance)
+                        || ((overlap - best_overlap).abs() <= 0.001 && distance < best_distance)
                     {
                         best_overlap = overlap;
                         best_distance = distance;

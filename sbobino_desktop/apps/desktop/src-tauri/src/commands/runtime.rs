@@ -5,6 +5,7 @@ use tauri::State;
 use tracing::warn;
 
 use sbobino_domain::{SpeechModel, TranscriptionEngine};
+use sbobino_infrastructure::PyannoteRuntimeHealth;
 
 use crate::{error::CommandError, state::AppState};
 
@@ -28,6 +29,7 @@ pub struct RuntimeHealthResponse {
     pub coreml_encoder_present: bool,
     pub missing_models: Vec<String>,
     pub missing_encoders: Vec<String>,
+    pub pyannote: PyannoteRuntimeHealth,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +47,7 @@ pub struct StartPreflightResponse {
     pub model_path: String,
     pub whisper_cli_resolved: String,
     pub whisper_stream_resolved: String,
+    pub pyannote: PyannoteRuntimeHealth,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +259,7 @@ pub async fn get_transcription_start_preflight(
             model_path,
             whisper_cli_resolved: health.whisper_cli_resolved,
             whisper_stream_resolved: health.whisper_stream_resolved,
+            pyannote: health.pyannote,
         });
     }
 
@@ -272,6 +276,21 @@ pub async fn get_transcription_start_preflight(
             model_path,
             whisper_cli_resolved: health.whisper_cli_resolved,
             whisper_stream_resolved: health.whisper_stream_resolved,
+            pyannote: health.pyannote,
+        });
+    }
+
+    if health.pyannote.enabled && !health.pyannote.ready {
+        return Ok(StartPreflightResponse {
+            allowed: false,
+            reason_code: health.pyannote.reason_code.clone(),
+            message: health.pyannote.message.clone(),
+            engine: "whisper_cpp".to_string(),
+            model_filename,
+            model_path,
+            whisper_cli_resolved: health.whisper_cli_resolved,
+            whisper_stream_resolved: health.whisper_stream_resolved,
+            pyannote: health.pyannote,
         });
     }
 
@@ -284,6 +303,7 @@ pub async fn get_transcription_start_preflight(
         model_path,
         whisper_cli_resolved: health.whisper_cli_resolved,
         whisper_stream_resolved: health.whisper_stream_resolved,
+        pyannote: health.pyannote,
     })
 }
 
@@ -315,5 +335,6 @@ pub async fn get_transcription_runtime_health(
         coreml_encoder_present: health.coreml_encoder_present,
         missing_models: health.missing_models,
         missing_encoders: health.missing_encoders,
+        pyannote: health.pyannote,
     })
 }

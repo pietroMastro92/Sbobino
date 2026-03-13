@@ -3,6 +3,7 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use docx_rs::{Docx, Paragraph, Run};
+use futures_util::stream::{self, StreamExt};
 use printpdf::{ops::PdfPage, text::TextItem, units::Pt, BuiltinFont, Mm, Op, PdfDocument};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -10,7 +11,10 @@ use tauri::State;
 use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, ArtifactQuery, TranscriptEnhancer};
-use sbobino_domain::{ArtifactKind, TranscriptArtifact};
+use sbobino_domain::{
+    constrain_transcript_edit, merge_optimized_transcript_sections,
+    minimize_transcript_repetitions, ArtifactKind, TranscriptArtifact,
+};
 
 use crate::{error::CommandError, state::AppState};
 
@@ -106,9 +110,15 @@ pub struct OptimizeArtifactPayload {
 const CHAT_CONTEXT_BUDGETS: &[(usize, usize)] = &[(8, 7600), (6, 5200), (4, 3400), (2, 2000)];
 const CHAT_CHUNK_TARGET_CHARS: usize = 900;
 const CHAT_CHUNK_OVERLAP_WORDS: usize = 24;
+const OPTIMIZE_CHUNK_TARGET_CHARS: usize = 2600;
+const OPTIMIZE_CHUNK_OVERLAP_WORDS: usize = 28;
+const OPTIMIZE_CHUNK_CONCURRENCY_LIMIT: usize = 3;
 const SUMMARY_CHUNK_TARGET_CHARS: usize = 4000;
 const SUMMARY_CHUNK_OVERLAP_WORDS: usize = 30;
+const SUMMARY_CHUNK_CONCURRENCY_LIMIT: usize = 3;
 const SUMMARY_SYNTHESIS_BUDGETS: &[usize] = &[12_000, 8_000, 5_000, 3_000];
+const SUMMARY_CONTEXT_OVERFLOW_MESSAGE: &str =
+    "Exceeded model context window size. The app now uses chunked retrieval, but this request is still too large. Try a shorter custom prompt or fewer summary constraints.";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct TimelineV2Document {
@@ -174,9 +184,13 @@ pub enum ExportFormat {
     Html,
     Pdf,
     Json,
+    Srt,
+    Vtt,
+    Csv,
+    Md,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportStyle {
     Transcript,
@@ -219,10 +233,23 @@ pub struct ExportArtifactPayload {
     pub id: String,
     pub format: ExportFormat,
     pub destination_path: String,
+    pub language: Option<String>,
     pub style: Option<ExportStyle>,
     pub options: Option<ExportOptions>,
     pub segments: Option<Vec<ExportSegment>>,
     pub content_override: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExportDocument {
+    title: String,
+    sections: Vec<ExportDocumentSection>,
+}
+
+#[derive(Debug, Clone)]
+struct ExportDocumentSection {
+    title: String,
+    body: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -488,30 +515,60 @@ pub async fn export_artifact(
     let style = payload.style.unwrap_or(ExportStyle::Transcript);
     let options = payload.options.unwrap_or_default();
     let grouping = options.grouping.unwrap_or(ExportGrouping::None);
-    let segments = payload
-        .segments
-        .filter(|entries| !entries.is_empty())
-        .unwrap_or_else(|| build_segments_from_text(&base_transcription));
+    let language = normalize_export_language(payload.language.as_deref());
+    let segments = match payload.segments {
+        Some(entries) if !entries.is_empty() => entries,
+        Some(_) if payload.content_override.is_some() => build_segments_from_text(&base_transcription),
+        _ => build_export_segments(&artifact, &base_transcription),
+    };
     let export_content = build_export_content(
         &base_transcription,
         &segments,
         style,
         options.include_timestamps,
     );
+    let export_document = build_export_document(
+        language,
+        &artifact.title,
+        &base_transcription,
+        &artifact.summary,
+        &artifact.faqs,
+        &segments,
+        style,
+        options.include_timestamps,
+    );
 
     match payload.format {
-        ExportFormat::Txt => export_txt(destination_path, &export_content)?,
-        ExportFormat::Docx => export_docx(destination_path, &export_content)?,
-        ExportFormat::Html => export_html(destination_path, &artifact.title, &export_content)?,
-        ExportFormat::Pdf => export_pdf(destination_path, &export_content)?,
+        ExportFormat::Txt => export_txt(
+            destination_path,
+            &render_plain_text_document(&export_document),
+        )?,
+        ExportFormat::Docx => export_docx(destination_path, &export_document)?,
+        ExportFormat::Html => export_html(destination_path, language, &export_document)?,
+        ExportFormat::Pdf => export_pdf(destination_path, &export_document)?,
         ExportFormat::Json => export_json(
             destination_path,
             &artifact,
+            &export_document,
             style,
             grouping,
             options.include_timestamps,
             &segments,
             &export_content,
+        )?,
+        ExportFormat::Csv => export_csv(destination_path, &segments)?,
+        ExportFormat::Md => {
+            let content = if style == ExportStyle::Subtitles {
+                build_markdown_subtitles_content(&segments, &base_transcription)
+            } else {
+                render_markdown_document(&export_document)
+            };
+            export_md(destination_path, &content)?
+        }
+        ExportFormat::Srt => export_txt(destination_path, &export_content)?,
+        ExportFormat::Vtt => export_txt(
+            destination_path,
+            &build_vtt_content(&segments, &base_transcription),
         )?,
     }
 
@@ -569,18 +626,7 @@ pub async fn optimize_artifact(
         .map_err(CommandError::from)?
         .ok_or_else(|| CommandError::new("not_found", "artifact not found"))?;
 
-    let enhancer = state
-        .runtime_factory
-        .build_active_enhancer()
-        .map_err(|e| CommandError::new("runtime_factory", e))?
-        .ok_or_else(|| {
-            CommandError::new(
-                "missing_ai_provider",
-                "No AI provider is configured in Settings > AI Services.",
-            )
-        })?;
-
-    let text = payload.text.trim();
+    let text = minimize_transcript_repetitions(payload.text.trim());
     if text.is_empty() {
         return Err(CommandError::new(
             "validation",
@@ -596,10 +642,17 @@ pub async fn optimize_artifact(
         .filter(|value| !value.is_empty())
         .unwrap_or("");
 
-    enhancer
-        .optimize(text, language_code)
-        .await
-        .map_err(CommandError::from)
+    let enhancer = state
+        .runtime_factory
+        .build_active_enhancer()
+        .map_err(|e| CommandError::new("runtime_factory", e))?;
+
+    match enhancer {
+        Some(enhancer) => optimize_with_rag(enhancer.as_ref(), &text, language_code)
+            .await
+            .map_err(CommandError::from),
+        None => Ok(text),
+    }
 }
 
 #[tauri::command]
@@ -1013,8 +1066,7 @@ fn build_summary_instructions(payload: &SummarizeArtifactPayload) -> String {
 
     if payload.context.include_speakers {
         lines.push(
-            "Attribute statements to named speakers when speaker labels are available."
-                .to_string(),
+            "Attribute statements to named speakers when speaker labels are available.".to_string(),
         );
     } else {
         lines.push("Do not include speaker attributions in the final summary.".to_string());
@@ -1049,6 +1101,72 @@ fn language_display_name(language_code: &str) -> &str {
     }
 }
 
+async fn optimize_with_rag(
+    enhancer: &dyn TranscriptEnhancer,
+    transcript: &str,
+    language_code: &str,
+) -> Result<String, ApplicationError> {
+    let cleaned = minimize_transcript_repetitions(transcript);
+    if cleaned.trim().is_empty() {
+        return Err(ApplicationError::Validation(
+            "cannot optimize an empty transcript".to_string(),
+        ));
+    }
+
+    let chunks = chunk_text_by_words(
+        &cleaned,
+        OPTIMIZE_CHUNK_TARGET_CHARS,
+        OPTIMIZE_CHUNK_OVERLAP_WORDS,
+    );
+
+    if chunks.is_empty() {
+        return Err(ApplicationError::Validation(
+            "cannot optimize an empty transcript".to_string(),
+        ));
+    }
+
+    if chunks.len() == 1 {
+        return enhancer
+            .optimize(&cleaned, language_code)
+            .await
+            .map(|optimized| constrain_transcript_edit(&cleaned, &optimized));
+    }
+
+    let concurrency_limit = enhancer
+        .summary_chunk_concurrency_limit()
+        .max(1)
+        .min(OPTIMIZE_CHUNK_CONCURRENCY_LIMIT);
+    let chunk_concurrency = chunks.len().clamp(1, concurrency_limit);
+
+    let current_sections = stream::iter(chunks.into_iter())
+        .map(|chunk| async move {
+            enhancer
+                .optimize(&chunk, language_code)
+                .await
+                .map(|optimized| constrain_transcript_edit(&chunk, &optimized))
+        })
+        .buffered(chunk_concurrency)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let stitched = merge_optimized_transcript_sections(
+        &current_sections,
+        (OPTIMIZE_CHUNK_OVERLAP_WORDS / 2).max(4),
+    );
+    if stitched.trim().is_empty() {
+        return Ok(cleaned);
+    }
+
+    let reduced = constrain_transcript_edit(&cleaned, &stitched);
+    if reduced.trim().is_empty() {
+        Ok(cleaned)
+    } else {
+        Ok(reduced)
+    }
+}
+
 async fn summarize_with_rag(
     enhancer: &dyn TranscriptEnhancer,
     transcript: &str,
@@ -1066,66 +1184,129 @@ async fn summarize_with_rag(
         ));
     }
 
-    let mut chunk_notes = Vec::with_capacity(chunks.len());
-    let total = chunks.len();
-
-    for (index, chunk) in chunks.iter().enumerate() {
-        let chunk_prompt = format!(
-            "You are extracting detailed notes from a transcript chunk to support a comprehensive summary.\n\
-             Your goal is to capture ALL substantive content — not just bullet-point keywords.\n\n\
-             User instructions (follow these exactly):\n{user_instructions}\n\n\
-             This is chunk {}/{} of the full transcript.\n\n\
-             Extract the following from this chunk:\n\
-             - Main topics and arguments discussed, with enough context to understand them\n\
-             - Key facts, statistics, names, dates, and specific claims\n\
-             - Explanations, reasoning, and cause-effect relationships\n\
-             - Decisions made, action items, or next steps mentioned\n\
-             - Notable quotes or strong statements\n\
-             - Any speaker attributions if present\n\n\
-             Write thorough, self-contained notes (not single-word bullets). \
-             Each note should be understandable on its own without the original transcript.\n\n\
-             Transcript chunk:\n{}",
-            index + 1,
-            total,
-            chunk
-        );
-
-        let note = ask_with_overflow_fallback(
-            enhancer,
-            vec![
-                chunk_prompt.clone(),
-                truncate_chars(&chunk_prompt, 2600),
-                truncate_chars(&chunk_prompt, 1900),
-            ],
-        )
-        .await?;
-
-        chunk_notes.push(format!("Chunk {} notes:\n{}", index + 1, note.trim()));
+    if enhancer.prefers_single_pass_summary() {
+        match enhancer
+            .ask(&build_direct_summary_prompt(transcript, user_instructions))
+            .await
+        {
+            Ok(answer) => {
+                let trimmed = answer.trim();
+                if !trimmed.is_empty() {
+                    return Ok(trimmed.to_string());
+                }
+            }
+            Err(error) => {
+                if !is_context_window_error(&error) {
+                    return Err(error);
+                }
+            }
+        }
     }
+
+    if chunks.len() == 1 {
+        return ask_with_overflow_fallback(
+            enhancer,
+            vec![build_direct_summary_prompt(transcript, user_instructions)],
+        )
+        .await;
+    }
+
+    let total = chunks.len();
+    let chunk_concurrency_limit = enhancer
+        .summary_chunk_concurrency_limit()
+        .max(1)
+        .min(SUMMARY_CHUNK_CONCURRENCY_LIMIT);
+    let chunk_concurrency = total.clamp(1, chunk_concurrency_limit);
+    let chunk_notes = stream::iter(chunks.into_iter().enumerate())
+        .map(|(index, chunk)| async move {
+            let chunk_prompt =
+                build_chunk_note_prompt(index + 1, total, user_instructions, chunk.as_str());
+            let note = ask_with_overflow_fallback(
+                enhancer,
+                vec![
+                    chunk_prompt.clone(),
+                    truncate_chars(&chunk_prompt, 2600),
+                    truncate_chars(&chunk_prompt, 1900),
+                ],
+            )
+            .await?;
+
+            Ok::<String, ApplicationError>(format!("Chunk {} notes:\n{}", index + 1, note.trim()))
+        })
+        .buffered(chunk_concurrency)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
 
     let merged_notes = chunk_notes.join("\n\n");
     let candidates = SUMMARY_SYNTHESIS_BUDGETS
         .iter()
         .map(|budget| {
             let clipped_notes = truncate_chars(&merged_notes, *budget);
-            format!(
-                "You are writing the final summary of a transcript from the extracted chunk notes below.\n\n\
-                 User instructions (follow these exactly — including language, structure, and formatting preferences):\n\
-                 {user_instructions}\n\n\
-                 Requirements for the final summary:\n\
-                 - Produce a substantive, polished document — not an abbreviated list of topics.\n\
-                 - Cover all major subjects discussed in the transcript with enough depth that a reader \
-                 who has not heard the original audio would gain a clear understanding.\n\
-                 - Maintain logical flow between topics: use transitions and group related ideas together.\n\
-                 - Preserve specific details (names, numbers, examples) that support the main points.\n\
-                 - Respect the user's language, structural, and formatting preferences exactly.\n\
-                 - Output ONLY the summary text. Do not add meta-commentary or labels like \"Summary:\".\n\n\
-                 Chunk notes:\n{clipped_notes}"
-            )
+            build_summary_synthesis_prompt(&clipped_notes, user_instructions)
         })
         .collect::<Vec<_>>();
 
     ask_with_overflow_fallback(enhancer, candidates).await
+}
+
+fn build_direct_summary_prompt(transcript: &str, user_instructions: &str) -> String {
+    format!(
+        "You are writing the final summary of a transcript.\n\n\
+         User instructions (follow these exactly — including language, structure, and formatting preferences):\n\
+         {user_instructions}\n\n\
+         Requirements for the final summary:\n\
+         - Produce a substantive, polished document — not an abbreviated list of topics.\n\
+         - Cover all major subjects discussed in the transcript with enough depth that a reader \
+         who has not heard the original audio would gain a clear understanding.\n\
+         - Maintain logical flow between topics: use transitions and group related ideas together.\n\
+         - Preserve specific details (names, numbers, examples) that support the main points.\n\
+         - Respect the user's language, structural, and formatting preferences exactly.\n\
+         - Output ONLY the summary text. Do not add meta-commentary or labels like \"Summary:\".\n\n\
+         Full transcript:\n{transcript}"
+    )
+}
+
+fn build_chunk_note_prompt(
+    chunk_index: usize,
+    total_chunks: usize,
+    user_instructions: &str,
+    chunk: &str,
+) -> String {
+    format!(
+        "You are extracting detailed notes from a transcript chunk to support a comprehensive summary.\n\
+         Your goal is to capture ALL substantive content — not just bullet-point keywords.\n\n\
+         User instructions (follow these exactly):\n{user_instructions}\n\n\
+         This is chunk {chunk_index}/{total_chunks} of the full transcript.\n\n\
+         Extract the following from this chunk:\n\
+         - Main topics and arguments discussed, with enough context to understand them\n\
+         - Key facts, statistics, names, dates, and specific claims\n\
+         - Explanations, reasoning, and cause-effect relationships\n\
+         - Decisions made, action items, or next steps mentioned\n\
+         - Notable quotes or strong statements\n\
+         - Any speaker attributions if present\n\n\
+         Write thorough, self-contained notes (not single-word bullets). \
+         Each note should be understandable on its own without the original transcript.\n\n\
+         Transcript chunk:\n{chunk}"
+    )
+}
+
+fn build_summary_synthesis_prompt(chunk_notes: &str, user_instructions: &str) -> String {
+    format!(
+        "You are writing the final summary of a transcript from the extracted chunk notes below.\n\n\
+         User instructions (follow these exactly — including language, structure, and formatting preferences):\n\
+         {user_instructions}\n\n\
+         Requirements for the final summary:\n\
+         - Produce a substantive, polished document — not an abbreviated list of topics.\n\
+         - Cover all major subjects discussed in the transcript with enough depth that a reader \
+         who has not heard the original audio would gain a clear understanding.\n\
+         - Maintain logical flow between topics: use transitions and group related ideas together.\n\
+         - Preserve specific details (names, numbers, examples) that support the main points.\n\
+         - Respect the user's language, structural, and formatting preferences exactly.\n\
+         - Output ONLY the summary text. Do not add meta-commentary or labels like \"Summary:\".\n\n\
+         Chunk notes:\n{chunk_notes}"
+    )
 }
 
 fn is_context_window_error(error: &ApplicationError) -> bool {
@@ -1144,6 +1325,15 @@ fn is_context_window_error(error: &ApplicationError) -> bool {
 async fn ask_with_overflow_fallback(
     enhancer: &dyn TranscriptEnhancer,
     candidates: Vec<String>,
+) -> Result<String, ApplicationError> {
+    ask_with_overflow_fallback_for_operation(enhancer, candidates, SUMMARY_CONTEXT_OVERFLOW_MESSAGE)
+        .await
+}
+
+async fn ask_with_overflow_fallback_for_operation(
+    enhancer: &dyn TranscriptEnhancer,
+    candidates: Vec<String>,
+    overflow_message: &str,
 ) -> Result<String, ApplicationError> {
     let mut last_context_error: Option<ApplicationError> = None;
 
@@ -1167,8 +1357,7 @@ async fn ask_with_overflow_fallback(
 
     if last_context_error.is_some() {
         return Err(ApplicationError::PostProcessing(
-            "Exceeded model context window size. The app now uses chunked retrieval, but this request is still too large. Try a shorter custom prompt or fewer summary constraints."
-                .to_string(),
+            overflow_message.to_string(),
         ));
     }
 
@@ -1381,9 +1570,51 @@ fn export_txt(path: &Path, transcription: &str) -> Result<(), CommandError> {
         .map_err(|e| CommandError::new("export", format!("failed to export txt: {e}")))
 }
 
-fn export_docx(path: &Path, transcription: &str) -> Result<(), CommandError> {
-    let doc =
-        Docx::new().add_paragraph(Paragraph::new().add_run(Run::new().add_text(transcription)));
+fn export_md(path: &Path, content: &str) -> Result<(), CommandError> {
+    std::fs::write(path, content)
+        .map_err(|e| CommandError::new("export", format!("failed to export markdown: {e}")))
+}
+
+fn export_csv(path: &Path, segments: &[ExportSegment]) -> Result<(), CommandError> {
+    let header = "Start Timestamp;End Timestamp;Transcript";
+    let rows = if segments.is_empty() {
+        vec!["00:00;00:00;\"\"".to_string()]
+    } else {
+        segments
+            .iter()
+            .map(|segment| {
+                let start_seconds = parse_timestamp_to_seconds(&segment.time);
+                let end_time = format_mm_ss_u32(start_seconds + 11);
+                format!(
+                    "{};{};\"{}\"",
+                    segment.time,
+                    end_time,
+                    segment.line.replace('"', "\"\"")
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    std::fs::write(path, format!("{header}\n{}", rows.join("\n")))
+        .map_err(|e| CommandError::new("export", format!("failed to export csv: {e}")))
+}
+
+fn export_docx(path: &Path, document: &ExportDocument) -> Result<(), CommandError> {
+    let mut doc = Docx::new()
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text(&document.title)))
+        .add_paragraph(Paragraph::new());
+
+    for (index, section) in document.sections.iter().enumerate() {
+        if index > 0 {
+            doc = doc.add_paragraph(Paragraph::new());
+        }
+
+        doc = doc.add_paragraph(Paragraph::new().add_run(Run::new().add_text(&section.title)));
+
+        for line in section.body.lines() {
+            doc = doc.add_paragraph(Paragraph::new().add_run(Run::new().add_text(line)));
+        }
+    }
 
     let file = File::create(path)
         .map_err(|e| CommandError::new("export", format!("failed to create docx file: {e}")))?;
@@ -1393,12 +1624,23 @@ fn export_docx(path: &Path, transcription: &str) -> Result<(), CommandError> {
         .map_err(|e| CommandError::new("export", format!("failed to write docx: {e}")))
 }
 
-fn export_html(path: &Path, title: &str, transcription: &str) -> Result<(), CommandError> {
-    let escaped_title = escape_html(title);
-    let escaped_transcription = escape_html(transcription).replace('\n', "<br/>\n");
+fn export_html(path: &Path, language: &str, document: &ExportDocument) -> Result<(), CommandError> {
+    let escaped_title = escape_html(&document.title);
+    let sections_html = document
+        .sections
+        .iter()
+        .map(|section| {
+            format!(
+                "<section class=\"section\"><h2>{}</h2><div class=\"content\">{}</div></section>",
+                escape_html(&section.title),
+                escape_html(&section.body).replace('\n', "<br/>\n")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let html = format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n<title>{}</title>\n<style>\nbody{{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:2rem;color:#1f2430;background:#f8fafc;}}\nmain{{max-width:880px;margin:0 auto;padding:1.5rem 1.75rem;background:#fff;border:1px solid #dbe2ee;border-radius:14px;}}\nh1{{font-size:1.35rem;margin:0 0 1rem;}}\n.content{{line-height:1.6;font-size:1rem;word-break:break-word;}}\n</style>\n</head>\n<body>\n<main>\n<h1>{}</h1>\n<div class=\"content\">{}</div>\n</main>\n</body>\n</html>\n",
-        escaped_title, escaped_title, escaped_transcription
+        "<!doctype html>\n<html lang=\"{}\">\n<head>\n<meta charset=\"utf-8\" />\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n<title>{}</title>\n<style>\nbody{{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;margin:2rem;color:#1f2430;background:#f8fafc;}}\nmain{{max-width:880px;margin:0 auto;padding:1.5rem 1.75rem;background:#fff;border:1px solid #dbe2ee;border-radius:14px;}}\nh1{{font-size:1.35rem;margin:0 0 1rem;}}\n.section + .section{{margin-top:1.75rem;padding-top:1.25rem;border-top:1px solid #e2e8f0;}}\nh2{{font-size:1rem;margin:0 0 0.75rem;}}\n.content{{line-height:1.6;font-size:1rem;word-break:break-word;}}\n</style>\n</head>\n<body>\n<main>\n<h1>{}</h1>\n{}\n</main>\n</body>\n</html>\n",
+        language, escaped_title, escaped_title, sections_html
     );
 
     std::fs::write(path, html)
@@ -1408,6 +1650,7 @@ fn export_html(path: &Path, title: &str, transcription: &str) -> Result<(), Comm
 fn export_json(
     path: &Path,
     artifact: &TranscriptArtifact,
+    document: &ExportDocument,
     style: ExportStyle,
     grouping: ExportGrouping,
     include_timestamps: bool,
@@ -1427,6 +1670,13 @@ fn export_json(
             "include_timestamps": include_timestamps,
             "grouping": grouping
         },
+        "document_title": document.title,
+        "sections": document.sections.iter().map(|section| {
+            json!({
+                "title": section.title,
+                "content": section.body,
+            })
+        }).collect::<Vec<_>>(),
         "content": content,
         "summary": artifact.summary,
         "faqs": artifact.faqs,
@@ -1441,24 +1691,25 @@ fn export_json(
         .map_err(|e| CommandError::new("export", format!("failed to export json: {e}")))
 }
 
-fn export_pdf(path: &Path, transcription: &str) -> Result<(), CommandError> {
-    let mut doc = PdfDocument::new("Transcription");
+fn export_pdf(path: &Path, document: &ExportDocument) -> Result<(), CommandError> {
+    let mut doc = PdfDocument::new(&document.title);
     let mut pages = Vec::new();
-    let mut ops = start_pdf_page_ops(true);
+    let mut ops = start_pdf_page_ops(Some(&document.title));
     let mut y = 780.0_f32;
+    let body_lines = render_document_body_lines(document);
 
-    if transcription.trim().is_empty() {
+    if body_lines.is_empty() {
         write_pdf_line(&mut ops, "No content available for export.", y);
     } else {
-        for line in transcription.lines() {
+        for line in body_lines {
             if y < 42.0 {
                 ops.push(Op::EndTextSection);
                 pages.push(PdfPage::new(Mm(210.0), Mm(297.0), ops));
-                ops = start_pdf_page_ops(false);
+                ops = start_pdf_page_ops(None);
                 y = 810.0;
             }
 
-            write_pdf_line(&mut ops, line, y);
+            write_pdf_line(&mut ops, &line, y);
             y -= 14.0;
         }
     }
@@ -1485,10 +1736,10 @@ fn export_pdf(path: &Path, transcription: &str) -> Result<(), CommandError> {
         .map_err(|e| CommandError::new("export", format!("failed to write pdf: {e}")))
 }
 
-fn start_pdf_page_ops(with_title: bool) -> Vec<Op> {
+fn start_pdf_page_ops(title: Option<&str>) -> Vec<Op> {
     let mut ops = vec![Op::StartTextSection];
 
-    if with_title {
+    if let Some(title) = title {
         ops.push(Op::SetFontSizeBuiltinFont {
             size: Pt(20.0),
             font: BuiltinFont::HelveticaBold,
@@ -1500,7 +1751,7 @@ fn start_pdf_page_ops(with_title: bool) -> Vec<Op> {
             },
         });
         ops.push(Op::WriteTextBuiltinFont {
-            items: vec![TextItem::Text("Transcription".to_string())],
+            items: vec![TextItem::Text(title.to_string())],
             font: BuiltinFont::HelveticaBold,
         });
 
@@ -1531,6 +1782,175 @@ fn write_pdf_line(ops: &mut Vec<Op>, line: &str, y: f32) {
     });
 }
 
+fn normalize_export_language(value: Option<&str>) -> &'static str {
+    match value.unwrap_or("en").trim() {
+        "it" => "it",
+        "es" => "es",
+        "de" => "de",
+        _ => "en",
+    }
+}
+
+fn localized_export_fallback_title(language: &str) -> &'static str {
+    match language {
+        "it" => "Trascrizione",
+        "es" => "Transcripcion",
+        "de" => "Transkript",
+        _ => "Transcript",
+    }
+}
+
+fn localized_export_document_title(language: &str, title: &str) -> String {
+    let title = if title.trim().is_empty() {
+        localized_export_fallback_title(language)
+    } else {
+        title.trim()
+    };
+
+    match language {
+        "it" => format!("Trascrizione di {title}"),
+        "es" => format!("Transcripcion de {title}"),
+        "de" => format!("Transkript von {title}"),
+        _ => format!("Transcript of {title}"),
+    }
+}
+
+fn localized_export_primary_section_title(language: &str, style: ExportStyle) -> &'static str {
+    match style {
+        ExportStyle::Segments => match language {
+            "it" => "Segmenti",
+            "es" => "Segmentos",
+            "de" => "Segmente",
+            _ => "Segments",
+        },
+        _ => match language {
+            "it" => "Trascrizione",
+            "es" => "Transcripcion",
+            "de" => "Transkript",
+            _ => "Transcript",
+        },
+    }
+}
+
+fn localized_export_summary_title(language: &str) -> &'static str {
+    match language {
+        "it" => "Riassunto",
+        "es" => "Resumen",
+        "de" => "Zusammenfassung",
+        _ => "Summary",
+    }
+}
+
+fn localized_export_faq_title(language: &str) -> &'static str {
+    match language {
+        "it" => "Domande frequenti",
+        "es" => "Preguntas frecuentes",
+        "de" => "Haeufige Fragen",
+        _ => "FAQs",
+    }
+}
+
+fn build_export_document(
+    language: &str,
+    title: &str,
+    transcription: &str,
+    summary: &str,
+    faqs: &str,
+    segments: &[ExportSegment],
+    style: ExportStyle,
+    include_timestamps: bool,
+) -> ExportDocument {
+    let mut sections = vec![ExportDocumentSection {
+        title: localized_export_primary_section_title(language, style).to_string(),
+        body: build_export_content(transcription, segments, style, include_timestamps),
+    }];
+
+    if !summary.trim().is_empty() {
+        sections.push(ExportDocumentSection {
+            title: localized_export_summary_title(language).to_string(),
+            body: summary.trim().to_string(),
+        });
+    }
+
+    if !faqs.trim().is_empty() {
+        sections.push(ExportDocumentSection {
+            title: localized_export_faq_title(language).to_string(),
+            body: faqs.trim().to_string(),
+        });
+    }
+
+    ExportDocument {
+        title: localized_export_document_title(language, title),
+        sections,
+    }
+}
+
+fn render_plain_text_document(document: &ExportDocument) -> String {
+    let mut blocks = vec![document.title.trim().to_string()];
+    blocks.extend(document.sections.iter().filter_map(|section| {
+        let body = section.body.trim();
+        if body.is_empty() {
+            None
+        } else {
+            Some(format!("{}\n{}", section.title.trim(), body))
+        }
+    }));
+    blocks.join("\n\n")
+}
+
+fn render_markdown_document(document: &ExportDocument) -> String {
+    let mut blocks = vec![format!("# {}", document.title.trim())];
+    blocks.extend(document.sections.iter().filter_map(|section| {
+        let body = section.body.trim();
+        if body.is_empty() {
+            None
+        } else {
+            Some(format!("## {}\n\n{}", section.title.trim(), body))
+        }
+    }));
+    blocks.join("\n\n")
+}
+
+fn render_document_body_lines(document: &ExportDocument) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for (index, section) in document.sections.iter().enumerate() {
+        if index == 0 {
+            lines.push(String::new());
+        } else {
+            lines.push(String::new());
+            lines.push(String::new());
+        }
+        lines.push(section.title.clone());
+        lines.extend(section.body.lines().map(|line| line.to_string()));
+    }
+
+    lines
+}
+
+fn build_export_segments(artifact: &TranscriptArtifact, transcription: &str) -> Vec<ExportSegment> {
+    let timeline_segments = parse_timeline_context_segments(artifact)
+        .into_iter()
+        .filter_map(|segment| {
+            let text = segment.text.trim();
+            let time = segment.time_label.unwrap_or_default();
+            if text.is_empty() || time.trim().is_empty() {
+                return None;
+            }
+            Some(ExportSegment {
+                time,
+                line: text.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if timeline_segments.is_empty() {
+        build_segments_from_text(transcription)
+    } else {
+        timeline_segments
+    }
+}
+
 fn build_segments_from_text(transcription: &str) -> Vec<ExportSegment> {
     transcription
         .lines()
@@ -1547,6 +1967,12 @@ fn build_segments_from_text(transcription: &str) -> Vec<ExportSegment> {
             }
         })
         .collect()
+}
+
+fn format_mm_ss_u32(total_seconds: u32) -> String {
+    let mm = total_seconds / 60;
+    let ss = total_seconds % 60;
+    format!("{:02}:{:02}", mm, ss)
 }
 
 fn parse_timestamp_to_seconds(value: &str) -> u32 {
@@ -1573,6 +1999,48 @@ fn format_srt_time(seconds: u32) -> String {
     format!("{:02}:{:02}:{:02},000", hh, mm, ss)
 }
 
+fn format_vtt_time(seconds: u32) -> String {
+    let hh = seconds / 3600;
+    let mm = (seconds % 3600) / 60;
+    let ss = seconds % 60;
+    format!("{:02}:{:02}:{:02}.000", hh, mm, ss)
+}
+
+fn build_markdown_subtitles_content(segments: &[ExportSegment], transcription: &str) -> String {
+    if segments.is_empty() {
+        return transcription.trim().to_string();
+    }
+
+    segments
+        .iter()
+        .map(|segment| format!("{}\n{}", segment.line.trim(), segment.time))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn build_vtt_content(segments: &[ExportSegment], transcription: &str) -> String {
+    if segments.is_empty() {
+        return format!("WEBVTT\n\n{}", transcription.trim());
+    }
+
+    let cues = segments
+        .iter()
+        .map(|segment| {
+            let start_seconds = parse_timestamp_to_seconds(&segment.time);
+            let end_seconds = start_seconds + 11;
+            format!(
+                "{} --> {}\n{}",
+                format_vtt_time(start_seconds),
+                format_vtt_time(end_seconds),
+                segment.line.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    format!("WEBVTT\n\n{cues}")
+}
+
 fn build_export_content(
     transcription: &str,
     segments: &[ExportSegment],
@@ -1592,7 +2060,7 @@ fn build_export_content(
                 .enumerate()
                 .map(|(index, segment)| {
                     let start_seconds = parse_timestamp_to_seconds(&segment.time);
-                    let end_seconds = start_seconds + 4;
+                    let end_seconds = start_seconds + 11;
                     format!(
                         "{}\n{} --> {}\n{}",
                         index + 1,
@@ -1646,17 +2114,182 @@ fn escape_html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+    };
 
+    use async_trait::async_trait;
     use chrono::Utc;
+    use sbobino_application::dto::SummaryFaq;
     use serde_json::json;
 
     use super::{
-        build_artifact_context_transcript, build_chat_context_candidates,
-        build_summary_instructions, chunk_text_by_words, is_context_window_error,
-        ApplicationError, ArtifactAiContextOptions, ArtifactKind, SummarizeArtifactPayload,
-        TranscriptArtifact,
+        build_artifact_context_transcript, build_chat_context_candidates, build_export_content,
+        build_export_document, build_export_segments, build_summary_instructions,
+        chunk_text_by_words, is_context_window_error, optimize_with_rag,
+        render_plain_text_document, summarize_with_rag, ApplicationError, ArtifactAiContextOptions,
+        ArtifactKind, ExportStyle, SummarizeArtifactPayload, TranscriptArtifact,
+        TranscriptEnhancer,
     };
+
+    struct TrackingEnhancer {
+        optimize_calls: AtomicUsize,
+        ask_calls: AtomicUsize,
+        active_calls: AtomicUsize,
+        max_active_calls: AtomicUsize,
+        prompts: Mutex<Vec<String>>,
+        prefer_single_pass: bool,
+        chunk_concurrency_limit: usize,
+        fail_direct_attempts: AtomicUsize,
+        hallucinate_optimize: bool,
+        hallucinate_merge: bool,
+    }
+
+    impl TrackingEnhancer {
+        fn new(
+            prefer_single_pass: bool,
+            chunk_concurrency_limit: usize,
+            fail_direct_attempts: usize,
+        ) -> Self {
+            Self {
+                optimize_calls: AtomicUsize::new(0),
+                ask_calls: AtomicUsize::new(0),
+                active_calls: AtomicUsize::new(0),
+                max_active_calls: AtomicUsize::new(0),
+                prompts: Mutex::new(Vec::new()),
+                prefer_single_pass,
+                chunk_concurrency_limit,
+                fail_direct_attempts: AtomicUsize::new(fail_direct_attempts),
+                hallucinate_optimize: false,
+                hallucinate_merge: false,
+            }
+        }
+
+        fn with_hallucinations(
+            prefer_single_pass: bool,
+            chunk_concurrency_limit: usize,
+            fail_direct_attempts: usize,
+            hallucinate_optimize: bool,
+            hallucinate_merge: bool,
+        ) -> Self {
+            Self {
+                hallucinate_optimize,
+                hallucinate_merge,
+                ..Self::new(
+                    prefer_single_pass,
+                    chunk_concurrency_limit,
+                    fail_direct_attempts,
+                )
+            }
+        }
+
+        fn record_peak_concurrency(&self, observed: usize) {
+            let mut current = self.max_active_calls.load(Ordering::SeqCst);
+            while observed > current {
+                match self.max_active_calls.compare_exchange(
+                    current,
+                    observed,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TranscriptEnhancer for TrackingEnhancer {
+        async fn optimize(
+            &self,
+            text: &str,
+            _language_code: &str,
+        ) -> Result<String, ApplicationError> {
+            self.optimize_calls.fetch_add(1, Ordering::SeqCst);
+            if self.hallucinate_optimize {
+                Ok(format!("{text} added commentary"))
+            } else {
+                Ok(text.to_string())
+            }
+        }
+
+        async fn summarize_and_faq(
+            &self,
+            text: &str,
+            _language_code: &str,
+        ) -> Result<SummaryFaq, ApplicationError> {
+            Ok(SummaryFaq {
+                summary: text.to_string(),
+                faqs: String::new(),
+            })
+        }
+
+        async fn ask(&self, prompt: &str) -> Result<String, ApplicationError> {
+            self.ask_calls.fetch_add(1, Ordering::SeqCst);
+            self.prompts
+                .lock()
+                .expect("prompt log lock poisoned")
+                .push(prompt.to_string());
+
+            let active = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.record_peak_concurrency(active);
+
+            for _ in 0..6 {
+                tokio::task::yield_now().await;
+            }
+
+            self.active_calls.fetch_sub(1, Ordering::SeqCst);
+
+            if prompt.contains("Full transcript:")
+                && self.fail_direct_attempts.load(Ordering::SeqCst) > 0
+            {
+                self.fail_direct_attempts.fetch_sub(1, Ordering::SeqCst);
+                return Err(ApplicationError::PostProcessing(
+                    "Foundation bridge error: Exceeded model context window size".to_string(),
+                ));
+            }
+
+            if prompt.contains("Chunk notes:") || prompt.contains("Full transcript:") {
+                Ok("final summary".to_string())
+            } else if prompt.contains("Optimized transcript sections:") {
+                if self.hallucinate_merge {
+                    Ok("merged optimized transcript with extra conclusion".to_string())
+                } else {
+                    Ok(prompt
+                        .split("Optimized transcript sections:\n")
+                        .nth(1)
+                        .unwrap_or_default()
+                        .lines()
+                        .filter(|line| !line.trim_start().starts_with("[Section "))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .trim()
+                        .to_string())
+                }
+            } else {
+                Ok("chunk note".to_string())
+            }
+        }
+
+        fn prefers_single_pass_summary(&self) -> bool {
+            self.prefer_single_pass
+        }
+
+        fn summary_chunk_concurrency_limit(&self) -> usize {
+            self.chunk_concurrency_limit
+        }
+    }
+
+    impl Default for TrackingEnhancer {
+        fn default() -> Self {
+            Self::new(false, 3, 0)
+        }
+    }
 
     fn sample_artifact(text: &str) -> TranscriptArtifact {
         TranscriptArtifact {
@@ -1753,6 +2386,80 @@ mod tests {
     }
 
     #[test]
+    fn export_segments_use_timeline_and_keep_one_line_per_segment() {
+        let artifact = sample_artifact_with_timeline("fallback transcript");
+        let segments = build_export_segments(&artifact, "fallback transcript");
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].time, "00:12");
+        assert_eq!(segments[0].line, "Alice opens the meeting.");
+
+        let content = build_export_content(
+            "fallback transcript",
+            &segments,
+            ExportStyle::Segments,
+            true,
+        );
+
+        assert!(content.contains("[00:12] Alice opens the meeting."));
+        assert!(!content.contains("[00:12]\nAlice opens the meeting."));
+    }
+
+    #[test]
+    fn export_with_content_override_and_empty_segments_generates_segments_from_override() {
+        let artifact = sample_artifact_with_timeline("fallback transcript");
+        let base_transcription = "Optimized first line.\nOptimized second line.";
+        let payload_segments = Some(Vec::<super::ExportSegment>::new());
+
+        let segments = match payload_segments {
+            Some(entries) if !entries.is_empty() => entries,
+            Some(_) => super::build_segments_from_text(base_transcription),
+            None => build_export_segments(&artifact, base_transcription),
+        };
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].time, "00:00");
+        assert_eq!(segments[0].line, "Optimized first line.");
+        assert_eq!(segments[1].time, "00:04");
+        assert_eq!(segments[1].line, "Optimized second line.");
+    }
+
+    #[test]
+    fn export_document_localizes_title_and_includes_summary_and_faqs() {
+        let mut artifact = sample_artifact("Linea uno");
+        artifact.title = "Riunione team".to_string();
+        artifact.summary = "Sintesi breve".to_string();
+        artifact.faqs = "D: Chi segue?\nR: Marta.".to_string();
+
+        let segments = vec![super::ExportSegment {
+            time: "00:00".to_string(),
+            line: "Linea uno".to_string(),
+        }];
+
+        let document = build_export_document(
+            "it",
+            &artifact.title,
+            &artifact.raw_transcript,
+            &artifact.summary,
+            &artifact.faqs,
+            &segments,
+            ExportStyle::Segments,
+            true,
+        );
+
+        assert_eq!(document.title, "Trascrizione di Riunione team");
+        assert_eq!(document.sections[0].title, "Segmenti");
+        assert_eq!(document.sections[1].title, "Riassunto");
+        assert_eq!(document.sections[2].title, "Domande frequenti");
+
+        let plain_text = render_plain_text_document(&document);
+        assert!(plain_text.contains("Trascrizione di Riunione team"));
+        assert!(plain_text.contains("Segmenti\n[00:00] Linea uno"));
+        assert!(plain_text.contains("Riassunto\nSintesi breve"));
+        assert!(plain_text.contains("Domande frequenti\nD: Chi segue?\nR: Marta."));
+    }
+
+    #[test]
     fn summary_instructions_keep_required_controls_even_with_custom_prompt() {
         let instructions = build_summary_instructions(&SummarizeArtifactPayload {
             id: "artifact-1".to_string(),
@@ -1780,5 +2487,135 @@ mod tests {
             "Foundation bridge error: Exceeded model context window size".to_string(),
         );
         assert!(is_context_window_error(&error));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_uses_single_pass_for_short_transcripts() {
+        let enhancer = TrackingEnhancer::default();
+        let transcript = "Alice reviews the roadmap and confirms the launch checklist is complete.";
+
+        let optimized = optimize_with_rag(&enhancer, transcript, "en")
+            .await
+            .expect("optimization should succeed");
+
+        assert_eq!(optimized, transcript);
+        assert_eq!(enhancer.optimize_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(enhancer.ask_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_chunks_large_transcripts_and_merges_them() {
+        let enhancer = Arc::new(TrackingEnhancer::new(true, 1, 0));
+        let transcript =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(450);
+
+        let optimized = optimize_with_rag(enhancer.as_ref(), &transcript, "en")
+            .await
+            .expect("optimization should succeed");
+
+        assert!(!optimized.trim().is_empty());
+        assert!(enhancer.optimize_calls.load(Ordering::SeqCst) > 1);
+        assert_eq!(enhancer.ask_calls.load(Ordering::SeqCst), 0);
+        assert!(!optimized.contains("[Section"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_rejects_added_text_from_enhancer() {
+        let enhancer = TrackingEnhancer::with_hallucinations(false, 1, 0, true, false);
+        let transcript = "Alice reviews the roadmap and confirms the launch checklist is complete.";
+
+        let optimized = optimize_with_rag(&enhancer, transcript, "en")
+            .await
+            .expect("optimization should succeed");
+
+        assert_eq!(optimized, transcript);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn summarize_with_rag_uses_single_pass_for_short_transcripts() {
+        let enhancer = TrackingEnhancer::default();
+
+        let summary = summarize_with_rag(
+            &enhancer,
+            "Alice reviews the roadmap and confirms the launch checklist is complete.",
+            "Write a concise English summary.",
+        )
+        .await
+        .expect("summary should succeed");
+
+        assert_eq!(summary, "final summary");
+        assert_eq!(enhancer.ask_calls.load(Ordering::SeqCst), 1);
+
+        let prompts = enhancer.prompts.lock().expect("prompt log lock poisoned");
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("Full transcript:"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn summarize_with_rag_processes_chunk_notes_with_bounded_concurrency() {
+        let enhancer = Arc::new(TrackingEnhancer::default());
+        let transcript =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(450);
+
+        let summary = summarize_with_rag(
+            enhancer.as_ref(),
+            &transcript,
+            "Write a detailed English summary with sections.",
+        )
+        .await
+        .expect("summary should succeed");
+
+        assert_eq!(summary, "final summary");
+        assert!(enhancer.ask_calls.load(Ordering::SeqCst) >= 3);
+        assert!(enhancer.max_active_calls.load(Ordering::SeqCst) > 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn summarize_with_rag_prefers_single_pass_for_foundation_style_enhancer() {
+        let enhancer = TrackingEnhancer::new(true, 1, 0);
+        let transcript =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(450);
+
+        let summary = summarize_with_rag(
+            &enhancer,
+            &transcript,
+            "Write a detailed English summary with sections.",
+        )
+        .await
+        .expect("summary should succeed");
+
+        assert_eq!(summary, "final summary");
+        assert_eq!(enhancer.ask_calls.load(Ordering::SeqCst), 1);
+
+        let prompts = enhancer.prompts.lock().expect("prompt log lock poisoned");
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("Full transcript:"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn summarize_with_rag_falls_back_to_chunking_after_direct_context_error() {
+        let enhancer = Arc::new(TrackingEnhancer::new(true, 1, 1));
+        let transcript =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(450);
+
+        let summary = summarize_with_rag(
+            enhancer.as_ref(),
+            &transcript,
+            "Write a detailed English summary with sections.",
+        )
+        .await
+        .expect("summary should succeed");
+
+        assert_eq!(summary, "final summary");
+        assert!(enhancer.ask_calls.load(Ordering::SeqCst) >= 4);
+        assert_eq!(enhancer.max_active_calls.load(Ordering::SeqCst), 1);
+
+        let prompts = enhancer.prompts.lock().expect("prompt log lock poisoned");
+        assert!(prompts
+            .first()
+            .is_some_and(|prompt| prompt.contains("Full transcript:")));
+        assert!(prompts
+            .iter()
+            .any(|prompt| prompt.contains("Transcript chunk:")));
     }
 }

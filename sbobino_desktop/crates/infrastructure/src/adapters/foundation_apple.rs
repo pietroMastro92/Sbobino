@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use sbobino_application::{dto::SummaryFaq, ApplicationError, TranscriptEnhancer};
 
@@ -124,6 +124,14 @@ impl TranscriptEnhancer for FoundationAppleEnhancer {
     async fn ask(&self, prompt: &str) -> Result<String, ApplicationError> {
         FoundationAppleEnhancer::ask(self, prompt).await
     }
+
+    fn prefers_single_pass_summary(&self) -> bool {
+        true
+    }
+
+    fn summary_chunk_concurrency_limit(&self) -> usize {
+        1
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -168,12 +176,12 @@ fn build_optimize_prompt(
         })
     {
         return format!(
-            "{template}\n\nLanguage: {language_instruction}\n\nTranscript:\n{text}\n\nReturn only the optimized text."
+            "{template}\n\nLanguage: {language_instruction}\n\nAdditional cleanup rules:\n- Preserve the original wording and order of the transcript.\n- Only improve punctuation, capitalization, spacing, and paragraph breaks.\n- Remove obvious accidental repetitions, duplicated lines, and looped sentences.\n- Keep only one occurrence when the same sentence is repeated in sequence by mistake.\n- Do not paraphrase, summarize, rewrite, fix wording, or add any words that are not already present in the transcript.\n- Do not invent missing content.\n\nTranscript:\n{text}\n\nReturn only the cleaned transcript."
         );
     }
 
     format!(
-        "Clean and optimize this transcript while preserving the same language as the source text ({language_instruction}). Return only optimized text.\n\n{text}"
+        "Clean this transcript while preserving the same language as the source text ({language_instruction}). Preserve the original wording and order. Only improve punctuation, capitalization, spacing, and paragraph breaks, and remove obvious transcription glitches such as consecutive duplicated lines, repeated phrases, looped sentences, and hallucinated filler. When the same sentence is repeated accidentally in sequence, keep only the single best occurrence. Do not paraphrase, summarize, rewrite, fix wording, or add any words that are not already present in the transcript. Do not invent missing content. Return only the cleaned transcript.\n\n{text}"
     )
 }
 
@@ -214,59 +222,122 @@ fn build_summary_prompt(
 fn run_foundation_bridge(
     input: &FoundationBridgeInput,
 ) -> Result<FoundationBridgeOutput, ApplicationError> {
-    let binary_path = ensure_bridge_binary()?;
-    let input_json = serde_json::to_vec(input).map_err(|error| {
-        ApplicationError::PostProcessing(format!(
-            "failed to encode Foundation bridge input: {error}"
-        ))
+    static CLIENT: OnceLock<Mutex<Option<FoundationBridgeProcess>>> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| Mutex::new(None));
+    let mut guard = client.lock().map_err(|_| {
+        ApplicationError::PostProcessing("Foundation bridge client lock poisoned".to_string())
     })?;
 
-    let mut child = Command::new(binary_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
+    if guard.is_none() {
+        *guard = Some(FoundationBridgeProcess::spawn()?);
+    }
+
+    let first_attempt = guard
+        .as_mut()
+        .expect("foundation bridge process initialized")
+        .send(input);
+
+    match first_attempt {
+        Ok(output) => Ok(output),
+        Err(_) => {
+            *guard = Some(FoundationBridgeProcess::spawn()?);
+            guard
+                .as_mut()
+                .expect("foundation bridge process reinitialized")
+                .send(input)
+        }
+    }
+}
+
+struct FoundationBridgeProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl FoundationBridgeProcess {
+    fn spawn() -> Result<Self, ApplicationError> {
+        let binary_path = ensure_bridge_binary()?;
+        let mut child = Command::new(binary_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                ApplicationError::PostProcessing(format!(
+                    "failed to launch Foundation bridge binary: {error}"
+                ))
+            })?;
+
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ApplicationError::PostProcessing(
+                "Foundation bridge did not expose a writable stdin".to_string(),
+            )
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ApplicationError::PostProcessing(
+                "Foundation bridge did not expose a readable stdout".to_string(),
+            )
+        })?;
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    fn send(
+        &mut self,
+        input: &FoundationBridgeInput,
+    ) -> Result<FoundationBridgeOutput, ApplicationError> {
+        let input_json = serde_json::to_string(input).map_err(|error| {
             ApplicationError::PostProcessing(format!(
-                "failed to launch Foundation bridge binary: {error}"
+                "failed to encode Foundation bridge input: {error}"
             ))
         })?;
 
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(&input_json).map_err(|error| {
+        writeln!(self.stdin, "{input_json}").map_err(|error| {
             ApplicationError::PostProcessing(format!(
                 "failed to write Foundation bridge input: {error}"
             ))
         })?;
+        self.stdin.flush().map_err(|error| {
+            ApplicationError::PostProcessing(format!(
+                "failed to flush Foundation bridge input: {error}"
+            ))
+        })?;
+
+        let mut response_line = String::new();
+        let bytes_read = self.stdout.read_line(&mut response_line).map_err(|error| {
+            ApplicationError::PostProcessing(format!(
+                "failed to read Foundation bridge output: {error}"
+            ))
+        })?;
+
+        if bytes_read == 0 {
+            let status = self.child.try_wait().ok().flatten();
+            let suffix = status
+                .map(|value| format!(" (status {value})"))
+                .unwrap_or_default();
+            return Err(ApplicationError::PostProcessing(format!(
+                "Foundation bridge terminated without a response{suffix}"
+            )));
+        }
+
+        serde_json::from_str::<FoundationBridgeOutput>(response_line.trim()).map_err(|error| {
+            ApplicationError::PostProcessing(format!(
+                "failed to decode Foundation bridge response: {error}"
+            ))
+        })
     }
+}
 
-    let output = child.wait_with_output().map_err(|error| {
-        ApplicationError::PostProcessing(format!(
-            "failed to read Foundation bridge output: {error}"
-        ))
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let message = if stderr.is_empty() {
-            format!("Foundation bridge exited with status {}", output.status)
-        } else {
-            format!("Foundation bridge failed: {stderr}")
-        };
-        return Err(ApplicationError::PostProcessing(message));
+impl Drop for FoundationBridgeProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
-
-    let stdout = String::from_utf8(output.stdout).map_err(|error| {
-        ApplicationError::PostProcessing(format!(
-            "Foundation bridge returned invalid UTF-8 output: {error}"
-        ))
-    })?;
-
-    serde_json::from_str::<FoundationBridgeOutput>(stdout.trim()).map_err(|error| {
-        ApplicationError::PostProcessing(format!(
-            "failed to decode Foundation bridge response: {error}"
-        ))
-    })
 }
 
 #[cfg(test)]
@@ -278,6 +349,7 @@ mod tests {
         let prompt = build_optimize_prompt("ciao", "auto", None, None);
         assert!(prompt.contains("the same language as the source text"));
         assert!(prompt.contains("the same language as the transcript"));
+        assert!(prompt.contains("repeated phrases"));
     }
 }
 
@@ -385,57 +457,79 @@ struct BridgeOutput: Encodable {
 @main
 struct FoundationBridge {
     static func main() async {
-        do {
-            let data = FileHandle.standardInput.readDataToEndOfFile()
-            let input = try JSONDecoder().decode(BridgeInput.self, from: data)
+        while let line = readLine() {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                continue
+            }
 
-            #if canImport(FoundationModels)
-            let model = SystemLanguageModel.default
-            guard model.isAvailable else {
-                let output = BridgeOutput(
-                    ok: false,
-                    content: nil,
-                    error: "Foundation Model is unavailable on this Mac",
-                    availability: availabilityDescription(model.availability)
+            do {
+                guard let data = trimmed.data(using: .utf8) else {
+                    writeLine(
+                        BridgeOutput(
+                            ok: false,
+                            content: nil,
+                            error: "Foundation bridge error: invalid UTF-8 input",
+                            availability: nil
+                        )
+                    )
+                    continue
+                }
+
+                let input = try JSONDecoder().decode(BridgeInput.self, from: data)
+
+                #if canImport(FoundationModels)
+                let model = SystemLanguageModel.default
+                guard model.isAvailable else {
+                    writeLine(
+                        BridgeOutput(
+                            ok: false,
+                            content: nil,
+                            error: "Foundation Model is unavailable on this Mac",
+                            availability: availabilityDescription(model.availability)
+                        )
+                    )
+                    continue
+                }
+
+                let session = LanguageModelSession()
+                let mergedPrompt: String
+                if let instructions = input.instructions?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !instructions.isEmpty {
+                    mergedPrompt = "\(instructions)\n\n\(input.prompt)"
+                } else {
+                    mergedPrompt = input.prompt
+                }
+
+                let response = try await session.respond(to: mergedPrompt)
+                writeLine(
+                    BridgeOutput(
+                        ok: true,
+                        content: response.content,
+                        error: nil,
+                        availability: "available"
+                    )
                 )
-                print(encode(output))
-                return
+                #else
+                writeLine(
+                    BridgeOutput(
+                        ok: false,
+                        content: nil,
+                        error: "FoundationModels framework is not available in this runtime",
+                        availability: "unsupported_runtime"
+                    )
+                )
+                #endif
+            } catch {
+                writeLine(
+                    BridgeOutput(
+                        ok: false,
+                        content: nil,
+                        error: "Foundation bridge error: \(error.localizedDescription)",
+                        availability: nil
+                    )
+                )
             }
-
-            let session = LanguageModelSession()
-            let mergedPrompt: String
-            if let instructions = input.instructions?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !instructions.isEmpty {
-                mergedPrompt = "\(instructions)\n\n\(input.prompt)"
-            } else {
-                mergedPrompt = input.prompt
-            }
-
-            let response = try await session.respond(to: mergedPrompt)
-            let output = BridgeOutput(
-                ok: true,
-                content: response.content,
-                error: nil,
-                availability: "available"
-            )
-            print(encode(output))
-            #else
-            let output = BridgeOutput(
-                ok: false,
-                content: nil,
-                error: "FoundationModels framework is not available in this runtime",
-                availability: "unsupported_runtime"
-            )
-            print(encode(output))
-            #endif
-        } catch {
-            let output = BridgeOutput(
-                ok: false,
-                content: nil,
-                error: "Foundation bridge error: \(error.localizedDescription)",
-                availability: nil
-            )
-            print(encode(output))
         }
     }
 
@@ -465,6 +559,13 @@ struct FoundationBridge {
             return text
         }
         return "{\"ok\":false,\"error\":\"encoding_failure\"}"
+    }
+
+    static func writeLine(_ value: BridgeOutput) {
+        let line = encode(value) + "\n"
+        if let data = line.data(using: .utf8) {
+            try? FileHandle.standardOutput.write(contentsOf: data)
+        }
     }
 }
 "#;

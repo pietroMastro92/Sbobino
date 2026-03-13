@@ -204,17 +204,17 @@ impl Default for WhisperOptions {
 
         Self {
             translate_to_english: false,
-            no_context: false,
-            split_on_word: false,
+            no_context: true,
+            split_on_word: true,
             tinydiarize: false,
             diarize: false,
             temperature: 0.0,
-            temperature_increment_on_fallback: 0.2,
+            temperature_increment_on_fallback: 0.1,
             temperature_fallback_count: 5,
             entropy_threshold: 2.5,
             logprob_threshold: -1.0,
             first_token_logprob_threshold: -1.5,
-            no_speech_threshold: 0.6,
+            no_speech_threshold: 0.72,
             word_threshold: 0.01,
             best_of: 5,
             beam_size: 5,
@@ -580,7 +580,7 @@ pub fn default_prompt_templates() -> Vec<PromptTemplate> {
             icon: "abc".to_string(),
             category: PromptCategory::Cleanup,
             body:
-                "Improve spelling, grammar, and punctuation while preserving the original meaning."
+                "Preserve the original wording. Only improve punctuation, capitalization, spacing, and paragraph breaks, and remove obvious accidental repetitions, looped sentences, and duplicated lines. Do not add new text."
                     .to_string(),
             builtin: true,
             updated_at: "".to_string(),

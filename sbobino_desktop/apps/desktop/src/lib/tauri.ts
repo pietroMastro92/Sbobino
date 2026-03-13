@@ -180,6 +180,7 @@ export async function exportArtifact(payload: {
   id: string;
   format: "txt" | "docx" | "html" | "pdf" | "json" | "srt" | "vtt" | "csv" | "md";
   destination_path: string;
+  language?: "en" | "it" | "es" | "de";
   style?: "transcript" | "subtitles" | "segments";
   options?: {
     include_timestamps: boolean;
@@ -261,6 +262,12 @@ export async function provisioningDownloadModel(payload: {
   include_coreml?: boolean;
 }): Promise<{ started: boolean }> {
   return invoke<{ started: boolean }>("provisioning_download_model", { payload });
+}
+
+export async function provisioningInstallPyannote(force = false): Promise<{ started: boolean }> {
+  return invoke<{ started: boolean }>("provisioning_install_pyannote", {
+    payload: { force },
+  });
 }
 
 export async function provisioningCancel(): Promise<void> {
@@ -402,9 +409,9 @@ export async function subscribeProvisioningProgress(
 }
 
 export async function subscribeProvisioningStatus(
-  onStatus: (payload: { state: string; message: string }) => void,
+  onStatus: (payload: { state: string; message: string; reason_code?: string | null }) => void,
 ): Promise<() => void> {
-  const unlisten = await listen<{ state: string; message: string }>(
+  const unlisten = await listen<{ state: string; message: string; reason_code?: string | null }>(
     "provisioning://status",
     (event) => {
       onStatus(event.payload);

@@ -16,6 +16,11 @@
   - `ubuntu-22.04` -> `x86_64-unknown-linux-gnu` (AppImage + DEB, optional distribution target).
 - Produces updater artifacts/signatures (`createUpdaterArtifacts: true` in `tauri.conf.json`).
 - Publishes all generated bundle assets to the GitHub Release for that tag.
+- Must also publish pyannote provisioning assets for the same tag:
+  - `pyannote-runtime-macos-aarch64.zip`
+  - `pyannote-runtime-macos-x86_64.zip`
+  - `pyannote-model-community-1.zip`
+  - `pyannote-manifest.json`
 
 ## Signing and Notarization
 
@@ -33,6 +38,9 @@
 - Build signed bundles in CI.
 - Submit DMG to Apple Notary Service with `xcrun notarytool`.
 - Staple notarization ticket with `xcrun stapler`.
+- Build pyannote release assets before publishing the tag:
+  - `./scripts/package_pyannote_release_assets.sh <version> <runtime_aarch64_dir> <runtime_x86_64_dir> <model_dir> <output_dir>`
+  - Upload the generated zips and manifest to the same GitHub Release as the app bundles.
 
 ### Windows
 - Bundle MSI + NSIS by default.

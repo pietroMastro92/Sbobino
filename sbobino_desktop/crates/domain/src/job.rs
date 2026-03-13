@@ -10,6 +10,7 @@ pub enum JobStage {
     Queued,
     PreparingAudio,
     Transcribing,
+    Diarizing,
     Optimizing,
     Summarizing,
     Persisting,

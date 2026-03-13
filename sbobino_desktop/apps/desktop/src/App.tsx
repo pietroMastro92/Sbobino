@@ -20,6 +20,7 @@ import {
   Clock3,
   ChevronDown,
   ChevronRight,
+  Copy,
   Cpu,
   Database,
   FileAudio,
@@ -71,6 +72,7 @@ import {
   pauseRealtime,
   provisioningCancel,
   provisioningDownloadModel,
+  provisioningInstallPyannote,
   provisioningModels,
   provisioningStart,
   provisioningStatus,
@@ -100,6 +102,10 @@ import {
   updateArtifact,
   updateArtifactTimeline,
 } from "./lib/tauri";
+import {
+  formatProvisioningAssetLabel,
+  shouldOfferLocalModelsCta,
+} from "./lib/provisioningUi";
 import { useAppStore } from "./state/useAppStore";
 import type {
   AppearanceMode,
@@ -162,6 +168,7 @@ type Section =
   | "detail"
   | "realtime";
 type DetailMode = "transcript" | "segments" | "summary" | "chat";
+type TranscriptViewMode = "optimized" | "original";
 type InspectorMode = "details" | "info";
 type SettingsPane =
   | "general"
@@ -172,6 +179,41 @@ type SettingsPane =
   | "prompts"
   | "advanced";
 type ChatMessage = { role: "user" | "assistant"; text: string };
+const HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY = "has_optimized_transcript";
+
+function findPreviousUserQuestion(messages: ChatMessage[], assistantIndex: number): string {
+  for (let index = assistantIndex - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      return messages[index].text;
+    }
+  }
+
+  return "";
+}
+
+function hasPersistedOptimizedTranscript(artifact: TranscriptArtifact | null | undefined): boolean {
+  if (!artifact) {
+    return false;
+  }
+
+  const optimizedTranscript = artifact.optimized_transcript.trim();
+  if (!optimizedTranscript) {
+    return false;
+  }
+
+  const optimizedFlag = artifact.metadata?.[HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY]
+    ?.trim()
+    .toLowerCase();
+  if (optimizedFlag === "true") {
+    return true;
+  }
+
+  if (artifact.summary.trim() || artifact.faqs.trim()) {
+    return true;
+  }
+
+  return optimizedTranscript !== artifact.raw_transcript.trim();
+}
 
 type DetailSegment = {
   sourceIndex: number;
@@ -390,17 +432,17 @@ function getDefaultWhisperOptions(useAppleSiliconDefaults = guessAppleSiliconFro
 
   return {
     translate_to_english: false,
-    no_context: false,
-    split_on_word: false,
+    no_context: true,
+    split_on_word: true,
     tinydiarize: false,
     diarize: false,
     temperature: 0,
-    temperature_increment_on_fallback: 0.2,
+    temperature_increment_on_fallback: 0.1,
     temperature_fallback_count: 5,
     entropy_threshold: 2.5,
     logprob_threshold: -1,
     first_token_logprob_threshold: -1.5,
-    no_speech_threshold: 0.6,
+    no_speech_threshold: 0.72,
     word_threshold: 0.01,
     best_of: useAppleSiliconDefaults ? 5 : 1,
     beam_size: useAppleSiliconDefaults ? 1 : 5,
@@ -789,6 +831,56 @@ function percentageFromJobProgress(progress: JobProgress | null | undefined): nu
   return clampPercentage(progress.percentage);
 }
 
+function activeJobPercentage(
+  activeJobId: string | null,
+  activeQueueJob: JobProgress | null,
+  progress: JobProgress | null,
+): number {
+  if (!activeJobId) return 0;
+  const queuePercentage =
+    activeQueueJob?.job_id === activeJobId ? percentageFromJobProgress(activeQueueJob) : 0;
+  const livePercentage =
+    progress?.job_id === activeJobId ? percentageFromJobProgress(progress) : 0;
+  return clampPercentage(Math.max(queuePercentage, livePercentage));
+}
+
+function mergeTranscriptionPreview(previous: string, incoming: string): string {
+  const next = incoming.trim();
+  if (!next) return previous;
+
+  const current = previous.trimEnd();
+  if (!current) return next;
+  if (current === next) return previous;
+  if (current.includes(next)) return previous;
+  if (next.startsWith(current)) return next;
+
+  const overlapLimit = Math.min(current.length, next.length);
+  for (let size = overlapLimit; size > 0; size -= 1) {
+    if (current.slice(-size) === next.slice(0, size)) {
+      return `${current}${next.slice(size)}`;
+    }
+  }
+
+  return `${current}\n${next}`;
+}
+
+function setCancelPillDangerProximity(button: HTMLButtonElement, clientX: number): void {
+  const bounds = button.getBoundingClientRect();
+  if (bounds.width <= 0) {
+    button.style.setProperty("--danger-proximity", "0");
+    return;
+  }
+  const activationStart = bounds.left + bounds.width * 0.46;
+  const activationWidth = Math.max(bounds.width * 0.54, 1);
+  const proximity = (clientX - activationStart) / activationWidth;
+  const clamped = Math.min(1, Math.max(0, proximity));
+  button.style.setProperty("--danger-proximity", clamped.toFixed(3));
+}
+
+function resetCancelPillDangerProximity(button: HTMLButtonElement): void {
+  button.style.setProperty("--danger-proximity", "0");
+}
+
 function formatJobStageLabel(stage: string): string {
   return stage
     .replace(/_/g, " ")
@@ -859,12 +951,64 @@ function ProgressRing({ percentage, size = 18 }: { percentage: number; size?: nu
   const ringStyle = {
     width: `${size}px`,
     height: `${size}px`,
-    backgroundImage: `conic-gradient(from -90deg, var(--accent) ${clamped}%, var(--line-soft) ${clamped}% 100%)`,
+    backgroundImage: `conic-gradient(from -90deg, var(--progress-ring-fill, var(--accent)) ${clamped}%, var(--progress-ring-track, var(--line-soft)) ${clamped}% 100%)`,
   } satisfies CSSProperties;
 
   return (
     <span className="progress-ring" style={ringStyle} aria-hidden>
       <span className="progress-ring-core" />
+    </span>
+  );
+}
+
+function RollingProgressValue({ value }: { value: string }): JSX.Element {
+  const [settledValue, setSettledValue] = useState(value);
+  const [outgoingValue, setOutgoingValue] = useState<string | null>(null);
+  const [isRolling, setIsRolling] = useState(false);
+
+  useEffect(() => {
+    if (value === settledValue) {
+      return;
+    }
+
+    setOutgoingValue(settledValue);
+    setSettledValue(value);
+    setIsRolling(false);
+
+    const frame = window.requestAnimationFrame(() => {
+      setIsRolling(true);
+    });
+    const timeout = window.setTimeout(() => {
+      setOutgoingValue(null);
+      setIsRolling(false);
+    }, 260);
+
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+    };
+  }, [settledValue, value]);
+
+  return (
+    <span className="transcribing-cancel-pill-value" aria-hidden>
+      {outgoingValue ? (
+        <>
+          <span
+            className={`transcribing-cancel-pill-value-slot transcribing-cancel-pill-value-slot-out${isRolling ? " is-rolling" : ""}`}
+          >
+            {outgoingValue}
+          </span>
+          <span
+            className={`transcribing-cancel-pill-value-slot transcribing-cancel-pill-value-slot-in${isRolling ? " is-rolling" : ""}`}
+          >
+            {settledValue}
+          </span>
+        </>
+      ) : (
+        <span className="transcribing-cancel-pill-value-slot transcribing-cancel-pill-value-slot-stable">
+          {settledValue}
+        </span>
+      )}
     </span>
   );
 }
@@ -956,7 +1100,6 @@ function sanitizeSpeakerDiarizationSettings(
 ): SpeakerDiarizationSettings {
   const device = settings.device === "auto"
     || settings.device === "mps"
-    || settings.device === "cuda"
     ? settings.device
     : "cpu";
 
@@ -1054,6 +1197,7 @@ type DetailToolbarProps = {
   transcriptionProgress: number;
   onToggleSidebar: () => void;
   onBack: () => void;
+  onRenameTitle?: () => void;
   onSelectMode: (mode: "transcript" | "summary" | "chat") => void;
   onOpenExport: () => void;
   onShowDetailsPanel: () => void;
@@ -1076,6 +1220,7 @@ function DetailToolbar({
   transcriptionProgress,
   onToggleSidebar,
   onBack,
+  onRenameTitle,
   onSelectMode,
   onOpenExport,
   onShowDetailsPanel,
@@ -1092,6 +1237,11 @@ function DetailToolbar({
     : rightSidebarOpen
       ? t("detail.hideDetailsPanel", "Hide details panel")
       : t("detail.showDetailsPanel", "Show details panel");
+  const roundedTranscriptionProgress = Math.round(clampPercentage(transcriptionProgress));
+  const transcriptionProgressText = roundedTranscriptionProgress === 100
+    ? "100%"
+    : `${String(roundedTranscriptionProgress).padStart(2, "0")}%`;
+  const cancelTranscriptionTitle = `${t("detail.cancelTranscription", "Cancel transcription")} (${roundedTranscriptionProgress}%)`;
   return (
     <header
       className={`detail-toolbar ${!leftSidebarOpen ? "sidebar-closed" : ""}`}
@@ -1112,7 +1262,19 @@ function DetailToolbar({
         <button className="icon-button" onClick={onBack} title={t("detail.backToHistory")}>
           <ArrowLeft size={16} />
         </button>
-        <strong className="detail-title" data-tauri-drag-region>{title}</strong>
+        <div className="detail-title-group" data-tauri-drag-region>
+          <strong className="detail-title" data-tauri-drag-region>{title}</strong>
+          {hasArtifact && onRenameTitle ? (
+            <button
+              className="icon-button detail-title-rename-button"
+              onClick={onRenameTitle}
+              title={t("rename.title", "Rename transcription")}
+              aria-label={t("rename.title", "Rename transcription")}
+            >
+              <Pencil size={14} />
+            </button>
+          ) : null}
+        </div>
       </div>
 
       <div className="detail-toolbar-controls">
@@ -1158,14 +1320,24 @@ function DetailToolbar({
             </button>
           ) : null}
           {!hasArtifact && hasActiveJob ? (
-            <button className="transcribing-cancel-pill" onClick={onCancel} title={t("detail.cancelTranscription", "Cancel transcription")}>
-              <span className="pill-content default-content">
-                <ProgressRing percentage={transcriptionProgress} size={16} />
-                <span>{t("detail.transcribing")}</span>
+            <button
+              className="transcribing-cancel-pill"
+              onClick={onCancel}
+              onMouseMove={(event: ReactMouseEvent<HTMLButtonElement>) =>
+                setCancelPillDangerProximity(event.currentTarget, event.clientX)}
+              onMouseLeave={(event: ReactMouseEvent<HTMLButtonElement>) =>
+                resetCancelPillDangerProximity(event.currentTarget)}
+              title={cancelTranscriptionTitle}
+              aria-label={cancelTranscriptionTitle}
+            >
+              <span className="transcribing-cancel-pill-compact" aria-hidden>
+                <ProgressRing percentage={transcriptionProgress} size={20} />
               </span>
-              <span className="pill-content hover-content">
-                <X size={16} />
-                <span>{t("detail.cancelTranscription")}</span>
+              <span className="transcribing-cancel-pill-expanded" aria-hidden>
+                <RollingProgressValue value={transcriptionProgressText} />
+                <span className="transcribing-cancel-pill-cancel">
+                  <X size={14} />
+                </span>
               </span>
             </button>
           ) : null}
@@ -1399,6 +1571,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const draftTitleActiveInstance = activeArtifact?.title || "";
   const [draftTitle, setDraftTitle] = useState("");
   const [draftTranscript, setDraftTranscript] = useState("");
+  const [optimizedTranscriptAvailable, setOptimizedTranscriptAvailable] = useState(false);
+  const [transcriptViewMode, setTranscriptViewMode] = useState<TranscriptViewMode>("optimized");
   const [draftSummary, setDraftSummary] = useState("");
   const [draftFaqs, setDraftFaqs] = useState("");
   const [showExportSheet, setShowExportSheet] = useState(false);
@@ -1407,7 +1581,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [isRenamingArtifact, setIsRenamingArtifact] = useState(false);
 
   const [chatInput, setChatInput] = useState("");
-  const [chatHistory, setChatHistory] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [copiedChatMessageIndex, setCopiedChatMessageIndex] = useState<number | null>(null);
   const [isAskingChat, setIsAskingChat] = useState(false);
   const [isImprovingText, setIsImprovingText] = useState(false);
   const [activeJobPreviewText, setActiveJobPreviewText] = useState("");
@@ -1439,6 +1614,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     ready: boolean;
     modelsDir: string;
     missing: string[];
+    pyannote: RuntimeHealth["pyannote"] | null;
     running: boolean;
     progress: ProvisioningProgressEvent | null;
     statusMessage: string;
@@ -1446,6 +1622,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     ready: true,
     modelsDir: "",
     missing: [],
+    pyannote: null,
     running: false,
     progress: null,
     statusMessage: "",
@@ -1475,6 +1652,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [fontSize, setFontSize] = useState(18);
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [groupSegmentsWithoutSpeakers, setGroupSegmentsWithoutSpeakers] = useState(true);
+  const copiedChatResetTimerRef = useRef<number | null>(null);
   const [summaryIncludeTimestamps, setSummaryIncludeTimestamps] = useState(true);
   const [summaryIncludeSpeakers, setSummaryIncludeSpeakers] = useState(false);
   const [summaryAutostart, setSummaryAutostart] = useState(false);
@@ -2022,10 +2200,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             return next;
           }
 
-          const nextLine = next.trim();
-          if (!previous) return nextLine;
-          if (previous.endsWith(nextLine)) return previous;
-          return `${previous}\n${nextLine}`;
+          return mergeTranscriptionPreview(previous, next);
         });
       });
       if (unmounted) { uTranscriptionDelta(); } else { unsubTranscriptionDelta = uTranscriptionDelta; }
@@ -2064,7 +2239,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           ...previous,
           running: true,
           progress: event,
-          statusMessage: `Downloading ${event.asset} (${event.current}/${event.total})`,
+          statusMessage: `${formatProvisioningAssetLabel(event)} (${event.current}/${event.total})`,
         }));
       });
       if (unmounted) { uProvisioningProgress(); } else { unsubProvisioningProgress = uProvisioningProgress; }
@@ -2442,19 +2617,87 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return 0;
   }, [audioDurationSeconds, detailSegments]);
 
-  const transcriptWordCount = useMemo(
-    () => draftTranscript.split(/\s+/).filter(Boolean).length,
-    [draftTranscript],
+  const activeRawTranscript = activeArtifact?.raw_transcript ?? "";
+  const persistedOptimizedTranscriptAvailable = hasPersistedOptimizedTranscript(activeArtifact);
+  const hasOptimizedTranscript = !effectiveTrimmedAudioDraft && Boolean(activeArtifact) && (
+    optimizedTranscriptAvailable
+    || persistedOptimizedTranscriptAvailable
   );
+  const visibleTranscript = useMemo(() => {
+    if (transcriptViewMode === "original" && hasOptimizedTranscript) {
+      return activeRawTranscript;
+    }
+    return draftTranscript;
+  }, [activeRawTranscript, draftTranscript, hasOptimizedTranscript, transcriptViewMode]);
+  const transcriptReadOnly = transcriptViewMode === "original" && hasOptimizedTranscript;
+
+  const transcriptWordCount = useMemo(
+    () => visibleTranscript.split(/\s+/).filter(Boolean).length,
+    [visibleTranscript],
+  );
+
+  const optimizedTranscriptForPersistence = useMemo(() => {
+    if (!activeArtifact) {
+      return draftTranscript;
+    }
+    if (optimizedTranscriptAvailable || persistedOptimizedTranscriptAvailable) {
+      return draftTranscript;
+    }
+    if (draftTranscript !== activeRawTranscript) {
+      return draftTranscript;
+    }
+    return "";
+  }, [
+    activeArtifact,
+    activeRawTranscript,
+    draftTranscript,
+    optimizedTranscriptAvailable,
+    persistedOptimizedTranscriptAvailable,
+  ]);
+
+  const hasTranscriptDraftChanges = useMemo(() => {
+    if (!activeArtifact) {
+      return false;
+    }
+    const baselineTranscript = persistedOptimizedTranscriptAvailable
+      ? activeArtifact.optimized_transcript
+      : activeRawTranscript;
+    return draftTranscript !== baselineTranscript;
+  }, [activeArtifact, activeRawTranscript, draftTranscript, persistedOptimizedTranscriptAvailable]);
 
   const activeQueueJob = useMemo(
     () => (activeJobId ? queueItems.find((item) => item.job_id === activeJobId) ?? null : null),
     [activeJobId, queueItems],
   );
 
-  const activeTranscriptionPercentage = useMemo(() => {
-    return percentageFromJobProgress(activeQueueJob ?? progress);
-  }, [activeQueueJob, progress]);
+  const rawActiveTranscriptionPercentage = useMemo(
+    () => activeJobPercentage(activeJobId, activeQueueJob, progress),
+    [activeJobId, activeQueueJob, progress],
+  );
+  const [displayedTranscriptionPercentage, setDisplayedTranscriptionPercentage] = useState(0);
+  const displayedTranscriptionJobIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!hasOptimizedTranscript && transcriptViewMode !== "original") {
+      setTranscriptViewMode("original");
+    }
+  }, [hasOptimizedTranscript, transcriptViewMode]);
+
+  useEffect(() => {
+    if (!activeJobId) {
+      displayedTranscriptionJobIdRef.current = null;
+      setDisplayedTranscriptionPercentage(0);
+      return;
+    }
+    if (displayedTranscriptionJobIdRef.current !== activeJobId) {
+      displayedTranscriptionJobIdRef.current = activeJobId;
+      setDisplayedTranscriptionPercentage(rawActiveTranscriptionPercentage);
+      return;
+    }
+    setDisplayedTranscriptionPercentage((previous) =>
+      Math.max(previous, rawActiveTranscriptionPercentage),
+    );
+  }, [activeJobId, rawActiveTranscriptionPercentage]);
 
   const queueActiveItems = useMemo(
     () =>
@@ -2463,12 +2706,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   );
 
   const exportPreviewText = useMemo(() => {
-    const transcript = draftTranscript.trim();
+    const transcript = visibleTranscript.trim();
     if (transcript) {
       return transcript;
     }
-    return activeArtifact?.raw_transcript?.trim() ?? "";
-  }, [activeArtifact?.raw_transcript, draftTranscript]);
+    return activeRawTranscript.trim();
+  }, [activeRawTranscript, visibleTranscript]);
+  const segmentsAlignedWithVisibleTranscript = transcriptViewMode === "original" || !hasOptimizedTranscript;
 
   const selectedPromptTemplate = useMemo(() => {
     if (!settings || !activePromptId) return null;
@@ -2575,12 +2819,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     models_dir: string;
     missing_models: string[];
     missing_encoders: string[];
+    pyannote: RuntimeHealth["pyannote"];
   }): void {
     setProvisioning((previous) => ({
       ...previous,
       ready: status.ready,
       modelsDir: status.models_dir,
       missing: [...status.missing_models, ...status.missing_encoders],
+      pyannote: status.pyannote,
       running: false,
       progress: null,
       statusMessage: status.ready
@@ -2590,17 +2836,29 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   }
 
   function hydrateDetail(artifact: TranscriptArtifact): void {
+    const optimizedTranscriptExists = hasPersistedOptimizedTranscript(artifact);
     setActiveArtifact(artifact);
     setActiveDetailContext(null);
     setDraftTitle(artifact.title);
-    setDraftTranscript(artifact.optimized_transcript || artifact.raw_transcript);
+    setDraftTranscript(optimizedTranscriptExists ? artifact.optimized_transcript : artifact.raw_transcript);
+    setOptimizedTranscriptAvailable(optimizedTranscriptExists);
+    setTranscriptViewMode(optimizedTranscriptExists ? "optimized" : "original");
     setDraftSummary(artifact.summary);
     setDraftFaqs(artifact.faqs);
     setChatInput("");
     setChatHistory([]);
+    setCopiedChatMessageIndex(null);
     setDetailMode("transcript");
     setInspectorMode("details");
   }
+
+  useEffect(() => {
+    return () => {
+      if (copiedChatResetTimerRef.current !== null) {
+        window.clearTimeout(copiedChatResetTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const artifactId = activeArtifact?.id ?? null;
@@ -2629,6 +2887,31 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     isGeneratingSummary,
     summaryAutostart,
   ]);
+
+  async function onCopyChatExchange(messageIndex: number): Promise<void> {
+    const assistantMessage = chatHistory[messageIndex];
+    if (!assistantMessage || assistantMessage.role !== "assistant") {
+      return;
+    }
+
+    const question = findPreviousUserQuestion(chatHistory, messageIndex);
+    const clipboardText = question
+      ? `${t("detail.chatCopyQuestionLabel", "Question")}:\n${question}\n\n${t("detail.chatCopyAnswerLabel", "Answer")}:\n${assistantMessage.text}`
+      : assistantMessage.text;
+
+    try {
+      await navigator.clipboard.writeText(clipboardText);
+      setCopiedChatMessageIndex(messageIndex);
+      if (copiedChatResetTimerRef.current !== null) {
+        window.clearTimeout(copiedChatResetTimerRef.current);
+      }
+      copiedChatResetTimerRef.current = window.setTimeout(() => {
+        setCopiedChatMessageIndex((current) => (current === messageIndex ? null : current));
+      }, 1800);
+    } catch {
+      setError(t("detail.chatCopyFailed", "Copy failed. Please try again."));
+    }
+  }
 
   function restoreDetailAfterFailedTranscription(
     detailContext: ActiveDetailContext | null | undefined,
@@ -2990,16 +3273,19 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
       activeJobIdRef.current = job_id;
       setJobStarted(job_id);
-      setQueueItems((previous) =>
-        pushOrReplaceQueueItem(previous, {
+      setQueueItems((previous) => {
+        if (previous.some((entry) => entry.job_id === job_id)) {
+          return previous;
+        }
+        return pushOrReplaceQueueItem(previous, {
           job_id,
           stage: "queued",
           message: "Queued transcription job.",
           percentage: 0,
           current_seconds: 0,
           total_seconds: null,
-        }),
-      );
+        });
+      });
       setActiveJobTitle(requestedTitle ?? fileLabel(targetFile));
       setActiveJobPreviewText("");
       activeJobDeltaSequenceRef.current = -1;
@@ -3110,7 +3396,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     try {
       const updated = await updateArtifact({
         id: activeArtifact.id,
-        optimized_transcript: draftTranscript,
+        optimized_transcript: optimizedTranscriptForPersistence,
         summary: draftSummary,
         faqs: draftFaqs,
       });
@@ -3244,9 +3530,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       upsertArtifact(updated);
       // Update artifact data without resetting detailMode (hydrateDetail
       // would switch back to "transcript", losing the user's current view).
+      const updatedHasOptimizedTranscript = hasPersistedOptimizedTranscript(updated);
       setActiveArtifact(updated);
       setDraftTitle(updated.title);
-      setDraftTranscript(updated.optimized_transcript || updated.raw_transcript);
+      setDraftTranscript(updatedHasOptimizedTranscript ? updated.optimized_transcript : updated.raw_transcript);
+      setOptimizedTranscriptAvailable(updatedHasOptimizedTranscript);
       setDraftSummary(updated.summary);
       setDraftFaqs(updated.faqs);
       setError(null);
@@ -3568,12 +3856,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
-  async function onExport(payload: ExportRequest): Promise<void> {
-    if (!activeArtifact) return;
+  async function onExport(payload: ExportRequest): Promise<boolean> {
+    if (!activeArtifact) return false;
 
     let artifactForExport = activeArtifact;
     const hasDraftChanges =
-      draftTranscript !== activeArtifact.optimized_transcript ||
+      hasTranscriptDraftChanges ||
       draftSummary !== activeArtifact.summary ||
       draftFaqs !== activeArtifact.faqs;
 
@@ -3581,7 +3869,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       try {
         const updated = await updateArtifact({
           id: activeArtifact.id,
-          optimized_transcript: draftTranscript,
+          optimized_transcript: optimizedTranscriptForPersistence,
           summary: draftSummary,
           faqs: draftFaqs,
         });
@@ -3592,7 +3880,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         }
       } catch (syncError) {
         setError(`Could not sync changes before export: ${formatAppError(syncError)}`);
-        return;
+        return false;
       }
     }
 
@@ -3601,7 +3889,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     });
 
     if (!destination) {
-      return;
+      return false;
     }
 
     try {
@@ -3609,6 +3897,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         id: artifactForExport.id,
         format: payload.format,
         destination_path: destination,
+        language,
         style: payload.style,
         options: {
           include_timestamps: payload.options.includeTimestamps,
@@ -3618,6 +3907,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         content_override: payload.contentOverride,
       });
       setError(null);
+      return true;
     } catch (exportError) {
       setError(`Export failed: ${formatAppError(exportError)}`);
       throw exportError;
@@ -3713,14 +4003,23 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   async function onImproveText(): Promise<void> {
     if (!activeArtifact || isImprovingText) return;
 
-    if (draftTranscript.trim() === "") {
-        return;
+    const transcriptToOptimize = transcriptViewMode === "original"
+      ? activeRawTranscript
+      : draftTranscript;
+
+    if (transcriptToOptimize.trim() === "") {
+      return;
     }
 
     setIsImprovingText(true);
     try {
-      const optimizedText = await optimizeArtifact({ id: activeArtifact.id, text: draftTranscript });
+      const optimizedText = await optimizeArtifact({
+        id: activeArtifact.id,
+        text: transcriptToOptimize,
+      });
       setDraftTranscript(optimizedText);
+      setOptimizedTranscriptAvailable(true);
+      setTranscriptViewMode("optimized");
       setError(null);
     } catch (optimizeError) {
       const code = formatAppErrorCode(optimizeError);
@@ -3780,6 +4079,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setProvisioning((previous) => ({
         ...previous,
         running: true,
+        progress: null,
         statusMessage: "Provisioning started...",
       }));
       await provisioningStart(true);
@@ -3797,6 +4097,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setProvisioning((previous) => ({
         ...previous,
         running: true,
+        progress: null,
         statusMessage: `Downloading ${model}...`,
       }));
       await provisioningDownloadModel({ model, include_coreml: true });
@@ -3806,6 +4107,26 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         running: false,
       }));
       setError(`Model download failed: ${formatAppError(downloadError)}`);
+    }
+  }
+
+  async function onInstallPyannote(force = false): Promise<void> {
+    try {
+      setProvisioning((previous) => ({
+        ...previous,
+        running: true,
+        progress: null,
+        statusMessage: force
+          ? "Repairing pyannote diarization runtime..."
+          : "Installing pyannote diarization runtime...",
+      }));
+      await provisioningInstallPyannote(force);
+    } catch (installError) {
+      setProvisioning((previous) => ({
+        ...previous,
+        running: false,
+      }));
+      setError(`Pyannote install failed: ${formatAppError(installError)}`);
     }
   }
 
@@ -4199,7 +4520,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             {queueActiveItems.map((item) => {
               const displayPercentage =
                 item.job_id === activeJobId
-                  ? activeTranscriptionPercentage
+                  ? displayedTranscriptionPercentage
                   : percentageFromJobProgress(item);
 
               return (
@@ -4487,11 +4808,27 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 <p>{t("detail.chatEmptyDesc")}</p>
               </div>
             ) : null}
-            {!isAskingChat && chatHistory.map((message, index) => (
-              <article key={`${message.role}-${index}`} className={`chat-bubble ${message.role}`}>
-                {message.text}
-              </article>
-            ))}
+            {!isAskingChat && chatHistory.map((message, index) => {
+              const copied = copiedChatMessageIndex === index;
+
+              return (
+                <article key={`${message.role}-${index}`} className={`chat-bubble ${message.role}`}>
+                  {message.role === "assistant" ? (
+                    <button
+                      type="button"
+                      className={`chat-copy-button ${copied ? "copied" : ""}`}
+                      onClick={() => void onCopyChatExchange(index)}
+                      title={t("detail.chatCopyExchange", "Copy question and answer")}
+                      aria-label={t("detail.chatCopyExchange", "Copy question and answer")}
+                    >
+                      {copied ? <Check size={14} /> : <Copy size={14} />}
+                      <span>{copied ? t("detail.chatCopied", "Copied") : t("inspector.copy", "Copy")}</span>
+                    </button>
+                  ) : null}
+                  <div className="chat-bubble-text">{message.text}</div>
+                </article>
+              );
+            })}
           </div>
 
           <div className="chat-input-bar">
@@ -4596,13 +4933,20 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               color: "transparent",
             }}
           >
-            <HighlightMatch text={draftTranscript} search={search} />
+            <HighlightMatch text={visibleTranscript} search={search} />
           </div>
         ) : null}
         <textarea
           className="detail-editor"
-          value={draftTranscript}
+          value={visibleTranscript}
           onChange={(event) => setDraftTranscript(event.target.value)}
+          readOnly={transcriptReadOnly}
+          title={transcriptReadOnly
+            ? t(
+              "detail.originalTranscriptReadonly",
+              "Original transcript is read-only. Switch back to the optimized version to edit.",
+            )
+            : undefined}
           style={{
             fontSize: `${fontSize}px`,
             position: search.trim() ? "absolute" : "relative",
@@ -4622,7 +4966,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   function renderDefaultInspector(): JSX.Element {
     return (
       <div className="inspector-body">
-        <button className="secondary-button" onClick={() => void navigator.clipboard.writeText(draftTranscript)}>
+        <button className="secondary-button" onClick={() => void navigator.clipboard.writeText(visibleTranscript)}>
           Copy
         </button>
 
@@ -4630,6 +4974,33 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           detailMode={detailMode}
           onSelectMode={(mode) => setDetailMode(mode)}
         />
+
+        {detailMode === "transcript" && hasOptimizedTranscript ? (
+          <div className="inspector-block transcript-version-block">
+            <div
+              className="segmented-control transcript-version-toggle"
+              role="group"
+              aria-label={t("detail.transcriptVersion", "Transcript version")}
+            >
+              <button
+                type="button"
+                className={transcriptViewMode === "optimized" ? "seg active" : "seg"}
+                onClick={() => setTranscriptViewMode("optimized")}
+                title={t("detail.showOptimizedTranscript", "Show optimized transcript")}
+              >
+                {t("detail.showOptimized", "Show optimized")}
+              </button>
+              <button
+                type="button"
+                className={transcriptViewMode === "original" ? "seg active" : "seg"}
+                onClick={() => setTranscriptViewMode("original")}
+                title={t("detail.showOriginalTranscript", "Show original transcript")}
+              >
+                {t("detail.showOriginal", "Show original")}
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         <div className="inspector-block">
           <h4>{t("inspector.audio")}</h4>
@@ -4777,7 +5148,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           </select>
         </label>
 
-        <button className="secondary-button" onClick={() => void navigator.clipboard.writeText(draftSummary || draftTranscript)}>
+        <button className="secondary-button" onClick={() => void navigator.clipboard.writeText(draftSummary || visibleTranscript)}>
           Copy
         </button>
         <button className="secondary-button" onClick={() => void onGenerateSummary()} disabled={isGeneratingSummary || !activeArtifact}>
@@ -4954,7 +5325,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             <div className="property-line"><span>{t("metadata.audioDuration")}</span><strong>{formatShortDuration(transcriptSeconds)}</strong></div>
             <div className="property-line"><span>{t("metadata.created")}</span><strong>{formatDate(activeArtifact.created_at)}</strong></div>
             <div className="property-line"><span>{t("metadata.updated")}</span><strong>{formatDate(activeArtifact.updated_at)}</strong></div>
-            <div className="property-line"><span>{t("metadata.characters")}</span><strong>{draftTranscript.length}</strong></div>
+            <div className="property-line"><span>{t("metadata.characters")}</span><strong>{visibleTranscript.length}</strong></div>
             <div className="property-line"><span>{t("metadata.words")}</span><strong>{transcriptWordCount}</strong></div>
           </>
         ) : null}
@@ -5006,9 +5377,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             title={effectiveDetailContext?.title ?? activeJobTitle ?? "Transcribing"}
             hasArtifact={Boolean(activeArtifact)}
             hasActiveJob={Boolean(activeJobId)}
-            transcriptionProgress={activeTranscriptionPercentage}
+            transcriptionProgress={displayedTranscriptionPercentage}
             onToggleSidebar={() => setLeftSidebarOpen((open) => !open)}
             onBack={() => setSection("history")}
+            onRenameTitle={activeArtifact ? () => onRenameArtifact(activeArtifact) : undefined}
             onSelectMode={(mode) => {
               if (mode === "transcript") {
                 if (detailMode !== "segments") {
@@ -5101,7 +5473,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   if (!trimSourceArtifact) {
                     return;
                   }
-                  const sourceLabel = fileLabel(trimSourceArtifact.input_path);
+                  const sourceLabel = trimSourceArtifact.title.trim() || fileLabel(trimSourceArtifact.input_path);
                   setTrimmedAudioDraft({
                     path,
                     parentArtifactId: trimSourceArtifact.id,
@@ -5313,6 +5685,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
     const speakerDiarization =
       settings.transcription.speaker_diarization ?? getDefaultSpeakerDiarizationSettings();
+    const pyannoteHealth = runtimeHealth?.pyannote ?? provisioning.pyannote;
 
     return (
       <div className="settings-stack">
@@ -5381,24 +5754,38 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           <div className="settings-row">
             <div>
               <strong>{t("settings.transcription.speakerDiarization", "Enable speaker diarization")}</strong>
-              <small>{t("settings.transcription.speakerDiarizationDesc", "After transcription completes, the app will try its managed offline pyannote diarization runtime and assign speakers into the timeline when this build includes the bundled pyannote assets.")}</small>
+              <small>{t("settings.transcription.speakerDiarizationDesc", "After transcription completes, the app will run its managed offline pyannote diarization runtime and assign speakers into the timeline when the pyannote assets are installed from Local Models.")}</small>
+              {pyannoteHealth ? (
+                <small className="muted">
+                  {pyannoteHealth.ready
+                    ? `Pyannote ready on ${pyannoteHealth.arch}.`
+                    : pyannoteHealth.message}
+                </small>
+              ) : null}
             </div>
-            <input
-              type="checkbox"
-              checked={speakerDiarization.enabled}
-              onChange={(event) => {
-                void onPatchSpeakerDiarizationSettings((current) => ({
-                  ...current,
-                  enabled: event.target.checked,
-                }));
-              }}
-            />
+            <div className="settings-toggle-stack">
+              {pyannoteHealth ? (
+                <span className={pyannoteHealth.ready ? "kind-chip" : "missing-chip"}>
+                  {pyannoteHealth.ready ? "Ready" : "Setup required"}
+                </span>
+              ) : null}
+              <input
+                type="checkbox"
+                checked={speakerDiarization.enabled}
+                onChange={(event) => {
+                  void onPatchSpeakerDiarizationSettings((current) => ({
+                    ...current,
+                    enabled: event.target.checked,
+                  }));
+                }}
+              />
+            </div>
           </div>
 
           <div className="settings-row settings-row-block">
             <div>
               <strong>{t("settings.transcription.pyannoteDevice", "Pyannote device")}</strong>
-              <small>{t("settings.transcription.pyannoteDeviceDesc", "Use CPU by default for best Intel/Apple Silicon compatibility. `auto` will try MPS when available when the managed runtime supports it.")}</small>
+              <small>{t("settings.transcription.pyannoteDeviceDesc", "Use CPU by default for best Intel/Apple Silicon compatibility. `auto` will try MPS when available in the managed local runtime.")}</small>
             </div>
             <select
               value={speakerDiarization.device}
@@ -5412,7 +5799,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               <option value="cpu">CPU</option>
               <option value="auto">Auto</option>
               <option value="mps">MPS</option>
-              <option value="cuda">CUDA</option>
             </select>
           </div>
         </section>
@@ -5876,6 +6262,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     if (!settings) {
       return <div className="settings-placeholder">{t("settings.unavailable")}</div>;
     }
+    const pyannoteHealth = runtimeHealth?.pyannote ?? provisioning.pyannote;
+    const pyannoteBusy = provisioning.running
+      && (provisioning.progress?.asset_kind === "pyannote_runtime"
+        || provisioning.progress?.asset_kind === "pyannote_model");
 
     return (
       <div className="settings-stack">
@@ -6006,6 +6396,91 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             </div>
           ) : null}
           {provisioning.statusMessage ? <small className="muted">{provisioning.statusMessage}</small> : null}
+        </section>
+
+        <section className="settings-panel">
+          <div className="settings-card-head">
+            <h3>{t("settings.pyannote.title", "Speaker Diarization")}</h3>
+            <button className="secondary-button" onClick={() => void refreshRuntimeHealth()}>
+              Refresh
+            </button>
+          </div>
+
+          <p className="muted">
+            {t(
+              "settings.pyannote.desc",
+              "Install the managed offline pyannote runtime once, then file transcription can assign speakers fully offline.",
+            )}
+          </p>
+          <p className="muted">
+            Directory: <code>{provisioning.modelsDir ? `${provisioning.modelsDir}/../runtime/pyannote` : "runtime/pyannote"}</code>
+          </p>
+
+          {pyannoteHealth ? (
+            <div className="settings-health-block">
+              <div className="settings-health-rows">
+                <div className="settings-health-row">
+                  <span className="settings-health-label">{t("settings.pyannote.arch", "Architecture")}</span>
+                  <span className="settings-health-value-inline">
+                    <code>{pyannoteHealth.arch}</code>
+                    <span className={pyannoteHealth.ready ? "kind-chip" : "missing-chip"}>
+                      {pyannoteHealth.ready ? "Ready" : "Missing"}
+                    </span>
+                  </span>
+                </div>
+                <div className="settings-health-row">
+                  <span className="settings-health-label">{t("settings.pyannote.runtime", "Runtime")}</span>
+                  <span className={pyannoteHealth.runtime_installed ? "kind-chip" : "missing-chip"}>
+                    {pyannoteHealth.runtime_installed ? "Installed" : "Missing"}
+                  </span>
+                </div>
+                <div className="settings-health-row">
+                  <span className="settings-health-label">{t("settings.pyannote.model", "Model")}</span>
+                  <span className={pyannoteHealth.model_installed ? "kind-chip" : "missing-chip"}>
+                    {pyannoteHealth.model_installed ? "Installed" : "Missing"}
+                  </span>
+                </div>
+                <div className="settings-health-row">
+                  <span className="settings-health-label">{t("settings.pyannote.device", "Configured device")}</span>
+                  <code>{pyannoteHealth.device || "cpu"}</code>
+                </div>
+                <div className="settings-health-row">
+                  <span className="settings-health-label">{t("settings.pyannote.source", "Source")}</span>
+                  <code>{pyannoteHealth.source}</code>
+                </div>
+              </div>
+              <small className="muted">{pyannoteHealth.message}</small>
+            </div>
+          ) : null}
+
+          <div className="notice-actions">
+            <button
+              className="primary-button"
+              onClick={() => void onInstallPyannote(false)}
+              disabled={provisioning.running || Boolean(pyannoteHealth?.ready)}
+            >
+              Install Pyannote
+            </button>
+            <button
+              className="secondary-button"
+              onClick={() => void onInstallPyannote(true)}
+              disabled={provisioning.running}
+            >
+              Repair
+            </button>
+            <button className="secondary-button" onClick={() => void onCancelProvisioning()} disabled={!provisioning.running}>
+              Cancel
+            </button>
+          </div>
+
+          {pyannoteBusy && provisioning.progress ? (
+            <div className="inline-progress">
+              <div style={{ width: `${provisioning.progress.percentage}%` }} />
+            </div>
+          ) : null}
+          {pyannoteBusy && provisioning.statusMessage ? (
+            <small className="muted">{provisioning.statusMessage}</small>
+          ) : null}
         </section>
       </div>
     );
@@ -6851,6 +7326,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           {error ? (
             <div className="error-banner settings-window-error">
               <p>{error}</p>
+              {shouldOfferLocalModelsCta(error) ? (
+                <button
+                  className="secondary-button error-action-button"
+                  onClick={() => void onOpenStandaloneSettingsWindow("local_models")}
+                >
+                  Open Local Models
+                </button>
+              ) : null}
               <button className="error-close" onClick={() => setError(null)} title="Dismiss">
                 <X size={14} />
               </button>
@@ -7067,6 +7550,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           {error ? (
             <div className="error-banner">
               <p>{error}</p>
+              {shouldOfferLocalModelsCta(error) ? (
+                <button
+                  className="secondary-button error-action-button"
+                  onClick={() => void onOpenStandaloneSettingsWindow("local_models")}
+                >
+                  Open Local Models
+                </button>
+              ) : null}
               <button className="error-close" onClick={() => setError(null)} title="Dismiss">
                 <X size={14} />
               </button>
@@ -7136,8 +7627,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       <ExportSheet
         open={showExportSheet}
         transcriptText={exportPreviewText}
-        segments={detailSegments}
+        segments={segmentsAlignedWithVisibleTranscript ? detailSegments : []}
+        segmentsAlignedWithTranscript={segmentsAlignedWithVisibleTranscript}
         title={activeArtifact?.title ?? ""}
+        summary={draftSummary}
+        faqs={draftFaqs}
         onClose={() => setShowExportSheet(false)}
         onExport={onExport}
       />

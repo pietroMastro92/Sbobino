@@ -1,4 +1,4 @@
-use sbobino_domain::{TimedSegment, TimedWord};
+use sbobino_domain::{collapse_consecutive_repeated_segments, TimedSegment, TimedWord};
 
 const GAP_BREAK_SECONDS: f32 = 1.25;
 const MAX_TIMED_SEGMENT_CHARS: usize = 140;
@@ -36,7 +36,7 @@ pub fn normalize_transcript_segments(
 }
 
 fn sanitize_segments(segments: &[TimedSegment]) -> Vec<TimedSegment> {
-    segments
+    let sanitized = segments
         .iter()
         .filter_map(|segment| {
             let text = segment.text.trim().to_string();
@@ -66,7 +66,9 @@ fn sanitize_segments(segments: &[TimedSegment]) -> Vec<TimedSegment> {
                 words,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    collapse_consecutive_repeated_segments(&sanitized)
 }
 
 fn sanitize_word(word: &TimedWord) -> Option<TimedWord> {

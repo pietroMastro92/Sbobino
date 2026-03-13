@@ -26,6 +26,7 @@ From workspace root:
 
 1. `./scripts/setup_runtime.sh` (downloads `ggml-base.bin` into app data models dir)
 2. In app, keep `Model = Base` for first run.
+3. Optional for local speaker diarization: install pyannote assets from `Settings > Local Models > Speaker Diarization`.
 
 ## Current Milestone
 

@@ -3,8 +3,7 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use sbobino_domain::{
-    AppSettings, ArtifactKind, SpeakerTurn, TranscriptArtifact, TranscriptionOutput,
-    WhisperOptions,
+    AppSettings, ArtifactKind, SpeakerTurn, TranscriptArtifact, TranscriptionOutput, WhisperOptions,
 };
 
 use crate::{dto::SummaryFaq, ApplicationError};
@@ -46,6 +45,14 @@ pub trait TranscriptEnhancer: Send + Sync {
         Err(ApplicationError::PostProcessing(
             "chat is not supported by the active AI provider".to_string(),
         ))
+    }
+
+    fn prefers_single_pass_summary(&self) -> bool {
+        false
+    }
+
+    fn summary_chunk_concurrency_limit(&self) -> usize {
+        3
     }
 }
 

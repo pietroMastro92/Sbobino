@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use rusqlite::{params, params_from_iter, types::Value, Connection, Row};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension, Row};
 
 use sbobino_application::{ApplicationError, ArtifactRepository};
 use sbobino_domain::{ArtifactKind, TranscriptArtifact};
+
+const HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY: &str = "has_optimized_transcript";
 
 #[derive(Debug, Clone)]
 pub struct SqliteArtifactRepository {
@@ -359,6 +361,42 @@ impl ArtifactRepository for SqliteArtifactRepository {
                 ApplicationError::Persistence(format!("failed to open sqlite database: {e}"))
             })?;
 
+            let Some(existing_metadata_json) = conn
+                .query_row(
+                    "SELECT metadata_json FROM transcript_artifacts WHERE id = ?1 AND is_deleted = 0 LIMIT 1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| {
+                    ApplicationError::Persistence(format!(
+                        "failed to load artifact metadata before update: {e}"
+                    ))
+                })?
+            else {
+                return Ok(None);
+            };
+
+            let mut metadata: BTreeMap<String, String> = serde_json::from_str(&existing_metadata_json)
+                .map_err(|e| {
+                    ApplicationError::Persistence(format!(
+                        "failed to parse artifact metadata before update: {e}"
+                    ))
+                })?;
+            if optimized_transcript.trim().is_empty() {
+                metadata.remove(HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY);
+            } else {
+                metadata.insert(
+                    HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                );
+            }
+            let metadata_json = serde_json::to_string(&metadata).map_err(|e| {
+                ApplicationError::Persistence(format!(
+                    "failed to serialize artifact metadata during update: {e}"
+                ))
+            })?;
+
             let updated_rows = conn
                 .execute(
                     r#"
@@ -366,10 +404,18 @@ impl ArtifactRepository for SqliteArtifactRepository {
                     SET optimized_transcript = ?2,
                         summary = ?3,
                         faqs = ?4,
-                        updated_at = ?5
+                        metadata_json = ?5,
+                        updated_at = ?6
                     WHERE id = ?1 AND is_deleted = 0
                     "#,
-                    params![id, optimized_transcript, summary, faqs, Utc::now().to_rfc3339()],
+                    params![
+                        id,
+                        optimized_transcript,
+                        summary,
+                        faqs,
+                        metadata_json,
+                        Utc::now().to_rfc3339()
+                    ],
                 )
                 .map_err(|e| ApplicationError::Persistence(format!("failed to update artifact: {e}")))?;
 

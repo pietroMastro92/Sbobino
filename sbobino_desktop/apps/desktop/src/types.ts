@@ -83,7 +83,7 @@ export type WhisperOptions = {
 
 export type SpeakerDiarizationSettings = {
   enabled: boolean;
-  device: "auto" | "cpu" | "mps" | "cuda";
+  device: "auto" | "cpu" | "mps";
 };
 
 export type TranscriptionSettings = {
@@ -177,6 +177,7 @@ export type JobStage =
   | "queued"
   | "preparing_audio"
   | "transcribing"
+  | "diarizing"
   | "optimizing"
   | "summarizing"
   | "persisting"
@@ -283,12 +284,14 @@ export type ProvisioningStatus = {
   models_dir: string;
   missing_models: string[];
   missing_encoders: string[];
+  pyannote: PyannoteRuntimeHealth;
 };
 
 export type ProvisioningProgressEvent = {
   current: number;
   total: number;
   asset: string;
+  asset_kind: "whisper_model" | "whisper_encoder" | "pyannote_runtime" | "pyannote_model";
   stage: string;
   percentage: number;
 };
@@ -320,6 +323,7 @@ export type RuntimeHealth = {
   coreml_encoder_present: boolean;
   missing_models: string[];
   missing_encoders: string[];
+  pyannote: PyannoteRuntimeHealth;
 };
 
 export type TranscriptionStartPreflight = {
@@ -331,6 +335,19 @@ export type TranscriptionStartPreflight = {
   model_path: string;
   whisper_cli_resolved: string;
   whisper_stream_resolved: string;
+  pyannote: PyannoteRuntimeHealth;
+};
+
+export type PyannoteRuntimeHealth = {
+  enabled: boolean;
+  ready: boolean;
+  runtime_installed: boolean;
+  model_installed: boolean;
+  arch: string;
+  device: string;
+  source: string;
+  reason_code: string;
+  message: string;
 };
 
 export type EnsureRuntimeResponse = {

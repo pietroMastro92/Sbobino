@@ -181,7 +181,7 @@ exit 2
 }
 
 #[tokio::test]
-async fn transcribe_keeps_repeated_lines_from_stream() {
+async fn transcribe_collapses_consecutive_repeated_lines_in_final_output() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("whisper-cli");
     let models_dir = temp.path().join("models");
@@ -226,10 +226,13 @@ exit 0
         .expect("transcription should succeed");
 
     let transcript_lines: Vec<&str> = transcript.text.lines().collect();
-    assert_eq!(transcript_lines.len(), 3, "expected all streamed lines");
+    assert_eq!(
+        transcript_lines.len(),
+        2,
+        "expected duplicate lines to collapse"
+    );
     assert_eq!(transcript_lines[0], "repeated line");
-    assert_eq!(transcript_lines[1], "repeated line");
-    assert_eq!(transcript_lines[2], "final line");
+    assert_eq!(transcript_lines[1], "final line");
 
     let lines = emitted.lock().expect("emit lock poisoned").clone();
     assert_eq!(
@@ -268,6 +271,9 @@ logprob=""
 word=""
 best_of=""
 beam_size=""
+temp_inc=""
+no_speech=""
+prompt=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -278,19 +284,22 @@ while [ $# -gt 0 ]; do
     -t) shift; threads="$1" ;;
     -p) shift; processors="$1" ;;
     -tp) shift; temp="$1" ;;
+    -tpi) shift; temp_inc="$1" ;;
     -et) shift; entropy="$1" ;;
     -lpt) shift; logprob="$1" ;;
+    -nth) shift; no_speech="$1" ;;
     -wt) shift; word="$1" ;;
     -bo) shift; best_of="$1" ;;
     -bs) shift; beam_size="$1" ;;
+    --prompt) shift; prompt="$1" ;;
   esac
   shift
 done
 
 if [ -n "$out" ]; then
-  printf "tr=%s sow=%s mc=%s t=%s p=%s tp=%s et=%s lpt=%s wt=%s bo=%s bs=%s\n" \
+  printf "tr=%s sow=%s mc=%s t=%s p=%s tp=%s tpi=%s et=%s lpt=%s nth=%s wt=%s bo=%s bs=%s prompt=%s\n" \
     "$translate" "$split_on_word" "$max_context" "$threads" "$processors" \
-    "$temp" "$entropy" "$logprob" "$word" "$best_of" "$beam_size" > "${out}.txt"
+    "$temp" "$temp_inc" "$entropy" "$logprob" "$no_speech" "$word" "$best_of" "$beam_size" "$prompt" > "${out}.txt"
 fi
 exit 0
 "#,
@@ -311,13 +320,16 @@ exit 0
                 no_context: true,
                 split_on_word: true,
                 temperature: 0.35,
+                temperature_increment_on_fallback: 0.15,
                 entropy_threshold: 2.2,
                 logprob_threshold: -0.9,
+                no_speech_threshold: 0.74,
                 word_threshold: 0.2,
                 best_of: 7,
                 beam_size: 1,
                 threads: 6,
                 processors: 2,
+                prompt: Some("Meeting about launch".to_string()),
                 ..WhisperOptions::default()
             },
             None,
@@ -333,9 +345,12 @@ exit 0
     assert!(transcript.text.contains("t=6"));
     assert!(transcript.text.contains("p=2"));
     assert!(transcript.text.contains("tp=0.35"));
+    assert!(transcript.text.contains("tpi=0.15"));
     assert!(transcript.text.contains("et=2.2"));
     assert!(transcript.text.contains("lpt=-0.9"));
+    assert!(transcript.text.contains("nth=0.74"));
     assert!(transcript.text.contains("wt=0.2"));
     assert!(transcript.text.contains("bo=7"));
     assert!(transcript.text.contains("bs="));
+    assert!(transcript.text.contains("prompt=Meeting about launch"));
 }

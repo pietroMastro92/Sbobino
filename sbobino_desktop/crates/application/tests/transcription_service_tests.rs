@@ -18,6 +18,8 @@ use sbobino_domain::{
     TranscriptArtifact, TranscriptionOutput, WhisperOptions,
 };
 
+const HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY: &str = "has_optimized_transcript";
+
 #[derive(Default)]
 struct MockTranscoder {
     calls: Mutex<usize>,
@@ -59,11 +61,15 @@ impl SpeechToTextEngine for MockSpeechEngine {
 #[derive(Default)]
 struct MockSpeakerDiarizer {
     turns: Vec<SpeakerTurn>,
+    fail_with: Option<String>,
 }
 
 #[async_trait]
 impl SpeakerDiarizationEngine for MockSpeakerDiarizer {
     async fn diarize(&self, _input_wav: &Path) -> Result<Vec<SpeakerTurn>, ApplicationError> {
+        if let Some(message) = &self.fail_with {
+            return Err(ApplicationError::SpeakerDiarization(message.clone()));
+        }
         Ok(self.turns.clone())
     }
 }
@@ -217,6 +223,14 @@ impl ArtifactRepository for InMemoryArtifactRepository {
         artifact.optimized_transcript = optimized_transcript.to_string();
         artifact.summary = summary.to_string();
         artifact.faqs = faqs.to_string();
+        if optimized_transcript.trim().is_empty() {
+            artifact.metadata.remove(HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY);
+        } else {
+            artifact.metadata.insert(
+                HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        }
         artifact.touch();
         Ok(Some(artifact.clone()))
     }
@@ -408,7 +422,12 @@ async fn run_file_transcription_without_ai_emits_expected_stages_and_persists() 
     );
 
     assert_eq!(artifact.raw_transcript, "raw transcript");
-    assert_eq!(artifact.optimized_transcript, "raw transcript");
+    assert!(artifact.optimized_transcript.is_empty());
+    assert!(
+        !artifact
+            .metadata
+            .contains_key(HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY)
+    );
     assert!(artifact.summary.is_empty());
     assert!(artifact.faqs.is_empty());
 
@@ -436,6 +455,59 @@ async fn run_file_transcription_without_ai_emits_expected_stages_and_persists() 
 
     let persisted = repo.list_recent(10, 0).await.expect("list should succeed");
     assert_eq!(persisted.len(), 1);
+}
+
+#[tokio::test]
+async fn run_file_transcription_emits_final_transcript_snapshot_before_post_processing() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("lecture.mp3");
+    tokio::fs::write(&input_path, b"fake mp3 content")
+        .await
+        .expect("failed to create test input file");
+
+    let transcoder = Arc::new(MockTranscoder::default());
+    let speech = Arc::new(MockSpeechEngine {
+        transcript: "line one\nline two".to_string(),
+        segments: Vec::new(),
+    });
+    let enhancer = Arc::new(MockEnhancer::default());
+    let repo = Arc::new(InMemoryArtifactRepository::default());
+
+    let service = TranscriptionService::new(transcoder, speech, enhancer, repo);
+    let emitted_partials: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_partials_clone = emitted_partials.clone();
+
+    service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-001b".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Base,
+                enable_ai: false,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+            },
+            Arc::new(|_| {}),
+            Arc::new(move |text: String| {
+                emitted_partials_clone
+                    .lock()
+                    .expect("emitted partials lock poisoned")
+                    .push(text);
+            }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("transcription service should succeed");
+
+    let partials = emitted_partials
+        .lock()
+        .expect("emitted partials lock poisoned");
+    assert_eq!(
+        partials.last().map(String::as_str),
+        Some("line one\nline two")
+    );
 }
 
 #[tokio::test]
@@ -493,9 +565,16 @@ async fn run_file_transcription_with_ai_runs_enhancer_steps() {
     assert!(stages.contains(&JobStage::Optimizing));
     assert!(stages.contains(&JobStage::Summarizing));
 
-    assert_eq!(artifact.optimized_transcript, "optimized::meeting raw");
-    assert_eq!(artifact.summary, "summary::optimized::meeting raw");
-    assert_eq!(artifact.faqs, "faqs::optimized::meeting raw");
+    assert_eq!(artifact.optimized_transcript, "meeting raw");
+    assert_eq!(
+        artifact
+            .metadata
+            .get(HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY)
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(artifact.summary, "summary::meeting raw");
+    assert_eq!(artifact.faqs, "faqs::meeting raw");
 
     assert_eq!(
         *enhancer
@@ -595,6 +674,7 @@ async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
                 end_seconds: 4.0,
             },
         ],
+        fail_with: None,
     });
 
     let service = TranscriptionService::new(transcoder, speech, enhancer, repo)
@@ -626,6 +706,76 @@ async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
     assert!(timeline.contains("\"speaker_id\":\"speaker_1\""));
     assert!(timeline.contains("\"speaker_label\":\"Speaker 1\""));
     assert!(timeline.contains("\"speaker_id\":\"speaker_2\""));
+    assert_eq!(
+        artifact
+            .metadata
+            .get("speaker_diarization_status")
+            .map(String::as_str),
+        Some("completed")
+    );
+}
+
+#[tokio::test]
+async fn run_file_transcription_persists_diarization_failure_metadata() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("meeting.wav");
+    tokio::fs::write(&input_path, b"fake wav content")
+        .await
+        .expect("failed to create wav file");
+
+    let transcoder = Arc::new(MockTranscoder::default());
+    let speech = Arc::new(MockSpeechEngine {
+        transcript: "meeting raw".to_string(),
+        segments: vec![TimedSegment {
+            text: "Hello there.".to_string(),
+            start_seconds: Some(0.0),
+            end_seconds: Some(1.8),
+            ..TimedSegment::default()
+        }],
+    });
+    let enhancer = Arc::new(MockEnhancer::default());
+    let repo = Arc::new(InMemoryArtifactRepository::default());
+    let diarizer = Arc::new(MockSpeakerDiarizer {
+        fail_with: Some("pyannote crashed".to_string()),
+        ..MockSpeakerDiarizer::default()
+    });
+
+    let service = TranscriptionService::new(transcoder, speech, enhancer, repo)
+        .with_speaker_diarizer(diarizer);
+
+    let artifact = service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-004b".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Base,
+                enable_ai: false,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_text: String| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("transcription should still succeed when diarization fails");
+
+    assert_eq!(
+        artifact
+            .metadata
+            .get("speaker_diarization_status")
+            .map(String::as_str),
+        Some("failed")
+    );
+    assert_eq!(
+        artifact
+            .metadata
+            .get("speaker_diarization_error")
+            .map(String::as_str),
+        Some("speaker diarization failed: pyannote crashed")
+    );
 }
 
 #[tokio::test]
@@ -669,7 +819,12 @@ async fn run_file_transcription_keeps_raw_transcript_when_ai_fails() {
         .expect("transcription should still succeed when ai fails");
 
     assert_eq!(artifact.raw_transcript, "meeting raw");
-    assert_eq!(artifact.optimized_transcript, "meeting raw");
+    assert!(artifact.optimized_transcript.is_empty());
+    assert!(
+        !artifact
+            .metadata
+            .contains_key(HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY)
+    );
     assert!(artifact.summary.is_empty());
     assert!(artifact.faqs.is_empty());
     assert_eq!(

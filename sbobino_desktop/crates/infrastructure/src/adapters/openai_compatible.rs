@@ -258,12 +258,12 @@ fn build_optimize_prompt(
         })
     {
         return format!(
-            "{template}\n\nLanguage: {language_instruction}\n\nTranscript:\n{text}\n\nReturn only the optimized text."
+            "{template}\n\nLanguage: {language_instruction}\n\nAdditional cleanup rules:\n- Preserve the original wording and order of the transcript.\n- Only improve punctuation, capitalization, spacing, and paragraph breaks.\n- Remove obvious accidental repetitions, duplicated lines, and looped sentences.\n- Keep only one occurrence when the same sentence is repeated in sequence by mistake.\n- Do not paraphrase, summarize, rewrite, fix wording, or add any words that are not already present in the transcript.\n- Do not invent missing content.\n\nTranscript:\n{text}\n\nReturn only the cleaned transcript."
         );
     }
 
     format!(
-        "Clean and optimize this transcript while preserving the same language as the source text ({language_instruction}). Return only optimized text.\n\n{text}"
+        "Clean this transcript while preserving the same language as the source text ({language_instruction}). Preserve the original wording and order. Only improve punctuation, capitalization, spacing, and paragraph breaks, and remove obvious transcription glitches such as consecutive duplicated lines, repeated phrases, looped sentences, and hallucinated filler. When the same sentence is repeated accidentally in sequence, keep only the single best occurrence. Do not paraphrase, summarize, rewrite, fix wording, or add any words that are not already present in the transcript. Do not invent missing content. Return only the cleaned transcript.\n\n{text}"
     )
 }
 
@@ -310,6 +310,7 @@ mod tests {
         let prompt = build_optimize_prompt("ciao", "auto", None, None);
         assert!(prompt.contains("the same language as the source text"));
         assert!(prompt.contains("the same language as the transcript"));
+        assert!(prompt.contains("repeated phrases"));
     }
 }
 

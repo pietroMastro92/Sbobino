@@ -17,8 +17,8 @@ use crate::commands::artifacts::{
     update_artifact, update_artifact_timeline, write_trimmed_audio,
 };
 use crate::commands::provisioning::{
-    provisioning_cancel, provisioning_download_model, provisioning_models, provisioning_start,
-    provisioning_status,
+    provisioning_cancel, provisioning_download_model, provisioning_install_pyannote,
+    provisioning_models, provisioning_start, provisioning_status,
 };
 use crate::commands::realtime::{
     list_realtime_sessions, load_realtime_session, pause_realtime, resume_realtime, start_realtime,
@@ -158,6 +158,7 @@ pub fn run() {
             provisioning_models,
             provisioning_start,
             provisioning_download_model,
+            provisioning_install_pyannote,
             provisioning_cancel,
             ensure_transcription_runtime,
             get_transcription_runtime_health,

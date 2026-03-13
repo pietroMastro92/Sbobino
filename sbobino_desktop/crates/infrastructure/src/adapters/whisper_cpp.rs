@@ -10,7 +10,10 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
-use sbobino_domain::{TimedSegment, TimedWord, TranscriptionOutput, WhisperOptions};
+use sbobino_domain::{
+    collapse_consecutive_repeated_segments, minimize_transcript_repetitions, TimedSegment,
+    TimedWord, TranscriptionOutput, WhisperOptions,
+};
 
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
 
@@ -263,8 +266,11 @@ impl WhisperCppEngine {
         let mut normalized = options.clone();
 
         normalized.temperature = normalized.temperature.clamp(0.0, 1.0);
+        normalized.temperature_increment_on_fallback =
+            normalized.temperature_increment_on_fallback.clamp(0.0, 1.0);
         normalized.entropy_threshold = normalized.entropy_threshold.clamp(0.0, 10.0);
         normalized.logprob_threshold = normalized.logprob_threshold.clamp(-10.0, 0.0);
+        normalized.no_speech_threshold = normalized.no_speech_threshold.clamp(0.0, 1.0);
         normalized.word_threshold = normalized.word_threshold.clamp(0.0, 1.0);
         normalized.best_of = normalized.best_of.clamp(1, 20);
         normalized.beam_size = normalized.beam_size.clamp(1, 20);
@@ -343,12 +349,17 @@ impl WhisperCppEngine {
             .arg(options.processors.to_string())
             .arg("-tp")
             .arg(options.temperature.to_string())
+            .arg("-tpi")
+            .arg(options.temperature_increment_on_fallback.to_string())
             .arg("-et")
             .arg(options.entropy_threshold.to_string())
             .arg("-lpt")
             .arg(options.logprob_threshold.to_string())
+            .arg("-nth")
+            .arg(options.no_speech_threshold.to_string())
             .arg("-wt")
-            .arg(options.word_threshold.to_string());
+            .arg(options.word_threshold.to_string())
+            .arg("-sns");
 
         if language_code != "auto" {
             command.arg("-l").arg(language_code);
@@ -368,6 +379,14 @@ impl WhisperCppEngine {
         }
         if options.diarize {
             command.arg("-di");
+        }
+        if let Some(prompt) = options
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            command.arg("--prompt").arg(prompt);
         }
         if options.beam_size > 1 {
             command.arg("-bs").arg(options.beam_size.to_string());
@@ -452,7 +471,7 @@ impl WhisperCppEngine {
         let stderr_output = stderr_lines.join("\n");
 
         let segments = if let Ok(state) = collected.lock() {
-            state.segments.clone()
+            collapse_consecutive_repeated_segments(&state.segments)
         } else {
             Vec::new()
         };
@@ -477,6 +496,7 @@ impl WhisperCppEngine {
         };
 
         let transcript = transcript_from_file.unwrap_or_else(|| Self::join_segment_text(&segments));
+        let transcript = minimize_transcript_repetitions(&transcript);
 
         let _ = fs::remove_file(&output_txt_path).await;
 

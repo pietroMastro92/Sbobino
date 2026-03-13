@@ -4024,6 +4024,7 @@ dependencies = [
 name = "sbobino-desktop"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "docx-rs",
@@ -4035,10 +4036,12 @@ dependencies = [
  "sbobino-infrastructure",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-updater",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

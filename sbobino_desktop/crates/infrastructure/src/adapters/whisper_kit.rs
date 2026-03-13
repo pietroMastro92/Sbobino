@@ -15,7 +15,10 @@ use tokio::time::{timeout, Duration, Instant};
 use tracing::warn;
 
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
-use sbobino_domain::{TimedSegment, TranscriptionOutput, WhisperOptions};
+use sbobino_domain::{
+    collapse_consecutive_repeated_segments, minimize_transcript_repetitions, TimedSegment,
+    TranscriptionOutput, WhisperOptions,
+};
 
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
 
@@ -242,11 +245,26 @@ impl WhisperKitEngine {
             .lines()
             .filter_map(Self::parse_timed_segment_line)
             .collect::<Vec<_>>();
-        let segments =
-            normalize_transcript_segments(&transcript, &parsed_segments, total_audio_seconds);
+        let collapsed_segments = collapse_consecutive_repeated_segments(&parsed_segments);
+        let normalized_text = if collapsed_segments.is_empty() {
+            minimize_transcript_repetitions(&transcript)
+        } else {
+            minimize_transcript_repetitions(
+                &collapsed_segments
+                    .iter()
+                    .map(|segment| segment.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+        let segments = normalize_transcript_segments(
+            &normalized_text,
+            &collapsed_segments,
+            total_audio_seconds,
+        );
 
         TranscriptionOutput {
-            text: transcript,
+            text: normalized_text,
             segments,
         }
     }
@@ -964,6 +982,7 @@ impl WhisperKitEngine {
             .ok_or_else(|| {
                 ApplicationError::SpeechToText("whisperkit-cli produced empty output".to_string())
             })?;
+        let transcript = minimize_transcript_repetitions(&transcript);
 
         for line in transcript.lines() {
             let trimmed = line.trim();
