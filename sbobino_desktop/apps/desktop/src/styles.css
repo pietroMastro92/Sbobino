@@ -547,6 +547,42 @@ code {
   margin-inline: auto;
 }
 
+.home-audio-player-card {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 0;
+  height: max-content;
+  padding: 0;
+  min-width: 0;
+  overflow: hidden;
+  min-height: max-content;
+}
+
+.home-audio-player-card .detail-audio-stack,
+.home-audio-player-card .detail-audio-player-group {
+  gap: 0;
+  min-width: 0;
+}
+
+.home-audio-player-card .audio-player {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+  border-top: none;
+  background: transparent;
+  backdrop-filter: none;
+}
+
+.home-audio-player-card .audio-player:not(.audio-player--trim) {
+  min-height: 68px;
+}
+
+.home-view .home-audio-player-card {
+  width: min(100%, 920px);
+}
+
 .main-input-bar {
   display: flex;
   align-items: center;
@@ -643,6 +679,31 @@ code {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .audio-controls-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "play slider trim"
+      "time speed speed";
+    row-gap: 10px;
+  }
+
+  .audio-controls-row > .audio-time {
+    justify-self: start;
+  }
+
+  .audio-controls-row > .audio-speed {
+    justify-self: end;
+  }
+
+  .audio-trim-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .trim-selection-status {
+    align-self: flex-start;
+  }
+
   .home-topbar-controls {
     gap: 8px;
   }
@@ -660,6 +721,61 @@ code {
 @container main-content (max-width: 700px) {
   .quick-actions-grid {
     grid-template-columns: 1fr;
+  }
+
+  .audio-controls-row {
+    grid-template-columns: auto auto;
+    grid-template-areas:
+      "play trim"
+      "slider slider"
+      "time speed";
+    align-items: center;
+  }
+
+  .audio-controls-row > .trim-toggle {
+    justify-self: end;
+  }
+
+  .audio-controls-row > .audio-speed {
+    justify-self: end;
+  }
+
+  .audio-speed {
+    gap: 4px;
+  }
+
+  .audio-speed select {
+    min-width: 0;
+    padding-inline: 6px;
+  }
+
+  .audio-trim-panel {
+    padding: 0 10px 12px;
+  }
+
+  .audio-waveform-track {
+    height: 96px;
+  }
+
+  .trim-scale {
+    grid-template-columns: 1fr;
+    justify-items: start;
+    gap: 4px;
+  }
+
+  .trim-scale span:nth-child(2) {
+    justify-self: start;
+  }
+
+  .trim-region-window {
+    left: 8px;
+    right: 8px;
+    gap: 8px;
+    padding: 0 10px;
+  }
+
+  .trim-region-window-duration {
+    display: none;
   }
 
   .file-picker-card {
@@ -683,6 +799,47 @@ code {
 
   .home-topbar-controls .chip-label {
     gap: 3px;
+  }
+}
+
+@media (max-height: 760px) {
+  .home-audio-player-card .audio-player:not(.audio-player--trim) {
+    min-height: 88px;
+  }
+
+  .home-audio-player-card .audio-controls-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "play slider trim"
+      "time speed speed";
+    row-gap: 10px;
+    align-items: center;
+  }
+
+  .home-audio-player-card .audio-controls-row > .audio-time {
+    justify-self: start;
+  }
+
+  .home-audio-player-card .audio-controls-row > .audio-speed {
+    justify-self: end;
+  }
+}
+
+@media (max-height: 620px) {
+  .home-audio-player-card .audio-player:not(.audio-player--trim) {
+    min-height: 100px;
+  }
+
+  .home-audio-player-card .audio-controls-row {
+    grid-template-columns: auto auto;
+    grid-template-areas:
+      "play trim"
+      "slider slider"
+      "time speed";
+  }
+
+  .home-audio-player-card .audio-controls-row > .trim-toggle {
+    justify-self: end;
   }
 }
 
@@ -2289,6 +2446,7 @@ code {
   display: flex;
   flex-direction: column;
   gap: 0;
+  min-width: 0;
   border-top: 1px solid var(--line-soft);
   background: var(--detail-glass-soft);
   backdrop-filter: blur(8px);
@@ -2322,9 +2480,37 @@ code {
 .audio-controls-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto auto auto;
+  grid-template-areas: "play slider time speed trim";
   align-items: center;
   gap: 8px;
   padding: 9px 12px;
+  min-height: 44px;
+  min-width: 0;
+}
+
+.audio-player:not(.audio-player--trim) .audio-controls-row {
+  padding-block: 11px;
+}
+
+.audio-controls-row > .playback-button {
+  grid-area: play;
+}
+
+.audio-controls-row > .audio-slider,
+.audio-controls-row > .audio-waveform-spacer {
+  grid-area: slider;
+}
+
+.audio-controls-row > .audio-time {
+  grid-area: time;
+}
+
+.audio-controls-row > .audio-speed {
+  grid-area: speed;
+}
+
+.audio-controls-row > .trim-toggle {
+  grid-area: trim;
 }
 
 .audio-waveform-spacer {
@@ -2365,25 +2551,39 @@ code {
 
 /* ── Trim panel (waveform + regions) ───────────────────────── */
 
+.audio-trim-shell {
+  overflow: hidden;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-10px);
+  pointer-events: none;
+  transition:
+    max-height 280ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 180ms ease,
+    transform 220ms ease,
+    visibility 0s linear 280ms;
+  will-change: max-height, opacity, transform;
+}
+
+.audio-trim-shell.is-open {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  pointer-events: auto;
+  transition:
+    max-height 320ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 220ms ease,
+    transform 260ms ease,
+    visibility 0s linear 0s;
+}
+
 .audio-trim-panel {
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding: 0 12px 12px;
-  animation: trimPanelIn 250ms ease;
-}
-
-@keyframes trimPanelIn {
-  from {
-    opacity: 0;
-    max-height: 0;
-    transform: translateY(-4px);
-  }
-  to {
-    opacity: 1;
-    max-height: 200px;
-    transform: translateY(0);
-  }
+  min-width: 0;
+  transform-origin: top center;
 }
 
 /* ── Waveform track ────────────────────────────────────────── */
@@ -2394,6 +2594,11 @@ code {
   justify-content: space-between;
   gap: 12px;
   padding-top: 2px;
+  min-width: 0;
+}
+
+.audio-trim-header > div:first-child {
+  min-width: 0;
 }
 
 .audio-trim-header strong {
@@ -2406,10 +2611,11 @@ code {
 .audio-trim-header span {
   display: block;
   margin-top: 3px;
-  max-width: 640px;
+  max-width: min(640px, 100%);
   font-size: 0.75rem;
   line-height: 1.35;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .trim-selection-status {
@@ -2425,6 +2631,8 @@ code {
 
 .audio-waveform-track {
   position: relative;
+  width: 100%;
+  min-width: 0;
   height: 108px;
   border-radius: 18px;
   background:
@@ -2433,6 +2641,8 @@ code {
   border: 1px solid rgba(109, 148, 197, 0.18);
   overflow: hidden;
   cursor: crosshair;
+  touch-action: none;
+  user-select: none;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
 }
 
@@ -2547,6 +2757,8 @@ code {
     rgba(109, 148, 197, 0.12);
   color: var(--text);
   cursor: grab;
+  touch-action: none;
+  user-select: none;
   box-shadow: 0 12px 28px rgba(84, 120, 168, 0.16);
   transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
 }
@@ -2599,6 +2811,8 @@ code {
   justify-content: center;
   padding: 0;
   cursor: ew-resize;
+  touch-action: none;
+  user-select: none;
   box-shadow: 0 12px 24px rgba(84, 120, 168, 0.2);
   z-index: 2;
 }
@@ -2642,6 +2856,7 @@ code {
   align-items: center;
   gap: 6px;
   min-height: 28px;
+  min-width: 0;
 }
 
 .trim-region-chip {
@@ -2655,6 +2870,7 @@ code {
   font-size: 0.76rem;
   font-weight: 500;
   color: var(--muted);
+  min-width: 0;
   white-space: nowrap;
   animation: chipIn 200ms ease;
 }
@@ -2670,8 +2886,16 @@ code {
   background: transparent;
   color: inherit;
   cursor: pointer;
+  min-width: 0;
   padding: 0 4px;
   font: inherit;
+}
+
+.trim-region-chip-label span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 @keyframes chipIn {
@@ -2729,6 +2953,7 @@ code {
   align-items: center;
   gap: 5px;
   margin-left: auto;
+  max-width: 100%;
   border: 0;
   border-radius: 999px;
   background: var(--accent);

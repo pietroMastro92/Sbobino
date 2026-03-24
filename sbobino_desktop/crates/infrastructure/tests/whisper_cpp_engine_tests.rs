@@ -9,6 +9,8 @@ use sbobino_application::{ApplicationError, SpeechToTextEngine};
 use sbobino_domain::WhisperOptions;
 use sbobino_infrastructure::adapters::whisper_cpp::WhisperCppEngine;
 
+const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
+
 fn write_executable_script(path: &Path, content: &str) {
     std::fs::write(path, content).expect("failed to write script");
 
@@ -70,8 +72,8 @@ exit 0
     assert!(transcript.text.contains("second line"));
 
     let lines = emitted.lock().expect("emit lock poisoned").clone();
-    assert!(lines.iter().any(|line| line == "first line"));
-    assert!(lines.iter().any(|line| line == "second line"));
+    assert!(lines.iter().any(|line| line == &format!("{DELTA_REPLACE_PREFIX}first line")));
+    assert!(lines.iter().any(|line| line.contains("first line\nsecond line")));
 }
 
 #[tokio::test]
@@ -235,12 +237,63 @@ exit 0
     assert_eq!(transcript_lines[1], "final line");
 
     let lines = emitted.lock().expect("emit lock poisoned").clone();
+    assert!(lines.iter().any(|line| line == &format!("{DELTA_REPLACE_PREFIX}repeated line")));
+    assert!(lines.iter().any(|line| line.contains("repeated line\nrepeated line")));
+    assert!(lines.last().is_some_and(|line| line.contains("final line")));
+}
+
+#[tokio::test]
+async fn transcribe_ignores_cli_progress_percent_without_segments() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+echo "whisper_print_progress_callback: progress = 57%"
+echo "[00:00:00.000 --> 00:00:04.000] first segment"
+exit 0
+"#,
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let progress_updates: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let progress_updates_clone = progress_updates.clone();
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            "en",
+            &WhisperOptions::default(),
+            Some(120.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(move |seconds: f32| {
+                progress_updates_clone
+                    .lock()
+                    .expect("progress lock poisoned")
+                    .push(seconds);
+            }),
+        )
+        .await
+        .expect("transcription should succeed");
+
+    assert!(transcript.text.contains("first segment"));
     assert_eq!(
-        lines
-            .iter()
-            .filter(|line| line.as_str() == "repeated line")
-            .count(),
-        2
+        progress_updates.lock().expect("progress lock poisoned").as_slice(),
+        &[4.0],
+        "expected progress to advance only from finalized segment timing",
     );
 }
 

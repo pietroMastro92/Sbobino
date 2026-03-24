@@ -1,6 +1,8 @@
 import { Pause, Play, Rabbit, Scissors, X, Trash2, Check } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { readAudioFile, writeTrimmedAudio } from "../lib/tauri";
+import { useTranslation, type AppLanguage } from "../i18n";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -16,18 +18,74 @@ type AudioPlayerProps = {
   initialTrimRegions?: TrimRegion[];
   onMetadataLoaded?: (metadata: { durationSeconds: number }) => void;
   onTrimRegionsChange?: (regions: TrimRegion[]) => void;
-  onTrimApplied?: (trimmedPath: string) => void;
+  onTrimApplied?: (trimmedPath: string, regions: TrimRegion[]) => void;
 };
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-function formatTime(seconds: number): string {
+const localeByLanguage: Record<AppLanguage, string> = {
+  en: "en-US",
+  it: "it-IT",
+  es: "es-ES",
+  de: "de-DE",
+};
+
+function getLocale(language: AppLanguage): string {
+  return localeByLanguage[language] ?? "en-US";
+}
+
+function getDurationParts(seconds: number): { hours: number; minutes: number; seconds: number } {
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    return "00:00";
+    return { hours: 0, minutes: 0, seconds: 0 };
   }
-  const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
-  const ss = String(Math.floor(seconds % 60)).padStart(2, "0");
-  return `${mm}:${ss}`;
+
+  const totalSeconds = Math.floor(seconds);
+  return {
+    hours: Math.floor(totalSeconds / 3600),
+    minutes: Math.floor((totalSeconds % 3600) / 60),
+    seconds: totalSeconds % 60,
+  };
+}
+
+function formatTime(seconds: number, language: AppLanguage): string {
+  const { hours, minutes, seconds: secondsPart } = getDurationParts(seconds);
+  const formatter = new Intl.NumberFormat(getLocale(language), {
+    minimumIntegerDigits: 2,
+    useGrouping: false,
+  });
+
+  if (hours > 0) {
+    return `${formatter.format(hours)}:${formatter.format(minutes)}:${formatter.format(secondsPart)}`;
+  }
+
+  return `${formatter.format(minutes)}:${formatter.format(secondsPart)}`;
+}
+
+function formatTimeWithUnits(
+  seconds: number,
+  language: AppLanguage,
+  t: (key: string, fallback?: string) => string,
+): string {
+  const { hours, minutes, seconds: secondsPart } = getDurationParts(seconds);
+  const formatter = new Intl.NumberFormat(getLocale(language), {
+    useGrouping: false,
+  });
+  const units = {
+    hours: t("audio.timeUnit.hours", "h"),
+    minutes: t("audio.timeUnit.minutes", "min"),
+    seconds: t("audio.timeUnit.seconds", "s"),
+  };
+  const parts: string[] = [];
+
+  if (hours > 0) {
+    parts.push(`${formatter.format(hours)} ${units.hours}`);
+  }
+  if (hours > 0 || minutes > 0) {
+    parts.push(`${formatter.format(minutes)} ${units.minutes}`);
+  }
+  parts.push(`${formatter.format(secondsPart)} ${units.seconds}`);
+
+  return parts.join(" ");
 }
 
 function mimeFromPath(path: string): string {
@@ -89,8 +147,8 @@ function findRegionBounds(
   };
 }
 
-function formatRegionLabel(region: TrimRegion): string {
-  return `${formatTime(region.startTime)} - ${formatTime(region.endTime)}`;
+function formatRegionLabel(region: TrimRegion, language: AppLanguage): string {
+  return `${formatTime(region.startTime, language)} - ${formatTime(region.endTime, language)}`;
 }
 
 // ── Waveform: pre-compute peaks (expensive — done once) ────────────
@@ -98,6 +156,7 @@ function formatRegionLabel(region: TrimRegion): string {
 interface CachedPeaks {
   peaks: Float32Array;
   maxPeak: number;
+  width: number;
 }
 
 interface WaveformColors {
@@ -107,11 +166,12 @@ interface WaveformColors {
 }
 
 function computePeaks(audioBuffer: AudioBuffer, targetWidth: number): CachedPeaks {
+  const width = Math.max(64, Math.round(targetWidth));
   const rawData = audioBuffer.getChannelData(0);
-  const samplesPerPixel = Math.max(1, Math.floor(rawData.length / targetWidth));
-  const peaks = new Float32Array(targetWidth);
+  const samplesPerPixel = Math.max(1, Math.floor(rawData.length / width));
+  const peaks = new Float32Array(width);
 
-  for (let i = 0; i < targetWidth; i++) {
+  for (let i = 0; i < width; i++) {
     const start = i * samplesPerPixel;
     const end = Math.min(start + samplesPerPixel, rawData.length);
     let max = 0;
@@ -127,7 +187,20 @@ function computePeaks(audioBuffer: AudioBuffer, targetWidth: number): CachedPeak
     if (peaks[i] > maxPeak) maxPeak = peaks[i];
   }
 
-  return { peaks, maxPeak };
+  return { peaks, maxPeak, width };
+}
+
+function waveformTargetWidth(width: number): number {
+  if (!Number.isFinite(width) || width <= 0) {
+    return 800;
+  }
+  return Math.min(Math.max(Math.round(width), 64), 2400);
+}
+
+function waitForNextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
 }
 
 // ── Waveform: draw (uses pre-computed peaks, no heavy work) ────────
@@ -259,9 +332,11 @@ export function AudioPlayer({
   onTrimRegionsChange,
   onTrimApplied,
 }: AudioPlayerProps): JSX.Element | null {
+  const { t, language } = useTranslation();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const waveformTrackRef = useRef<HTMLDivElement | null>(null);
+  const trimPanelContentRef = useRef<HTMLDivElement | null>(null);
   const onMetadataLoadedRef = useRef(onMetadataLoaded);
   const fallbackBlobUrlRef = useRef<string | null>(null);
   const fallbackLoadPromiseRef = useRef<Promise<boolean> | null>(null);
@@ -272,6 +347,7 @@ export function AudioPlayer({
   const animFrameRef = useRef<number>(0);
   const trimPlaybackRegionIndexRef = useRef<number | null>(null);
   const manualTrimStartRef = useRef(false);
+  const activePointerCleanupRef = useRef<(() => void) | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -293,6 +369,7 @@ export function AudioPlayer({
   const [cachedPeaks, setCachedPeaks] = useState<CachedPeaks | null>(null);
   const [isDecodingWaveform, setIsDecodingWaveform] = useState(false);
   const [isApplyingTrim, setIsApplyingTrim] = useState(false);
+  const [trimPanelHeight, setTrimPanelHeight] = useState(0);
   const audioBufferRef = useRef<AudioBuffer | null>(null);
 
   // Cached CSS colors — read once + updated on theme change
@@ -329,10 +406,36 @@ export function AudioPlayer({
     hapticsRef.current?.trigger(preset);
   }, []);
 
+  const formatClockTime = useCallback((seconds: number) => formatTime(seconds, language), [language]);
+  const formatReadableDuration = useCallback(
+    (seconds: number) => formatTimeWithUnits(seconds, language, t),
+    [language, t],
+  );
+  const formatRangeCount = useCallback((count: number): string => {
+    if (count <= 0) {
+      return t("audio.trimNoRanges", "No ranges yet");
+    }
+
+    const countLabel = new Intl.NumberFormat(getLocale(language)).format(count);
+    const rangeKey = count === 1 ? "audio.trimRangeSingular" : "audio.trimRangePlural";
+    return `${countLabel} ${t(rangeKey, count === 1 ? "range" : "ranges")}`;
+  }, [language, t]);
+
   const sourcePath = useMemo(() => {
     if (!inputPath || inputPath.trim().length === 0) return null;
     return inputPath;
   }, [inputPath]);
+  const preferredLocalSrc = useMemo(() => {
+    if (!sourcePath) return null;
+    if (sourcePath.startsWith("http://") || sourcePath.startsWith("https://")) {
+      return sourcePath;
+    }
+    try {
+      return convertFileSrc(sourcePath);
+    } catch {
+      return null;
+    }
+  }, [sourcePath]);
 
   const normalizedInitialTrimRegions = useMemo(
     () => sortRegions(initialTrimRegions ?? []),
@@ -352,6 +455,43 @@ export function AudioPlayer({
     trimPlaybackRegionIndexRef.current = null;
     manualTrimStartRef.current = false;
   }, [regions, trimMode, sourcePath]);
+
+  useEffect(() => () => {
+    activePointerCleanupRef.current?.();
+  }, []);
+
+  useEffect(() => {
+    if (!trimMode) {
+      activePointerCleanupRef.current?.();
+    }
+  }, [trimMode]);
+
+  useEffect(() => {
+    const panel = trimPanelContentRef.current;
+    if (!trimEnabled || !panel) {
+      setTrimPanelHeight(0);
+      return;
+    }
+
+    const syncHeight = () => {
+      setTrimPanelHeight(panel.scrollHeight);
+    };
+
+    syncHeight();
+
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      syncHeight();
+    });
+    observer.observe(panel);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [trimEnabled, trimMode, regions.length, isDecodingWaveform, isApplyingTrim, duration]);
 
   // ── Cache CSS colors & listen for theme changes ─────────────
 
@@ -389,6 +529,7 @@ export function AudioPlayer({
       pendingAutoPlayRef.current = false;
       setNeedsFallback(false);
       setCachedPeaks(null);
+      audioBufferRef.current = null;
       setRegions(normalizedInitialTrimRegions);
       setActiveRegionId(normalizedInitialTrimRegions[0]?.id ?? null);
       setTrimMode(false);
@@ -404,6 +545,7 @@ export function AudioPlayer({
       pendingAutoPlayRef.current = false;
       setNeedsFallback(false);
       setCachedPeaks(null);
+      audioBufferRef.current = null;
       setRegions(normalizedInitialTrimRegions);
       setActiveRegionId(normalizedInitialTrimRegions[0]?.id ?? null);
       setTrimMode(false);
@@ -413,13 +555,14 @@ export function AudioPlayer({
     const sourceVersion = sourceVersionRef.current + 1;
     sourceVersionRef.current = sourceVersion;
 
-    setSrc(null);
+    setSrc(preferredLocalSrc);
     setLoadError(null);
     setIsLoading(true);
     fallbackAttemptedRef.current = false;
     pendingAutoPlayRef.current = false;
     setNeedsFallback(false);
     setCachedPeaks(null);
+    audioBufferRef.current = null;
     setRegions(normalizedInitialTrimRegions);
     setActiveRegionId(normalizedInitialTrimRegions[0]?.id ?? null);
     setTrimMode(false);
@@ -429,7 +572,7 @@ export function AudioPlayer({
         sourceVersionRef.current += 1;
       }
     };
-  }, [normalizedInitialTrimRegions, sourcePath]);
+  }, [normalizedInitialTrimRegions, preferredLocalSrc, sourcePath]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -457,28 +600,38 @@ export function AudioPlayer({
     setIsDecodingWaveform(true);
 
     (async () => {
+      let audioCtx: AudioContext | null = null;
       try {
-        const response = await fetch(src);
+        await waitForNextPaint();
         if (cancelled) return;
-        const arrayBuffer = await response.arrayBuffer();
+        const arrayBuffer = sourcePath && !sourcePath.startsWith("http://") && !sourcePath.startsWith("https://")
+          ? new Uint8Array(await readAudioFile(sourcePath)).buffer
+          : await fetch(src).then((response) => response.arrayBuffer());
         if (cancelled) return;
-        const audioCtx = new AudioContext();
+        audioCtx = new AudioContext();
         const decoded = await audioCtx.decodeAudioData(arrayBuffer);
         if (cancelled) return;
-        // Compute peaks ONCE at a reasonable resolution (max 1200px)
-        const targetWidth = Math.min(canvasRef.current?.clientWidth || 800, 1200);
+        const targetWidth = waveformTargetWidth(
+          waveformTrackRef.current?.clientWidth || canvasRef.current?.clientWidth || 800,
+        );
         setCachedPeaks(computePeaks(decoded, targetWidth));
         audioBufferRef.current = decoded;
-        await audioCtx.close();
       } catch {
         setCachedPeaks(null);
       } finally {
+        if (audioCtx) {
+          try {
+            await audioCtx.close();
+          } catch {
+            // Ignore close failures during cancellation.
+          }
+        }
         if (!cancelled) setIsDecodingWaveform(false);
       }
     })();
 
     return () => { cancelled = true; };
-  }, [trimMode, src, cachedPeaks]);
+  }, [trimMode, src, cachedPeaks, sourcePath]);
 
   // ── Canvas redraw — ONLY when state changes, NOT continuous rAF ─
 
@@ -527,6 +680,13 @@ export function AudioPlayer({
     }
 
     const observer = new ResizeObserver(() => {
+      const trackWidth = waveformTrackRef.current?.clientWidth ?? 0;
+      const decodedBuffer = audioBufferRef.current;
+      const nextWidth = waveformTargetWidth(trackWidth);
+      if (decodedBuffer && (!cachedPeaks || Math.abs(cachedPeaks.width - nextWidth) > 8)) {
+        setCachedPeaks(computePeaks(decodedBuffer, nextWidth));
+        return;
+      }
       scheduleRedraw();
     });
     observer.observe(track);
@@ -535,7 +695,7 @@ export function AudioPlayer({
       observer.disconnect();
       cancelAnimationFrame(animFrameRef.current);
     };
-  }, [trimMode, redrawCanvas]);
+  }, [cachedPeaks, trimMode, redrawCanvas]);
 
   // ── Fallback audio loading ─────────────────────────────────
 
@@ -585,7 +745,7 @@ export function AudioPlayer({
       } catch (error) {
         if (sourceVersionRef.current !== sourceVersion) return false;
         if (!background) {
-          setLoadError(`Cannot load fallback audio: ${String(error)}`);
+        setLoadError(`${t("audio.errorLoadFallback", "Cannot load fallback audio")}: ${String(error)}`);
         }
         return false;
       } finally {
@@ -603,42 +763,30 @@ export function AudioPlayer({
   }, [sourcePath]);
 
   useEffect(() => {
-    if (!sourcePath || sourcePath.startsWith("http://") || sourcePath.startsWith("https://")) {
+    if (!needsFallback || !sourcePath) {
       return;
     }
-
-    if (fallbackBlobUrlRef.current) {
+    if (sourcePath.startsWith("http://") || sourcePath.startsWith("https://")) {
       return;
     }
-
     void loadFallbackAudio(false, false);
     return undefined;
-  }, [loadFallbackAudio, sourcePath]);
+  }, [loadFallbackAudio, needsFallback, sourcePath]);
 
   // ── Playback ───────────────────────────────────────────────
 
   async function togglePlayback(): Promise<void> {
     const audio = audioRef.current;
     if (!audio) return;
-    const prefersLocalBlob = Boolean(
-      sourcePath
-      && !sourcePath.startsWith("http://")
-      && !sourcePath.startsWith("https://"),
-    );
 
     if (audio.paused) {
-      if (prefersLocalBlob) {
-        const localSourceReady = Boolean(audio.currentSrc) && audio.readyState >= HTMLMediaElement.HAVE_METADATA;
-        if (!localSourceReady) {
-          pendingAutoPlayRef.current = true;
-          if (!fallbackBlobUrlRef.current) {
-            const prepared = await loadFallbackAudio(false);
-            if (!prepared) {
-              pendingAutoPlayRef.current = false;
-            }
-          }
-          return;
+      if (needsFallback && !fallbackBlobUrlRef.current) {
+        pendingAutoPlayRef.current = true;
+        const prepared = await loadFallbackAudio(true);
+        if (!prepared) {
+          pendingAutoPlayRef.current = false;
         }
+        return;
       }
       if (trimMode && regions.length > 0) {
         const regionIndex = manualTrimStartRef.current
@@ -659,7 +807,7 @@ export function AudioPlayer({
         setIsPlaying(true);
       } catch (error) {
         setIsPlaying(false);
-        setLoadError(`Cannot play audio: ${String(error)}`);
+        setLoadError(`${t("audio.errorPlay", "Cannot play audio")}: ${String(error)}`);
       }
       return;
     }
@@ -685,6 +833,44 @@ export function AudioPlayer({
     setPlaybackRate(nextRate);
   }
 
+  function bindPointerSession(
+    onPointerMove: (event: PointerEvent) => void,
+    onPointerEnd: () => void,
+  ): void {
+    activePointerCleanupRef.current?.();
+
+    let finished = false;
+
+    const cleanup = () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", finishPointerSession);
+      window.removeEventListener("pointercancel", finishPointerSession);
+      window.removeEventListener("blur", finishPointerSession);
+      if (activePointerCleanupRef.current === cleanup) {
+        activePointerCleanupRef.current = null;
+      }
+    };
+
+    const finishPointerSession = () => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      onPointerEnd();
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!finished) {
+        onPointerMove(event);
+      }
+    };
+
+    activePointerCleanupRef.current = cleanup;
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", finishPointerSession);
+    window.addEventListener("pointercancel", finishPointerSession);
+    window.addEventListener("blur", finishPointerSession);
+  }
+
   // ── Waveform: click-drag to create region ──────────────────
 
   function getTimeFromMouseEvent(e: { clientX: number }): number {
@@ -698,17 +884,18 @@ export function AudioPlayer({
     if (!trimMode || duration <= 0) return;
     if ((event.target as HTMLElement).closest(".trim-region-overlay")) return;
 
+    event.currentTarget.setPointerCapture?.(event.pointerId);
     const time = getTimeFromMouseEvent(event);
+    let latestClientX = event.clientX;
     setActiveRegionId(null);
     setCreating({ startTime: time, currentTime: time });
 
-    function onPointerMove(e: PointerEvent) {
+    bindPointerSession((e) => {
+      latestClientX = e.clientX;
       const moveTime = getTimeFromMouseEvent(e);
       setCreating((prev) => prev ? { ...prev, currentTime: moveTime } : null);
-    }
-
-    function onPointerUp(e: PointerEvent) {
-      const endTime = getTimeFromMouseEvent(e);
+    }, () => {
+      const endTime = getTimeFromMouseEvent({ clientX: latestClientX });
       setCreating(null);
 
       const s = Math.min(time, endTime);
@@ -735,14 +922,9 @@ export function AudioPlayer({
       } else {
         onSeek(endTime);
       }
-
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-    }
+    });
 
     event.preventDefault();
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
   }
 
   // ── Trim region management ─────────────────────────────────
@@ -811,48 +993,36 @@ export function AudioPlayer({
   function onHandlePointerDown(event: ReactPointerEvent, regionId: string, handle: "start" | "end"): void {
     event.preventDefault();
     event.stopPropagation();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
     setActiveRegionId(regionId);
     setDragging({ regionId, handle });
     lastHapticSecondRef.current = -1;
 
-    function onPointerMove(e: PointerEvent) {
+    bindPointerSession((e) => {
       const time = getTimeFromMouseEvent(e);
       dragRegionHandle(regionId, handle, time);
-    }
-
-    function onPointerUp() {
+    }, () => {
       setDragging(null);
       triggerHaptic("success");
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-    }
-
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
+    });
   }
 
   function onRegionPointerDown(event: ReactPointerEvent<HTMLButtonElement>, region: TrimRegion): void {
     event.preventDefault();
     event.stopPropagation();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
     setActiveRegionId(region.id);
     setDragging({ regionId: region.id, handle: "move" });
     lastHapticSecondRef.current = -1;
     const anchorOffset = getTimeFromMouseEvent(event) - region.startTime;
 
-    function onPointerMove(e: PointerEvent) {
+    bindPointerSession((e) => {
       const time = getTimeFromMouseEvent(e);
       dragRegionWindow(region.id, time, anchorOffset);
-    }
-
-    function onPointerUp() {
+    }, () => {
       setDragging(null);
       triggerHaptic("success");
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-    }
-
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
+    });
   }
 
   // ── Compute creating region for display ─────────────────────
@@ -948,8 +1118,9 @@ export function AudioPlayer({
         <button
           className="playback-button"
           onClick={() => void togglePlayback()}
-          title="Play/Pause"
+          title={t("audio.playPause", "Play/Pause")}
           disabled={!sourcePath}
+          aria-label={t("audio.playPause", "Play/Pause")}
         >
           {isPlaying ? <Pause size={16} /> : <Play size={16} />}
         </button>
@@ -965,14 +1136,17 @@ export function AudioPlayer({
             onChange={(e) => onSeek(Number(e.target.value))}
             onInput={(e) => onSeek(Number((e.target as HTMLInputElement).value))}
             disabled={duration <= 0 || !src || isLoading}
-            aria-label="Seek audio"
+            aria-label={t("audio.seek", "Seek audio")}
           />
         ) : (
           <div className="audio-waveform-spacer" />
         )}
 
-        <span className="audio-time">
-          {formatTime(currentTime)} / {formatTime(duration)}
+        <span
+          className="audio-time"
+          title={`${formatReadableDuration(currentTime)} / ${formatReadableDuration(duration)}`}
+        >
+          {formatClockTime(currentTime)} / {formatClockTime(duration)}
         </span>
 
         <label className="audio-speed">
@@ -980,7 +1154,7 @@ export function AudioPlayer({
           <select
             value={String(playbackRate)}
             onChange={(e) => onChangeSpeed(Number(e.target.value))}
-            aria-label="Playback speed"
+            aria-label={t("audio.playbackSpeed", "Playback speed")}
           >
             <option value="0.75">0.75x</option>
             <option value="1">1x</option>
@@ -998,7 +1172,8 @@ export function AudioPlayer({
               setTrimMode((prev) => !prev);
               if (!trimMode) triggerHaptic("nudge");
             }}
-            title={trimMode ? "Disable trim mode" : "Enable trim mode"}
+            title={trimMode ? t("audio.trimDisable", "Disable trim mode") : t("audio.trimEnable", "Enable trim mode")}
+            aria-label={trimMode ? t("audio.trimDisable", "Disable trim mode") : t("audio.trimEnable", "Enable trim mode")}
             disabled={duration <= 0 || !src}
           >
             <Scissors size={14} />
@@ -1007,15 +1182,20 @@ export function AudioPlayer({
       </div>
 
       {/* Waveform + trim handles */}
-      {trimEnabled && trimMode ? (
-        <div className="audio-trim-panel">
+      {trimEnabled ? (
+        <div
+          className={`audio-trim-shell ${trimMode ? "is-open" : ""}`}
+          style={{ maxHeight: trimMode ? `${Math.max(trimPanelHeight, 1)}px` : "0px" }}
+          aria-hidden={!trimMode}
+        >
+        <div className="audio-trim-panel" ref={trimPanelContentRef}>
           <div className="audio-trim-header">
             <div>
-              <strong>Trim editor</strong>
-              <span>Drag on the waveform to keep the moments you want. Resize from the handles or move a range from its center.</span>
+              <strong>{t("audio.trimEditorTitle", "Trim editor")}</strong>
+              <span>{t("audio.trimEditorHelp", "Drag on the waveform to keep the moments you want. Resize from the handles or move a range from its center.")}</span>
             </div>
             <div className="trim-selection-status">
-              {regions.length > 0 ? `${regions.length} range${regions.length > 1 ? "s" : ""}` : "No ranges yet"}
+              {formatRangeCount(regions.length)}
             </div>
           </div>
 
@@ -1027,11 +1207,11 @@ export function AudioPlayer({
             <canvas ref={canvasRef} className="audio-waveform-canvas" />
 
             {isDecodingWaveform ? (
-              <div className="audio-waveform-loading">Decoding waveform...</div>
+              <div className="audio-waveform-loading">{t("audio.trimDecodingWaveform", "Decoding waveform...")}</div>
             ) : null}
 
             {!isDecodingWaveform && regions.length === 0 && !creating ? (
-              <div className="audio-waveform-hint">Drag to keep the part you want</div>
+              <div className="audio-waveform-hint">{t("audio.trimWaveformHint", "Drag to keep the part you want")}</div>
             ) : null}
 
             {creatingRegion && creatingRegion.endTime - creatingRegion.startTime >= 0.1 ? (
@@ -1043,7 +1223,7 @@ export function AudioPlayer({
                 }}
               >
                 <span className="trim-creating-label">
-                  {formatTime(creatingRegion.endTime - creatingRegion.startTime)}
+                  {formatClockTime(creatingRegion.endTime - creatingRegion.startTime)}
                 </span>
               </div>
             ) : null}
@@ -1063,7 +1243,7 @@ export function AudioPlayer({
                     className="trim-region-handle trim-region-handle--start"
                     onPointerDown={(e) => onHandlePointerDown(e, region.id, "start")}
                     onClick={(e) => e.stopPropagation()}
-                    title={`Start: ${formatTime(region.startTime)}`}
+                    title={`${t("audio.trimStart", "Start")}: ${formatReadableDuration(region.startTime)}`}
                   >
                     <span className="trim-region-handle-grip" />
                   </button>
@@ -1076,11 +1256,11 @@ export function AudioPlayer({
                       e.stopPropagation();
                       setActiveRegionId(region.id);
                     }}
-                    title={`Move range ${formatRegionLabel(region)}`}
+                    title={`${t("audio.trimMoveRange", "Move range")} ${formatRegionLabel(region, language)}`}
                   >
-                    <span className="trim-region-window-badge">{formatRegionLabel(region)}</span>
+                    <span className="trim-region-window-badge">{formatRegionLabel(region, language)}</span>
                     <span className="trim-region-window-duration">
-                      {formatTime(region.endTime - region.startTime)}
+                      {formatClockTime(region.endTime - region.startTime)}
                     </span>
                   </button>
 
@@ -1089,7 +1269,7 @@ export function AudioPlayer({
                     className="trim-region-handle trim-region-handle--end"
                     onPointerDown={(e) => onHandlePointerDown(e, region.id, "end")}
                     onClick={(e) => e.stopPropagation()}
-                    title={`End: ${formatTime(region.endTime)}`}
+                    title={`${t("audio.trimEnd", "End")}: ${formatReadableDuration(region.endTime)}`}
                   >
                     <span className="trim-region-handle-grip" />
                   </button>
@@ -1099,9 +1279,11 @@ export function AudioPlayer({
           </div>
 
           <div className="trim-scale">
-            <span>00:00</span>
-            <span>Playhead {formatTime(currentTime)}</span>
-            <span>{formatTime(duration)}</span>
+            <span title={formatReadableDuration(0)}>{formatClockTime(0)}</span>
+            <span title={`${t("audio.playhead", "Playhead")} ${formatReadableDuration(currentTime)}`}>
+              {t("audio.playhead", "Playhead")} {formatClockTime(currentTime)}
+            </span>
+            <span title={formatReadableDuration(duration)}>{formatClockTime(duration)}</span>
           </div>
 
           {regions.length > 0 ? (
@@ -1115,20 +1297,28 @@ export function AudioPlayer({
                     type="button"
                     className="trim-region-chip-label"
                     onClick={() => setActiveRegionId(region.id)}
-                    title={`Focus range ${formatRegionLabel(region)}`}
+                    title={`${t("audio.trimFocusRange", "Focus range")} ${formatRegionLabel(region, language)}`}
                   >
-                    <span>{formatRegionLabel(region)}</span>
+                    <span>{formatRegionLabel(region, language)}</span>
                   </button>
-                  <button className="trim-region-chip-remove" onClick={() => removeRegion(region.id)} title="Remove region">
+                  <button
+                    className="trim-region-chip-remove"
+                    onClick={() => removeRegion(region.id)}
+                    title={t("audio.trimRemoveRegion", "Remove region")}
+                  >
                     <X size={10} />
                   </button>
                 </div>
               ))}
 
               {regions.length > 1 ? (
-                <button className="trim-clear-button" onClick={clearAllRegions} title="Clear all regions">
+                <button
+                  className="trim-clear-button"
+                  onClick={clearAllRegions}
+                  title={t("audio.trimClearAllTitle", "Clear all regions")}
+                >
                   <Trash2 size={11} />
-                  <span>Clear All</span>
+                  <span>{t("audio.trimClearAll", "Clear All")}</span>
                 </button>
               ) : null}
 
@@ -1144,32 +1334,33 @@ export function AudioPlayer({
                     );
 
                     triggerHaptic("success");
-                    onTrimApplied?.(result.path);
+                    onTrimApplied?.(result.path, [...regions]);
                   } catch (error) {
                     console.error("Failed to apply trim:", error);
                     triggerHaptic("error");
-                    setLoadError(`Trim failed: ${String(error)}`);
+                    setLoadError(`${t("audio.errorTrim", "Trim failed")}: ${String(error)}`);
                   } finally {
                     setIsApplyingTrim(false);
                   }
                 }}
                 disabled={isApplyingTrim || regions.length === 0}
-                title="Apply trim and prepare for transcription"
+                title={t("audio.trimApplyTitle", "Apply trim and prepare for transcription")}
               >
                 {isApplyingTrim ? (
                   <span className="trim-apply-spinner" />
                 ) : (
                   <Check size={12} />
                 )}
-                <span>{isApplyingTrim ? "Applying..." : "Apply Trim"}</span>
+                <span>{isApplyingTrim ? t("audio.trimApplying", "Applying...") : t("audio.trimApply", "Apply Trim")}</span>
               </button>
             </div>
           ) : null}
         </div>
+        </div>
       ) : null}
 
       {loadError ? <span className="audio-error">{loadError}</span> : null}
-      {isLoading ? <span className="audio-error">Loading audio...</span> : null}
+      {isLoading ? <span className="audio-error">{t("audio.loading", "Loading audio...")}</span> : null}
     </footer>
   );
 }

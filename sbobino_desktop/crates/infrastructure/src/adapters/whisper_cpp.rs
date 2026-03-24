@@ -18,6 +18,7 @@ use sbobino_domain::{
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
 
 static OUTPUT_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
 
 #[derive(Debug, Clone)]
 pub struct WhisperCppEngine {
@@ -208,11 +209,16 @@ impl WhisperCppEngine {
         emit_partial: &Arc<dyn Fn(String) + Send + Sync>,
         segment: TimedSegment,
     ) {
+        let mut snapshot: Option<String> = None;
         if let Ok(mut state) = collector.lock() {
             state.segments.push(segment.clone());
+            snapshot = Some(Self::join_segment_text(&state.segments));
         }
 
-        emit_partial(segment.text);
+        emit_partial(format!(
+            "{DELTA_REPLACE_PREFIX}{}",
+            snapshot.unwrap_or(segment.text)
+        ));
     }
 
     fn join_segment_text(segments: &[TimedSegment]) -> String {
@@ -229,7 +235,7 @@ impl WhisperCppEngine {
         collector: Arc<Mutex<TranscriptCollector>>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
-        total_audio_seconds: Option<f32>,
+        _total_audio_seconds: Option<f32>,
     ) -> Result<Vec<String>, ApplicationError>
     where
         R: AsyncRead + Unpin,
@@ -249,12 +255,12 @@ impl WhisperCppEngine {
                         }
                         Self::collect_segment(&collector, &emit_partial, segment);
                     }
-                    ParsedCliEvent::ProgressPercent(progress_percent) => {
-                        if let Some(total_seconds) = total_audio_seconds.filter(|v| *v > 0.0) {
-                            let estimated_seconds = (progress_percent / 100.0) * total_seconds;
-                            emit_progress_seconds(estimated_seconds);
-                        }
-                    }
+                    // The CLI prints internal progress updates that can run
+                    // well ahead of the finalized segments we have actually
+                    // received. Driving the UI from those percentages makes the
+                    // progress pill look "ahead" of the live transcript, so
+                    // we only advance progress from segment end times.
+                    ParsedCliEvent::ProgressPercent(_progress_percent) => {}
                 }
             }
         }

@@ -237,6 +237,13 @@ type TrimmedAudioDraft = {
   regions: TrimRegion[];
 };
 
+type PreparedImportTrimDraft = {
+  path: string;
+  sourcePath: string;
+  title: string;
+  regions: TrimRegion[];
+};
+
 type ActiveDetailContext = {
   title: string;
   inputPath: string | null;
@@ -1666,6 +1673,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [chatIncludeSpeakers, setChatIncludeSpeakers] = useState(false);
   const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
   const [audioDurationSeconds, setAudioDurationSeconds] = useState(0);
+  const [preparedImportTrimDraft, setPreparedImportTrimDraft] = useState<PreparedImportTrimDraft | null>(null);
   const [trimRegions, setTrimRegions] = useState<TrimRegion[]>([]);
   const [trimmedAudioDraft, setTrimmedAudioDraft] = useState<TrimmedAudioDraft | null>(null);
   const [activeDetailContext, setActiveDetailContext] = useState<ActiveDetailContext | null>(null);
@@ -2035,7 +2043,18 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     };
   }, [setSettings]);
 
-  // Tauri native drag-and-drop: auto-load + transcribe dropped audio files
+  const resetPreparedImportAudio = useCallback(() => {
+    setPreparedImportTrimDraft(null);
+  }, []);
+
+  const primeSelectedFileForHome = useCallback((filePath: string) => {
+    resetPreparedImportAudio();
+    setSelectedFile(filePath);
+    setSection("home");
+    setError(null);
+  }, [resetPreparedImportAudio, setError, setSelectedFile]);
+
+  // Tauri native drag-and-drop: load dropped audio files into Home for review
   useEffect(() => {
     const audioExtensions = ["wav", "mp3", "m4a", "flac", "ogg", "aac", "opus", "webm", "mp4", "mov", "mkv", "wma", "aiff"];
     let unlisten: (() => void) | undefined;
@@ -2053,13 +2072,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             });
 
             if (audioFile) {
-              setSelectedFile(audioFile);
-              setSection("home");
-              setError(null);
-              // Defer briefly to let React flush states, then start transcription
-              setTimeout(() => {
-                void onStartTranscription(audioFile);
-              }, 100);
+              primeSelectedFileForHome(audioFile);
             }
           }
         });
@@ -2071,7 +2084,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return () => {
       unlisten?.();
     };
-  }, [setSelectedFile, setError]);
+  }, [primeSelectedFileForHome]);
 
   useEffect(() => {
     let unmounted = false;
@@ -3101,8 +3114,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     });
 
     if (picked && !Array.isArray(picked)) {
-      setSelectedFile(picked);
-      setError(null);
+      primeSelectedFileForHome(picked);
     }
   }
 
@@ -3171,17 +3183,30 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     fileToProcess?: string,
     options?: { parentId?: string; title?: string },
   ): Promise<void> {
-    const targetFile = fileToProcess && typeof fileToProcess === "string" ? fileToProcess : selectedFile;
+    const preparedHomeTrim =
+      !fileToProcess
+      && preparedImportTrimDraft
+      && preparedImportTrimDraft.sourcePath === selectedFile
+        ? preparedImportTrimDraft
+        : null;
+    const targetFile =
+      fileToProcess && typeof fileToProcess === "string"
+        ? fileToProcess
+        : preparedHomeTrim?.path ?? selectedFile;
     if (!settings || !targetFile) return;
     const parentId = options?.parentId;
-    const requestedTitle = options?.title?.trim() ? options.title.trim() : undefined;
+    const requestedTitle =
+      options?.title?.trim()
+      ? options.title.trim()
+      : preparedHomeTrim?.title;
+    const sourceArtifactForContext = parentId ? activeArtifact : section === "detail" ? activeArtifact : null;
     const isTrimRetranscription =
       trimmedAudioDraft?.path === targetFile
       && trimmedAudioDraft.parentArtifactId === parentId;
     const nextDetailContext = buildActiveDetailContext({
       inputPath: targetFile,
       requestedTitle,
-      sourceArtifact: activeArtifact,
+      sourceArtifact: sourceArtifactForContext,
       trimmedAudioDraft: isTrimRetranscription ? trimmedAudioDraft : null,
       restoreArtifactOnFailure: isTrimRetranscription,
     });
@@ -4329,6 +4354,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   }
 
   function renderHome(): JSX.Element {
+    const homeAudioInputPath = preparedImportTrimDraft?.path ?? selectedFile ?? null;
+    const homeAudioIsTrimmed = Boolean(preparedImportTrimDraft);
+
     const renderHomeTree = (artifact: GroupedArtifact, depth = 0): React.ReactNode => {
       return (
         <React.Fragment key={artifact.id}>
@@ -4426,7 +4454,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             disabled={!canStartFileTranscription}
           >
             <FileAudio size={18} strokeWidth={2.5} />
-            {isStarting ? t("home.starting", "Starting...") : t("home.startTranscription", "Start Transcription")}
+            {isStarting
+              ? t("home.starting", "Starting...")
+              : homeAudioIsTrimmed
+                ? t("home.startTrimmedTranscription", "Start Trimmed Transcription")
+                : t("home.startTranscription", "Start Transcription")}
           </button>
           <button className="quick-action" onClick={() => void onStartRealtime()} disabled={!canStartRealtime}>
             <Mic size={18} strokeWidth={2.5} />
@@ -4449,6 +4481,31 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             {t("home.history", "History")}
           </button>
         </div>
+
+        {homeAudioInputPath ? (
+          <section className="panel-card home-audio-player-card">
+            <div className="detail-audio-stack">
+              <div className="detail-audio-player-group">
+                <AudioPlayer
+                  inputPath={homeAudioInputPath}
+                  trimEnabled
+                  onTrimApplied={(path, regions) => {
+                    if (!selectedFile) {
+                      return;
+                    }
+                    const sourceLabel = fileLabel(selectedFile);
+                    setPreparedImportTrimDraft({
+                      path,
+                      sourcePath: selectedFile,
+                      title: buildTrimArtifactTitle(sourceLabel, regions),
+                      regions: [...regions],
+                    });
+                  }}
+                />
+              </div>
+            </div>
+          </section>
+        ) : null}
 
         <section className="panel-card">
           {isSelectionMode ? (
@@ -5468,7 +5525,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   setAudioDurationSeconds(metadata.durationSeconds);
                 }}
                 onTrimRegionsChange={setTrimRegions}
-                onTrimApplied={(path) => {
+                onTrimApplied={(path, regions) => {
                   const trimSourceArtifact = activeArtifact ?? effectiveDetailContext?.sourceArtifact;
                   if (!trimSourceArtifact) {
                     return;
@@ -5477,8 +5534,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   setTrimmedAudioDraft({
                     path,
                     parentArtifactId: trimSourceArtifact.id,
-                    title: buildTrimArtifactTitle(sourceLabel, trimRegions),
-                    regions: [...trimRegions],
+                    title: buildTrimArtifactTitle(sourceLabel, regions),
+                    regions: [...regions],
                   });
                 }}
               />
