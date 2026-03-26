@@ -1,4 +1,5 @@
 import type { TimelineV2 } from "../types";
+import { t } from "../i18n";
 
 export const WHISPER_CONFIDENCE_COLORS = [
   "rgb(220, 5, 12)",
@@ -54,6 +55,10 @@ function normalizeConfidence(value: unknown): number | null {
   return value;
 }
 
+function isWhisperControlToken(tokenText: string): boolean {
+  return tokenText.startsWith("[_") && tokenText.endsWith("]");
+}
+
 function appendFragment(
   fragments: ConfidenceTranscriptFragment[],
   fragment: ConfidenceTranscriptFragment,
@@ -102,7 +107,9 @@ function parseTimeline(timelineV2Json: string | null | undefined): TimelineV2 | 
 }
 
 function formatConfidenceTooltip(confidence: number): string {
-  return `${Math.round(confidence * 100)}% confidence`;
+  return t("confidence.tooltip", "{percent}% confidence", {
+    percent: Math.round(confidence * 100),
+  });
 }
 
 function buildAnnotatedSegmentFragments(
@@ -130,6 +137,9 @@ function buildAnnotatedSegmentFragments(
   for (const token of tokenEntries) {
     const tokenText = parseNonEmptyText(token.text);
     if (!tokenText) {
+      continue;
+    }
+    if (isWhisperControlToken(tokenText)) {
       continue;
     }
 

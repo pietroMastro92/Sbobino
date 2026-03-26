@@ -177,7 +177,19 @@ function buildPreviewContent(params: {
   const normalizedTranscript = transcriptText.trim();
 
   const localizedDocumentTitle = (rawTitle: string): string => {
-    const baseTitle = rawTitle.trim() || title.trim() || "Transcript";
+    const fallbackTitle = (() => {
+      switch (language) {
+        case "it":
+          return "Trascrizione";
+        case "es":
+          return "Transcripción";
+        case "de":
+          return "Transkript";
+        default:
+          return "Transcript";
+      }
+    })();
+    const baseTitle = rawTitle.trim() || title.trim() || fallbackTitle;
     switch (language) {
       case "it":
         return `Trascrizione di ${baseTitle}`;
@@ -187,6 +199,19 @@ function buildPreviewContent(params: {
         return `Transkript von ${baseTitle}`;
       default:
         return `Transcript of ${baseTitle}`;
+    }
+  };
+
+  const localizedCsvHeader = (): string => {
+    switch (language) {
+      case "it":
+        return "Timestamp inizio;Timestamp fine;Trascrizione";
+      case "es":
+        return "Marca de tiempo inicial;Marca de tiempo final;Transcripción";
+      case "de":
+        return "Start-Zeitstempel;End-Zeitstempel;Transkript";
+      default:
+        return "Start Timestamp;End Timestamp;Transcript";
     }
   };
 
@@ -301,7 +326,7 @@ function buildPreviewContent(params: {
     }
 
     if (format === "csv") {
-      const header = "Start Timestamp;End Timestamp;Transcript";
+      const header = localizedCsvHeader();
       if (segments.length === 0) return `${header}\n00:00;00:00;"${normalizedTranscript}"`;
       const rows = segments.map((segment) => {
         const startSeconds = parseMmSsToSeconds(segment.time);

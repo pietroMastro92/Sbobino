@@ -47,4 +47,29 @@ describe("whisper confidence helpers", () => {
     expect(document?.fragments.find((fragment) => fragment.text === "world")?.confidence).toBe(0.42);
     expect(document?.fragments.find((fragment) => fragment.text.includes("line"))?.confidence).toBeNull();
   });
+
+  it("ignores whisper control tokens when deciding whether confidence colors are available", () => {
+    const rawTranscript = "strutture";
+    const timeline = JSON.stringify({
+      version: 2,
+      segments: [
+        {
+          text: "strutture",
+          words: [
+            { text: "[_BEG_]", confidence: 1.0 },
+            { text: "str", confidence: 0.99 },
+            { text: "utt", confidence: 0.95 },
+            { text: "ure", confidence: 0.94 },
+            { text: "[_TT_1000]", confidence: 1.0 },
+          ],
+        },
+      ],
+    });
+
+    const document = buildConfidenceTranscript(rawTranscript, timeline);
+
+    expect(document).not.toBeNull();
+    expect(document?.confidenceWordCount).toBe(3);
+    expect(document?.fragments.map((fragment) => fragment.text).join("")).toBe(rawTranscript);
+  });
 });

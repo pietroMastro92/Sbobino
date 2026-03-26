@@ -745,7 +745,7 @@ export function AudioPlayer({
       } catch (error) {
         if (sourceVersionRef.current !== sourceVersion) return false;
         if (!background) {
-        setLoadError(`${t("audio.errorLoadFallback", "Cannot load fallback audio")}: ${String(error)}`);
+          setLoadError(t("audio.errorLoadFallback", "Cannot load fallback audio"));
         }
         return false;
       } finally {
@@ -805,9 +805,9 @@ export function AudioPlayer({
       try {
         await audio.play();
         setIsPlaying(true);
-      } catch (error) {
+      } catch {
         setIsPlaying(false);
-        setLoadError(`${t("audio.errorPlay", "Cannot play audio")}: ${String(error)}`);
+        setLoadError(t("audio.errorPlay", "Cannot play audio"));
       }
       return;
     }
@@ -1338,7 +1338,7 @@ export function AudioPlayer({
                   } catch (error) {
                     console.error("Failed to apply trim:", error);
                     triggerHaptic("error");
-                    setLoadError(`${t("audio.errorTrim", "Trim failed")}: ${String(error)}`);
+                    setLoadError(t("audio.errorTrim", "Trim failed"));
                   } finally {
                     setIsApplyingTrim(false);
                   }

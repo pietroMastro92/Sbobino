@@ -129,6 +129,7 @@ import type {
   SpeechModel,
   TimelineV2,
   TranscriptionEngine,
+  TranscriptionStartPreflight,
   TranscriptArtifact,
   UpdateCheckResponse,
   WhisperOptions,
@@ -138,7 +139,13 @@ import { ConfidenceTranscript } from "./components/ConfidenceTranscript";
 import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 import { LoadingAnimation } from "./components/LoadingAnimation";
-import { t, useTranslation, changeLanguage, type AppLanguage } from "./i18n";
+import {
+  t,
+  useTranslation,
+  changeLanguage,
+  supportedAppLanguages,
+  type AppLanguage,
+} from "./i18n";
 import { shouldStartWindowDrag } from "./lib/windowDrag";
 import {
   aiActionsAvailable,
@@ -436,7 +443,9 @@ const serviceCatalog: ServiceCatalogItem[] = [
   },
 ];
 
-const defaultPromptTestInput = "This is an example of some transcribed text.";
+function getDefaultPromptTestInput(): string {
+  return t("settings.prompts.defaultTestInput", "This is an example of some transcribed text.");
+}
 function getDefaultWhisperOptions(useAppleSiliconDefaults = guessAppleSiliconFromUA()): WhisperOptions {
   // On Intel Macs: use more CPU threads, greedy beam search, and CPU-only compute units
   // (no Neural Engine or CoreML acceleration available)
@@ -648,7 +657,7 @@ function buildActiveDetailContext(params: {
     requestedTitle?.trim()
     || trimmedAudioDraft?.title
     || sourceArtifact?.title
-    || (inputPath ? fileLabel(inputPath) : "Transcribing");
+    || (inputPath ? fileLabel(inputPath) : t("detail.transcribing", "Transcribing"));
 
   return {
     title,
@@ -923,15 +932,92 @@ function resetCancelPillDangerProximity(button: HTMLButtonElement): void {
 }
 
 function formatJobStageLabel(stage: string): string {
-  return stage
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (match) => match.toUpperCase());
+  switch (stage) {
+    case "queued":
+      return t("queue.stage.queued", "Queued");
+    case "preparing_audio":
+      return t("queue.stage.preparingAudio", "Preparing audio");
+    case "transcribing":
+      return t("queue.stage.transcribing", "Transcribing");
+    case "diarizing":
+      return t("queue.stage.diarizing", "Assigning speakers");
+    case "optimizing":
+      return t("queue.stage.optimizing", "Optimizing");
+    case "summarizing":
+      return t("queue.stage.summarizing", "Summarizing");
+    case "persisting":
+      return t("queue.stage.persisting", "Saving");
+    case "completed":
+      return t("queue.stage.completed", "Completed");
+    case "failed":
+      return t("queue.stage.failed", "Failed");
+    case "cancelled":
+      return t("queue.stage.cancelled", "Cancelled");
+    default:
+      return t("queue.inProgress", "Transcription in progress");
+  }
+}
+
+function formatJobMessage(stage: string): string {
+  switch (stage) {
+    case "queued":
+      return t("queue.queuedJob", "Queued transcription job.");
+    case "preparing_audio":
+      return t("queue.message.preparingAudio", "Preparing audio for transcription...");
+    case "transcribing":
+      return t("queue.message.transcribing", "Transcribing audio...");
+    case "diarizing":
+      return t("queue.message.diarizing", "Assigning speakers...");
+    case "optimizing":
+      return t("queue.message.optimizing", "Improving transcript...");
+    case "summarizing":
+      return t("queue.message.summarizing", "Generating summary...");
+    case "persisting":
+      return t("queue.message.persisting", "Saving transcription...");
+    case "completed":
+      return t("queue.message.completed", "Transcription completed.");
+    case "failed":
+      return t("queue.message.failed", "Transcription failed.");
+    case "cancelled":
+      return t("queue.message.cancelled", "Transcription cancelled.");
+    default:
+      return t("queue.inProgress", "Transcription in progress");
+  }
 }
 
 function formatProviderLabel(kind: RemoteServiceKind): string {
   const entry = serviceCatalog.find((item) => item.kind === kind);
+  if (kind === "custom") {
+    return t("settings.ai.customService", "Custom");
+  }
   if (entry) return entry.label;
   return kind.replace(/_/g, " ").replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function formatRemoteServiceLabel(
+  service: Pick<RemoteServiceConfig, "kind" | "label" | "model">,
+  settings?: AppSettings | null,
+): string {
+  if (service.kind === "google") {
+    return `Google (${service.model?.trim() || settings?.ai.providers.gemini.model || "Gemini"})`;
+  }
+
+  const label = service.label?.trim();
+  if (service.kind === "custom" && (!label || label === "Custom")) {
+    return t("settings.ai.customService", "Custom");
+  }
+
+  return label || formatProviderLabel(service.kind);
+}
+
+function formatSpeechModelLabel(model: SpeechModel, fallback?: string): string {
+  return t(`speechModel.${model}`, fallback ?? model);
+}
+
+function formatArtifactKindLabel(kind: ArtifactKind): string {
+  return kind === "realtime"
+    ? t("history.live", "Live")
+    : t("history.file", "File");
 }
 
 function formatAppError(error: unknown): string {
@@ -985,6 +1071,84 @@ function formatAppErrorCode(error: unknown): string | null {
   };
 
   return pickCode(error);
+}
+
+function formatUiError(key: string, fallback: string, _error: unknown): string {
+  return t(key, fallback);
+}
+
+function formatPyannoteHealthMessage(
+  health: RuntimeHealth["pyannote"] | null | undefined,
+): string | null {
+  if (!health) {
+    return null;
+  }
+  if (health.ready) {
+    return t("settings.pyannote.readyOn", "Pyannote ready on {arch}.", { arch: health.arch });
+  }
+
+  if (health.reason_code === "pyannote_runtime_missing") {
+    return t("settings.pyannote.desc");
+  }
+
+  if (health.reason_code === "pyannote_model_missing") {
+    return t("settings.pyannote.desc");
+  }
+
+  if (
+    health.reason_code === "pyannote_install_incomplete"
+    || health.reason_code === "pyannote_checksum_invalid"
+  ) {
+    return t(
+      "settings.pyannote.repairRequired",
+      "Pyannote assets need repair. Repair the diarization runtime from Local Models.",
+    );
+  }
+
+  return t("settings.pyannote.desc");
+}
+
+function formatRealtimeStatusMessage(state: string): string {
+  switch (state) {
+    case "running":
+      return t("realtime.running", "Listening live");
+    case "paused":
+      return t("realtime.paused", "Live paused");
+    default:
+      return t("realtime.idle", "Realtime idle");
+  }
+}
+
+function formatRuntimeNotReadyMessage(): string {
+  return t(
+    "error.runtimeNotReadyDetails",
+    "Transcription runtime is not ready. Check Whisper CLI and Whisper Stream in Settings > Local Models.",
+  );
+}
+
+function formatTranscriptionPreflightMessage(preflight: TranscriptionStartPreflight): string {
+  if (preflight.reason_code === "whispercpp_missing") {
+    return t(
+      "error.whisperCliNotRunnable",
+      "Whisper CLI is not runnable at '{path}'. Configure Whisper CLI path in Settings > Local Models.",
+      { path: preflight.whisper_cli_resolved },
+    );
+  }
+
+  if (preflight.reason_code === "model_missing") {
+    return t(
+      "error.modelMissingAtPath",
+      "Model file '{model}' was not found at '{path}'. Download models from Settings > Local Models.",
+      { model: preflight.model_filename, path: preflight.model_path },
+    );
+  }
+
+  if (preflight.reason_code.startsWith("pyannote_")) {
+    return formatPyannoteHealthMessage(preflight.pyannote)
+      ?? t("error.cannotStartOnMachine", "Transcription cannot start on this machine.");
+  }
+
+  return t("error.cannotStartOnMachine", "Transcription cannot start on this machine.");
 }
 
 function ProgressRing({ percentage, size = 18 }: { percentage: number; size?: number }): JSX.Element {
@@ -1106,7 +1270,7 @@ function normalizeSettings(settings: AppSettings): AppSettings {
       },
       remote_services: (settings.ai.remote_services ?? []).map((service) => ({
         ...service,
-        label: service.label || formatProviderLabel(service.kind),
+        label: formatRemoteServiceLabel(service, settings),
       })),
     },
     prompts: {
@@ -1653,7 +1817,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const settingsPaneDefinitions = useMemo(() => getSettingsPaneDefinitions(), [language]);
 
   const [realtimeState, setRealtimeState] = useState<"idle" | "running" | "paused">("idle");
-  const [realtimeMessage, setRealtimeMessage] = useState("Realtime idle");
+  const [realtimeMessage, setRealtimeMessage] = useState(t("realtime.idle", "Realtime idle"));
   const [realtimeFinalLines, setRealtimeFinalLines] = useState<string[]>([]);
   const [realtimePreview, setRealtimePreview] = useState("");
   const [isStoppingRealtime, setIsStoppingRealtime] = useState(false);
@@ -1694,7 +1858,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [promptDraft, setPromptDraft] = useState<PromptTemplate | null>(null);
   const [promptBindingTask, setPromptBindingTask] = useState<PromptTask>("optimize");
   const [promptTest, setPromptTest] = useState<PromptTestState>({
-    input: defaultPromptTestInput,
+    input: getDefaultPromptTestInput(),
     output: "",
     running: false,
   });
@@ -1702,6 +1866,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [groupSegmentsWithoutSpeakers, setGroupSegmentsWithoutSpeakers] = useState(true);
   const copiedChatResetTimerRef = useRef<number | null>(null);
+  const promptTestDefaultInputRef = useRef(getDefaultPromptTestInput());
   const [summaryIncludeTimestamps, setSummaryIncludeTimestamps] = useState(defaultSummaryControls.includeTimestamps);
   const [summaryIncludeSpeakers, setSummaryIncludeSpeakers] = useState(defaultSummaryControls.includeSpeakers);
   const [summaryAutostart, setSummaryAutostart] = useState(false);
@@ -1845,7 +2010,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         const deletedArtifactsSnapshot = await listDeletedArtifacts({ limit: 200 });
         setDeletedArtifacts(deletedArtifactsSnapshot);
       } catch (deletedError) {
-        setError(`Could not load Recently Deleted: ${formatAppError(deletedError)}`);
+        setError(formatUiError("error.loadDeleted", "Could not load Recently Deleted", deletedError));
       }
     })();
   }, [section, setError]);
@@ -1910,7 +2075,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           await refreshUpdates(true, () => disposed);
         }
       } catch (bootstrapError) {
-        setError(`Bootstrap failed: ${formatAppError(bootstrapError)}`);
+        setError(formatUiError("error.bootstrapFailed", "Bootstrap failed", bootstrapError));
       }
     })();
 
@@ -2110,6 +2275,21 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     };
   }, [settings]);
 
+  useEffect(() => {
+    const localizedDefaultInput = getDefaultPromptTestInput();
+    setPromptTest((current) => {
+      const previousDefaultInput = promptTestDefaultInputRef.current;
+      promptTestDefaultInputRef.current = localizedDefaultInput;
+      if (current.input.trim().length > 0 && current.input !== previousDefaultInput) {
+        return current;
+      }
+      return {
+        ...current,
+        input: localizedDefaultInput,
+      };
+    });
+  }, [language]);
+
   const resetPreparedImportAudio = useCallback(() => {
     setPreparedImportTrimDraft(null);
   }, []);
@@ -2167,7 +2347,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
     void (async () => {
       const uProgress = await subscribeJobProgress((event) => {
-        setQueueItems((previous) => pushOrReplaceQueueItem(previous, event));
+        const localizedEvent = {
+          ...event,
+          message: formatJobMessage(event.stage),
+        };
+        setQueueItems((previous) => pushOrReplaceQueueItem(previous, localizedEvent));
         if (event.job_id === activeJobIdRef.current) {
           clearStartupWatchdog();
           setProgress(event);
@@ -2182,7 +2366,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             activeJobDeltaSequenceRef.current = -1;
             setActiveDetailContext(null);
             if (event.stage === "failed") {
-              setError(event.message || "Transcription failed.");
+              setError(formatJobMessage("failed"));
               if (!restoreDetailAfterFailedTranscription(failedContext?.detailContext)) {
                 setSection("home");
               }
@@ -2229,7 +2413,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       if (unmounted) { uCompleted(); } else { unsubCompleted = uCompleted; }
 
       const uFailed = await subscribeJobFailed((payload) => {
-        failedJobMessagesRef.current.set(payload.job_id, payload.message);
+        const localizedFailureMessage = formatJobMessage("failed");
+        failedJobMessagesRef.current.set(payload.job_id, localizedFailureMessage);
         const failedContext = pendingTranscriptionContextRef.current.get(payload.job_id);
         pendingTranscriptionContextRef.current.delete(payload.job_id);
         setQueueItems((previous) =>
@@ -2238,7 +2423,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               ? {
                   ...entry,
                   stage: "failed",
-                  message: payload.message,
+                  message: localizedFailureMessage,
                   percentage: 100,
                 }
               : entry,
@@ -2254,7 +2439,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setActiveJobTitle("");
           activeJobDeltaSequenceRef.current = -1;
           setActiveDetailContext(null);
-          setError(payload.message);
+          setError(localizedFailureMessage);
           if (!restoreDetailAfterFailedTranscription(failedContext?.detailContext)) {
             setSection("home");
           }
@@ -2298,7 +2483,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       if (unmounted) { uRealtimeDelta(); } else { unsubRealtimeDelta = uRealtimeDelta; }
 
       const uRealtimeStatus = await subscribeRealtimeStatus((event) => {
-        setRealtimeMessage(event.message);
+        setRealtimeMessage(formatRealtimeStatusMessage(event.state));
         if (event.state === "running") {
           setRealtimeState("running");
         } else if (event.state === "paused") {
@@ -2325,10 +2510,21 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       if (unmounted) { uProvisioningProgress(); } else { unsubProvisioningProgress = uProvisioningProgress; }
 
       const uProvisioningStatus = await subscribeProvisioningStatus((event) => {
+        const localizedStatusMessage =
+          event.state === "completed"
+            ? t("settings.localModels.readyMessage", "Local models are ready")
+            : event.state === "cancelled"
+              ? t("provisioning.cancelled", "Provisioning cancelled")
+              : event.reason_code === "pyannote_runtime_missing"
+                || event.reason_code === "pyannote_model_missing"
+                || event.reason_code === "pyannote_install_incomplete"
+                || event.reason_code === "pyannote_checksum_invalid"
+                ? t("settings.pyannote.desc")
+                : t("error.provisioningFailed", "Provisioning failed");
         setProvisioning((previous) => ({
           ...previous,
           running: false,
-          statusMessage: event.message,
+          statusMessage: localizedStatusMessage,
           progress: event.state === "completed" ? previous.progress : null,
           ready: event.state === "completed" ? true : previous.ready,
         }));
@@ -2513,8 +2709,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     [aiCapabilityStatus],
   );
 
-  const aiUnavailableReason = aiCapabilityStatus?.unavailable_reason?.trim()
-    || "No usable AI provider is available. Configure it in Settings > AI Services.";
+  const aiUnavailableReason = t(
+    "error.aiUnavailable",
+    "No usable AI provider is available. Configure it in Settings > AI Services.",
+  );
 
   useEffect(() => {
     if (section === "home" || section === "history") {
@@ -2676,20 +2874,20 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   );
 
   const detailAudioFileLabel = useMemo(
-    () => (detailAudioInputPath ? fileLabel(detailAudioInputPath) : "Unknown"),
-    [detailAudioInputPath],
+    () => (detailAudioInputPath ? fileLabel(detailAudioInputPath) : t("inspector.unknown", "Unknown")),
+    [detailAudioInputPath, language],
   );
 
   const detailAudioFormat = useMemo(() => {
     if (!detailAudioInputPath) {
-      return "Unknown";
+      return t("inspector.unknown", "Unknown");
     }
     const extension = detailAudioInputPath.split(".").pop();
     if (!extension) {
-      return "Unknown";
+      return t("inspector.unknown", "Unknown");
     }
     return extension.toUpperCase();
-  }, [detailAudioInputPath]);
+  }, [detailAudioInputPath, language]);
 
   const transcriptSeconds = useMemo(() => {
     if (audioDurationSeconds > 0) {
@@ -2882,25 +3080,21 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
   const aiServiceSelectOptions = useMemo(() => {
     const options: Array<{ value: string; label: string; disabled?: boolean }> = [
-      { value: AI_SERVICE_NONE, label: "No AI provider" },
+      { value: AI_SERVICE_NONE, label: t("settings.ai.noProvider", "No AI provider") },
     ];
 
     if (platformIsAppleSilicon) {
       options.push({
         value: AI_SERVICE_FOUNDATION,
-        label: "Foundation Model",
+        label: t("settings.ai.foundationModel", "Foundation Model"),
         disabled: !settings?.ai.providers.foundation_apple.enabled,
       });
     }
 
     for (const service of enabledRemoteServices) {
-      const label = service.kind === "google"
-        ? `Google (${service.model?.trim() || settings?.ai.providers.gemini.model || "Gemini"})`
-        : service.label || formatProviderLabel(service.kind);
-
       options.push({
         value: `remote:${service.id}`,
-        label,
+        label: formatRemoteServiceLabel(service, settings),
       });
     }
 
@@ -2910,6 +3104,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     platformIsAppleSilicon,
     settings?.ai.providers.foundation_apple.enabled,
     settings?.ai.providers.gemini.model,
+    language,
   ]);
 
   useEffect(() => {
@@ -2939,8 +3134,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       running: false,
       progress: null,
       statusMessage: status.ready
-        ? "Local models are ready"
-        : `${status.missing_models.length + status.missing_encoders.length} model assets missing`,
+        ? t("settings.localModels.readyMessage", "Local models are ready")
+        : t("settings.localModels.missingAssets", "{count} model assets missing", {
+          count: status.missing_models.length + status.missing_encoders.length,
+        }),
     }));
   }
 
@@ -3056,7 +3253,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       if (sequence === settingsSaveSequenceRef.current && previous) {
         setSettings(previous);
       }
-      setError(`Could not save settings: ${formatAppError(settingsError)}`);
+      setError(formatUiError("error.saveSettings", "Could not save settings", settingsError));
     }
   }
 
@@ -3089,7 +3286,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       if (sequence === settingsSaveSequenceRef.current) {
         setSettings(previous);
       }
-      setError(`Could not save settings: ${formatAppError(settingsError)}`);
+      setError(formatUiError("error.saveSettings", "Could not save settings", settingsError));
     }
   }
 
@@ -3102,7 +3299,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         changeLanguage(normalized.general.app_language);
       }
     } catch (error) {
-      setError(`Could not reload settings: ${formatAppError(error)}`);
+      setError(formatUiError("error.reloadSettings", "Could not reload settings", error));
     }
   }
 
@@ -3111,7 +3308,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       const status = await provisioningStatus();
       setProvisioningState(status);
     } catch (statusError) {
-      setError(`Could not read provisioning status: ${formatAppError(statusError)}`);
+      setError(formatUiError("error.readProvisioningStatus", "Could not read provisioning status", statusError));
     }
   }
 
@@ -3120,7 +3317,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       const health = await fetchRuntimeHealth();
       setRuntimeHealth(health);
     } catch (healthError) {
-      setError(`Could not read transcription runtime health: ${formatAppError(healthError)}`);
+      setError(formatUiError("error.readRuntimeHealth", "Could not read transcription runtime health", healthError));
     }
   }
 
@@ -3130,7 +3327,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setModelCatalog(models);
       setRuntimeHealth(health);
     } catch (modelsError) {
-      setError(`Could not read models catalog: ${formatAppError(modelsError)}`);
+      setError(formatUiError("error.readModelsCatalog", "Could not read models catalog", modelsError));
     }
   }
 
@@ -3193,7 +3390,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       multiple: false,
       filters: [
         {
-          name: "Audio/Video",
+          name: t("home.audioVideoFiles", "Audio/Video"),
           extensions: [
             "m4a",
             "mp3",
@@ -3323,10 +3520,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       const runtimeStatus = await withTimeout(
         ensureTranscriptionRuntime(),
         20_000,
-        "Runtime setup timed out.",
+        t("error.runtimeSetupTimedOut", "Runtime setup timed out."),
       );
       if (!runtimeStatus.ready) {
-        setError(runtimeStatus.message || "Transcription runtime is not ready.");
+        setError(formatRuntimeNotReadyMessage());
         setSection("home");
         return;
       }
@@ -3334,20 +3531,20 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         void refreshRuntimeHealth();
       }
 
-      let preflight: { allowed: boolean; message: string } | null = null;
+      let preflight: TranscriptionStartPreflight | null = null;
       try {
         preflight = await withTimeout(
           fetchTranscriptionStartPreflight({
             model: settings.transcription.model,
           }),
           8_000,
-          "Preflight timed out.",
+          t("error.preflightTimedOut", "Preflight timed out."),
         );
       } catch (preflightError) {
         console.warn("Transcription preflight failed, continuing with backend start:", preflightError);
       }
       if (preflight && !preflight.allowed) {
-        setError(preflight.message || "Transcription cannot start on this machine.");
+        setError(formatTranscriptionPreflightMessage(preflight));
         setSection("home");
         return;
       }
@@ -3365,7 +3562,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           parent_id: parentId,
         }),
         12_000,
-        "Start request timed out while waiting for backend response.",
+        t("error.startRequestTimedOut", "Start request timed out while waiting for backend response."),
       );
 
       const { job_id } = startResult;
@@ -3379,7 +3576,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
       if (failedJobMessagesRef.current.has(job_id)) {
         const earlyFailure =
-          failedJobMessagesRef.current.get(job_id) ?? "Transcription failed.";
+          failedJobMessagesRef.current.get(job_id) ?? t("error.transcriptionFailed", "Transcription failed.");
         failedJobMessagesRef.current.delete(job_id);
         const failedContext = pendingTranscriptionContextRef.current.get(job_id);
         pendingTranscriptionContextRef.current.delete(job_id);
@@ -3405,7 +3602,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         return pushOrReplaceQueueItem(previous, {
           job_id,
           stage: "queued",
-          message: "Queued transcription job.",
+          message: t("queue.queuedJob", "Queued transcription job."),
           percentage: 0,
           current_seconds: 0,
           total_seconds: null,
@@ -3436,12 +3633,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setSection("home");
         }
         setError(
-          "Transcription is not starting correctly. Check Whisper CLI/Whisper Stream paths in Settings > Local Models.",
+          t(
+            "error.transcriptionStartupProblem",
+            "Transcription is not starting correctly. Check Whisper CLI/Whisper Stream paths in Settings > Local Models.",
+          ),
         );
       }, 120_000);
     } catch (startError) {
-      const friendlyError = formatAppError(startError);
-      setError(`Failed to start transcription: ${friendlyError}`);
+      setError(formatUiError("error.startTranscriptionFailed", "Failed to start transcription", startError));
       clearStartupWatchdog();
       setActiveDetailContext(null);
       if (!restoreDetailAfterFailedTranscription(nextDetailContext)) {
@@ -3458,7 +3657,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     try {
       await cancelTranscription(activeJobId);
     } catch (cancelError) {
-      setError(`Failed to cancel transcription: ${formatAppError(cancelError)}`);
+      setError(formatUiError("error.cancelTranscriptionFailed", "Failed to cancel transcription", cancelError));
     }
   }
 
@@ -3466,7 +3665,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     try {
       const artifact = await getArtifact(artifactId);
       if (!artifact) {
-        setError("Transcript not found.");
+        setError(t("error.transcriptNotFound", "Transcript not found."));
         return;
       }
 
@@ -3474,7 +3673,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setSection("detail");
       setError(null);
     } catch (artifactError) {
-      setError(`Failed to open transcript: ${formatAppError(artifactError)}`);
+      setError(formatUiError("error.openTranscriptFailed", "Failed to open transcript", artifactError));
     }
   }
 
@@ -3482,7 +3681,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     try {
       await openSettingsWindow(pane);
     } catch (windowError) {
-      setError(`Failed to open settings window: ${formatAppError(windowError)}`);
+      setError(formatUiError("error.openSettingsFailed", "Failed to open settings window", windowError));
     }
   }
 
@@ -3496,7 +3695,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     if (switchingJob) {
       setActiveJobPreviewText("");
       activeJobDeltaSequenceRef.current = -1;
-      setActiveJobTitle(activeJobTitle || "Transcribing");
+      setActiveJobTitle(activeJobTitle || t("detail.transcribing", "Transcribing"));
     }
     setActiveDetailContext(pendingContext?.detailContext ?? null);
     setActiveArtifact(null);
@@ -3527,7 +3726,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       });
 
       if (!updated) {
-        setError("Artifact not found while saving.");
+        setError(t("error.artifactNotFoundSaving", "Artifact not found while saving."));
         return;
       }
 
@@ -3550,7 +3749,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
       setError(null);
     } catch (saveError) {
-      setError(`Failed to save changes: ${formatAppError(saveError)}`);
+      setError(formatUiError("error.saveChangesFailed", "Failed to save changes", saveError));
     } finally {
       setIsSavingArtifact(false);
     }
@@ -3568,11 +3767,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
     const parsedTimeline = parseTimelineV2Document(activeArtifact.metadata?.timeline_v2);
     if (!parsedTimeline) {
-      setError("Segment timeline metadata is missing or invalid.");
+      setError(t("error.segmentTimelineInvalid", "Segment timeline metadata is missing or invalid."));
       return;
     }
     if (sourceIndex < 0 || sourceIndex >= parsedTimeline.segments.length) {
-      setError("Selected segment is out of range.");
+      setError(t("error.segmentOutOfRange", "Selected segment is out of range."));
       return;
     }
 
@@ -3649,7 +3848,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         timeline_v2: JSON.stringify(nextTimeline),
       });
       if (!updated) {
-        setError("Transcript not found while assigning speaker.");
+        setError(t("error.transcriptNotFoundAssigning", "Transcript not found while assigning speaker."));
         return;
       }
       upsertArtifact(updated);
@@ -3664,7 +3863,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setDraftFaqs(updated.faqs);
       setError(null);
     } catch (assignError) {
-      setError(`Failed to assign speaker: ${formatAppError(assignError)}`);
+      setError(formatUiError("error.assignSpeakerFailed", "Failed to assign speaker", assignError));
     } finally {
       setIsAssigningSpeaker(false);
     }
@@ -3672,12 +3871,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
   async function onAssignSpeakerToSelectedSegment(): Promise<void> {
     if (selectedSegmentSourceIndex === null) {
-      setError("Select a segment first.");
+      setError(t("error.selectSegmentFirst", "Select a segment first."));
       return;
     }
     const speakerLabel = speakerDraft.trim();
     if (!speakerLabel) {
-      setError("Speaker name cannot be empty.");
+      setError(t("error.speakerNameEmpty", "Speaker name cannot be empty."));
       return;
     }
     await onAssignSpeakerToSegment(
@@ -3791,7 +3990,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
     const newTitle = renameDraft.trim();
     if (!newTitle) {
-      setError("Title cannot be empty.");
+      setError(t("error.titleEmpty", "Title cannot be empty."));
       return;
     }
 
@@ -3804,7 +4003,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     try {
       const updated = await renameArtifact({ id: renameTarget.id, new_title: newTitle });
       if (!updated) {
-        setError("Transcript not found while renaming.");
+        setError(t("error.transcriptNotFoundRenaming", "Transcript not found while renaming."));
         return;
       }
 
@@ -3816,7 +4015,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setError(null);
       closeRenameDialog();
     } catch (renameError) {
-      setError(`Rename failed: ${formatAppError(renameError)}`);
+      setError(formatUiError("error.renameFailed", "Rename failed", renameError));
     } finally {
       setIsRenamingArtifact(false);
     }
@@ -3830,23 +4029,28 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     if (targets.length === 0) return;
 
     const details =
-      targets.length === 1
-        ? `"${targets[0].title}"`
-        : `${targets.length} transcriptions:\n${targets
-            .slice(0, 5)
-            .map((artifact) => `- ${artifact.title}`)
-            .join("\n")}${targets.length > 5 ? "\n- ..." : ""}`;
+      `${targets
+        .slice(0, 5)
+        .map((artifact) => `- ${artifact.title}`)
+        .join("\n")}${targets.length > 5 ? "\n- ..." : ""}`;
 
     const confirmed = await confirmDialog(
-      `Move ${details} to Recently Deleted?\n\nYou can restore these items later from Recently Deleted.`,
-      { title: "Move to Recently Deleted", kind: "warning" },
+      targets.length === 1
+        ? t("deleted.confirmMove", "Move \"{title}\" to Recently Deleted?\n\nYou can restore this item later from Recently Deleted.", {
+          title: targets[0].title,
+        })
+        : t("deleted.confirmMoveMany", "Move {count} transcriptions to Recently Deleted?\n\n{items}\n\nYou can restore these items later from Recently Deleted.", {
+          count: targets.length,
+          items: details,
+        }),
+      { title: t("deleted.confirmMoveTitle", "Move to Recently Deleted"), kind: "warning" },
     );
     if (!confirmed) return;
 
     try {
       const result = await deleteArtifacts(uniqueIds);
       if (result.deleted <= 0) {
-        setError("No transcriptions were deleted.");
+        setError(t("deleted.noneDeleted", "No transcriptions were deleted."));
         return;
       }
 
@@ -3861,7 +4065,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
       setError(null);
     } catch (deleteError) {
-      setError(`Delete failed: ${formatAppError(deleteError)}`);
+      setError(formatUiError("error.deleteFailed", "Delete failed", deleteError));
     }
   }
 
@@ -3905,23 +4109,25 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
     const confirmed = await confirmDialog(
       uniqueIds.length === 1
-        ? "Restore this transcription from Recently Deleted?"
-        : `Restore ${uniqueIds.length} transcriptions from Recently Deleted?`,
-      { title: "Restore transcription" },
+        ? t("deleted.confirmRestore", "Restore this transcription from Recently Deleted?")
+        : t("deleted.confirmRestoreMany", "Restore {count} transcriptions from Recently Deleted?", {
+          count: uniqueIds.length,
+        }),
+      { title: t("deleted.confirmRestoreTitle", "Restore transcription") },
     );
     if (!confirmed) return;
 
     try {
       const result = await restoreArtifacts(uniqueIds);
       if (result.restored <= 0) {
-        setError("No transcriptions were restored.");
+        setError(t("deleted.noneRestored", "No transcriptions were restored."));
         return;
       }
 
       await Promise.all([refreshActiveArtifacts(), refreshDeletedArtifactsList()]);
       setError(null);
     } catch (restoreError) {
-      setError(`Restore failed: ${formatAppError(restoreError)}`);
+      setError(formatUiError("error.restoreFailed", "Restore failed", restoreError));
     }
   }
 
@@ -3931,9 +4137,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
     const confirmed = await confirmDialog(
       uniqueIds.length === 1
-        ? "Permanently delete this transcription from Recently Deleted? This action cannot be undone."
-        : `Permanently delete ${uniqueIds.length} transcriptions from Recently Deleted? This action cannot be undone.`,
-      { title: "Permanent delete", kind: "warning" },
+        ? t("deleted.confirmPermanentDelete", "Permanently delete this transcription from Recently Deleted? This action cannot be undone.")
+        : t("deleted.confirmPermanentDeleteMany", "Permanently delete {count} transcriptions from Recently Deleted? This action cannot be undone.", {
+          count: uniqueIds.length,
+        }),
+      { title: t("deleted.confirmPermanentDeleteTitle", "Permanent delete"), kind: "warning" },
     );
     if (!confirmed) return;
 
@@ -3941,21 +4149,21 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       const result = await hardDeleteArtifacts(uniqueIds);
       if (result.deleted <= 0) {
         await refreshDeletedArtifactsList();
-        setError("No transcriptions were permanently deleted.");
+        setError(t("deleted.nonePermanentlyDeleted", "No transcriptions were permanently deleted."));
         return;
       }
 
       await refreshDeletedArtifactsList();
       setError(null);
     } catch (deleteError) {
-      setError(`Permanent delete failed: ${formatAppError(deleteError)}`);
+      setError(formatUiError("error.permanentDeleteFailed", "Permanent delete failed", deleteError));
     }
   }
 
   async function onEmptyTrash(): Promise<void> {
     const confirmed = await confirmDialog(
-      "Empty Recently Deleted? This permanently deletes all trashed transcriptions.",
-      { title: "Empty Recently Deleted", kind: "warning" },
+      t("deleted.confirmEmpty", "Empty Recently Deleted? This permanently deletes all trashed transcriptions."),
+      { title: t("deleted.confirmEmptyTitle", "Empty Recently Deleted"), kind: "warning" },
     );
     if (!confirmed) return;
 
@@ -3963,13 +4171,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       const result = await emptyDeletedArtifacts();
       if (result.deleted <= 0) {
         await refreshDeletedArtifactsList();
-        setError("Recently Deleted is already empty.");
+        setError(t("deleted.alreadyEmpty", "Recently Deleted is already empty."));
         return;
       }
       await refreshDeletedArtifactsList();
       setError(null);
     } catch (emptyError) {
-      setError(`Empty trash failed: ${formatAppError(emptyError)}`);
+      setError(formatUiError("error.emptyTrashFailed", "Empty trash failed", emptyError));
     }
   }
 
@@ -4004,7 +4212,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           setActiveArtifact(updated);
         }
       } catch (syncError) {
-        setError(`Could not sync changes before export: ${formatAppError(syncError)}`);
+        setError(formatUiError("error.copyBeforeExportSync", "Could not sync changes before export", syncError));
         return false;
       }
     }
@@ -4034,7 +4242,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setError(null);
       return true;
     } catch (exportError) {
-      setError(`Export failed: ${formatAppError(exportError)}`);
+      setError(formatUiError("error.exportFailed", "Export failed", exportError));
       throw exportError;
     }
   }
@@ -4052,7 +4260,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setSection("realtime");
       setError(null);
     } catch (startError) {
-      setError(`Realtime start failed: ${formatAppError(startError)}`);
+      setError(formatUiError("error.realtimeStartFailed", "Realtime start failed", startError));
     }
   }
 
@@ -4060,7 +4268,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     try {
       await pauseRealtime();
     } catch (pauseError) {
-      setError(`Realtime pause failed: ${formatAppError(pauseError)}`);
+      setError(formatUiError("error.realtimePauseFailed", "Realtime pause failed", pauseError));
     }
   }
 
@@ -4068,7 +4276,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     try {
       await resumeRealtime();
     } catch (resumeError) {
-      setError(`Realtime resume failed: ${formatAppError(resumeError)}`);
+      setError(formatUiError("error.realtimeResumeFailed", "Realtime resume failed", resumeError));
     }
   }
 
@@ -4085,7 +4293,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setRealtimeFinalLines([]);
       setError(null);
     } catch (stopError) {
-      setError(`Realtime stop failed: ${formatAppError(stopError)}`);
+      setError(formatUiError("error.realtimeStopFailed", "Realtime stop failed", stopError));
     } finally {
       setIsStoppingRealtime(false);
     }
@@ -4118,11 +4326,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setError(null);
     } catch (summaryError) {
       const code = formatAppErrorCode(summaryError);
-      const message = formatAppError(summaryError);
       if (code === "missing_ai_provider" || code === "missing_api_key") {
-        setError("Summary failed: configure an AI provider in Settings > AI Services.");
+        setError(t("error.summaryConfigureProvider", "Summary failed: configure an AI provider in Settings > AI Services."));
       } else {
-        setError(`Summary failed: ${message}`);
+        setError(t("error.summaryFailed", "Summary failed"));
       }
     } finally {
       setIsGeneratingSummary(false);
@@ -4156,11 +4363,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setError(null);
     } catch (optimizeError) {
       const code = formatAppErrorCode(optimizeError);
-      const message = formatAppError(optimizeError);
       if (code === "missing_ai_provider" || code === "missing_api_key") {
-        setError("Improve text failed: configure an AI provider in Settings > AI Services.");
+        setError(t("error.improveConfigureProvider", "Improve text failed: configure an AI provider in Settings > AI Services."));
       } else {
-        setError(`Improve text failed: ${message}`);
+        setError(t("error.improveFailed", "Improve text failed"));
       }
     } finally {
       setIsImprovingText(false);
@@ -4194,18 +4400,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setChatHistory((previous) => [...previous, { role: "assistant", text: answer }]);
     } catch (chatError) {
       const code = formatAppErrorCode(chatError);
-      const message = formatAppError(chatError);
       const providerMissing = code === "missing_ai_provider" || code === "missing_api_key";
       setChatHistory((previous) => [
         ...previous,
         {
           role: "assistant",
           text: providerMissing
-            ? "Chat unavailable. Configure AI provider in Settings > AI Services."
-            : `Chat failed: ${message}`,
+            ? aiUnavailableReason
+            : t("error.chatFailed", "Chat failed"),
         },
       ]);
-      setError(providerMissing ? "Chat unavailable. Configure AI provider in Settings > AI Services." : message);
+      setError(providerMissing ? aiUnavailableReason : t("error.chatFailed", "Chat failed"));
     } finally {
       setIsAskingChat(false);
     }
@@ -4217,7 +4422,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         ...previous,
         running: true,
         progress: null,
-        statusMessage: "Provisioning started...",
+        statusMessage: t("provisioning.started", "Provisioning started..."),
       }));
       await provisioningStart(true);
     } catch (provisionError) {
@@ -4225,7 +4430,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         ...previous,
         running: false,
       }));
-      setError(`Provisioning failed: ${formatAppError(provisionError)}`);
+      setError(formatUiError("error.provisioningFailed", "Provisioning failed", provisionError));
     }
   }
 
@@ -4235,7 +4440,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         ...previous,
         running: true,
         progress: null,
-        statusMessage: `Downloading ${model}...`,
+        statusMessage: t("provisioning.downloadingModel", "Downloading {model}...", { model }),
       }));
       await provisioningDownloadModel({ model, include_coreml: true });
     } catch (downloadError) {
@@ -4243,7 +4448,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         ...previous,
         running: false,
       }));
-      setError(`Model download failed: ${formatAppError(downloadError)}`);
+      setError(formatUiError("error.modelDownloadFailed", "Model download failed", downloadError));
     }
   }
 
@@ -4254,8 +4459,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         running: true,
         progress: null,
         statusMessage: force
-          ? "Repairing pyannote diarization runtime..."
-          : "Installing pyannote diarization runtime...",
+          ? t("provisioning.repairingPyannote", "Repairing pyannote diarization runtime...")
+          : t("provisioning.installingPyannote", "Installing pyannote diarization runtime..."),
       }));
       await provisioningInstallPyannote(force);
     } catch (installError) {
@@ -4263,7 +4468,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         ...previous,
         running: false,
       }));
-      setError(`Pyannote install failed: ${formatAppError(installError)}`);
+      setError(formatUiError("error.pyannoteInstallFailed", "Pyannote install failed", installError));
     }
   }
 
@@ -4273,10 +4478,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setProvisioning((previous) => ({
         ...previous,
         running: false,
-        statusMessage: "Provisioning cancelled",
+        statusMessage: t("provisioning.cancelled", "Provisioning cancelled"),
       }));
     } catch (cancelError) {
-      setError(`Provisioning cancel failed: ${formatAppError(cancelError)}`);
+      setError(formatUiError("error.provisioningCancelFailed", "Provisioning cancel failed", cancelError));
     }
   }
 
@@ -4341,7 +4546,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setUpdateSource("github");
     } catch (updateError) {
       if (!silent) {
-        setError(`Update check failed: ${formatAppError(updateError)}`);
+        setError(formatUiError("error.updateCheckFailed", "Update check failed", updateError));
       }
     } finally {
       if (!shouldCancel?.()) {
@@ -4360,7 +4565,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     }
 
     setInstallingUpdate(true);
-    setUpdateStatusMessage("Downloading update...");
+    setUpdateStatusMessage(t("settings.general.downloadingUpdate", "Downloading update..."));
     setUpdateDownloadPercent(0);
     try {
       let expectedBytes = 0;
@@ -4369,7 +4574,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         if (event.event === "Started") {
           expectedBytes = event.data.contentLength ?? 0;
           downloadedBytes = 0;
-          setUpdateStatusMessage("Downloading update...");
+          setUpdateStatusMessage(t("settings.general.downloadingUpdate", "Downloading update..."));
           return;
         }
         if (event.event === "Progress") {
@@ -4385,11 +4590,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         }
         if (event.event === "Finished") {
           setUpdateDownloadPercent(100);
-          setUpdateStatusMessage("Installing update...");
+          setUpdateStatusMessage(t("settings.general.installingUpdate", "Installing update..."));
         }
       });
 
-      setUpdateStatusMessage("Update installed. Restart the app to apply it.");
+      setUpdateStatusMessage(t("settings.general.updateInstalled", "Update installed. Restart the app to apply it."));
       setUpdateInfo((previous) =>
         previous
           ? {
@@ -4401,7 +4606,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       );
       setNativeUpdate(null);
     } catch (installError) {
-      setError(`Update install failed: ${formatAppError(installError)}`);
+      setError(formatUiError("error.updateInstallFailed", "Update install failed", installError));
       setUpdateStatusMessage(null);
     } finally {
       setInstallingUpdate(false);
@@ -4429,7 +4634,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     } catch (error) {
       setPromptTest((current) => ({
         ...current,
-        output: `Prompt test failed: ${formatAppError(error)}`,
+        output: t("error.promptTestFailed", "Prompt test failed"),
         running: false,
       }));
     }
@@ -4461,7 +4666,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       await resetPromptTemplates();
       await refreshSettingsFromDisk();
     } catch (error) {
-      setError(`Could not reset prompts: ${formatAppError(error)}`);
+      setError(formatUiError("error.resetPromptsFailed", "Could not reset prompts", error));
     }
   }
 
@@ -4494,7 +4699,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                     <button 
                       className="tree-expand-button" 
                       onClick={(e) => toggleArtifactExpansion(artifact.id, e)}
-                      title={expandedArtifactIds.has(artifact.id) ? "Collapse child trims" : "Expand child trims"}
+                      title={expandedArtifactIds.has(artifact.id) ? t("history.collapseChildTrims", "Collapse child trims") : t("history.expandChildTrims", "Expand child trims")}
                     >
                       {expandedArtifactIds.has(artifact.id) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                     </button>
@@ -4513,7 +4718,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               </div>
             </button>
             <div className="home-history-actions">
-              <label className="home-history-select" title={depth > 0 ? "Select trim transcription" : "Select transcription"} onClick={(e) => e.stopPropagation()}>
+              <label className="home-history-select" title={depth > 0 ? t("history.selectTrimTranscription", "Select trim transcription") : t("history.selectTranscription", "Select transcription")} onClick={(e) => e.stopPropagation()}>
                 <input
                   type="checkbox"
                   checked={selectedArtifactIdSet.has(artifact.id)}
@@ -4527,8 +4732,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                     event.stopPropagation();
                     void onDeleteArtifact(artifact);
                   }}
-                  title="Move to trash"
-                  aria-label={`Move ${artifact.title} to trash`}
+                  title={t("history.moveToTrashTitle", "Move to trash")}
+                  aria-label={t("history.moveToTrashAria", "Move {title} to trash", { title: artifact.title })}
                 >
                   <Trash2 size={14} />
                 </button>
@@ -4670,10 +4875,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           <h2>{t("queue.title")}</h2>
           <div className="toolbar-actions">
             <button className="secondary-button" onClick={() => setQueueItems([])}>
-              Clear Finished
+              {t("queue.clearFinished", "Clear Finished")}
             </button>
             <button className="secondary-button" onClick={() => void onCancel()} disabled={!activeJobId}>
-              Cancel Active Job
+              {t("queue.cancelActiveJob", "Cancel Active Job")}
             </button>
           </div>
         </div>
@@ -4708,7 +4913,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 >
                   <div className="queue-card-head">
                     <strong>
-                      {item.job_id === activeJobId && activeJobTitle ? activeJobTitle : "Transcription in progress"}
+                      {item.job_id === activeJobId && activeJobTitle ? activeJobTitle : t("queue.activeJobFallback", "Transcription in progress")}
                     </strong>
                     <span className="queue-stage">
                       <ProgressRing percentage={displayPercentage} size={18} />
@@ -4752,7 +4957,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                     <button 
                       className="tree-expand-button" 
                       onClick={(e) => toggleArtifactExpansion(artifact.id, e)}
-                      title={expandedArtifactIds.has(artifact.id) ? "Collapse child trims" : "Expand child trims"}
+                      title={expandedArtifactIds.has(artifact.id) ? t("history.collapseChildTrims", "Collapse child trims") : t("history.expandChildTrims", "Expand child trims")}
                     >
                       {expandedArtifactIds.has(artifact.id) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                     </button>
@@ -4771,7 +4976,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               </div>
             </button>
             <div className="history-actions">
-              <label className="home-history-select history-select" title={depth > 0 ? "Select trim transcription" : "Select transcription"} onClick={(e) => e.stopPropagation()}>
+              <label className="home-history-select history-select" title={depth > 0 ? t("history.selectTrimTranscription", "Select trim transcription") : t("history.selectTranscription", "Select transcription")} onClick={(e) => e.stopPropagation()}>
                 <input
                   type="checkbox"
                   checked={selectedArtifactIdSet.has(artifact.id)}
@@ -4782,7 +4987,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 <>
                   <button className="secondary-button history-action-button" onClick={() => void onRenameArtifact(artifact)}>
                     <Pencil size={14} />
-                    Rename
+                    {t("history.rename", "Rename")}
                   </button>
                   <button
                     className="icon-button danger-icon-button history-inline-delete"
@@ -4790,8 +4995,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                         event.stopPropagation();
                         void onDeleteArtifact(artifact);
                     }}
-                    title="Move to trash"
-                    aria-label={`Move ${artifact.title} to trash`}
+                    title={t("history.moveToTrashTitle", "Move to trash")}
+                    aria-label={t("history.moveToTrashAria", "Move {title} to trash", { title: artifact.title })}
                   >
                     <Trash2 size={14} />
                   </button>
@@ -4814,21 +5019,21 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         {isSelectionMode ? (
           <div className="history-selection-toolbar">
             <button className="secondary-button" onClick={() => setSelectedArtifactIds([])}>
-              Cancel
+              {t("selection.cancel", "Cancel")}
             </button>
             <button
               className="secondary-button"
               onClick={selectAllVisibleArtifacts}
               disabled={historyVisibleArtifactIds.length === 0}
             >
-              Select all
+              {t("selection.selectAll", "Select all")}
             </button>
             <button
               className="secondary-button history-action-danger"
               onClick={() => void onDeleteSelectedArtifacts()}
               disabled={selectedArtifactIds.length === 0}
             >
-              Delete selected ({selectedArtifactIds.length})
+              {t("selection.deleteSelected", "Delete selected")} ({selectedArtifactIds.length})
             </button>
           </div>
         ) : null}
@@ -4881,19 +5086,19 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   <small>{formatDate(artifact.updated_at)}</small>
                 </div>
                 <div className="history-actions">
-                  <span className="kind-chip">{artifact.kind === "realtime" ? "Live" : "File"}</span>
+                  <span className="kind-chip">{artifact.kind === "realtime" ? t("history.live", "Live") : t("history.file", "File")}</span>
                   <button
                     className="secondary-button history-action-button"
                     onClick={() => void onRestoreArtifactsWithConsent([artifact.id])}
                   >
-                    Restore
+                    {t("deleted.restore", "Restore")}
                   </button>
                   <button
                     className="secondary-button history-action-button history-action-danger"
                     onClick={() => void onHardDeleteArtifactsWithConsent([artifact.id])}
                   >
                     <Trash2 size={14} />
-                    Delete Permanently
+                    {t("deleted.deletePermanently", "Delete Permanently")}
                   </button>
                 </div>
               </article>
@@ -4930,8 +5135,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         return (
           <LoadingAnimation
             icon={Sparkles}
-            title="Summarizing..."
-            description="Generating a summary from your transcript..."
+            title={t("detail.summarizing", "Summarizing...")}
+            description={t("detail.summaryGenerating", "Generating a summary from your transcript...")}
             variant="summarizing"
           />
         );
@@ -4963,8 +5168,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             {isAskingChat ? (
               <LoadingAnimation
                 icon={MessageSquareText}
-                title="Thinking..."
-                description="AI is analyzing your transcript and generating a response..."
+                title={t("detail.thinking", "Thinking...")}
+                description={t("detail.thinkingDesc", "AI is analyzing your transcript and generating a response...")}
                 variant="chat"
               />
             ) : chatHistory.length === 0 ? (
@@ -5076,8 +5281,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       return (
         <LoadingAnimation
           icon={Sparkles}
-          title="Improving Text..."
-          description="AI is optimizing semantics and punctuation..."
+          title={t("detail.improvingText", "Improving Text...")}
+          description={t("detail.improvingTextDesc", "AI is correcting punctuation and likely transcription mistakes...")}
           variant="transcribing"
         />
       );
@@ -5142,7 +5347,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return (
       <div className="inspector-body">
         <button className="secondary-button" onClick={() => void navigator.clipboard.writeText(visibleTranscript)}>
-          Copy
+          {t("inspector.copy", "Copy")}
         </button>
 
         <TranscriptSegmentsTileSwitch
@@ -5182,20 +5387,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
         {detailMode === "transcript" && confidenceColorsAvailable ? (
           <div className="inspector-block confidence-toggle-block">
-            <label className="confidence-toggle-card">
-              <div className="confidence-toggle-copy">
-                <span className="confidence-toggle-title">
-                  {t("sidebar.confidenceColors", "Confidence colors")}
-                </span>
-                <span className="confidence-toggle-note">
-                  {t(
-                    "sidebar.confidenceColorsHint",
-                    "Uses the original Whisper transcript. Hover words to inspect confidence.",
-                  )}
-                </span>
-              </div>
+            <label
+              className={`confidence-toggle-card ${showConfidenceColors ? "is-on" : "is-off"}`}
+            >
               <input
+                className="confidence-toggle-input"
                 type="checkbox"
+                role="switch"
+                aria-label={t(
+                  "sidebar.confidenceColorsToggle",
+                  "Toggle confidence colors",
+                )}
                 checked={showConfidenceColors}
                 onChange={(event) => {
                   const enabled = event.target.checked;
@@ -5205,6 +5407,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   }
                 }}
               />
+              <div className="confidence-toggle-copy">
+                <span className="confidence-toggle-title">
+                  {t("sidebar.confidenceColors", "Confidence colors")}
+                </span>
+              </div>
+              <span className="confidence-power-switch" aria-hidden="true">
+                <span className="confidence-power-track">
+                  <span className="confidence-power-spectrum" />
+                  <span className="confidence-power-thumb" />
+                </span>
+              </span>
             </label>
           </div>
         ) : null}
@@ -5236,15 +5449,15 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
         <div className="inspector-block">
           <h4>{t("inspector.people")}</h4>
-          <div className="pill">{selectedDetailSegment?.speakerLabel ?? "Unknown"}</div>
+          <div className="pill">{selectedDetailSegment?.speakerLabel ?? t("inspector.unknown", "Unknown")}</div>
           <div className="speaker-edit-row">
             <input
               ref={peopleSpeakerInputRef}
               className="inspector-input"
               placeholder={
                 detailMode === "segments"
-                  ? "Add a speaker..."
-                  : "Open Segments and select a segment"
+                  ? t("inspector.addSpeaker", "Add a speaker...")
+                  : t("inspector.openSegments", "Open Segments and select a segment")
               }
               list="speaker-suggestions"
               value={speakerDraft}
@@ -5268,7 +5481,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               }
               onClick={() => void onAssignSpeakerToSelectedSegment()}
             >
-              {isAssigningSpeaker ? "..." : "Assign"}
+              {isAssigningSpeaker ? "..." : t("inspector.assign", "Assign")}
             </button>
           </div>
           <label className="toggle-row compact">
@@ -5290,9 +5503,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           <small className="muted">
             {detailMode === "segments"
               ? selectedSegmentSourceIndex === null
-                ? "Select a segment to assign a speaker manually."
-                : "Speaker label is saved into segment metadata. Right-click a segment for quick actions."
-              : "Speaker assignment is available in Segments mode. Diarization controls are in Settings > Whisper C++."}
+                ? t("inspector.selectSegmentHint", "Select a segment to assign a speaker manually.")
+                : t("inspector.speakerSavedHint", "Speaker label is saved into segment metadata. Right-click a segment for quick actions.")
+              : t("inspector.diarizationHint", "Speaker assignment is available in Segments mode. Diarization controls are in Settings > Transcription Defaults and asset setup is in Settings > Local Models.")}
           </small>
         </div>
 
@@ -5339,7 +5552,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return (
       <div className="inspector-body">
         <label>
-          AI Service
+          {t("summary.aiService", "AI Service")}
           <select
             className="inspector-select"
             value={activeAiServiceSelectValue}
@@ -5356,7 +5569,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         </label>
 
         <button className="secondary-button" onClick={() => void navigator.clipboard.writeText(draftSummary || visibleTranscript)}>
-          Copy
+          {t("summary.copy", "Copy")}
         </button>
         <button
           className="secondary-button"
@@ -5364,7 +5577,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           disabled={isGeneratingSummary || !activeArtifact || !aiFeaturesAvailable}
           title={!aiFeaturesAvailable ? aiUnavailableReason : undefined}
         >
-          {isGeneratingSummary ? "Summarizing..." : "Summarize"}
+          {isGeneratingSummary ? t("detail.summarizing", "Summarizing...") : t("summary.summarize", "Summarize")}
         </button>
         <button className="secondary-button" onClick={() => setDraftSummary("")}>{t("summary.clear")}</button>
         {!aiFeaturesAvailable ? <p className="muted">{aiUnavailableReason}</p> : null}
@@ -5431,7 +5644,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         </div>
 
         <label>
-          Language
+          {t("summary.language", "Language")}
           <select
             className="inspector-select"
             value={summaryLanguage}
@@ -5439,19 +5652,19 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           >
             {languageOptions.filter((option) => option.value !== "auto").map((option) => (
               <option key={option.value} value={option.value}>
-                {option.label}
+                {t(`lang.${option.value}`, option.label)}
               </option>
             ))}
           </select>
         </label>
 
         <label>
-          Custom summary prompt
+          {t("summary.customPrompt", "Custom summary prompt")}
           <textarea
             className="inspector-prompt"
             value={summaryCustomPrompt}
             onChange={(event) => setSummaryCustomPrompt(event.target.value)}
-            placeholder="Optional: override summary instructions..."
+            placeholder={t("summary.customPromptPlaceholder", "Optional: override summary instructions...")}
           />
         </label>
       </div>
@@ -5481,7 +5694,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             void onOpenStandaloneSettingsWindow("prompts");
           }}
         >
-          Manage Prompts
+          {t("chat.managePrompts", "Manage Prompts")}
         </button>
         {!aiFeaturesAvailable ? <p className="muted">{aiUnavailableReason}</p> : null}
 
@@ -5511,7 +5724,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   function renderMetadataInspector(): JSX.Element {
     return (
       <div className="inspector-body">
-        <h4>Model & Language</h4>
+        <h4>{t("metadata.modelLanguage", "Model & Language")}</h4>
 
         <div className="property-grid">
           <label>{t("metadata.model")}</label>
@@ -5521,7 +5734,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           >
             {modelOptions.map((option) => (
               <option key={option.value} value={option.value}>
-                {option.label}
+                {formatSpeechModelLabel(option.value, option.label)}
               </option>
             ))}
           </select>
@@ -5541,7 +5754,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
         {activeArtifact ? (
           <>
-            <div className="property-line"><span>{t("metadata.kind")}</span><strong>{activeArtifact.kind}</strong></div>
+            <div className="property-line"><span>{t("metadata.kind")}</span><strong>{formatArtifactKindLabel(activeArtifact.kind)}</strong></div>
             <div className="property-line"><span>{t("metadata.audioDuration")}</span><strong>{formatShortDuration(transcriptSeconds)}</strong></div>
             <div className="property-line"><span>{t("metadata.created")}</span><strong>{formatDate(activeArtifact.created_at)}</strong></div>
             <div className="property-line"><span>{t("metadata.updated")}</span><strong>{formatDate(activeArtifact.updated_at)}</strong></div>
@@ -5551,7 +5764,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         ) : null}
 
         <button className="primary-button" onClick={() => void onSaveArtifact()} disabled={isSavingArtifact}>
-          {isSavingArtifact ? "Saving..." : "Save"}
+          {isSavingArtifact ? t("metadata.saving", "Saving...") : t("metadata.save", "Save")}
         </button>
       </div>
     );
@@ -5567,11 +5780,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               onClick={() => void navigator.clipboard.writeText(stripAnsi(activeJobPreviewText))}
               disabled={!activeJobPreviewText}
             >
-              Copy
+              {t("inspector.copy", "Copy")}
             </button>
             <div className="inspector-block">
               <h4>{t("inspector.transcribingTitle")}</h4>
-              <p className="muted">{progress?.message ?? "Running Whisper transcription..."}</p>
+              <p className="muted">{progress?.message ?? t("inspector.whisperRunning", "Running Whisper transcription...")}</p>
             </div>
           </div>
         );
@@ -5594,7 +5807,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             rightSidebarOpen={effectiveRightSidebarOpen}
             rightSidebarForcedCollapsed={rightSidebarForcedCollapsed}
             detailMode={detailMode}
-            title={effectiveDetailContext?.title ?? activeJobTitle ?? "Transcribing"}
+            title={effectiveDetailContext?.title ?? activeJobTitle ?? t("detail.transcribing", "Transcribing")}
             hasArtifact={Boolean(activeArtifact)}
             hasActiveJob={Boolean(activeJobId)}
             transcriptionProgress={displayedTranscriptionPercentage}
@@ -5646,7 +5859,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 role="menuitem"
                 onClick={onAddSpeakerFromContextMenu}
               >
-                Add Speaker...
+                {t("inspector.addSpeaker", "Add a speaker...")}
               </button>
               <div className="segment-context-separator" />
               <p className="segment-context-title">{t("inspector.assign")}</p>
@@ -5674,7 +5887,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 disabled={isAssigningSpeaker || !contextMenuSegment?.speakerLabel}
                 onClick={onClearSpeakerFromContextMenu}
               >
-                Clear Speaker
+                {t("inspector.clearSpeaker", "Clear Speaker")}
               </button>
             </div>
           ) : null}
@@ -5682,7 +5895,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           <div className="detail-audio-stack">
             <div className="detail-audio-player-group">
               {effectiveTrimmedAudioDraft ? (
-                <div className="detail-audio-player-label">Trimmed audio</div>
+                <div className="detail-audio-player-label">{t("detail.trimmedAudio", "Trimmed audio")}</div>
               ) : null}
               <AudioPlayer
                 inputPath={detailAudioInputPath}
@@ -5731,16 +5944,16 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           <h2>{t("topbar.live")}</h2>
           <div className="toolbar-actions">
             <button className="secondary-button" onClick={() => void onStartRealtime()} disabled={!canStartRealtime}>
-              Start
+              {t("realtime.start", "Start")}
             </button>
             <button className="secondary-button" onClick={() => void onPauseRealtime()} disabled={realtimeState !== "running"}>
-              Pause
+              {t("realtime.pause", "Pause")}
             </button>
             <button className="secondary-button" onClick={() => void onResumeRealtime()} disabled={realtimeState !== "paused"}>
-              Resume
+              {t("realtime.resume", "Resume")}
             </button>
             <button className="primary-button" onClick={() => void onStopRealtime(true)} disabled={realtimeState === "idle" || isStoppingRealtime}>
-              Stop & Save
+              {t("realtime.stopAndSave", "Stop & Save")}
             </button>
           </div>
         </div>
@@ -5748,7 +5961,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         <section className="panel-card">
           <div className="panel-head">
             <strong>{t("realtime.status")}</strong>
-            <span className={`status-chip ${realtimeState}`}>{realtimeMessage}</span>
+            <span className={`status-chip ${realtimeState}`}>
+              {realtimeState === "idle" ? t("realtime.idle", "Realtime idle") : realtimeMessage}
+            </span>
           </div>
 
           <div className="live-view">
@@ -5864,35 +6079,46 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 }));
               }}
             >
-              <option value="en">English</option>
-              <option value="it">Italiano</option>
-              <option value="es">Español</option>
-              <option value="de">Deutsch</option>
+              {supportedAppLanguages.map((language) => (
+                <option key={language} value={language}>
+                  {t(`lang.${language}`, language)}
+                </option>
+              ))}
             </select>
           </div>
 
           <div className="settings-actions-row">
             <button className="secondary-button" onClick={() => void onRefreshUpdates()} disabled={checkingUpdates}>
-              {checkingUpdates ? "Checking..." : "Check Updates"}
+              {checkingUpdates ? t("settings.general.checking", "Checking...") : t("settings.general.checkUpdates", "Check Updates")}
             </button>
             {updateInfo ? (
               <small>
                 {updateInfo.has_update
-                  ? `Update ${updateInfo.latest_version} available${updateSource === "native" ? " (in-app install)" : ""}`
-                  : `Up to date (${updateInfo.current_version})`}
+                  ? updateSource === "native"
+                    ? t("settings.general.updateAvailableInApp", "Update {version} available (in-app install)", {
+                      version: updateInfo.latest_version ?? "",
+                    })
+                    : t("settings.general.updateAvailable", "Update {version} available", {
+                      version: updateInfo.latest_version ?? "",
+                    })
+                  : t("settings.general.upToDate", "Up to date ({version})", {
+                    version: updateInfo.current_version,
+                  })}
               </small>
             ) : null}
           </div>
           {updateInfo?.has_update && nativeUpdate ? (
             <button className="cta-link-button" onClick={() => void onInstallUpdate()} disabled={installingUpdate}>
               {installingUpdate
-                ? `Installing${updateDownloadPercent !== null ? ` (${updateDownloadPercent}%)` : "..."}`
-                : "Download & Install"}
+                ? t("settings.general.installing", "Installing{suffix}", {
+                  suffix: updateDownloadPercent !== null ? ` (${updateDownloadPercent}%)` : "...",
+                })
+                : t("settings.general.downloadAndInstall", "Download & Install")}
             </button>
           ) : null}
           {updateInfo?.has_update && updateInfo.download_url ? (
             <a className="cta-link-button" href={updateInfo.download_url} target="_blank" rel="noreferrer">
-              {nativeUpdate ? "Manual Download" : "Download Update"}
+              {nativeUpdate ? t("settings.general.manualDownload", "Manual Download") : t("settings.general.downloadUpdate", "Download Update")}
             </a>
           ) : null}
           {updateStatusMessage ? <small>{updateStatusMessage}</small> : null}
@@ -5950,7 +6176,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             >
               {modelOptions.map((option) => (
                 <option key={option.value} value={option.value}>
-                  {option.label}
+                  {formatSpeechModelLabel(option.value, option.label)}
                 </option>
               ))}
             </select>
@@ -5980,16 +6206,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               <small>{t("settings.transcription.speakerDiarizationDesc", "After transcription completes, the app will run its managed offline pyannote diarization runtime and assign speakers into the timeline when the pyannote assets are installed from Local Models.")}</small>
               {pyannoteHealth ? (
                 <small className="muted">
-                  {pyannoteHealth.ready
-                    ? `Pyannote ready on ${pyannoteHealth.arch}.`
-                    : pyannoteHealth.message}
+                  {formatPyannoteHealthMessage(pyannoteHealth)}
                 </small>
               ) : null}
             </div>
             <div className="settings-toggle-stack">
               {pyannoteHealth ? (
                 <span className={pyannoteHealth.ready ? "kind-chip" : "missing-chip"}>
-                  {pyannoteHealth.ready ? "Ready" : "Setup required"}
+                  {pyannoteHealth.ready ? t("status.ready", "Ready") : t("status.setupRequired", "Setup required")}
                 </span>
               ) : null}
               <input
@@ -6019,9 +6243,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 }));
               }}
             >
-              <option value="cpu">CPU</option>
-              <option value="auto">Auto</option>
-              <option value="mps">MPS</option>
+              <option value="cpu">{t("settings.transcription.deviceCpu", "CPU")}</option>
+              <option value="auto">{t("lang.auto", "Auto Detect")}</option>
+              <option value="mps">{t("settings.transcription.deviceMps", "MPS")}</option>
             </select>
           </div>
         </section>
@@ -6189,7 +6413,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           <div className="settings-row settings-row-block">
             <div>
               <strong>{t("settings.whisper.bestOf")}</strong>
-              <small>`--best-of` (used when beam size is 1).</small>
+              <small>{t("settings.whisper.bestOfDesc", "`--best-of` (used when beam size is 1).")}</small>
             </div>
             <input
               type="number"
@@ -6473,7 +6697,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   prompt: event.target.value,
                 }));
               }}
-              placeholder="Optional decoder prompt"
+              placeholder={t("settings.whisperkit.promptPlaceholder", "Optional decoder prompt")}
             />
           </div>
         </section>
@@ -6496,15 +6720,15 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           <div className="settings-card-head">
             <h3>{t("settings.localModels.title")}</h3>
             <button className="secondary-button" onClick={() => void refreshProvisioningModels()}>
-              Refresh
+              {t("action.refresh", "Refresh")}
             </button>
           </div>
 
           <p className="muted">
-            Models are downloaded in background and used by local transcription.
+            {t("settings.localModels.modelsDownloaded", "Models are downloaded in background and used by local transcription.")}
           </p>
           <p className="muted">
-            Directory: <code>{provisioning.modelsDir || settings.transcription.models_dir}</code>
+            {t("settings.localModels.directory", "Directory:")} <code>{provisioning.modelsDir || settings.transcription.models_dir}</code>
           </p>
 
           {runtimeHealth ? (
@@ -6580,16 +6804,16 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             {modelCatalog.map((model) => (
               <div key={model.key} className="model-row">
                 <div className="model-row-main">
-                  <strong>{model.label}</strong>
+                  <strong>{formatSpeechModelLabel(model.key, model.label)}</strong>
                   <small>{model.model_file}</small>
                 </div>
                 <div className="model-row-actions">
                   <span className={model.installed ? "kind-chip" : "missing-chip"}>
-                    {model.installed ? "Installed" : "Missing"}
+                    {model.installed ? t("status.installed", "Installed") : t("status.missing", "Missing")}
                   </span>
                   {platformIsAppleSilicon && (
                     <span className={model.coreml_installed ? "kind-chip" : "missing-chip"}>
-                      {model.coreml_installed ? "CoreML Ready" : "CoreML Missing"}
+                      {model.coreml_installed ? t("settings.localModels.coremlReady", "CoreML Ready") : t("settings.localModels.coremlMissing", "CoreML Missing")}
                     </span>
                   )}
                   <button
@@ -6597,7 +6821,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                     disabled={provisioning.running || (model.installed && (!platformIsAppleSilicon || model.coreml_installed))}
                     onClick={() => void onDownloadModel(model.key)}
                   >
-                    {model.installed && (!platformIsAppleSilicon || model.coreml_installed) ? "Installed" : "Download"}
+                    {model.installed && (!platformIsAppleSilicon || model.coreml_installed)
+                      ? t("status.installed", "Installed")
+                      : t("settings.localModels.download", "Download")}
                   </button>
                 </div>
               </div>
@@ -6606,10 +6832,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
           <div className="notice-actions">
             <button className="primary-button" onClick={() => void onProvisionModels()} disabled={provisioning.running}>
-              Download Missing Models
+              {t("settings.localModels.downloadMissing", "Download Missing Models")}
             </button>
             <button className="secondary-button" onClick={() => void onCancelProvisioning()} disabled={!provisioning.running}>
-              Cancel
+              {t("action.cancel", "Cancel")}
             </button>
           </div>
 
@@ -6625,7 +6851,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           <div className="settings-card-head">
             <h3>{t("settings.pyannote.title", "Speaker Diarization")}</h3>
             <button className="secondary-button" onClick={() => void refreshRuntimeHealth()}>
-              Refresh
+              {t("action.refresh", "Refresh")}
             </button>
           </div>
 
@@ -6636,7 +6862,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             )}
           </p>
           <p className="muted">
-            Directory: <code>{provisioning.modelsDir ? `${provisioning.modelsDir}/../runtime/pyannote` : "runtime/pyannote"}</code>
+            {t("settings.localModels.directory", "Directory:")} <code>{provisioning.modelsDir ? `${provisioning.modelsDir}/../runtime/pyannote` : "runtime/pyannote"}</code>
           </p>
 
           {pyannoteHealth ? (
@@ -6647,20 +6873,20 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   <span className="settings-health-value-inline">
                     <code>{pyannoteHealth.arch}</code>
                     <span className={pyannoteHealth.ready ? "kind-chip" : "missing-chip"}>
-                      {pyannoteHealth.ready ? "Ready" : "Missing"}
+                      {pyannoteHealth.ready ? t("settings.pyannote.ready", "Ready") : t("settings.pyannote.missing", "Missing")}
                     </span>
                   </span>
                 </div>
                 <div className="settings-health-row">
                   <span className="settings-health-label">{t("settings.pyannote.runtime", "Runtime")}</span>
                   <span className={pyannoteHealth.runtime_installed ? "kind-chip" : "missing-chip"}>
-                    {pyannoteHealth.runtime_installed ? "Installed" : "Missing"}
+                    {pyannoteHealth.runtime_installed ? t("status.installed", "Installed") : t("status.missing", "Missing")}
                   </span>
                 </div>
                 <div className="settings-health-row">
                   <span className="settings-health-label">{t("settings.pyannote.model", "Model")}</span>
                   <span className={pyannoteHealth.model_installed ? "kind-chip" : "missing-chip"}>
-                    {pyannoteHealth.model_installed ? "Installed" : "Missing"}
+                    {pyannoteHealth.model_installed ? t("status.installed", "Installed") : t("status.missing", "Missing")}
                   </span>
                 </div>
                 <div className="settings-health-row">
@@ -6672,7 +6898,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   <code>{pyannoteHealth.source}</code>
                 </div>
               </div>
-              <small className="muted">{pyannoteHealth.message}</small>
+              <small className="muted">{formatPyannoteHealthMessage(pyannoteHealth)}</small>
             </div>
           ) : null}
 
@@ -6682,17 +6908,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               onClick={() => void onInstallPyannote(false)}
               disabled={provisioning.running || Boolean(pyannoteHealth?.ready)}
             >
-              Install Pyannote
+              {t("settings.pyannote.install", "Install Pyannote")}
             </button>
             <button
               className="secondary-button"
               onClick={() => void onInstallPyannote(true)}
               disabled={provisioning.running}
             >
-              Repair
+              {t("settings.pyannote.repair", "Repair")}
             </button>
             <button className="secondary-button" onClick={() => void onCancelProvisioning()} disabled={!provisioning.running}>
-              Cancel
+              {t("action.cancel", "Cancel")}
             </button>
           </div>
 
@@ -6739,7 +6965,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       return {
         id: createRemoteServiceId(kind),
         kind,
-        label: catalog.label,
+        label: formatProviderLabel(kind),
         enabled: true,
         api_key: kind === "google" ? settings.ai.providers.gemini.api_key : null,
         model: kind === "google" ? settings.ai.providers.gemini.model : catalog.defaultModel,
@@ -7063,7 +7289,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                     <ServiceIcon size={13} />
                   </span>
                   <div className="ai-service-title">
-                    <strong>{service.label || formatProviderLabel(service.kind)}</strong>
+                    <strong>{formatRemoteServiceLabel(service, settings)}</strong>
                     <small>{service.enabled ? t("settings.ai.configuredToUse", "Configured") : t("settings.ai.disabled", "Disabled")}</small>
                   </div>
                   <div className="ai-service-actions">
@@ -7193,7 +7419,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   >
                     <span className="ai-service-chip-main">
                       <ServiceIcon size={13} />
-                      <span>{service.label}</span>
+                      <span>{service.kind === "custom" ? t("settings.ai.customService", "Custom") : service.label}</span>
                     </span>
                     {alreadyAdded ? <Check size={14} /> : <Plus size={14} />}
                   </button>
@@ -7323,12 +7549,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 <h3>{t("settings.prompts.editPrompt")}</h3>
                 <button className="primary-button" onClick={() => void onSavePromptTemplate()}>
                   <Save size={14} />
-                  Save Prompt
+                  {t("settings.prompts.savePrompt", "Save Prompt")}
                 </button>
               </div>
 
               <label>
-                Title
+                {t("settings.prompts.promptTitle", "Title")}
                 <input
                   value={promptDraft.name}
                   onChange={(event) => setPromptDraft((current) => current ? { ...current, name: event.target.value } : current)}
@@ -7336,7 +7562,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               </label>
 
               <label>
-                Prompt Body
+                {t("settings.prompts.promptBody", "Prompt Body")}
                 <textarea
                   className="settings-textarea"
                   value={promptDraft.body}
@@ -7346,7 +7572,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
               <div className="prompt-test-row">
                 <label>
-                  Test task
+                  {t("settings.prompts.testTask", "Test task")}
                   <select
                     value={promptBindingTask}
                     onChange={(event) => setPromptBindingTask(event.target.value as PromptTask)}
@@ -7359,12 +7585,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   </select>
                 </label>
                 <button className="secondary-button" onClick={() => void onRunPromptTest()} disabled={promptTest.running}>
-                  {promptTest.running ? "Testing..." : "Run Test"}
+                  {promptTest.running ? t("settings.prompts.testing", "Testing...") : t("settings.prompts.runTest", "Run Test")}
                 </button>
               </div>
 
               <label>
-                Test input
+                {t("settings.prompts.testInput", "Test input")}
                 <textarea
                   className="settings-textarea small"
                   value={promptTest.input}
@@ -7373,7 +7599,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               </label>
 
               <label>
-                Output
+                {t("settings.prompts.output", "Output")}
                 <textarea
                   className="settings-textarea small"
                   value={promptTest.output}
@@ -7497,7 +7723,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           <div className="settings-nav-list">
             {visibleSettingsPaneGroups.map(({ group, panes }) => (
               <section key={group} className="settings-nav-group">
-                <p className="settings-nav-group-title">{group}</p>
+                <p className="settings-nav-group-title">
+                  {group === "General"
+                    ? t("nav.general", "General")
+                    : group === "Transcription"
+                      ? t("nav.transcription", "Transcription")
+                      : t("nav.aiServices", "AI Services")}
+                </p>
                 <div className="settings-nav-group-items">
                   {panes.map((pane) => {
                     const PaneIcon = pane.icon;
@@ -7554,10 +7786,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   className="secondary-button error-action-button"
                   onClick={() => void onOpenStandaloneSettingsWindow("local_models")}
                 >
-                  Open Local Models
+                  {t("action.openLocalModels", "Open Local Models")}
                 </button>
               ) : null}
-              <button className="error-close" onClick={() => setError(null)} title="Dismiss">
+              <button className="error-close" onClick={() => setError(null)} title={t("action.dismiss", "Dismiss")}>
                 <X size={14} />
               </button>
             </div>
@@ -7704,7 +7936,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                       onChange={(event) => void onChangeModel(event.target.value as SpeechModel)}
                     >
                       {modelOptions.map((option) => (
-                        <option key={option.value} value={option.value}>{option.label}</option>
+                        <option key={option.value} value={option.value}>
+                          {formatSpeechModelLabel(option.value, option.label)}
+                        </option>
                       ))}
                     </select>
                   </label>
@@ -7753,7 +7987,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 <div className="topbar-controls deleted-topbar-controls">
                   <button className="secondary-button history-action-button" onClick={() => void onEmptyTrash()}>
                     <Trash2 size={14} />
-                    Empty Trash
+                    {t("deleted.emptyTrash", "Empty Trash")}
                   </button>
                   <label className="search-chip history-top-search">
                     <Search size={14} />
@@ -7778,10 +8012,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   className="secondary-button error-action-button"
                   onClick={() => void onOpenStandaloneSettingsWindow("local_models")}
                 >
-                  Open Local Models
+                  {t("action.openLocalModels", "Open Local Models")}
                 </button>
               ) : null}
-              <button className="error-close" onClick={() => setError(null)} title="Dismiss">
+              <button className="error-close" onClick={() => setError(null)} title={t("action.dismiss", "Dismiss")}>
                 <X size={14} />
               </button>
             </div>
@@ -7795,7 +8029,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             className="rename-sheet"
             role="dialog"
             aria-modal="true"
-            aria-label="Rename transcription"
+            aria-label={t("rename.title", "Rename transcription")}
           >
             <header className="rename-sheet-head">
               <h3>{t("rename.title")}</h3>
@@ -7815,18 +8049,18 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 }
               }}
               autoFocus
-              placeholder="Transcription title"
+              placeholder={t("rename.placeholder", "Transcription title")}
             />
             <div className="rename-sheet-actions">
-              <button className="secondary-button" onClick={closeRenameDialog} disabled={isRenamingArtifact}>
-                Cancel
+            <button className="secondary-button" onClick={closeRenameDialog} disabled={isRenamingArtifact}>
+                {t("rename.cancel", "Cancel")}
               </button>
               <button
                 className="primary-button"
                 onClick={() => void confirmRenameArtifact()}
                 disabled={isRenamingArtifact || renameDraft.trim().length === 0}
               >
-                {isRenamingArtifact ? "Saving..." : "Save"}
+                {isRenamingArtifact ? t("rename.saving", "Saving...") : t("rename.save", "Save")}
               </button>
             </div>
           </section>

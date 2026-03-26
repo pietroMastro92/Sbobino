@@ -64,7 +64,7 @@ export function ModelManagerSheet({
           {models.map((model) => (
             <div key={model.key} className="model-row">
               <div className="model-row-main">
-                <strong>{model.label}</strong>
+                <strong>{t(`speechModel.${model.key}`, model.label)}</strong>
                 <small>{model.model_file}</small>
               </div>
               <div className="model-row-actions">
