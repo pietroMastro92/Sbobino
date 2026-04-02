@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 type LiveMicrophoneWaveformProps = {
+  ariaLabel: string;
   mode: "idle" | "running" | "paused";
   elapsedSeconds: number;
   runningLabel: string;
@@ -172,6 +173,7 @@ function drawWaveform(
 }
 
 export function LiveMicrophoneWaveform({
+  ariaLabel,
   mode,
   elapsedSeconds,
   runningLabel,
@@ -391,7 +393,7 @@ export function LiveMicrophoneWaveform({
       : idleStatusLabel;
 
   return (
-    <section className="live-waveform-panel" aria-label="Live microphone waveform">
+    <section className="live-waveform-panel" aria-label={ariaLabel}>
       <div className="audio-waveform-track live-waveform-track">
         <canvas ref={canvasRef} className="audio-waveform-canvas" />
         {overlayLabel ? <div className="audio-waveform-hint live-waveform-hint">{overlayLabel}</div> : null}

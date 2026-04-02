@@ -13,7 +13,6 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { check as checkAppUpdate, type Update as TauriUpdate } from "@tauri-apps/plugin-updater";
 import {
   ArrowLeft,
-  ArrowUp,
   AudioLines,
   Bot,
   Check,
@@ -21,7 +20,6 @@ import {
   Clock3,
   ChevronDown,
   ChevronRight,
-  Copy,
   Cpu,
   Database,
   FileAudio,
@@ -166,6 +164,14 @@ import type {
   WhisperOptions,
 } from "./types";
 import { AudioPlayer, type TrimRegion } from "./components/AudioPlayer";
+import { ChatComposer } from "./components/chat/ChatComposer";
+import { ChatConversation } from "./components/chat/ChatConversation";
+import type {
+  ChatMessageOrigin,
+  ChatMessageViewModel,
+  ChatPromptSuggestion,
+} from "./components/chat/chatTypes";
+import { buildChatClipboardText } from "./components/chat/chatUtils";
 import { ConfidenceTranscript } from "./components/ConfidenceTranscript";
 import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
 import { LiveMicrophoneWaveform } from "./components/LiveMicrophoneWaveform";
@@ -227,7 +233,6 @@ type SettingsPane =
   | "ai_services"
   | "prompts"
   | "advanced";
-type ChatMessage = { role: "user" | "assistant"; text: string };
 const HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY = "has_optimized_transcript";
 const EMOTION_ANALYSIS_METADATA_KEY = "emotion_analysis_v1";
 const EMOTION_ANALYSIS_GENERATED_AT_METADATA_KEY = "emotion_analysis_generated_at";
@@ -248,16 +253,6 @@ function parseStandaloneSettingsPaneFromLocation(): SettingsPane {
 
 function shouldPreloadSettingsDiagnostics(pane: SettingsPane): boolean {
   return pane === "transcription" || pane === "local_models";
-}
-
-function findPreviousUserQuestion(messages: ChatMessage[], assistantIndex: number): string {
-  for (let index = assistantIndex - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === "user") {
-      return messages[index].text;
-    }
-  }
-
-  return "";
 }
 
 function hasPersistedOptimizedTranscript(artifact: TranscriptArtifact | null | undefined): boolean {
@@ -2050,8 +2045,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [isRenamingArtifact, setIsRenamingArtifact] = useState(false);
 
   const [chatInput, setChatInput] = useState("");
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
-  const [copiedChatMessageIndex, setCopiedChatMessageIndex] = useState<number | null>(null);
+  const [chatHistory, setChatHistory] = useState<ChatMessageViewModel[]>([]);
+  const [copiedChatMessageId, setCopiedChatMessageId] = useState<string | null>(null);
   const [isAskingChat, setIsAskingChat] = useState(false);
   const [isImprovingText, setIsImprovingText] = useState(false);
   const [activeJobPreviewText, setActiveJobPreviewText] = useState("");
@@ -2128,6 +2123,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [groupSegmentsWithoutSpeakers, setGroupSegmentsWithoutSpeakers] = useState(true);
   const copiedChatResetTimerRef = useRef<number | null>(null);
+  const chatMessageSerialRef = useRef(0);
   const promptTestDefaultInputRef = useRef(getDefaultPromptTestInput());
   const [summaryIncludeTimestamps, setSummaryIncludeTimestamps] = useState(defaultSummaryControls.includeTimestamps);
   const [summaryIncludeSpeakers, setSummaryIncludeSpeakers] = useState(defaultSummaryControls.includeSpeakers);
@@ -3701,6 +3697,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     language,
   ]);
 
+  const chatPromptSuggestions = useMemo<ChatPromptSuggestion[]>(() => {
+    return (settings?.prompts.templates ?? []).map((prompt) => ({
+      id: prompt.id,
+      label: prompt.name,
+      body: prompt.body,
+    }));
+  }, [settings?.prompts.templates]);
+
   useEffect(() => {
     setAudioDurationSeconds(parseArtifactDurationSeconds(activeArtifact));
   }, [activeArtifact, detailAudioInputPath]);
@@ -3774,9 +3778,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     setDraftEmotionAnalysis(parsePersistedEmotionAnalysis(artifact));
     setTrimRetranscriptionError(null);
     if (options?.resetChat) {
+      if (copiedChatResetTimerRef.current !== null) {
+        window.clearTimeout(copiedChatResetTimerRef.current);
+        copiedChatResetTimerRef.current = null;
+      }
       setChatInput("");
       setChatHistory([]);
-      setCopiedChatMessageIndex(null);
+      setCopiedChatMessageId(null);
     }
     if (options?.resetDetailMode) {
       setDetailMode("transcript");
@@ -3790,6 +3798,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       resetDetailMode: true,
       clearDetailContext: true,
     });
+  }
+
+  function nextChatMessageId(prefix: "user" | "assistant"): string {
+    chatMessageSerialRef.current += 1;
+    return `${prefix}-${chatMessageSerialRef.current}`;
   }
 
   function focusRunningJob(jobId: string, detailContext: ActiveDetailContext | null | undefined): void {
@@ -3813,6 +3826,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return () => {
       if (copiedChatResetTimerRef.current !== null) {
         window.clearTimeout(copiedChatResetTimerRef.current);
+        copiedChatResetTimerRef.current = null;
       }
     };
   }, []);
@@ -3849,25 +3863,29 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     summaryAutostart,
   ]);
 
-  async function onCopyChatExchange(messageIndex: number): Promise<void> {
-    const assistantMessage = chatHistory[messageIndex];
-    if (!assistantMessage || assistantMessage.role !== "assistant") {
+  async function onCopyChatExchange(messageId: string): Promise<void> {
+    const assistantIndex = chatHistory.findIndex((message) => message.id === messageId);
+    const assistantMessage = assistantIndex >= 0 ? chatHistory[assistantIndex] : null;
+    if (!assistantMessage || assistantMessage.role !== "assistant" || !assistantMessage.canCopy) {
       return;
     }
 
-    const question = findPreviousUserQuestion(chatHistory, messageIndex);
-    const clipboardText = question
-      ? `${t("detail.chatCopyQuestionLabel", "Question")}:\n${question}\n\n${t("detail.chatCopyAnswerLabel", "Answer")}:\n${assistantMessage.text}`
-      : assistantMessage.text;
+    const clipboardText = buildChatClipboardText({
+      messages: chatHistory,
+      assistantIndex,
+      questionLabel: t("detail.chatCopyQuestionLabel", "Question"),
+      answerLabel: t("detail.chatCopyAnswerLabel", "Answer"),
+    });
 
     try {
       await navigator.clipboard.writeText(clipboardText);
-      setCopiedChatMessageIndex(messageIndex);
+      setCopiedChatMessageId(messageId);
       if (copiedChatResetTimerRef.current !== null) {
         window.clearTimeout(copiedChatResetTimerRef.current);
       }
       copiedChatResetTimerRef.current = window.setTimeout(() => {
-        setCopiedChatMessageIndex((current) => (current === messageIndex ? null : current));
+        setCopiedChatMessageId((current) => (current === messageId ? null : current));
+        copiedChatResetTimerRef.current = null;
       }, 1800);
     } catch {
       setError(t("detail.chatCopyFailed", "Copy failed. Please try again."));
@@ -5361,7 +5379,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   function onAskEmotionQuestion(prompt: string): void {
     setDetailMode("chat");
     setInspectorMode("details");
-    void onSendChat(prompt);
+    void onSendChat({ prefilledPrompt: prompt, origin: "emotion" });
   }
 
   async function onImproveText(): Promise<void> {
@@ -5401,22 +5419,46 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     }
   }
 
-  async function onSendChat(prefilledPrompt?: string): Promise<void> {
+  async function onSendChat(options?: {
+    prefilledPrompt?: string;
+    origin?: ChatMessageOrigin;
+  }): Promise<void> {
     if (!activeArtifact || isAskingChat) return;
     if (!aiFeaturesAvailable) {
       setError(aiUnavailableReason);
       return;
     }
 
-    const prompt = (prefilledPrompt ?? chatInput).trim();
+    const prompt = (options?.prefilledPrompt ?? chatInput).trim();
+    const origin = options?.origin ?? "typed";
     if (!prompt) return;
 
-    if (!prefilledPrompt) {
+    if (!options?.prefilledPrompt) {
       setChatInput("");
     }
 
+    const userMessageId = nextChatMessageId("user");
+    const assistantMessageId = nextChatMessageId("assistant");
     setIsAskingChat(true);
-    setChatHistory((previous) => [...previous, { role: "user", text: prompt }]);
+    setChatHistory((previous) => [
+      ...previous,
+      {
+        id: userMessageId,
+        role: "user",
+        text: prompt,
+        status: "complete",
+        origin,
+        canCopy: false,
+      },
+      {
+        id: assistantMessageId,
+        role: "assistant",
+        text: "",
+        status: "pending",
+        origin,
+        canCopy: false,
+      },
+    ]);
 
     try {
       const answer = await chatArtifact(buildChatArtifactPayload({
@@ -5425,19 +5467,31 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         includeTimestamps: chatIncludeTimestamps,
         includeSpeakers: chatIncludeSpeakers,
       }));
-      setChatHistory((previous) => [...previous, { role: "assistant", text: answer }]);
+      setChatHistory((previous) => previous.map((message) =>
+        message.id === assistantMessageId
+          ? {
+            ...message,
+            text: answer,
+            status: "complete",
+            canCopy: true,
+          }
+          : message
+      ));
     } catch (chatError) {
       const code = formatAppErrorCode(chatError);
       const providerMissing = code === "missing_ai_provider" || code === "missing_api_key";
-      setChatHistory((previous) => [
-        ...previous,
-        {
-          role: "assistant",
-          text: providerMissing
-            ? aiUnavailableReason
-            : t("error.chatFailed", "Chat failed"),
-        },
-      ]);
+      setChatHistory((previous) => previous.map((message) =>
+        message.id === assistantMessageId
+          ? {
+            ...message,
+            text: providerMissing
+              ? aiUnavailableReason
+              : t("error.chatFailed", "Chat failed"),
+            status: "error",
+            canCopy: true,
+          }
+          : message
+      ));
       setError(providerMissing ? aiUnavailableReason : t("error.chatFailed", "Chat failed"));
     } finally {
       setIsAskingChat(false);
@@ -6442,81 +6496,44 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     if (detailMode === "chat") {
       return (
         <div className="chat-view">
-          <div className="chat-thread">
-            {isAskingChat ? (
-              <LoadingAnimation
-                icon={MessageSquareText}
-                title={t("detail.thinking", "Thinking...")}
-                description={t("detail.thinkingDesc", "AI is analyzing your transcript and generating a response...")}
-                variant="chat"
-              />
-            ) : chatHistory.length === 0 ? (
-              <div className="detail-empty">
-                <div className="center-empty-icon"><MessageSquareText size={28} /></div>
-                <h2>{t("detail.aiChatTitle")}</h2>
-                <p>{t("detail.chatEmptyDesc")}</p>
-              </div>
-            ) : null}
-            {!isAskingChat && chatHistory.map((message, index) => {
-              const copied = copiedChatMessageIndex === index;
-
-              return (
-                <article key={`${message.role}-${index}`} className={`chat-bubble ${message.role}`}>
-                  {message.role === "assistant" ? (
-                    <button
-                      type="button"
-                      className={`chat-copy-button ${copied ? "copied" : ""}`}
-                      onClick={() => void onCopyChatExchange(index)}
-                      title={t("detail.chatCopyExchange", "Copy question and answer")}
-                      aria-label={t("detail.chatCopyExchange", "Copy question and answer")}
-                    >
-                      {copied ? <Check size={14} /> : <Copy size={14} />}
-                      <span>{copied ? t("detail.chatCopied", "Copied") : t("inspector.copy", "Copy")}</span>
-                    </button>
-                  ) : null}
-                  <div className="chat-bubble-text">{message.text}</div>
-                </article>
-              );
-            })}
-          </div>
-
-          <div className="chat-input-bar">
-            <input
-              placeholder={t("detail.chatPlaceholder")}
-              value={chatInput}
-              disabled={!aiFeaturesAvailable}
-              onChange={(event) => setChatInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  if (aiFeaturesAvailable && !isAskingChat && chatInput.trim().length > 0) {
-                    void onSendChat();
-                  }
-                }
-              }}
-            />
-            <select
-              value={activeAiServiceSelectValue}
-              onChange={(event) => {
-                void onSelectAiService(event.target.value);
-              }}
-            >
-              {aiServiceSelectOptions.map((option) => (
-                <option key={option.value} value={option.value} disabled={option.disabled}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-            <button 
-              className="chat-submit-button" 
-              onClick={() => void onSendChat()} 
-              disabled={!aiFeaturesAvailable || isAskingChat || chatInput.trim().length === 0}
-              title={!aiFeaturesAvailable ? aiUnavailableReason : undefined}
-              aria-label={t("detail.submitChat")}
-            >
-              <ArrowUp size={20} />
-            </button>
-          </div>
+          <ChatConversation
+            messages={chatHistory}
+            copiedMessageId={copiedChatMessageId}
+            emptyTitle={t("detail.aiChatTitle", "AI Chat")}
+            emptyDescription={t("detail.chatEmptyDesc", "Ask questions on the current transcript.")}
+            scrollToLatestLabel={t("detail.chatScrollToBottom", "Scroll to latest message")}
+            pendingLabel={t("detail.thinking", "Thinking...")}
+            pendingDescription={t("detail.thinkingDesc", "AI is analyzing your transcript and generating a response...")}
+            promptOriginLabel={t("detail.chatOriginPrompt", "Prompt")}
+            emotionOriginLabel={t("detail.chatOriginEmotion", "Emotion insight")}
+            copyLabel={t("detail.chatCopyExchange", "Copy question and answer")}
+            copiedLabel={t("detail.chatCopied", "Copied")}
+            onCopyMessage={(messageId) => {
+              void onCopyChatExchange(messageId);
+            }}
+          />
+          <ChatComposer
+            inputValue={chatInput}
+            inputPlaceholder={t("detail.chatPlaceholder", "Chat with your transcript...")}
+            suggestionsTitle={t("detail.chatSuggestions", "Quick prompts")}
+            serviceSelectValue={activeAiServiceSelectValue}
+            serviceOptions={aiServiceSelectOptions}
+            promptSuggestions={chatPromptSuggestions}
+            submitLabel={t("detail.submitChat", "Submit Chat")}
+            disabled={!aiFeaturesAvailable}
+            submitDisabled={!aiFeaturesAvailable || isAskingChat || chatInput.trim().length === 0}
+            footerMessage={!aiFeaturesAvailable ? aiUnavailableReason : null}
+            onInputChange={setChatInput}
+            onSelectService={(value) => {
+              void onSelectAiService(value);
+            }}
+            onSelectPrompt={(suggestion) => {
+              void onSendChat({ prefilledPrompt: suggestion.body, origin: "prompt" });
+            }}
+            onSubmit={() => {
+              void onSendChat();
+            }}
+          />
         </div>
       );
     }
@@ -7286,19 +7303,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return (
       <div className="inspector-body">
         <h4>{t("chat.prompts")}</h4>
-        <div className="prompt-list">
-          {settings?.prompts.templates.map((prompt) => (
-            <button
-              key={prompt.id}
-              className="prompt-item"
-              onClick={() => void onSendChat(prompt.body)}
-              disabled={!aiFeaturesAvailable}
-              title={!aiFeaturesAvailable ? aiUnavailableReason : undefined}
-            >
-              {prompt.name}
-            </button>
-          ))}
-        </div>
+        <p className="muted">{t("detail.chatPromptsHint", "Quick prompts are available above the composer.")}</p>
         <button
           className="secondary-button"
           onClick={() => {
@@ -7307,7 +7312,6 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         >
           {t("chat.managePrompts", "Manage Prompts")}
         </button>
-        {!aiFeaturesAvailable ? <p className="muted">{aiUnavailableReason}</p> : null}
 
         <div className="inspector-block">
           <h4>{t("inspector.options")}</h4>
@@ -7328,6 +7332,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             />
           </label>
         </div>
+        {!aiFeaturesAvailable ? <p className="muted">{aiUnavailableReason}</p> : null}
       </div>
     );
   }
@@ -7606,6 +7611,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               ) : null}
               {isRealtimeDetailActive ? (
                 <LiveMicrophoneWaveform
+                  ariaLabel={t("realtime.waveformAriaLabel", "Live microphone waveform")}
                   mode={realtimeState}
                   elapsedSeconds={realtimeElapsedSeconds}
                   runningLabel={t("realtime.waveformRunning", "Mic live")}
@@ -7723,6 +7729,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
           <div className="live-view">
             <LiveMicrophoneWaveform
+              ariaLabel={t("realtime.waveformAriaLabel", "Live microphone waveform")}
               mode={realtimeState}
               elapsedSeconds={realtimeElapsedSeconds}
               runningLabel={t("realtime.waveformRunning", "Mic live")}
