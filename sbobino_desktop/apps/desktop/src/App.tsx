@@ -41,11 +41,14 @@ import {
   PanelLeftOpen,
   PanelRightClose,
   PanelRightOpen,
+  Pause,
   Pencil,
+  Play,
   Radio,
   Save,
   Settings2,
   Sparkles,
+  Square,
   Plus,
   Search,
   Scissors,
@@ -128,6 +131,12 @@ import {
   formatProgressPercentageLabel,
   makeProgressVisible,
 } from "./lib/progressUi";
+import {
+  buildQueuedTranscriptionJob,
+  buildQueuedTranscriptionJobId,
+  isQueuedTranscriptionJobId,
+  replaceQueuedTranscriptionJob,
+} from "./lib/transcriptionQueue";
 import { stripAnsi } from "./lib/ansiText";
 import { buildConfidenceTranscript } from "./lib/whisperConfidence";
 import { useAppStore } from "./state/useAppStore";
@@ -159,6 +168,7 @@ import type {
 import { AudioPlayer, type TrimRegion } from "./components/AudioPlayer";
 import { ConfidenceTranscript } from "./components/ConfidenceTranscript";
 import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
+import { LiveMicrophoneWaveform } from "./components/LiveMicrophoneWaveform";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 import { LoadingAnimation } from "./components/LoadingAnimation";
 import {
@@ -327,6 +337,14 @@ type PendingTranscriptionContext = {
   parentId?: string;
   title?: string;
   detailContext?: ActiveDetailContext | null;
+};
+
+type TranscriptionStartRequest = PendingTranscriptionContext & {
+  trimValidationSnapshot?: TrimmedAudioValidationSnapshot | null;
+};
+
+type QueuedTranscriptionStart = TranscriptionStartRequest & {
+  queueId: string;
 };
 
 const languageOptions: Array<{ value: LanguageCode; label: string }> = [
@@ -699,6 +717,11 @@ function buildTrimArtifactTitle(sourceLabel: string, regions: TrimRegion[]): str
   return ranges ? `${sourceLabel} - Trim ${ranges}` : `${sourceLabel} - Trim`;
 }
 
+function buildLiveSessionTitle(timestamp = new Date()): string {
+  const twoDigits = (value: number): string => String(value).padStart(2, "0");
+  return `live_${twoDigits(timestamp.getDate())}${twoDigits(timestamp.getMonth() + 1)}${timestamp.getFullYear()}_${twoDigits(timestamp.getHours())}${twoDigits(timestamp.getMinutes())}${twoDigits(timestamp.getSeconds())}`;
+}
+
 function buildActiveDetailContext(params: {
   inputPath: string | null;
   requestedTitle?: string;
@@ -969,6 +992,47 @@ function formatShortDuration(seconds: number): string {
   return `${mm}:${ss}`;
 }
 
+function parseArtifactDurationSeconds(artifact: TranscriptArtifact | null | undefined): number {
+  if (!artifact) {
+    return 0;
+  }
+
+  const persisted = artifact.metadata?.duration_seconds?.trim();
+  if (!persisted) {
+    return 0;
+  }
+
+  const seconds = Number.parseFloat(persisted);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return 0;
+  }
+
+  return Math.round(seconds);
+}
+
+type InlineInfoHintProps = {
+  label: string;
+  description: string;
+  side?: "top" | "left";
+};
+
+function InlineInfoHint({ label, description, side = "top" }: InlineInfoHintProps): JSX.Element {
+  return (
+    <button
+      type="button"
+      className={`inline-info-hint inline-info-hint--${side}`}
+      aria-label={`${label}: ${description}`}
+      data-tooltip={description}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
+    >
+      <Info size={13} />
+    </button>
+  );
+}
+
 function percentageFromJobProgress(progress: JobProgress | null | undefined): number {
   if (!progress) return 0;
   const currentSeconds = progress.current_seconds ?? null;
@@ -1198,8 +1262,13 @@ function formatAppErrorCode(error: unknown): string | null {
   return pickCode(error);
 }
 
-function formatUiError(key: string, fallback: string, _error: unknown): string {
-  return t(key, fallback);
+function formatUiError(key: string, fallback: string, error: unknown): string {
+  const base = t(key, fallback);
+  const detail = formatAppError(error).trim();
+  if (!detail || detail === base) {
+    return base;
+  }
+  return `${base}: ${detail}`;
 }
 
 function formatPyannoteHealthMessage(
@@ -1552,6 +1621,13 @@ type DetailToolbarProps = {
   showRetranscribe?: boolean;
   isStartingTrimmedAudioRetranscription?: boolean;
   onRetranscribeTrimmedAudio?: () => void;
+  realtimeControls?: {
+    state: "idle" | "running" | "paused";
+    isStopping: boolean;
+    onPause: () => void;
+    onResume: () => void;
+    onStop: () => void;
+  } | null;
 };
 
 function DetailToolbar({
@@ -1579,6 +1655,7 @@ function DetailToolbar({
   showRetranscribe,
   isStartingTrimmedAudioRetranscription,
   onRetranscribeTrimmedAudio,
+  realtimeControls,
 }: DetailToolbarProps): JSX.Element {
   const { t } = useTranslation();
   const rightSidebarTitle = rightSidebarForcedCollapsed
@@ -1636,6 +1713,34 @@ function DetailToolbar({
         </div>
 
         <div className="detail-toolbar-actions">
+          {realtimeControls ? (
+            <>
+              <button
+                className="realtime-toolbar-button realtime-toolbar-button--secondary"
+                onClick={realtimeControls.state === "paused" ? realtimeControls.onResume : realtimeControls.onPause}
+                disabled={realtimeControls.state === "idle" || realtimeControls.isStopping}
+              >
+                <span className="button-content">
+                  {realtimeControls.state === "paused" ? <Play size={14} /> : <Pause size={14} />}
+                  <span className="detail-action-label">
+                    {realtimeControls.state === "paused"
+                      ? t("realtime.resume", "Resume")
+                      : t("realtime.pause", "Pause")}
+                  </span>
+                </span>
+              </button>
+              <button
+                className="realtime-toolbar-button realtime-toolbar-button--primary"
+                onClick={realtimeControls.onStop}
+                disabled={realtimeControls.state === "idle" || realtimeControls.isStopping}
+              >
+                <span className="button-content">
+                  <Square size={13} />
+                  <span className="detail-action-label">{t("realtime.stopAndSave", "Stop & Save")}</span>
+                </span>
+              </button>
+            </>
+          ) : null}
           {detailMode === "transcript" && !showRetranscribe && onImproveText && (
             <button
               className="optimize-hover-button"
@@ -1938,6 +2043,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [draftSummary, setDraftSummary] = useState("");
   const [draftFaqs, setDraftFaqs] = useState("");
   const [draftEmotionAnalysis, setDraftEmotionAnalysis] = useState<EmotionAnalysisResult | null>(null);
+  const [emotionTimelineExpanded, setEmotionTimelineExpanded] = useState(false);
   const [showExportSheet, setShowExportSheet] = useState(false);
   const [renameTarget, setRenameTarget] = useState<TranscriptArtifact | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
@@ -1950,6 +2056,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [isImprovingText, setIsImprovingText] = useState(false);
   const [activeJobPreviewText, setActiveJobPreviewText] = useState("");
   const [activeJobTitle, setActiveJobTitle] = useState("");
+  const [focusedJobId, setFocusedJobId] = useState<string | null>(null);
   const [selectedSegmentSourceIndex, setSelectedSegmentSourceIndex] = useState<number | null>(null);
   const [speakerDraft, setSpeakerDraft] = useState("");
   const [isAssigningSpeaker, setIsAssigningSpeaker] = useState(false);
@@ -1961,6 +2068,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   } | null>(null);
 
   const [queueItems, setQueueItems] = useState<JobProgress[]>([]);
+  const [queuedTranscriptionStarts, setQueuedTranscriptionStarts] = useState<QueuedTranscriptionStart[]>([]);
   const [modelCatalog, setModelCatalog] = useState<ProvisioningModelCatalogEntry[]>([]);
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null);
   const platformIsAppleSilicon = runtimeHealth?.is_apple_silicon ?? guessAppleSiliconFromUA();
@@ -1971,6 +2079,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [realtimeMessage, setRealtimeMessage] = useState(t("realtime.idle", "Realtime idle"));
   const [realtimeFinalLines, setRealtimeFinalLines] = useState<string[]>([]);
   const [realtimePreview, setRealtimePreview] = useState("");
+  const [realtimeSessionOpen, setRealtimeSessionOpen] = useState(false);
+  const [realtimeStartedAtMs, setRealtimeStartedAtMs] = useState<number | null>(null);
+  const [realtimeElapsedSeconds, setRealtimeElapsedSeconds] = useState(0);
   const [isStoppingRealtime, setIsStoppingRealtime] = useState(false);
 
   const [provisioning, setProvisioning] = useState<{
@@ -2043,6 +2154,119 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [activeDetailContext, setActiveDetailContext] = useState<ActiveDetailContext | null>(null);
 
   const activeJobIdRef = useRef<string | null>(activeJobId);
+  const segmentElementMapRef = useRef<Map<number, HTMLElement>>(new Map());
+
+  const describeEmotionValence = useCallback((score: number): string => {
+    if (score >= 0.35) {
+      return t("emotion.valencePositive", "positive");
+    }
+    if (score <= -0.35) {
+      return t("emotion.valenceNegative", "negative");
+    }
+    return t("emotion.valenceNeutral", "neutral");
+  }, [t]);
+
+  const emotionToneClass = useCallback((score: number): "positive" | "negative" | "neutral" => {
+    if (score >= 0.35) {
+      return "positive";
+    }
+    if (score <= -0.35) {
+      return "negative";
+    }
+    return "neutral";
+  }, []);
+
+  const describeEmotionIntensity = useCallback((score: number): string => {
+    if (score >= 1.5) {
+      return t("emotion.intensityHigh", "high");
+    }
+    if (score >= 0.9) {
+      return t("emotion.intensityMedium", "medium");
+    }
+    if (score > 0.05) {
+      return t("emotion.intensityLow", "low");
+    }
+    return t("emotion.intensityFlat", "flat");
+  }, [t]);
+
+  useEffect(() => {
+    setEmotionTimelineExpanded(false);
+  }, [activeArtifactId, draftEmotionAnalysis]);
+
+  const renderEmotionTimelineCard = useCallback((entry: EmotionAnalysisResult["timeline"][number]) => (
+    <article
+      key={`emotion-timeline-${entry.segment_index}`}
+      className={`emotion-card emotion-card--${emotionToneClass(entry.valence_score)}`}
+    >
+      <div className="emotion-card-meta">
+        <strong>{entry.time_label ?? `${t("emotion.segment", "Segment")} ${entry.segment_index + 1}`}</strong>
+        {entry.speaker_label ? <span className="kind-chip">{entry.speaker_label}</span> : null}
+      </div>
+      <p>{entry.evidence_text}</p>
+      <div className="emotion-chip-row">
+        {entry.dominant_emotions.map((emotion) => (
+          <span key={`${entry.segment_index}-${emotion}`} className="kind-chip">{emotion}</span>
+        ))}
+      </div>
+      <div className="emotion-metric-grid">
+        <div className="emotion-metric">
+          <span className="emotion-metric-label">
+            {t("emotion.valenceLabel", "Tone")}
+            <InlineInfoHint
+              label={t("emotion.valenceLabel", "Tone")}
+              description={t(
+                "emotion.valenceHelp",
+                "Tone shows the emotional direction of the segment: negative means more concern or friction, neutral means emotionally flat or balanced, positive means more confidence, relief, or enthusiasm.",
+              )}
+            />
+          </span>
+          <strong>{describeEmotionValence(entry.valence_score)}</strong>
+          <small>{entry.valence_score.toFixed(1)}</small>
+        </div>
+        <div className="emotion-metric">
+          <span className="emotion-metric-label">
+            {t("emotion.intensity", "Intensity")}
+            <InlineInfoHint
+              label={t("emotion.intensity", "Intensity")}
+              description={t(
+                "emotion.intensityHelp",
+                "Intensity shows how emotionally charged the segment is. Low means flat or procedural, high means the language carries stronger stress, urgency, relief, or excitement.",
+              )}
+            />
+          </span>
+          <strong>{describeEmotionIntensity(entry.intensity_score)}</strong>
+          <small>{entry.intensity_score.toFixed(1)}</small>
+        </div>
+      </div>
+      {entry.shift_label ? <small>{entry.shift_label}</small> : null}
+      <div className="emotion-card-actions">
+        <button
+          className="secondary-button"
+          onClick={() =>
+            onJumpToEmotionSegment({
+              segmentIndex: entry.segment_index,
+              evidenceText: entry.evidence_text,
+              timeLabel: entry.time_label,
+              startSeconds: entry.start_seconds,
+            })
+          }
+        >
+          {t("emotion.jump", "Jump to segment")}
+        </button>
+        <button
+          className="secondary-button"
+          onClick={() =>
+            onAskEmotionQuestion(
+              `Reflect on the emotional shift around segment ${entry.segment_index + 1}. What appears to trigger ${entry.dominant_emotions.join(", ") || "the tone change"}?`,
+            )
+          }
+        >
+          {t("emotion.ask", "Ask in chat")}
+        </button>
+      </div>
+    </article>
+  ), [describeEmotionIntensity, describeEmotionValence, emotionToneClass, onAskEmotionQuestion, onJumpToEmotionSegment, t]);
+  const focusedJobIdRef = useRef<string | null>(focusedJobId);
   const activeJobDeltaSequenceRef = useRef<number>(-1);
   const activeJobPreviewTextareaRef = useRef<HTMLDivElement>(null);
   const detailMainRef = useRef<HTMLElement | null>(null);
@@ -2051,6 +2275,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const peopleSpeakerInputRef = useRef<HTMLInputElement | null>(null);
   const failedJobMessagesRef = useRef<Map<string, string>>(new Map());
   const pendingTranscriptionContextRef = useRef<Map<string, PendingTranscriptionContext>>(new Map());
+  const queuedTranscriptionSequenceRef = useRef(0);
   const startupWatchdogRef = useRef<number | null>(null);
   const settingsSaveSequenceRef = useRef(0);
   const summaryAutostartedArtifactIdsRef = useRef<Set<string>>(new Set());
@@ -2064,6 +2289,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   useEffect(() => {
     activeJobIdRef.current = activeJobId;
   }, [activeJobId]);
+
+  useEffect(() => {
+    focusedJobIdRef.current = focusedJobId;
+  }, [focusedJobId]);
 
   useEffect(() => {
     const surfaces = [mainAreaRef.current, leftSidebarRef.current].filter(
@@ -2125,7 +2354,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   }, [activeArtifact, trimmedAudioDraft]);
 
   useEffect(() => {
-    if (!activeJobId) {
+    if (!focusedJobId) {
       return;
     }
     const previewContainer = activeJobPreviewTextareaRef.current;
@@ -2136,7 +2365,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       previewContainer.scrollTop = previewContainer.scrollHeight;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [activeJobId, activeJobPreviewText]);
+  }, [focusedJobId, activeJobPreviewText]);
 
   useEffect(() => {
     setSelectedSegmentSourceIndex(null);
@@ -2548,18 +2777,24 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           clearStartupWatchdog();
           setProgress(queueEvent);
           if (event.stage === "cancelled" || event.stage === "failed") {
+            const wasFocused = focusedJobIdRef.current === event.job_id;
             clearStartupWatchdog();
             const failedContext = pendingTranscriptionContextRef.current.get(event.job_id);
             pendingTranscriptionContextRef.current.delete(event.job_id);
             clearActiveJob();
             activeJobIdRef.current = null;
-            setActiveJobPreviewText("");
             setActiveJobTitle("");
-            activeJobDeltaSequenceRef.current = -1;
-            setActiveDetailContext(null);
-            if (event.stage === "failed") {
+            if (wasFocused) {
+              setFocusedJobId(null);
+              setActiveJobPreviewText("");
+              activeJobDeltaSequenceRef.current = -1;
+              setActiveDetailContext(null);
+            }
+            if (event.stage === "failed" && wasFocused) {
               presentTranscriptionFailure(resolvedMessage, failedContext?.detailContext);
-            } else if (!restoreDetailAfterFailedTranscription(failedContext?.detailContext)) {
+            } else if (event.stage === "failed") {
+              setError(resolvedMessage);
+            } else if (wasFocused && !restoreDetailAfterFailedTranscription(failedContext?.detailContext)) {
               setSection("home");
             }
           }
@@ -2571,6 +2806,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         failedJobMessagesRef.current.delete(artifact.job_id);
         const pendingContext = pendingTranscriptionContextRef.current.get(artifact.job_id);
         pendingTranscriptionContextRef.current.delete(artifact.job_id);
+        const wasRunning = artifact.job_id === activeJobIdRef.current;
+        const wasFocused = artifact.job_id === focusedJobIdRef.current;
         const hydratedArtifact = pendingContext
           ? {
               ...artifact,
@@ -2585,14 +2822,18 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
         prependArtifact(hydratedArtifact);
         setQueueItems((previous) => previous.filter((entry) => entry.job_id !== artifact.job_id));
-        setActiveJobPreviewText("");
-        setActiveJobTitle("");
-        activeJobDeltaSequenceRef.current = -1;
 
-        if (artifact.job_id === activeJobIdRef.current) {
+        if (wasRunning) {
           clearStartupWatchdog();
           clearActiveJob();
           activeJobIdRef.current = null;
+          setActiveJobTitle("");
+        }
+
+        if (wasFocused) {
+          setFocusedJobId(null);
+          setActiveJobPreviewText("");
+          activeJobDeltaSequenceRef.current = -1;
           setActiveDetailContext(null);
           hydrateDetail(hydratedArtifact);
           setSection("detail");
@@ -2609,6 +2850,8 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         failedJobMessagesRef.current.set(payload.job_id, resolvedFailureMessage);
         const failedContext = pendingTranscriptionContextRef.current.get(payload.job_id);
         pendingTranscriptionContextRef.current.delete(payload.job_id);
+        const wasRunning = payload.job_id === activeJobIdRef.current;
+        const wasFocused = payload.job_id === focusedJobIdRef.current;
         setQueueItems((previous) =>
           previous.map((entry) =>
             entry.job_id === payload.job_id
@@ -2622,22 +2865,28 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           ),
         );
 
-        if (payload.job_id === activeJobIdRef.current) {
+        if (wasRunning) {
           clearStartupWatchdog();
           failedJobMessagesRef.current.delete(payload.job_id);
           clearActiveJob();
           activeJobIdRef.current = null;
-          setActiveJobPreviewText("");
           setActiveJobTitle("");
+        }
+
+        if (wasFocused) {
+          setFocusedJobId(null);
+          setActiveJobPreviewText("");
           activeJobDeltaSequenceRef.current = -1;
           setActiveDetailContext(null);
           presentTranscriptionFailure(resolvedFailureMessage, failedContext?.detailContext);
+        } else if (wasRunning) {
+          setError(resolvedFailureMessage);
         }
       });
       if (unmounted) { uFailed(); } else { unsubFailed = uFailed; }
 
       const uTranscriptionDelta = await subscribeTranscriptionDelta((delta) => {
-        if (delta.job_id !== activeJobIdRef.current) {
+        if (delta.job_id !== focusedJobIdRef.current) {
           return;
         }
         if (delta.sequence <= activeJobDeltaSequenceRef.current) {
@@ -2662,6 +2911,18 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       const uRealtimeDelta = await subscribeRealtimeDelta((delta: RealtimeDelta) => {
         if (delta.kind === "append_final") {
           setRealtimeFinalLines((previous) => [...previous, delta.text]);
+          setRealtimePreview("");
+        }
+
+        if (delta.kind === "replace_final") {
+          setRealtimeFinalLines((previous) => {
+            if (previous.length === 0) {
+              return [delta.text];
+            }
+            const next = [...previous];
+            next[next.length - 1] = delta.text;
+            return next;
+          });
           setRealtimePreview("");
         }
 
@@ -2875,7 +3136,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   );
 
   const canStartFileTranscription = useMemo(() => {
-    if (!settings || !selectedFile || isStarting || Boolean(activeJobId)) {
+    if (!settings || !selectedFile || isStarting) {
       return false;
     }
 
@@ -2886,12 +3147,21 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     }
 
     return modelEntry.installed;
-  }, [activeJobId, isStarting, modelCatalog, selectedFile, settings]);
+  }, [isStarting, modelCatalog, selectedFile, settings]);
 
-  const canStartRealtime = useMemo(
-    () => Boolean(settings && provisioning.ready && realtimeState === "idle"),
-    [provisioning.ready, realtimeState, settings],
-  );
+  const canStartRealtime = useMemo(() => {
+    if (!settings || realtimeState !== "idle" || isStoppingRealtime) {
+      return false;
+    }
+
+    const selectedModel = settings.transcription.model;
+    const modelEntry = modelCatalog.find((entry) => entry.key === selectedModel);
+    if (!modelEntry) {
+      return true;
+    }
+
+    return modelEntry.installed;
+  }, [isStoppingRealtime, modelCatalog, realtimeState, settings]);
 
   const aiFeaturesAvailable = useMemo(
     () => aiActionsAvailable(aiCapabilityStatus),
@@ -2931,6 +3201,64 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         : detailSegments.find((segment) => segment.sourceIndex === selectedSegmentSourceIndex) ?? null,
     [detailSegments, selectedSegmentSourceIndex],
   );
+
+  const resolveEmotionSegmentSourceIndex = useCallback((
+    segmentIndex: number,
+    evidenceText?: string | null,
+    timeLabel?: string | null,
+    startSeconds?: number | null,
+  ): number | null => {
+    if (detailSegments.some((segment) => segment.sourceIndex === segmentIndex)) {
+      return segmentIndex;
+    }
+
+    const normalizedEvidence = evidenceText?.trim().toLowerCase() ?? "";
+    if (startSeconds !== null && startSeconds !== undefined) {
+      const byStartSeconds = detailSegments.find((segment) =>
+        segment.startSeconds !== null
+        && Math.abs(segment.startSeconds - startSeconds) < 0.25
+        && (!normalizedEvidence
+          || segment.line.toLowerCase().includes(normalizedEvidence)
+          || normalizedEvidence.includes(segment.line.trim().toLowerCase())),
+      );
+      if (byStartSeconds) {
+        return byStartSeconds.sourceIndex;
+      }
+    }
+
+    if (timeLabel) {
+      const byTime = detailSegments.find((segment) =>
+        segment.time === timeLabel
+        && (!normalizedEvidence
+          || segment.line.toLowerCase().includes(normalizedEvidence)
+          || normalizedEvidence.includes(segment.line.trim().toLowerCase())),
+      );
+      if (byTime) {
+        return byTime.sourceIndex;
+      }
+    }
+
+    if (normalizedEvidence) {
+      const byEvidence = detailSegments.find((segment) => {
+        const normalizedLine = segment.line.trim().toLowerCase();
+        return normalizedLine.includes(normalizedEvidence)
+          || normalizedEvidence.includes(normalizedLine);
+      });
+      if (byEvidence) {
+        return byEvidence.sourceIndex;
+      }
+    }
+
+    return null;
+  }, [detailSegments]);
+
+  const setSegmentElementRef = useCallback((sourceIndex: number, node: HTMLElement | null) => {
+    if (node) {
+      segmentElementMapRef.current.set(sourceIndex, node);
+    } else {
+      segmentElementMapRef.current.delete(sourceIndex);
+    }
+  }, []);
 
   const contextMenuSegment = useMemo(
     () =>
@@ -3005,6 +3333,19 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     const selected = detailSegments.find((segment) => segment.sourceIndex === selectedSegmentSourceIndex);
     setSpeakerDraft(selected?.speakerLabel ?? "");
   }, [detailSegments, selectedSegmentSourceIndex]);
+
+  useEffect(() => {
+    if (detailMode !== "segments" || selectedSegmentSourceIndex === null) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      const element = segmentElementMapRef.current.get(selectedSegmentSourceIndex);
+      element?.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [detailMode, selectedSegmentSourceIndex]);
 
   useEffect(() => {
     if (segmentContextMenu === null) {
@@ -3088,18 +3429,28 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     () => effectiveDetailContext?.trimmedAudioDraft ?? activeTrimmedAudioDraft ?? null,
     [activeTrimmedAudioDraft, effectiveDetailContext],
   );
+  const realtimeTranscriptText = useMemo(
+    () => realtimeFinalLines.filter((line) => line.trim().length > 0).join("\n"),
+    [realtimeFinalLines],
+  );
+  const realtimePreviewText = realtimePreview.trim();
+  const realtimeTranscriptDisplayText = useMemo(
+    () => [...realtimeFinalLines, realtimePreviewText]
+      .filter((line) => line.trim().length > 0)
+      .join("\n"),
+    [realtimeFinalLines, realtimePreviewText],
+  );
+  const realtimeHasAnyText = realtimeTranscriptText.trim().length > 0 || realtimePreviewText.length > 0;
+  const isRealtimeDetailActive = realtimeSessionOpen && !activeArtifact && !focusedJobId;
 
   const detailAudioInputPath = useMemo(
     () => {
       if (effectiveDetailContext?.inputPath) {
         return effectiveDetailContext.inputPath;
       }
-      if (activeJobId) {
-        return selectedFile;
-      }
       return null;
     },
-    [activeJobId, effectiveDetailContext, selectedFile],
+    [effectiveDetailContext],
   );
 
   const detailAudioFileLabel = useMemo(
@@ -3122,6 +3473,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     if (audioDurationSeconds > 0) {
       return Math.round(audioDurationSeconds);
     }
+    const persistedDuration = parseArtifactDurationSeconds(activeArtifact);
+    if (persistedDuration > 0) {
+      return persistedDuration;
+    }
     const timelineDuration = detailSegments.reduce((maxSeconds, segment) => {
       const candidate = segment.endSeconds ?? segment.startSeconds ?? 0;
       return Math.max(maxSeconds, candidate);
@@ -3130,7 +3485,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       return Math.round(timelineDuration);
     }
     return 0;
-  }, [audioDurationSeconds, detailSegments]);
+  }, [activeArtifact, audioDurationSeconds, detailSegments]);
 
   const activeRawTranscript = activeArtifact?.raw_transcript ?? "";
   const persistedOptimizedTranscriptAvailable = hasPersistedOptimizedTranscript(activeArtifact);
@@ -3189,14 +3544,24 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return draftTranscript !== baselineTranscript;
   }, [activeArtifact, activeRawTranscript, draftTranscript, persistedOptimizedTranscriptAvailable]);
 
-  const activeQueueJob = useMemo(
+  const runningQueueJob = useMemo(
     () => (activeJobId ? queueItems.find((item) => item.job_id === activeJobId) ?? null : null),
     [activeJobId, queueItems],
   );
 
+  const runningJobPercentage = useMemo(
+    () => activeJobPercentage(activeJobId, runningQueueJob, progress),
+    [activeJobId, progress, runningQueueJob],
+  );
+
+  const focusedQueueJob = useMemo(
+    () => (focusedJobId ? queueItems.find((item) => item.job_id === focusedJobId) ?? null : null),
+    [focusedJobId, queueItems],
+  );
+
   const rawActiveTranscriptionPercentage = useMemo(
-    () => activeJobPercentage(activeJobId, activeQueueJob, progress),
-    [activeJobId, activeQueueJob, progress],
+    () => activeJobPercentage(focusedJobId, focusedQueueJob, progress),
+    [focusedJobId, focusedQueueJob, progress],
   );
   const [displayedTranscriptionPercentage, setDisplayedTranscriptionPercentage] = useState(0);
   const displayedTranscriptionJobIdRef = useRef<string | null>(null);
@@ -3220,20 +3585,20 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   }, [showConfidenceColors, transcriptViewMode]);
 
   useEffect(() => {
-    if (!activeJobId) {
+    if (!focusedJobId) {
       displayedTranscriptionJobIdRef.current = null;
       setDisplayedTranscriptionPercentage(0);
       return;
     }
-    if (displayedTranscriptionJobIdRef.current !== activeJobId) {
-      displayedTranscriptionJobIdRef.current = activeJobId;
+    if (displayedTranscriptionJobIdRef.current !== focusedJobId) {
+      displayedTranscriptionJobIdRef.current = focusedJobId;
       setDisplayedTranscriptionPercentage(rawActiveTranscriptionPercentage);
       return;
     }
     setDisplayedTranscriptionPercentage((previous) =>
       Math.max(previous, rawActiveTranscriptionPercentage),
     );
-  }, [activeJobId, rawActiveTranscriptionPercentage]);
+  }, [focusedJobId, rawActiveTranscriptionPercentage]);
 
   const queueActiveItems = useMemo(
     () =>
@@ -3337,8 +3702,25 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   ]);
 
   useEffect(() => {
-    setAudioDurationSeconds(0);
-  }, [detailAudioInputPath]);
+    setAudioDurationSeconds(parseArtifactDurationSeconds(activeArtifact));
+  }, [activeArtifact, detailAudioInputPath]);
+
+  useEffect(() => {
+    if (!realtimeSessionOpen || realtimeStartedAtMs === null) {
+      setRealtimeElapsedSeconds(0);
+      return;
+    }
+
+    const updateElapsed = (): void => {
+      setRealtimeElapsedSeconds(Math.max(0, (Date.now() - realtimeStartedAtMs) / 1000));
+    };
+
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 500);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [realtimeSessionOpen, realtimeStartedAtMs]);
 
   useEffect(() => {
     if (visibleSettingsPanes.length === 0) return;
@@ -3408,6 +3790,23 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       resetDetailMode: true,
       clearDetailContext: true,
     });
+  }
+
+  function focusRunningJob(jobId: string, detailContext: ActiveDetailContext | null | undefined): void {
+    clearStartupWatchdog();
+    const switchingJob = focusedJobIdRef.current !== jobId;
+    setFocusedJobId(jobId);
+    setActiveDetailContext(detailContext ?? null);
+    setActiveArtifact(null);
+    setDetailMode("transcript");
+    setInspectorMode("details");
+    setSection("detail");
+    setTrimRetranscriptionError(null);
+    setError(null);
+    if (switchingJob) {
+      setActiveJobPreviewText("");
+      activeJobDeltaSequenceRef.current = -1;
+    }
   }
 
   useEffect(() => {
@@ -3793,6 +4192,213 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     }));
   }
 
+  const launchTranscriptionStart = useCallback(async (
+    request: TranscriptionStartRequest,
+    options?: { queuedJobId?: string },
+  ): Promise<void> => {
+    if (!settings) return;
+
+    const targetFile = request.inputPath;
+    const parentId = request.parentId;
+    const requestedTitle = request.title?.trim() ? request.title.trim() : undefined;
+    const nextDetailContext = request.detailContext ?? null;
+    const preserveCurrentArtifact = Boolean(activeArtifact && section === "detail");
+
+    clearStartupWatchdog();
+    setIsStarting(true);
+    setError(null);
+    setTrimRetranscriptionError(null);
+    try {
+      const trimValidationError = validateTrimmedAudioDraftForTranscription(
+        request.trimValidationSnapshot ?? null,
+      );
+      if (trimValidationError) {
+        if (preserveCurrentArtifact) {
+          setError(trimValidationError);
+        } else {
+          presentTranscriptionFailure(trimValidationError, nextDetailContext);
+        }
+        if (options?.queuedJobId) {
+          setQueueItems((previous) => previous.filter((entry) => entry.job_id !== options.queuedJobId));
+        }
+        return;
+      }
+
+      const runtimeStatus = await withTimeout(
+        ensureTranscriptionRuntime(),
+        20_000,
+        t("error.runtimeSetupTimedOut", "Runtime setup timed out."),
+      );
+      if (!runtimeStatus.ready) {
+        const failureMessage = formatRuntimeNotReadyMessage();
+        if (preserveCurrentArtifact) {
+          setError(failureMessage);
+        } else {
+          presentTranscriptionFailure(failureMessage, nextDetailContext);
+        }
+        if (options?.queuedJobId) {
+          setQueueItems((previous) => previous.filter((entry) => entry.job_id !== options.queuedJobId));
+        }
+        return;
+      }
+      if (runtimeStatus.did_setup) {
+        void refreshRuntimeHealth();
+      }
+
+      let preflight: TranscriptionStartPreflight | null = null;
+      try {
+        preflight = await withTimeout(
+          fetchTranscriptionStartPreflight({
+            model: settings.transcription.model,
+          }),
+          8_000,
+          t("error.preflightTimedOut", "Preflight timed out."),
+        );
+      } catch (preflightError) {
+        console.warn("Transcription preflight failed, continuing with backend start:", preflightError);
+      }
+      if (preflight && !preflight.allowed) {
+        const failureMessage = formatTranscriptionPreflightMessage(preflight);
+        if (preserveCurrentArtifact) {
+          setError(failureMessage);
+        } else {
+          presentTranscriptionFailure(failureMessage, nextDetailContext);
+        }
+        if (options?.queuedJobId) {
+          setQueueItems((previous) => previous.filter((entry) => entry.job_id !== options.queuedJobId));
+        }
+        return;
+      }
+
+      const startResult = await withTimeout(
+        startTranscription({
+          input_path: targetFile,
+          language: settings.transcription.language,
+          model: settings.transcription.model,
+          enable_ai: false,
+          whisper_options: sanitizeWhisperOptions(
+            settings.transcription.whisper_options ?? getDefaultWhisperOptions(platformIsAppleSilicon),
+          ),
+          title: requestedTitle,
+          parent_id: parentId,
+        }),
+        12_000,
+        t("error.startRequestTimedOut", "Start request timed out while waiting for backend response."),
+      );
+
+      const { job_id } = startResult;
+      pendingTranscriptionContextRef.current.set(job_id, {
+        inputPath: targetFile,
+        parentId,
+        title: requestedTitle,
+        detailContext: nextDetailContext,
+      });
+
+      if (failedJobMessagesRef.current.has(job_id)) {
+        const earlyFailure =
+          failedJobMessagesRef.current.get(job_id) ?? t("error.transcriptionFailed", "Transcription failed.");
+        failedJobMessagesRef.current.delete(job_id);
+        const failedContext = pendingTranscriptionContextRef.current.get(job_id);
+        pendingTranscriptionContextRef.current.delete(job_id);
+        clearActiveJob();
+        activeJobIdRef.current = null;
+        setActiveJobTitle("");
+        if (options?.queuedJobId) {
+          setQueueItems((previous) => previous.filter((entry) => entry.job_id !== options.queuedJobId));
+        }
+        if (preserveCurrentArtifact) {
+          setError(earlyFailure);
+        } else {
+          setFocusedJobId(null);
+          setActiveJobPreviewText("");
+          activeJobDeltaSequenceRef.current = -1;
+          setActiveDetailContext(null);
+          presentTranscriptionFailure(earlyFailure, failedContext?.detailContext);
+        }
+        return;
+      }
+
+      activeJobIdRef.current = job_id;
+      setJobStarted(job_id);
+      setQueueItems((previous) => {
+        const startedJob = buildQueuedTranscriptionJob(
+          job_id,
+          t("queue.queuedJob", "Queued transcription job."),
+        );
+        if (options?.queuedJobId) {
+          const replaced = replaceQueuedTranscriptionJob(previous, options.queuedJobId, startedJob);
+          return replaced.some((entry) => entry.job_id === job_id)
+            ? replaced
+            : pushOrReplaceQueueItem(replaced, startedJob);
+        }
+        if (previous.some((entry) => entry.job_id === job_id)) {
+          return previous;
+        }
+        return pushOrReplaceQueueItem(previous, startedJob);
+      });
+      setActiveJobTitle(requestedTitle ?? fileLabel(targetFile));
+
+      if (!preserveCurrentArtifact) {
+        setShowExportSheet(false);
+        focusRunningJob(job_id, nextDetailContext);
+      }
+
+      startupWatchdogRef.current = window.setTimeout(() => {
+        if (activeJobIdRef.current !== job_id) {
+          return;
+        }
+        const stalledContext = pendingTranscriptionContextRef.current.get(job_id);
+        pendingTranscriptionContextRef.current.delete(job_id);
+        clearActiveJob();
+        activeJobIdRef.current = null;
+        setActiveJobTitle("");
+        if (focusedJobIdRef.current === job_id) {
+          setFocusedJobId(null);
+          setActiveJobPreviewText("");
+          activeJobDeltaSequenceRef.current = -1;
+          setActiveDetailContext(null);
+          presentTranscriptionFailure(
+            t(
+              "error.transcriptionStartupProblem",
+              "Transcription is not starting correctly. Check Whisper CLI/Whisper Stream paths in Settings > Local Models.",
+            ),
+            stalledContext?.detailContext,
+          );
+        } else {
+          setError(
+            t(
+              "error.transcriptionStartupProblem",
+              "Transcription is not starting correctly. Check Whisper CLI/Whisper Stream paths in Settings > Local Models.",
+            ),
+          );
+        }
+      }, 120_000);
+    } catch (startError) {
+      clearStartupWatchdog();
+      if (options?.queuedJobId) {
+        setQueueItems((previous) => previous.filter((entry) => entry.job_id !== options.queuedJobId));
+      }
+      if (preserveCurrentArtifact) {
+        setError(formatAppError(startError));
+      } else {
+        setActiveDetailContext(null);
+        presentTranscriptionFailure(formatAppError(startError), nextDetailContext);
+      }
+    } finally {
+      setIsStarting(false);
+    }
+  }, [
+    activeArtifact,
+    clearStartupWatchdog,
+    focusRunningJob,
+    platformIsAppleSilicon,
+    presentTranscriptionFailure,
+    refreshRuntimeHealth,
+    section,
+    settings,
+    t,
+  ]);
+
   async function onStartTranscription(
     fileToProcess?: string,
     options?: { parentId?: string; title?: string },
@@ -3824,148 +4430,51 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       trimmedAudioDraft: isTrimRetranscription ? trimmedAudioDraft : null,
       restoreArtifactOnFailure: isTrimRetranscription,
     });
+    const trimValidationSnapshot = isTrimRetranscription
+      ? trimmedAudioDraft
+      : preparedHomeTrim;
+    const request: TranscriptionStartRequest = {
+      inputPath: targetFile,
+      parentId,
+      title: requestedTitle,
+      detailContext: nextDetailContext,
+      trimValidationSnapshot,
+    };
 
     if (!isTrimRetranscription) {
       setTrimmedAudioDraft(null);
       setTrimRegions([]);
     }
 
-    clearStartupWatchdog();
-    setIsStarting(true);
-    setError(null);
-    setTrimRetranscriptionError(null);
-    try {
-      const trimValidationError = validateTrimmedAudioDraftForTranscription(
-        isTrimRetranscription ? trimmedAudioDraft : preparedHomeTrim,
-      );
-      if (trimValidationError) {
-        presentTranscriptionFailure(trimValidationError, nextDetailContext);
-        return;
-      }
-
-      const runtimeStatus = await withTimeout(
-        ensureTranscriptionRuntime(),
-        20_000,
-        t("error.runtimeSetupTimedOut", "Runtime setup timed out."),
-      );
-      if (!runtimeStatus.ready) {
-        presentTranscriptionFailure(formatRuntimeNotReadyMessage(), nextDetailContext);
-        return;
-      }
-      if (runtimeStatus.did_setup) {
-        void refreshRuntimeHealth();
-      }
-
-      let preflight: TranscriptionStartPreflight | null = null;
-      try {
-        preflight = await withTimeout(
-          fetchTranscriptionStartPreflight({
-            model: settings.transcription.model,
-          }),
-          8_000,
-          t("error.preflightTimedOut", "Preflight timed out."),
-        );
-      } catch (preflightError) {
-        console.warn("Transcription preflight failed, continuing with backend start:", preflightError);
-      }
-      if (preflight && !preflight.allowed) {
-        presentTranscriptionFailure(formatTranscriptionPreflightMessage(preflight), nextDetailContext);
-        return;
-      }
-
-      const startResult = await withTimeout(
-        startTranscription({
-          input_path: targetFile,
-          language: settings.transcription.language,
-          model: settings.transcription.model,
-          enable_ai: false,
-          whisper_options: sanitizeWhisperOptions(
-            settings.transcription.whisper_options ?? getDefaultWhisperOptions(platformIsAppleSilicon),
-          ),
-          title: requestedTitle,
-          parent_id: parentId,
-        }),
-        12_000,
-        t("error.startRequestTimedOut", "Start request timed out while waiting for backend response."),
-      );
-
-      const { job_id } = startResult;
-      pendingTranscriptionContextRef.current.set(job_id, {
-        inputPath: targetFile,
-        parentId,
-        title: requestedTitle,
-        detailContext: nextDetailContext,
-      });
-      setActiveDetailContext(nextDetailContext);
-
-      if (failedJobMessagesRef.current.has(job_id)) {
-        const earlyFailure =
-          failedJobMessagesRef.current.get(job_id) ?? t("error.transcriptionFailed", "Transcription failed.");
-        failedJobMessagesRef.current.delete(job_id);
-        const failedContext = pendingTranscriptionContextRef.current.get(job_id);
-        pendingTranscriptionContextRef.current.delete(job_id);
-        clearActiveJob();
-        activeJobIdRef.current = null;
-        setActiveJobPreviewText("");
-        setActiveJobTitle("");
-        activeJobDeltaSequenceRef.current = -1;
-        setActiveDetailContext(null);
-        presentTranscriptionFailure(earlyFailure, failedContext?.detailContext);
-        return;
-      }
-
-      activeJobIdRef.current = job_id;
-      setJobStarted(job_id);
-      setQueueItems((previous) => {
-        if (previous.some((entry) => entry.job_id === job_id)) {
-          return previous;
-        }
-        return pushOrReplaceQueueItem(previous, {
-          job_id,
-          stage: "queued",
-          message: t("queue.queuedJob", "Queued transcription job."),
-          percentage: 0,
-          current_seconds: 0,
-          total_seconds: null,
-        });
-      });
-      setActiveJobTitle(requestedTitle ?? fileLabel(targetFile));
-      setActiveJobPreviewText("");
-      activeJobDeltaSequenceRef.current = -1;
-      setActiveArtifact(null);
-      setShowExportSheet(false);
-      setSection("detail");
-      setDetailMode("transcript");
-      setInspectorMode("details");
-
-      startupWatchdogRef.current = window.setTimeout(() => {
-        if (activeJobIdRef.current !== job_id) {
-          return;
-        }
-        const stalledContext = pendingTranscriptionContextRef.current.get(job_id);
-        pendingTranscriptionContextRef.current.delete(job_id);
-        clearActiveJob();
-        activeJobIdRef.current = null;
-        setActiveJobPreviewText("");
-        setActiveJobTitle("");
-        activeJobDeltaSequenceRef.current = -1;
-        setActiveDetailContext(null);
-        presentTranscriptionFailure(
-          t(
-            "error.transcriptionStartupProblem",
-            "Transcription is not starting correctly. Check Whisper CLI/Whisper Stream paths in Settings > Local Models.",
-          ),
-          stalledContext?.detailContext,
-        );
-      }, 120_000);
-    } catch (startError) {
-      clearStartupWatchdog();
-      setActiveDetailContext(null);
-      presentTranscriptionFailure(formatAppError(startError), nextDetailContext);
-    } finally {
-      setIsStarting(false);
+    if (activeJobId || isStarting) {
+      const queueId = buildQueuedTranscriptionJobId(++queuedTranscriptionSequenceRef.current);
+      setQueuedTranscriptionStarts((previous) => [...previous, { ...request, queueId }]);
+      setQueueItems((previous) =>
+        pushOrReplaceQueueItem(
+          previous,
+          buildQueuedTranscriptionJob(queueId, t("queue.queuedJob", "Queued transcription job.")),
+        ));
+      setError(null);
+      setTrimRetranscriptionError(null);
+      return;
     }
+
+    await launchTranscriptionStart(request);
   }
+
+  useEffect(() => {
+    if (activeJobId || isStarting || queuedTranscriptionStarts.length === 0) {
+      return;
+    }
+
+    const [next, ...rest] = queuedTranscriptionStarts;
+    if (!next) {
+      return;
+    }
+
+    setQueuedTranscriptionStarts(rest);
+    void launchTranscriptionStart(next, { queuedJobId: next.queueId });
+  }, [activeJobId, isStarting, launchTranscriptionStart, queuedTranscriptionStarts]);
 
   async function onCancel(): Promise<void> {
     if (!activeJobId) return;
@@ -4002,24 +4511,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   }
 
   function onFocusQueueJob(item: JobProgress): void {
-    clearStartupWatchdog();
-    const switchingJob = activeJobIdRef.current !== item.job_id;
-    const pendingContext = pendingTranscriptionContextRef.current.get(item.job_id);
-    setJobStarted(item.job_id);
-    setProgress(item);
-    activeJobIdRef.current = item.job_id;
-    if (switchingJob) {
-      setActiveJobPreviewText("");
-      activeJobDeltaSequenceRef.current = -1;
-      setActiveJobTitle(activeJobTitle || t("detail.transcribing", "Transcribing"));
+    if (isQueuedTranscriptionJobId(item.job_id)) {
+      return;
     }
-    setActiveDetailContext(pendingContext?.detailContext ?? null);
-    setActiveArtifact(null);
-    setDetailMode("transcript");
-    setInspectorMode("details");
-    setSection("detail");
-    setTrimRetranscriptionError(null);
-    setError(null);
+    const pendingContext = pendingTranscriptionContextRef.current.get(item.job_id);
+    focusRunningJob(item.job_id, pendingContext?.detailContext ?? null);
   }
 
   function onCloseOpenedArtifact(): void {
@@ -4656,15 +5152,38 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     if (!settings) return;
 
     try {
+      const sessionTitle = buildLiveSessionTitle();
       setRealtimeFinalLines([]);
       setRealtimePreview("");
+      setRealtimeSessionOpen(false);
       await startRealtime({
         model: settings.transcription.model,
         language: settings.transcription.language,
       });
-      setSection("realtime");
+      setDraftTitle(sessionTitle);
+      setDraftTranscript("");
+      setDraftSummary("");
+      setDraftFaqs("");
+      setOptimizedTranscriptAvailable(false);
+      setTranscriptViewMode("original");
+      setActiveArtifact(null);
+      setActiveDetailContext(
+        buildActiveDetailContext({
+          inputPath: null,
+          requestedTitle: sessionTitle,
+          sourceArtifact: null,
+          restoreArtifactOnFailure: false,
+        }),
+      );
+      setDetailMode("transcript");
+      setInspectorMode("details");
+      setRealtimeSessionOpen(true);
+      setRealtimeStartedAtMs(Date.now());
+      setSection("detail");
       setError(null);
     } catch (startError) {
+      setRealtimeSessionOpen(false);
+      setRealtimeStartedAtMs(null);
       setError(formatUiError("error.realtimeStartFailed", "Realtime start failed", startError));
     }
   }
@@ -4688,14 +5207,34 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   async function onStopRealtime(saveResult: boolean): Promise<void> {
     setIsStoppingRealtime(true);
     try {
-      const result = await stopRealtime(saveResult);
+      const currentLiveTranscript = [...realtimeFinalLines, realtimePreviewText]
+        .filter((line) => line.trim().length > 0)
+        .join("\n")
+        .trim();
+      const result = await stopRealtime(
+        saveResult,
+        draftTitle,
+        Math.max(0, Math.round(realtimeElapsedSeconds)),
+      );
       if (result.artifact) {
         prependArtifact(result.artifact);
         hydrateDetail(result.artifact);
+        setTranscriptViewMode("original");
         setSection("detail");
+      } else if (saveResult && currentLiveTranscript) {
+        setError(t(
+          "error.realtimeSaveIncomplete",
+          "Live transcription stopped, but the final transcript was not returned. The current live text is still visible here.",
+        ));
+        return;
+      } else {
+        setActiveDetailContext(null);
+        setSection("home");
       }
       setRealtimePreview("");
       setRealtimeFinalLines([]);
+      setRealtimeSessionOpen(false);
+      setRealtimeStartedAtMs(null);
       setError(null);
     } catch (stopError) {
       setError(formatUiError("error.realtimeStopFailed", "Realtime stop failed", stopError));
@@ -4793,7 +5332,27 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     }
   }
 
-  function onJumpToEmotionSegment(sourceIndex: number): void {
+  function onJumpToEmotionSegment({
+    segmentIndex,
+    evidenceText,
+    timeLabel,
+    startSeconds,
+  }: {
+    segmentIndex: number;
+    evidenceText?: string | null;
+    timeLabel?: string | null;
+    startSeconds?: number | null;
+  }): void {
+    const sourceIndex = resolveEmotionSegmentSourceIndex(
+      segmentIndex,
+      evidenceText,
+      timeLabel,
+      startSeconds,
+    );
+    if (sourceIndex === null) {
+      setError(t("error.segmentTimelineInvalid", "Segment timeline metadata is missing or invalid."));
+      return;
+    }
     setSelectedSegmentSourceIndex(sourceIndex);
     setDetailMode("segments");
     setInspectorMode("details");
@@ -5363,28 +5922,41 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         ) : (
           <div className="queue-list">
             {queueActiveItems.map((item) => {
+              const isQueuedPlaceholder = isQueuedTranscriptionJobId(item.job_id);
+              const queuedStart = queuedTranscriptionStarts.find((entry) => entry.queueId === item.job_id);
+              const pendingContext = pendingTranscriptionContextRef.current.get(item.job_id);
+              const queueItemTitle =
+                queuedStart?.title
+                ?? (queuedStart?.inputPath ? fileLabel(queuedStart.inputPath) : undefined)
+                ?? pendingContext?.title
+                ?? (pendingContext?.inputPath ? fileLabel(pendingContext.inputPath) : undefined)
+                ?? (item.job_id === activeJobId && activeJobTitle
+                  ? activeJobTitle
+                  : t("queue.activeJobFallback", "Transcription in progress"));
               const displayPercentage =
                 item.job_id === activeJobId
-                  ? displayedTranscriptionPercentage
+                  ? runningJobPercentage
                   : percentageFromJobProgress(item);
 
               return (
                 <article
                   key={item.job_id}
-                  className="queue-card queue-card-clickable"
-                  onClick={() => onFocusQueueJob(item)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      onFocusQueueJob(item);
-                    }
-                  }}
+                  className={`queue-card ${isQueuedPlaceholder ? "" : "queue-card-clickable"}`}
+                  onClick={isQueuedPlaceholder ? undefined : () => onFocusQueueJob(item)}
+                  role={isQueuedPlaceholder ? undefined : "button"}
+                  tabIndex={isQueuedPlaceholder ? undefined : 0}
+                  onKeyDown={isQueuedPlaceholder
+                    ? undefined
+                    : (event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        onFocusQueueJob(item);
+                      }
+                    }}
                 >
                   <div className="queue-card-head">
                     <strong>
-                      {item.job_id === activeJobId && activeJobTitle ? activeJobTitle : t("queue.activeJobFallback", "Transcription in progress")}
+                      {queueItemTitle}
                     </strong>
                     <span className="queue-stage">
                       <ProgressRing percentage={displayPercentage} size={18} />
@@ -5580,8 +6152,33 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     );
   }
   function renderDetailMain(): JSX.Element {
+    if (isRealtimeDetailActive) {
+      return (
+        <div className="transcript-shell realtime-transcript-shell">
+          <div className="transcript-container realtime-transcript-container" style={{ position: "relative", height: "100%" }}>
+            <textarea
+              className="detail-editor realtime-detail-editor"
+              value={realtimeTranscriptDisplayText}
+              readOnly
+              style={{
+                fontSize: `${fontSize}px`,
+                width: "100%",
+                height: "100%",
+              }}
+            />
+            {!realtimeTranscriptDisplayText ? (
+              <div className="center-empty compact realtime-detail-empty">
+                <h3>{t("realtime.noTranscript")}</h3>
+                <p>{t("realtime.noTranscriptDesc")}</p>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      );
+    }
+
     if (!activeArtifact) {
-      if (activeJobId) {
+      if (focusedJobId) {
         if (!activeJobPreviewText) {
           return <LoadingAnimation />;
         }
@@ -5654,6 +6251,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         );
       }
 
+      const timelineEntries = draftEmotionAnalysis.timeline;
+      const timelineStart = timelineEntries[0] ?? null;
+      const timelineEnd = timelineEntries.length > 1 ? timelineEntries[timelineEntries.length - 1] : null;
+      const canCollapseTimeline = timelineEntries.length > 2;
+
       return (
         <div className="emotion-view">
           <section className="emotion-section">
@@ -5677,43 +6279,61 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
           <section className="emotion-section">
             <div className="emotion-section-header">
-              <h3>{t("emotion.timeline", "Emotional arc")}</h3>
+              <div className="emotion-title-row">
+                <h3>{t("emotion.timeline", "Emotional arc")}</h3>
+                <InlineInfoHint
+                  label={t("emotion.timeline", "Emotional arc")}
+                  description={t(
+                    "emotion.timelineHelp",
+                    "This timeline breaks the conversation into segments so you can spot where the tone changes, who is speaking, and which moments feel more charged or flat.",
+                  )}
+                />
+              </div>
             </div>
-            <div className="emotion-card-grid">
-              {draftEmotionAnalysis.timeline.map((entry) => (
-                <article key={`emotion-timeline-${entry.segment_index}`} className="emotion-card">
-                  <div className="emotion-card-meta">
-                    <strong>{entry.time_label ?? `${t("emotion.segment", "Segment")} ${entry.segment_index + 1}`}</strong>
-                    {entry.speaker_label ? <span className="kind-chip">{entry.speaker_label}</span> : null}
-                  </div>
-                  <p>{entry.evidence_text}</p>
-                  <div className="emotion-chip-row">
-                    {entry.dominant_emotions.map((emotion) => (
-                      <span key={`${entry.segment_index}-${emotion}`} className="kind-chip">{emotion}</span>
-                    ))}
-                  </div>
+            <p className="emotion-section-help">
+              {t(
+                "emotion.timelineHelpShort",
+                "Use this section to see where the discussion stays neutral, becomes tense, or shifts toward relief or confidence.",
+              )}
+            </p>
+            {emotionTimelineExpanded || !canCollapseTimeline ? (
+              <>
+                <div className="emotion-card-grid">
+                  {timelineEntries.map((entry) => renderEmotionTimelineCard(entry))}
+                </div>
+                {canCollapseTimeline ? (
+                  <button
+                    className="secondary-button emotion-timeline-toggle"
+                    onClick={() => setEmotionTimelineExpanded(false)}
+                  >
+                    {t("emotion.hideTimeline", "Hide full timeline")}
+                  </button>
+                ) : null}
+              </>
+            ) : (
+              <div className="emotion-timeline-preview">
+                {timelineStart ? renderEmotionTimelineCard(timelineStart) : null}
+                <div className="emotion-timeline-connector" aria-hidden="true">
+                  <div className="emotion-timeline-connector-line" />
+                  <span className="emotion-timeline-connector-arrow">→</span>
+                  <p>
+                    {t("emotion.timelineCollapsedSummary", "Showing the start and end of the conversation.")}
+                  </p>
                   <small>
-                    {t("emotion.scores", "Valence")} {entry.valence_score} · {t("emotion.intensity", "Intensity")} {entry.intensity_score}
+                    {t("emotion.timelineCollapsedCount", "{count} moments hidden in between", {
+                      count: Math.max(0, timelineEntries.length - (timelineEnd ? 2 : 1)),
+                    })}
                   </small>
-                  {entry.shift_label ? <small>{entry.shift_label}</small> : null}
-                  <div className="emotion-card-actions">
-                    <button className="secondary-button" onClick={() => onJumpToEmotionSegment(entry.segment_index)}>
-                      {t("emotion.jump", "Jump to segment")}
-                    </button>
-                    <button
-                      className="secondary-button"
-                      onClick={() =>
-                        onAskEmotionQuestion(
-                          `Reflect on the emotional shift around segment ${entry.segment_index + 1}. What appears to trigger ${entry.dominant_emotions.join(", ") || "the tone change"}?`,
-                        )
-                      }
-                    >
-                      {t("emotion.ask", "Ask in chat")}
-                    </button>
-                  </div>
-                </article>
-              ))}
-            </div>
+                </div>
+                {timelineEnd ? renderEmotionTimelineCard(timelineEnd) : null}
+                <button
+                  className="secondary-button emotion-timeline-toggle"
+                  onClick={() => setEmotionTimelineExpanded(true)}
+                >
+                  {t("emotion.showTimeline", "Show full timeline")}
+                </button>
+              </div>
+            )}
           </section>
 
           <section className="emotion-section">
@@ -5737,7 +6357,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                       onClick={() => {
                         const target = cluster.segment_indices[0];
                         if (target !== undefined) {
-                          onJumpToEmotionSegment(target);
+                          onJumpToEmotionSegment({ segmentIndex: target });
                         }
                       }}
                     >
@@ -5777,7 +6397,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                     ))}
                   </div>
                   <div className="emotion-card-actions">
-                    <button className="secondary-button" onClick={() => onJumpToEmotionSegment(bridge.from_segment_index)}>
+                    <button
+                      className="secondary-button"
+                      onClick={() => onJumpToEmotionSegment({ segmentIndex: bridge.from_segment_index })}
+                    >
                       {t("emotion.jump", "Jump to segment")}
                     </button>
                     <button
@@ -5904,6 +6527,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           {detailSegments.length === 0 ? <p className="muted">{t("detail.noSegments")}</p> : null}
           {detailSegments.map((segment, index) => (
             <article
+              ref={(node) => {
+                setSegmentElementRef(segment.sourceIndex, node);
+              }}
               className={`segment-row ${
                 selectedSegmentSourceIndex === segment.sourceIndex ? "selected" : ""
               } ${segmentContextMenu?.sourceIndex === segment.sourceIndex ? "context-open" : ""}`}
@@ -6030,23 +6656,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         );
       }
 
-      return (
-        <div className="transcript-speaker-banner">
-          <div className="transcript-speaker-banner-copy">
-            <strong>{t("detail.diarizationNotRequested", "This transcript was created without speaker diarization.")}</strong>
-            <span>{t("detail.diarizationNotRequestedHint", "Turn on Speaker diarization in Settings > Transcription Defaults before retranscribing the source audio.")}</span>
-          </div>
-          <div className="transcript-speaker-banner-actions">
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => void onOpenStandaloneSettingsWindow("transcription")}
-            >
-              {t("action.openTranscriptionDefaults", "Open Transcription Defaults")}
-            </button>
-          </div>
-        </div>
-      );
+      return null;
     })();
 
     return (
@@ -6128,7 +6738,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           return t("detail.noSpeakersShort", "No speakers detected");
         case "not_requested":
         default:
-          return t("inspector.unknown", "Unknown");
+          return t("detail.noSpeakerLabels", "No speaker labels");
       }
     })();
 
@@ -6150,7 +6760,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       }
 
       if (!artifactDiarizationUiState) {
-        return t("inspector.diarizationHint", "Speaker assignment is available in Segments mode. Diarization controls are in Settings > Transcription Defaults and asset setup is in Settings > Local Models.");
+        return t("detail.manualSpeakerHint", "Assign speakers manually in Segments. You can decide later whether to run speaker diarization.");
       }
 
       switch (artifactDiarizationUiState.kind) {
@@ -6163,7 +6773,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           return t("detail.noSpeakersDetectedHint", "Open Segments to inspect the timeline or assign speakers manually.");
         case "not_requested":
         default:
-          return t("detail.diarizationNotRequestedHint", "Turn on Speaker diarization in Settings > Transcription Defaults before retranscribing the source audio.");
+          return t("detail.manualSpeakerHint", "Assign speakers manually in Segments. You can decide later whether to run speaker diarization.");
       }
     })();
 
@@ -6599,7 +7209,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         ) : null}
 
         <label className="toggle-row">
-          <span>{t("summary.includeTimestamps", "Include timestamps")}</span>
+          <span className="emotion-toggle-label">
+            {t("summary.includeTimestamps", "Include timestamps")}
+            <InlineInfoHint
+              label={t("summary.includeTimestamps", "Include timestamps")}
+              description={t(
+                "emotion.includeTimestampsHelp",
+                "Shows transcript timestamps in the analysis so you can connect each emotional moment back to the recording.",
+              )}
+              side="left"
+            />
+          </span>
           <input
             type="checkbox"
             checked={emotionIncludeTimestamps}
@@ -6607,7 +7227,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           />
         </label>
         <label className="toggle-row">
-          <span>{t("summary.includeSpeakers", "Include speakers")}</span>
+          <span className="emotion-toggle-label">
+            {t("summary.includeSpeakers", "Include speakers")}
+            <InlineInfoHint
+              label={t("summary.includeSpeakers", "Include speakers")}
+              description={t(
+                "emotion.includeSpeakersHelp",
+                "Shows speaker labels inside the analysis when the transcript has diarization or speaker metadata available.",
+              )}
+              side="left"
+            />
+          </span>
           <input
             type="checkbox"
             checked={emotionIncludeSpeakers}
@@ -6615,7 +7245,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           />
         </label>
         <label className="toggle-row">
-          <span>{t("emotion.speakerDynamics", "Speaker dynamics")}</span>
+          <span className="emotion-toggle-label">
+            {t("emotion.speakerDynamics", "Speaker dynamics")}
+            <InlineInfoHint
+              label={t("emotion.speakerDynamics", "Speaker dynamics")}
+              description={t(
+                "emotion.speakerDynamicsHelp",
+                "Adds a cross-speaker reading to the overview, highlighting how different speakers contribute tension, caution, confidence, or other recurring tones across the conversation.",
+              )}
+              side="left"
+            />
+          </span>
           <input
             type="checkbox"
             checked={speakerDynamicsAvailable && emotionSpeakerDynamics}
@@ -6742,8 +7382,59 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   }
 
   function renderInspector(): JSX.Element {
+    if (isRealtimeDetailActive) {
+      return (
+        <div className="inspector-body">
+          <button
+            className="secondary-button"
+            onClick={() => void navigator.clipboard.writeText(realtimeTranscriptText)}
+            disabled={!realtimeTranscriptText.trim()}
+          >
+            {t("inspector.copy", "Copy")}
+          </button>
+
+          <div className="inspector-block">
+            <h4>{t("realtime.status")}</h4>
+            <div className="property-line">
+              <span>{t("realtime.status")}</span>
+              <strong>{realtimeState === "idle" ? t("realtime.idle", "Realtime idle") : realtimeMessage}</strong>
+            </div>
+            <div className="property-line">
+              <span>{t("inspector.duration")}</span>
+              <strong>{formatShortDuration(realtimeElapsedSeconds)}</strong>
+            </div>
+          </div>
+
+          <div className="inspector-block">
+            <h4>{t("inspector.title")}</h4>
+            <input
+              className="inspector-input"
+              value={draftTitle}
+              onChange={(event) => setDraftTitle(event.target.value)}
+            />
+          </div>
+
+          <div className="inspector-block">
+            <h4>{t("inspector.audio")}</h4>
+            <div className="property-line">
+              <span>{t("inspector.file")}</span>
+              <strong className="truncate-value">{t("realtime.liveMicrophone", "Live microphone")}</strong>
+            </div>
+            <div className="property-line">
+              <span>{t("inspector.format")}</span>
+              <strong>{t("realtime.recordingPending", "Recording in progress")}</strong>
+            </div>
+            <div className="property-line">
+              <span>{t("detail.transcript", "Transcript")}</span>
+              <strong>{realtimeHasAnyText ? t("realtime.transcriptUpdating", "Updating live") : t("realtime.waitingForSpeech", "Waiting for speech")}</strong>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     if (!activeArtifact) {
-      if (activeJobId) {
+      if (focusedJobId) {
         return (
           <div className="inspector-body">
             <button
@@ -6781,12 +7472,22 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
             rightSidebarOpen={effectiveRightSidebarOpen}
             rightSidebarForcedCollapsed={rightSidebarForcedCollapsed}
             detailMode={detailMode}
-            title={effectiveDetailContext?.title ?? activeJobTitle ?? t("detail.transcribing", "Transcribing")}
+            title={
+              isRealtimeDetailActive
+                ? (draftTitle.trim() || effectiveDetailContext?.title || t("topbar.live", "Live"))
+                : (effectiveDetailContext?.title ?? activeJobTitle ?? t("detail.transcribing", "Transcribing"))
+            }
             hasArtifact={Boolean(activeArtifact)}
-            hasActiveJob={Boolean(activeJobId)}
+            hasActiveJob={Boolean(focusedJobId)}
             transcriptionProgress={displayedTranscriptionPercentage}
             onToggleSidebar={() => setLeftSidebarOpen((open) => !open)}
-            onBack={() => setSection("history")}
+            onBack={() => {
+              if (!activeArtifact && focusedJobId) {
+                setFocusedJobId(null);
+                setActiveDetailContext(null);
+              }
+              setSection("history");
+            }}
             onRenameTitle={activeArtifact ? () => onRenameArtifact(activeArtifact) : undefined}
             onSelectMode={(mode) => {
               if (mode === "transcript") {
@@ -6817,6 +7518,13 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                 });
               }
             }}
+            realtimeControls={isRealtimeDetailActive ? {
+              state: realtimeState,
+              isStopping: isStoppingRealtime,
+              onPause: () => void onPauseRealtime(),
+              onResume: () => void onResumeRealtime(),
+              onStop: () => void onStopRealtime(true),
+            } : null}
           />
 
           <div className="detail-body">{renderDetailMain()}</div>
@@ -6896,33 +7604,47 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
                   </span>
                 </div>
               ) : null}
-              <AudioPlayer
-                inputPath={detailAudioInputPath}
-                trimEnabled
-                onMetadataLoaded={(metadata) => {
-                  setAudioDurationSeconds(metadata.durationSeconds);
-                }}
-                onTrimRegionsChange={(regions) => {
-                  setTrimRegions(regions);
-                  setTrimRetranscriptionError(null);
-                }}
-                onTrimApplied={(trimmedAudio, regions) => {
-                  const trimSourceArtifact = activeArtifact ?? effectiveDetailContext?.sourceArtifact;
-                  if (!trimSourceArtifact) {
-                    return;
-                  }
-                  const sourceLabel = trimSourceArtifact.title.trim() || fileLabel(trimSourceArtifact.input_path);
-                  setTrimRetranscriptionError(null);
-                  setTrimmedAudioDraft({
-                    path: trimmedAudio.path,
-                    durationSeconds: trimmedAudio.duration_seconds,
-                    fileSizeBytes: trimmedAudio.file_size_bytes,
-                    parentArtifactId: trimSourceArtifact.id,
-                    title: buildTrimArtifactTitle(sourceLabel, regions),
-                    regions: [...regions],
-                  });
-                }}
-              />
+              {isRealtimeDetailActive ? (
+                <LiveMicrophoneWaveform
+                  mode={realtimeState}
+                  elapsedSeconds={realtimeElapsedSeconds}
+                  runningLabel={t("realtime.waveformRunning", "Mic live")}
+                  pausedLabel={t("realtime.waveformPaused", "Preview paused")}
+                  idleStatusLabel={t("realtime.waveformIdleShort", "Mic idle")}
+                  idleLabel={t("realtime.waveformIdle", "Start live mode to preview microphone activity.")}
+                  connectingLabel={t("realtime.waveformConnecting", "Connecting to the microphone...")}
+                  blockedLabel={t("realtime.waveformBlocked", "Microphone preview is blocked. Check microphone permissions.")}
+                  unavailableLabel={t("realtime.waveformUnavailable", "Microphone preview is unavailable on this device.")}
+                />
+              ) : (
+                <AudioPlayer
+                  inputPath={detailAudioInputPath}
+                  trimEnabled
+                  onMetadataLoaded={(metadata) => {
+                    setAudioDurationSeconds(metadata.durationSeconds);
+                  }}
+                  onTrimRegionsChange={(regions) => {
+                    setTrimRegions(regions);
+                    setTrimRetranscriptionError(null);
+                  }}
+                  onTrimApplied={(trimmedAudio, regions) => {
+                    const trimSourceArtifact = activeArtifact ?? effectiveDetailContext?.sourceArtifact;
+                    if (!trimSourceArtifact) {
+                      return;
+                    }
+                    const sourceLabel = trimSourceArtifact.title.trim() || fileLabel(trimSourceArtifact.input_path);
+                    setTrimRetranscriptionError(null);
+                    setTrimmedAudioDraft({
+                      path: trimmedAudio.path,
+                      durationSeconds: trimmedAudio.duration_seconds,
+                      fileSizeBytes: trimmedAudio.file_size_bytes,
+                      parentArtifactId: trimSourceArtifact.id,
+                      title: buildTrimArtifactTitle(sourceLabel, regions),
+                      regions: [...regions],
+                    });
+                  }}
+                />
+              )}
             </div>
           </div>
         </section>
@@ -6948,17 +7670,45 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         <div className="view-toolbar">
           <h2>{t("topbar.live")}</h2>
           <div className="toolbar-actions">
-            <button className="secondary-button" onClick={() => void onStartRealtime()} disabled={!canStartRealtime}>
-              {t("realtime.start", "Start")}
+            <button
+              className="realtime-toolbar-button realtime-toolbar-button--start"
+              onClick={() => void onStartRealtime()}
+              disabled={!canStartRealtime}
+            >
+              <span className="button-content">
+                <Play size={14} />
+                <span className="detail-action-label">{t("realtime.start", "Start")}</span>
+              </span>
             </button>
-            <button className="secondary-button" onClick={() => void onPauseRealtime()} disabled={realtimeState !== "running"}>
-              {t("realtime.pause", "Pause")}
+            <button
+              className="realtime-toolbar-button realtime-toolbar-button--secondary"
+              onClick={() => void onPauseRealtime()}
+              disabled={realtimeState !== "running"}
+            >
+              <span className="button-content">
+                <Pause size={14} />
+                <span className="detail-action-label">{t("realtime.pause", "Pause")}</span>
+              </span>
             </button>
-            <button className="secondary-button" onClick={() => void onResumeRealtime()} disabled={realtimeState !== "paused"}>
-              {t("realtime.resume", "Resume")}
+            <button
+              className="realtime-toolbar-button realtime-toolbar-button--secondary"
+              onClick={() => void onResumeRealtime()}
+              disabled={realtimeState !== "paused"}
+            >
+              <span className="button-content">
+                <Play size={14} />
+                <span className="detail-action-label">{t("realtime.resume", "Resume")}</span>
+              </span>
             </button>
-            <button className="primary-button" onClick={() => void onStopRealtime(true)} disabled={realtimeState === "idle" || isStoppingRealtime}>
-              {t("realtime.stopAndSave", "Stop & Save")}
+            <button
+              className="realtime-toolbar-button realtime-toolbar-button--primary"
+              onClick={() => void onStopRealtime(true)}
+              disabled={realtimeState === "idle" || isStoppingRealtime}
+            >
+              <span className="button-content">
+                <Square size={13} />
+                <span className="detail-action-label">{t("realtime.stopAndSave", "Stop & Save")}</span>
+              </span>
             </button>
           </div>
         </div>
@@ -6972,17 +7722,37 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           </div>
 
           <div className="live-view">
-            {combinedText || realtimePreview ? (
-              <>
-                {combinedText ? <pre>{combinedText}</pre> : null}
-                {realtimePreview ? <p className="preview-line">{realtimePreview}</p> : null}
-              </>
-            ) : (
-              <div className="center-empty compact">
-                <h3>{t("realtime.noTranscript")}</h3>
-                <p>{t("realtime.noTranscriptDesc")}</p>
+            <LiveMicrophoneWaveform
+              mode={realtimeState}
+              elapsedSeconds={realtimeElapsedSeconds}
+              runningLabel={t("realtime.waveformRunning", "Mic live")}
+              pausedLabel={t("realtime.waveformPaused", "Preview paused")}
+              idleStatusLabel={t("realtime.waveformIdleShort", "Mic idle")}
+              idleLabel={t("realtime.waveformIdle", "Start live mode to preview microphone activity.")}
+              connectingLabel={t("realtime.waveformConnecting", "Connecting to the microphone...")}
+              blockedLabel={t("realtime.waveformBlocked", "Microphone preview is blocked. Check microphone permissions.")}
+              unavailableLabel={t("realtime.waveformUnavailable", "Microphone preview is unavailable on this device.")}
+            />
+
+            <div className="live-transcript-panel">
+              <div className="live-transcript-head">
+                <strong>{t("detail.transcript", "Transcript")}</strong>
               </div>
-            )}
+
+              <div className="live-transcript-copy">
+                {combinedText || realtimePreviewText ? (
+                  <>
+                    {combinedText ? <pre>{combinedText}</pre> : null}
+                    {realtimePreviewText ? <p className="preview-line">{realtimePreviewText}</p> : null}
+                  </>
+                ) : (
+                  <div className="center-empty compact">
+                    <h3>{t("realtime.noTranscript")}</h3>
+                    <p>{t("realtime.noTranscriptDesc")}</p>
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         </section>
       </div>

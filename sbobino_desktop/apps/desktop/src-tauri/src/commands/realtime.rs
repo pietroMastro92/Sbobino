@@ -4,12 +4,13 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
-use sbobino_application::RealtimeDelta;
+use sbobino_application::{ApplicationError, RealtimeDelta};
 use sbobino_domain::{ArtifactKind, LanguageCode, SpeechModel, TranscriptArtifact};
 
-use crate::{ai_support::run_with_enhancer_fallback, error::CommandError, state::AppState};
+use crate::{error::CommandError, state::AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct StartRealtimePayload {
@@ -26,6 +27,8 @@ pub struct StartRealtimeResponse {
 #[derive(Debug, Deserialize)]
 pub struct StopRealtimePayload {
     pub save: Option<bool>,
+    pub title: Option<String>,
+    pub elapsed_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +103,17 @@ pub async fn start_realtime(
         .await
         .map_err(CommandError::from)?;
 
+    sleep(Duration::from_millis(350)).await;
+    if !state.realtime.engine.is_running().await {
+        let diagnostics = state.realtime.engine.snapshot_diagnostics().await;
+        let detail = if diagnostics.is_empty() {
+            "Realtime transcription stopped immediately. Verify microphone access and that at least one audio input device is available.".to_string()
+        } else {
+            diagnostics.join(" ")
+        };
+        return Err(CommandError::from(ApplicationError::SpeechToText(detail)));
+    }
+
     let _ = app.emit(
         "realtime://status",
         RealtimeStatusEvent {
@@ -163,9 +177,14 @@ pub async fn stop_realtime(
     state: State<'_, AppState>,
     payload: Option<StopRealtimePayload>,
 ) -> Result<StopRealtimeResponse, CommandError> {
-    let save = payload.and_then(|value| value.save).unwrap_or(true);
+    let payload = payload.unwrap_or(StopRealtimePayload {
+        save: Some(true),
+        title: None,
+        elapsed_seconds: None,
+    });
+    let save = payload.save.unwrap_or(true);
 
-    let consolidated = state
+    let stop_result = state
         .realtime
         .engine
         .stop()
@@ -180,7 +199,7 @@ pub async fn stop_realtime(
         },
     );
 
-    if !save || consolidated.trim().is_empty() {
+    if !save || stop_result.transcript.trim().is_empty() {
         return Ok(StopRealtimeResponse {
             saved: false,
             artifact: None,
@@ -198,6 +217,7 @@ pub async fn stop_realtime(
         .lock()
         .await
         .clone()
+        .or_else(|| payload.title.clone().filter(|title| !title.trim().is_empty()))
         .unwrap_or_else(|| format!("live_{}", Utc::now().format("%d%m%Y_%H%M%S")));
 
     let language_code = state.realtime.language_code.lock().await.clone();
@@ -209,49 +229,38 @@ pub async fn stop_realtime(
         .clone()
         .unwrap_or_else(|| settings.transcription.model.ggml_filename().to_string());
 
-    let mut optimized = consolidated.clone();
-    let mut summary = String::new();
-    let mut faqs = String::new();
-
-    if settings.transcription.enable_ai_post_processing {
-        let enhancers = state
-            .runtime_factory
-            .build_enhancer_candidates()
-            .map_err(|e| CommandError::new("runtime_factory", e))?;
-        if !enhancers.is_empty() {
-            if let Ok((next_optimized, summary_faq)) =
-                run_with_enhancer_fallback(&enhancers, "realtime post-processing", |enhancer| {
-                    let consolidated = consolidated.clone();
-                    let language_code = language_code.clone();
-                    Box::pin(async move {
-                        let next_optimized =
-                            enhancer.optimize(&consolidated, &language_code).await?;
-                        let summary_faq = enhancer
-                            .summarize_and_faq(&next_optimized, &language_code)
-                            .await?;
-                        Ok((next_optimized, summary_faq))
-                    })
-                })
-                .await
-            {
-                optimized = next_optimized;
-                summary = summary_faq.summary;
-                faqs = summary_faq.faqs;
-            }
-        }
-    }
+    let optimized = String::new();
+    let summary = String::new();
+    let faqs = String::new();
 
     let mut metadata = BTreeMap::new();
     metadata.insert("kind".to_string(), "realtime".to_string());
     metadata.insert("language".to_string(), language_code.clone());
     metadata.insert("model".to_string(), model_filename.clone());
+    if let Some(elapsed_seconds) = payload.elapsed_seconds {
+        metadata.insert("duration_seconds".to_string(), elapsed_seconds.to_string());
+    }
+    metadata.insert(
+        "audio_saved".to_string(),
+        if stop_result.saved_audio_path.is_some() {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        },
+    );
+
+    let input_path = stop_result
+        .saved_audio_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{session_title}.wav"));
 
     let artifact = TranscriptArtifact::new(
         Uuid::new_v4().to_string(),
         session_title.clone(),
         ArtifactKind::Realtime,
-        format!("{session_title}.wav"),
-        consolidated,
+        input_path,
+        stop_result.transcript,
         optimized,
         summary,
         faqs,

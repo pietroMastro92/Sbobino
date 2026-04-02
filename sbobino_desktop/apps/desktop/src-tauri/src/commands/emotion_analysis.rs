@@ -19,7 +19,6 @@ const EMOTION_CHUNK_TARGET_WORDS: usize = 550;
 const EMOTION_CHUNK_OVERLAP_WORDS: usize = 24;
 const EMOTION_CHUNK_CONCURRENCY_LIMIT: usize = 3;
 const EMOTION_SYNTHESIS_BUDGETS: &[usize] = &[6_000, 4_200, 2_800, 1_800, 1_200];
-const MAX_TIMELINE_ENTRIES: usize = 18;
 const MAX_SEMANTIC_NODES: usize = 16;
 const MAX_BRIDGES: usize = 6;
 const MAX_REFLECTION_PROMPTS: usize = 5;
@@ -420,9 +419,9 @@ fn build_local_emotion_analysis(
     let mut previous_valence = 0.0_f32;
     let mut previous_emotion = String::new();
 
-    for (segment_index, segment) in segments.iter().enumerate() {
+    for (order_index, segment) in segments.iter().enumerate() {
         let tokens = tokenize_text(&segment.text, resources.stopwords);
-        let scored = score_segment(segment_index, segment, &tokens, &resources);
+        let scored = score_segment(segment.segment_index, segment, &tokens, &resources);
         if scored.text.trim().is_empty() {
             continue;
         }
@@ -454,7 +453,7 @@ fn build_local_emotion_analysis(
             .cloned()
             .unwrap_or_default();
         let valence_delta = (scored.valence_score - previous_valence).abs();
-        if segment_index > 0
+        if order_index > 0
             && (valence_delta >= 1.0
                 || (!current_top.is_empty() && current_top != previous_emotion))
         {
@@ -499,7 +498,7 @@ fn build_local_emotion_analysis(
 
     LocalEmotionAnalysis {
         overview,
-        timeline: timeline.into_iter().take(MAX_TIMELINE_ENTRIES).collect(),
+        timeline,
         semantic_map,
         bridges,
         reflection_prompts,
@@ -738,7 +737,7 @@ fn parse_emotion_output(
     if result.overview.primary_emotions.is_empty() {
         result.overview = local.overview.clone();
     }
-    if result.timeline.is_empty() {
+    if result.timeline.is_empty() || result.timeline.len() < local.timeline.len() {
         result.timeline = local.timeline.clone();
     }
     if result.semantic_map.nodes.is_empty() {
@@ -754,7 +753,6 @@ fn parse_emotion_output(
         result.narrative_markdown = build_local_narrative(local, input, options);
     }
 
-    result.timeline.truncate(MAX_TIMELINE_ENTRIES);
     result.bridges.truncate(MAX_BRIDGES);
     result.reflection_prompts.truncate(MAX_REFLECTION_PROMPTS);
     result
@@ -1197,9 +1195,8 @@ fn collect_analysis_segments(
 ) -> Vec<SegmentEmotionEvidence> {
     let segments = parse_timeline_segments(input.timeline_v2_json.as_deref())
         .into_iter()
-        .enumerate()
-        .map(|(segment_index, value)| SegmentEmotionEvidence {
-            segment_index,
+        .map(|value| SegmentEmotionEvidence {
+            segment_index: value.source_index,
             speaker_label: if options.include_speakers || options.speaker_dynamics {
                 value.speaker_label
             } else {
@@ -1361,7 +1358,8 @@ fn parse_timeline_segments(raw: Option<&str>) -> Vec<TimelineSegmentSnapshot> {
     parsed
         .segments
         .into_iter()
-        .filter_map(|segment| {
+        .enumerate()
+        .filter_map(|(source_index, segment)| {
             let text = normalize_optional_text(segment.text).unwrap_or_else(|| {
                 segment
                     .words
@@ -1399,6 +1397,7 @@ fn parse_timeline_segments(raw: Option<&str>) -> Vec<TimelineSegmentSnapshot> {
                 .and_then(normalize_optional_text);
 
             Some(TimelineSegmentSnapshot {
+                source_index,
                 text: text.to_string(),
                 time_label,
                 start_seconds,
@@ -1411,6 +1410,7 @@ fn parse_timeline_segments(raw: Option<&str>) -> Vec<TimelineSegmentSnapshot> {
 
 #[derive(Debug, Clone)]
 struct TimelineSegmentSnapshot {
+    source_index: usize,
     text: String,
     time_label: Option<String>,
     start_seconds: Option<f32>,
@@ -1593,9 +1593,9 @@ async fn ask_with_overflow_fallback(
 mod tests {
     use super::{
         build_local_emotion_analysis, chunk_text_by_words, local_analysis_to_result,
-        EmotionAnalysisInput, EmotionAnalysisOptions, EMOTION_CHUNK_OVERLAP_WORDS,
-        EMOTION_CHUNK_TARGET_WORDS, MAX_PROMPT_BRIDGES, MAX_PROMPT_CLUSTERS,
-        MAX_PROMPT_REFLECTION_PROMPTS, MAX_PROMPT_SEMANTIC_EDGES,
+        parse_emotion_output, EmotionAnalysisInput, EmotionAnalysisOptions,
+        EMOTION_CHUNK_OVERLAP_WORDS, EMOTION_CHUNK_TARGET_WORDS, MAX_PROMPT_BRIDGES,
+        MAX_PROMPT_CLUSTERS, MAX_PROMPT_REFLECTION_PROMPTS, MAX_PROMPT_SEMANTIC_EDGES,
         MAX_PROMPT_SEMANTIC_NODES, MAX_PROMPT_TIMELINE_ENTRIES,
     };
     use sbobino_domain::EmotionAnalysisResult;
@@ -1816,10 +1816,7 @@ mod tests {
             .expect("prompt evidence should parse");
 
         assert!(
-            parsed["timeline"]
-                .as_array()
-                .expect("timeline array")
-                .len()
+            parsed["timeline"].as_array().expect("timeline array").len()
                 <= MAX_PROMPT_TIMELINE_ENTRIES
         );
         assert!(
@@ -1843,13 +1840,7 @@ mod tests {
                 .len()
                 <= MAX_PROMPT_CLUSTERS
         );
-        assert!(
-            parsed["bridges"]
-                .as_array()
-                .expect("bridges array")
-                .len()
-                <= MAX_PROMPT_BRIDGES
-        );
+        assert!(parsed["bridges"].as_array().expect("bridges array").len() <= MAX_PROMPT_BRIDGES);
         assert!(
             parsed["reflection_prompts"]
                 .as_array()
@@ -1857,5 +1848,73 @@ mod tests {
                 .len()
                 <= MAX_PROMPT_REFLECTION_PROMPTS
         );
+    }
+
+    #[test]
+    fn parsed_result_keeps_full_local_timeline_when_ai_returns_subset() {
+        let timeline_segments = (0..24)
+            .map(|index| {
+                format!(
+                    r#"{{
+                        "text": "Segment {index} keeps the conversation moving through planning, concern, and coordination.",
+                        "start_seconds": {start}
+                    }}"#,
+                    start = index * 15
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = EmotionAnalysisInput {
+            title: "Full timeline".to_string(),
+            transcript: "planning concern coordination ".repeat(500),
+            timeline_v2_json: Some(format!(r#"{{"segments":[{timeline_segments}]}}"#)),
+        };
+        let options = EmotionAnalysisOptions {
+            include_timestamps: true,
+            ..make_options()
+        };
+        let local = build_local_emotion_analysis(&input, &options);
+
+        let partial_output = r#"{
+            "overview": {"primary_emotions":["fear"],"emotional_arc":"Short arc","speaker_dynamics":null,"confidence_note":null},
+            "timeline": [
+                {"segment_index":0,"time_label":"00:00","start_seconds":0.0,"end_seconds":null,"speaker_label":null,"dominant_emotions":["fear"],"valence_score":-0.4,"intensity_score":0.8,"evidence_text":"Opening concern.","shift_label":null}
+            ],
+            "semantic_map": {"nodes":[],"edges":[],"clusters":[]},
+            "bridges": [],
+            "reflection_prompts": [],
+            "narrative_markdown": "Narrative"
+        }"#;
+
+        let parsed = parse_emotion_output(partial_output, &local, &input, &options);
+        assert_eq!(parsed.timeline.len(), local.timeline.len());
+        assert!(parsed.timeline.len() > 20);
+    }
+
+    #[test]
+    fn local_timeline_preserves_original_source_indexes() {
+        let input = EmotionAnalysisInput {
+            title: "Source indexes".to_string(),
+            transcript: "placeholder".to_string(),
+            timeline_v2_json: Some(
+                r#"{
+                    "segments": [
+                        {"text": "Opening concern.", "start_seconds": 0.0},
+                        {"text": "   "},
+                        {"text": "Resolution and relief.", "start_seconds": 12.0}
+                    ]
+                }"#
+                .to_string(),
+            ),
+        };
+        let options = EmotionAnalysisOptions {
+            include_timestamps: true,
+            ..make_options()
+        };
+
+        let local = build_local_emotion_analysis(&input, &options);
+        assert_eq!(local.timeline.len(), 2);
+        assert_eq!(local.timeline[0].segment_index, 0);
+        assert_eq!(local.timeline[1].segment_index, 2);
     }
 }

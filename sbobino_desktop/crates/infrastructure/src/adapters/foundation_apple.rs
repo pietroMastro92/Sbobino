@@ -461,7 +461,11 @@ fn ensure_bridge_binary() -> Result<PathBuf, ApplicationError> {
         } else {
             format!("swiftc exited with status {}", compile_output.status)
         };
-        diagnostics.push(format!("{}: {}", candidate.label, summarize_compile_diagnostics(&detail)));
+        diagnostics.push(format!(
+            "{}: {}",
+            candidate.label,
+            summarize_compile_diagnostics(&detail)
+        ));
     }
 
     Err(ApplicationError::PostProcessing(format!(

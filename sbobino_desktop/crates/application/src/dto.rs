@@ -32,6 +32,7 @@ pub struct ArtifactQuery {
 #[serde(rename_all = "snake_case")]
 pub enum RealtimeDeltaKind {
     AppendFinal,
+    ReplaceFinal,
     UpdatePreview,
 }
 

@@ -201,7 +201,10 @@ impl RuntimeTranscriptionFactory {
     }
 
     #[cfg(test)]
-    fn new_for_tests(data_dir: &Path, bundle_resources_dir: Option<PathBuf>) -> Result<Self, String> {
+    fn new_for_tests(
+        data_dir: &Path,
+        bundle_resources_dir: Option<PathBuf>,
+    ) -> Result<Self, String> {
         Self::new_with_options(data_dir, bundle_resources_dir, false)
     }
 
@@ -1180,10 +1183,7 @@ impl RuntimeTranscriptionFactory {
                 self.write_managed_pyannote_manifest(&manifest)?;
             }
             if copied_assets || status_missing {
-                self.write_managed_pyannote_status(
-                    "ok",
-                    "Bundled pyannote override is ready.",
-                )?;
+                self.write_managed_pyannote_status("ok", "Bundled pyannote override is ready.")?;
             }
         } else if copied_assets || runtime_invalid {
             let message = self
@@ -1268,11 +1268,7 @@ impl RuntimeTranscriptionFactory {
                 "Pyannote diarization model is not installed. Install it from Settings > Local Models.".to_string(),
             )
         } else if let Some(error) = runtime_validation_error {
-            (
-                false,
-                "pyannote_install_incomplete".to_string(),
-                error,
-            )
+            (false, "pyannote_install_incomplete".to_string(), error)
         } else if let Some(manifest) = manifest.as_ref() {
             if manifest.runtime_arch.trim() != target_triple_suffix() {
                 (
@@ -1960,21 +1956,26 @@ fn ensure_embedded_pyannote_stdlib_is_present(runtime_root: &Path) -> Result<(),
         return Ok(());
     };
     let stdlib_dir = runtime_root.join("lib").join(&version_dir_name);
-    let has_local_stdlib = stdlib_dir.join("encodings").is_dir() && stdlib_dir.join("lib-dynload").is_dir();
+    let has_local_stdlib =
+        stdlib_dir.join("encodings").is_dir() && stdlib_dir.join("lib-dynload").is_dir();
     if has_local_stdlib {
         return Ok(());
     }
 
-    let Some(source_stdlib_dir) = find_pyannote_source_stdlib_dir(runtime_root, &version_dir_name) else {
+    let Some(source_stdlib_dir) = find_pyannote_source_stdlib_dir(runtime_root, &version_dir_name)
+    else {
         return Ok(());
     };
 
     std::fs::create_dir_all(&stdlib_dir)
         .map_err(|e| format!("failed to create bundled stdlib directory: {e}"))?;
 
-    for entry in std::fs::read_dir(&source_stdlib_dir)
-        .map_err(|e| format!("failed to read source stdlib '{}': {e}", source_stdlib_dir.display()))?
-    {
+    for entry in std::fs::read_dir(&source_stdlib_dir).map_err(|e| {
+        format!(
+            "failed to read source stdlib '{}': {e}",
+            source_stdlib_dir.display()
+        )
+    })? {
         let entry = entry.map_err(|e| format!("failed to inspect source stdlib entry: {e}"))?;
         let name = entry.file_name();
         if name.to_string_lossy() == "site-packages" {
@@ -2056,7 +2057,9 @@ fn find_pyannote_source_stdlib_dir(runtime_root: &Path, version_dir_name: &str) 
             .unwrap_or_default(),
     ];
 
-    candidates.into_iter().find(|candidate| candidate.join("encodings").is_dir())
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("encodings").is_dir())
 }
 
 fn validate_pyannote_python_runtime(
@@ -2095,9 +2098,9 @@ fn validate_pyannote_python_runtime(
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(_)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|e| format!("failed to read pyannote runtime validation output: {e}"))?;
+                let output = child.wait_with_output().map_err(|e| {
+                    format!("failed to read pyannote runtime validation output: {e}")
+                })?;
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 return Err(if stderr.is_empty() {
                     "Pyannote runtime validation failed.".to_string()
@@ -2183,8 +2186,11 @@ mod tests {
         (temp, factory)
     }
 
-    fn build_factory_with_bundle_resources(
-    ) -> (tempfile::TempDir, RuntimeTranscriptionFactory, std::path::PathBuf) {
+    fn build_factory_with_bundle_resources() -> (
+        tempfile::TempDir,
+        RuntimeTranscriptionFactory,
+        std::path::PathBuf,
+    ) {
         let temp = tempdir().expect("failed to create tempdir");
         let resources_dir = temp.path().join("resources");
         let factory =
@@ -2358,14 +2364,15 @@ mod tests {
             .expect("status should be written");
         assert_eq!(status.reason_code, "ok");
 
-        assert!(
-            factory
-                .managed_pyannote_python_dir()
-                .join("bin")
-                .join("python3")
-                .is_file()
-        );
-        assert!(factory.managed_pyannote_model_dir().join("config.yaml").is_file());
+        assert!(factory
+            .managed_pyannote_python_dir()
+            .join("bin")
+            .join("python3")
+            .is_file());
+        assert!(factory
+            .managed_pyannote_model_dir()
+            .join("config.yaml")
+            .is_file());
     }
 
     #[test]
@@ -2397,23 +2404,19 @@ mod tests {
         .expect("nested libpython parent should exist");
         std::fs::write(&nested_libpython, "fake-libpython").expect("nested libpython should write");
 
-        assert!(
-            !factory
-                .managed_pyannote_python_dir()
-                .join("lib")
-                .join("libpython3.11.dylib")
-                .exists()
-        );
+        assert!(!factory
+            .managed_pyannote_python_dir()
+            .join("lib")
+            .join("libpython3.11.dylib")
+            .exists());
 
         let _ = factory.managed_pyannote_python_path();
 
-        assert!(
-            factory
-                .managed_pyannote_python_dir()
-                .join("lib")
-                .join("libpython3.11.dylib")
-                .is_file()
-        );
+        assert!(factory
+            .managed_pyannote_python_dir()
+            .join("lib")
+            .join("libpython3.11.dylib")
+            .is_file());
     }
 
     #[test]

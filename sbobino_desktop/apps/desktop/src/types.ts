@@ -352,7 +352,7 @@ export type WriteTrimmedAudioResponse = {
   file_size_bytes: number;
 };
 
-export type RealtimeDeltaKind = "append_final" | "update_preview";
+export type RealtimeDeltaKind = "append_final" | "replace_final" | "update_preview";
 
 export type RealtimeDelta = {
   kind: RealtimeDeltaKind;

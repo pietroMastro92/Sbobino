@@ -6,7 +6,9 @@ use std::path::Path;
 use chrono::Utc;
 use docx_rs::{Docx, Paragraph, Run};
 use futures_util::stream::{self, StreamExt};
-use printpdf::{ops::PdfPage, text::TextItem, units::Pt, BuiltinFont, Color, Mm, Op, PdfDocument, Rgb};
+use printpdf::{
+    ops::PdfPage, text::TextItem, units::Pt, BuiltinFont, Color, Mm, Op, PdfDocument, Rgb,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::State;
@@ -29,14 +31,7 @@ use crate::{
 
 const MIN_TRIMMED_AUDIO_DURATION_SECONDS: f64 = 1.5;
 const SPEAKER_COLOR_PALETTE: &[&str] = &[
-    "#4F7CFF",
-    "#EC6A5E",
-    "#27A376",
-    "#B06BF2",
-    "#D88B15",
-    "#1293A5",
-    "#E255A1",
-    "#6C7A2D",
+    "#4F7CFF", "#EC6A5E", "#27A376", "#B06BF2", "#D88B15", "#1293A5", "#E255A1", "#6C7A2D",
 ];
 
 fn default_true() -> bool {
@@ -635,7 +630,9 @@ pub async fn export_artifact(
             &segments,
             &export_content,
         )?,
-        ExportFormat::Csv => export_csv(destination_path, &segments, options.include_speaker_names)?,
+        ExportFormat::Csv => {
+            export_csv(destination_path, &segments, options.include_speaker_names)?
+        }
         ExportFormat::Md => {
             let content = if style == ExportStyle::Subtitles {
                 build_markdown_subtitles_content(
@@ -651,7 +648,11 @@ pub async fn export_artifact(
         ExportFormat::Srt => export_txt(destination_path, &export_content)?,
         ExportFormat::Vtt => export_txt(
             destination_path,
-            &build_vtt_content(&segments, &base_transcription, options.include_speaker_names),
+            &build_vtt_content(
+                &segments,
+                &base_transcription,
+                options.include_speaker_names,
+            ),
         )?,
     }
 
@@ -927,8 +928,8 @@ fn parse_timeline_context_segments(artifact: &TranscriptArtifact) -> Vec<Timelin
 
             let time_label = resolve_timeline_segment_seconds(&segment).map(format_mm_ss);
             let speaker_id = normalize_optional_text(segment.speaker_id);
-            let speaker_label = normalize_optional_text(segment.speaker_label)
-                .or_else(|| speaker_id.clone());
+            let speaker_label =
+                normalize_optional_text(segment.speaker_label).or_else(|| speaker_id.clone());
 
             Some(TimelineContextSegment {
                 text: text.to_string(),
@@ -2031,7 +2032,13 @@ fn normalize_speaker_color_key(value: impl AsRef<str>) -> String {
         .trim()
         .to_ascii_lowercase()
         .chars()
-        .map(|character| if character.is_ascii_alphanumeric() { character } else { '_' })
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
         .collect::<String>();
 
     let normalized = candidate.trim_matches('_').to_string();
@@ -2058,9 +2065,9 @@ fn sanitize_speaker_color_value(value: impl AsRef<str>) -> Option<String> {
 }
 
 fn default_speaker_color_for_key(key: &str) -> String {
-    let hash = key
-        .bytes()
-        .fold(0_u64, |accumulator, value| accumulator.wrapping_mul(31).wrapping_add(value as u64));
+    let hash = key.bytes().fold(0_u64, |accumulator, value| {
+        accumulator.wrapping_mul(31).wrapping_add(value as u64)
+    });
     SPEAKER_COLOR_PALETTE[(hash as usize) % SPEAKER_COLOR_PALETTE.len()].to_string()
 }
 
@@ -2768,7 +2775,13 @@ fn build_markdown_subtitles_content(
 
     segments
         .iter()
-        .map(|segment| format!("{}\n{}", render_export_segment_line(segment, include_speaker_names), segment.time))
+        .map(|segment| {
+            format!(
+                "{}\n{}",
+                render_export_segment_line(segment, include_speaker_names),
+                segment.time
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -3236,7 +3249,10 @@ mod tests {
             .styled_lines
             .as_ref()
             .expect("primary section should expose styled lines");
-        assert_eq!(styled_lines[0].text, "[00:12] Alice: Alice opens the meeting.");
+        assert_eq!(
+            styled_lines[0].text,
+            "[00:12] Alice: Alice opens the meeting."
+        );
         assert_eq!(styled_lines[0].speaker_color.as_deref(), Some("#123456"));
         assert!(styled_lines[1]
             .speaker_color

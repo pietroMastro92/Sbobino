@@ -245,11 +245,17 @@ export async function resumeRealtime(): Promise<void> {
   return invoke<void>("resume_realtime");
 }
 
-export async function stopRealtime(save = true): Promise<{
+export async function stopRealtime(save = true, title?: string, elapsedSeconds?: number): Promise<{
   saved: boolean;
   artifact: TranscriptArtifact | null;
 }> {
-  return invoke("stop_realtime", { payload: { save } });
+  return invoke("stop_realtime", {
+    payload: {
+      save,
+      title,
+      elapsed_seconds: elapsedSeconds ?? null,
+    },
+  });
 }
 
 export async function listRealtimeSessions(): Promise<TranscriptArtifact[]> {
