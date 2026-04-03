@@ -90,12 +90,15 @@ jobs:
           JSON
 
       - name: Notarize and staple macOS DMG
-        if: ${{ secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          if [[ -z "$APPLE_ID" || -z "$APPLE_PASSWORD" || -z "$APPLE_TEAM_ID" ]]; then
+            echo "Apple notarization secrets are not configured; skipping notarization."
+            exit 0
+          fi
           shopt -s nullglob
           for dmg in src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg; do
             xcrun notarytool submit "$dmg" \
