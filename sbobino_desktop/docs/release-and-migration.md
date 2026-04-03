@@ -9,16 +9,12 @@
 
 ### Release (`.github/workflows/release.yml`)
 - Trigger: git tag `v*` (example `v0.3.1`).
-- Build matrix:
+- First public release target:
   - `macos-14` -> `aarch64-apple-darwin` (DMG + APP).
-  - `macos-13` -> `x86_64-apple-darwin` (DMG + APP).
-  - `windows-latest` -> `x86_64-pc-windows-msvc` (NSIS + MSI).
-  - `ubuntu-22.04` -> `x86_64-unknown-linux-gnu` (AppImage + DEB, optional distribution target).
 - Produces updater artifacts/signatures (`createUpdaterArtifacts: true` in `tauri.conf.json`).
 - Publishes all generated bundle assets to the GitHub Release for that tag.
 - Must also publish pyannote provisioning assets for the same tag:
   - `pyannote-runtime-macos-aarch64.zip`
-  - `pyannote-runtime-macos-x86_64.zip`
   - `pyannote-model-community-1.zip`
   - `pyannote-manifest.json`
 
@@ -33,32 +29,37 @@
 - `APPLE_ID`
 - `APPLE_PASSWORD`
 - `APPLE_TEAM_ID`
+- `TAURI_UPDATER_PUBLIC_KEY`
 
 ### macOS
 - Build signed bundles in CI.
 - Submit DMG to Apple Notary Service with `xcrun notarytool`.
 - Staple notarization ticket with `xcrun stapler`.
+- Inject the updater public key in CI before `tauri build`:
+  - `./scripts/prepare_release_updater_config.sh apps/desktop/src-tauri/tauri.conf.json "$TAURI_UPDATER_PUBLIC_KEY"`
 - Before `tauri build`, hydrate the bundled pyannote resources on the macOS build machine:
   - `./scripts/setup_bundled_pyannote.sh --force`
   - this populates `apps/desktop/src-tauri/resources/pyannote/model` and `apps/desktop/src-tauri/resources/pyannote/python/<target-triple>`
   - the packaged app then ships pyannote offline and auto-installs it on first launch without asking the end user to download anything
 - Build pyannote release assets before publishing the tag:
-  - `./scripts/package_pyannote_release_assets.sh <version> <runtime_aarch64_dir> <runtime_x86_64_dir> <model_dir> <output_dir>`
-  - Upload the generated zips and manifest to the same GitHub Release as the app bundles.
+  - `./scripts/package_pyannote_asset.sh <runtime_aarch64_dir> python <output_zip>`
+  - `./scripts/package_pyannote_asset.sh <model_dir> model <output_zip>`
+  - generate `pyannote-manifest.json` with checksums for the same GitHub Release as the app bundles.
 
 ### Windows
-- Bundle MSI + NSIS by default.
-- Optionally add EV cert signing in a follow-up hardening pass (preferred for SmartScreen reputation).
+- Out of scope for the initial public release.
 
 ## Auto-Updates
 
 - `tauri.conf.json` enables updater artifact generation.
-- Updater plugin config is scaffolded and intentionally disabled until production key material is provisioned.
-- Before enabling:
-  1. Generate updater keypair.
-  2. Set real `pubkey` and release endpoint URL.
-  3. Flip `"plugins.updater.active"` to `true`.
-  4. Add frontend update UX (silent check + user-approved install).
+- Updater plugin config is enabled and points to:
+  - `https://github.com/pietroMastro92/sbobino_tauri/releases/latest/download/latest.json`
+- The repository version of `tauri.conf.json` intentionally keeps a placeholder `pubkey`; CI injects the real public key during release builds.
+- The frontend performs:
+  1. silent update check on startup when enabled;
+  2. manual "Check Updates" action in settings;
+  3. in-app install when Tauri updater returns an installable update;
+  4. manual GitHub download fallback if native updater is unavailable.
 
 ## Semantic Versioning Strategy
 
@@ -79,7 +80,7 @@
 5. Migrate live transcription and recorder controls with a process/session manager abstraction.
 6. Migrate model management (download, validation, checksum, upgrades).
 7. Migrate advanced post-processing prompts and language variants.
-8. Enable updater flow only after signed release pipeline is validated in staging.
+8. Validate updater flow by shipping `v0.1.0`, then publish `v0.1.1` and verify in-app update from the notarized arm64 release.
 9. Run side-by-side comparison runs between Python and Tauri app outputs for confidence.
 10. Cut over when parity checklist is green and error telemetry is stable.
 

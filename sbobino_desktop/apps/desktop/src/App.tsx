@@ -157,6 +157,7 @@ import type {
   PromptTemplate,
   ProvisioningProgressEvent,
   ProvisioningModelCatalogEntry,
+  ProvisioningStatus,
   RealtimeDelta,
   RemoteServiceConfig,
   RemoteServiceKind,
@@ -191,6 +192,10 @@ import {
   supportedAppLanguages,
   type AppLanguage,
 } from "./i18n";
+import {
+  PRIVACY_POLICY_SUMMARY,
+  PRIVACY_POLICY_VERSION,
+} from "./legal/privacyPolicy";
 import { shouldStartWindowDrag } from "./lib/windowDrag";
 import {
   aiActionsAvailable,
@@ -233,6 +238,11 @@ type Section =
 type DetailMode = "transcript" | "segments" | "summary" | "emotion" | "chat";
 type TranscriptViewMode = "optimized" | "original";
 type InspectorMode = "details" | "info";
+type StartupRequirementsSnapshot = {
+  provisioningStatus: ProvisioningStatus;
+  modelCatalog: ProvisioningModelCatalogEntry[];
+  runtimeHealth: RuntimeHealth;
+};
 type SettingsPane =
   | "general"
   | "transcription"
@@ -253,6 +263,39 @@ const SETTINGS_PANES: SettingsPane[] = [
   "prompts",
   "advanced",
 ];
+const INITIAL_SETUP_REQUIRED_MODELS: SpeechModel[] = ["base", "large_turbo"];
+
+function hasAcceptedCurrentPrivacyPolicy(settings: AppSettings | null | undefined): boolean {
+  return settings?.general.privacy_policy_version_accepted === PRIVACY_POLICY_VERSION;
+}
+
+function isProvisionedModelReady(
+  entry: ProvisioningModelCatalogEntry | undefined,
+  requireCoreml: boolean,
+): boolean {
+  if (!entry?.installed) {
+    return false;
+  }
+  if (!requireCoreml) {
+    return true;
+  }
+  return entry.coreml_installed;
+}
+
+function findProvisioningModelEntry(
+  modelCatalog: ProvisioningModelCatalogEntry[],
+  model: SpeechModel,
+): ProvisioningModelCatalogEntry | undefined {
+  return modelCatalog.find((entry) => entry.key === model);
+}
+
+function getInitialSetupMissingModels(
+  modelCatalog: ProvisioningModelCatalogEntry[],
+  requireCoreml: boolean,
+): SpeechModel[] {
+  return INITIAL_SETUP_REQUIRED_MODELS.filter((model) =>
+    !isProvisionedModelReady(findProvisioningModelEntry(modelCatalog, model), requireCoreml));
+}
 
 function parseStandaloneSettingsPaneFromLocation(): SettingsPane {
   const pane = new URLSearchParams(window.location.search).get("pane");
@@ -1469,6 +1512,8 @@ function normalizeSettings(settings: AppSettings): AppSettings {
     ...settings,
     general: {
       ...settings.general,
+      privacy_policy_version_accepted: settings.general?.privacy_policy_version_accepted ?? null,
+      privacy_policy_accepted_at: settings.general?.privacy_policy_accepted_at ?? null,
       appearance_mode: settings.general?.appearance_mode ?? "system",
     },
     transcription: {
@@ -2158,6 +2203,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     progress: null,
     statusMessage: "",
   });
+  const [startupRequirementsLoaded, setStartupRequirementsLoaded] = useState(standaloneSettingsWindow);
+  const [startupRequirementsError, setStartupRequirementsError] = useState<string | null>(null);
+  const [initialSetupRunning, setInitialSetupRunning] = useState(false);
+  const [initialSetupError, setInitialSetupError] = useState<string | null>(null);
+  const [initialSetupStepLabel, setInitialSetupStepLabel] = useState<string | null>(null);
+  const [acceptingPrivacyPolicy, setAcceptingPrivacyPolicy] = useState(false);
 
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResponse | null>(null);
   const [nativeUpdate, setNativeUpdate] = useState<TauriUpdate | null>(null);
@@ -2217,6 +2268,15 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const segmentElementMapRef = useRef<Map<number, HTMLElement>>(new Map());
   const windowFrameRef = useRef<HTMLElement | null>(null);
   const detailLayoutRef = useRef<HTMLDivElement | null>(null);
+  const autoInitialSetupAttemptedRef = useRef(false);
+
+  const privacyPolicyAccepted = hasAcceptedCurrentPrivacyPolicy(settings);
+  const runtimeToolchainReady = runtimeHealth?.whisper_cli_available === true
+    && runtimeHealth?.whisper_stream_available === true;
+  const pyannoteReady = runtimeHealth?.pyannote.ready ?? false;
+  const missingInitialSetupModels = getInitialSetupMissingModels(modelCatalog, platformIsAppleSilicon);
+  const initialSetupModelsReady = missingInitialSetupModels.length === 0;
+  const initialSetupReady = runtimeToolchainReady && pyannoteReady && initialSetupModelsReady;
 
   const describeEmotionValence = useCallback((score: number): string => {
     if (score >= 0.35) {
@@ -2851,6 +2911,56 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       cancelled = true;
     };
   }, [settings]);
+
+  useEffect(() => {
+    if (!settings || standaloneSettingsWindow) {
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        await loadStartupRequirements();
+      } catch (startupError) {
+        if (!cancelled) {
+          setStartupRequirementsLoaded(false);
+          setStartupRequirementsError(
+            formatUiError(
+              "error.startupRequirementsFailed",
+              "Could not prepare local runtime requirements",
+              startupError,
+            ),
+          );
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [settings, standaloneSettingsWindow]);
+
+  useEffect(() => {
+    if (standaloneSettingsWindow || !settings || !privacyPolicyAccepted) {
+      return;
+    }
+    if (!startupRequirementsLoaded || initialSetupRunning || initialSetupReady) {
+      return;
+    }
+    if (autoInitialSetupAttemptedRef.current) {
+      return;
+    }
+
+    autoInitialSetupAttemptedRef.current = true;
+    void beginInitialSetup();
+  }, [
+    initialSetupReady,
+    initialSetupRunning,
+    privacyPolicyAccepted,
+    settings,
+    standaloneSettingsWindow,
+    startupRequirementsLoaded,
+  ]);
 
   useEffect(() => {
     const localizedDefaultInput = getDefaultPromptTestInput();
@@ -4402,6 +4512,154 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
       setRuntimeHealth(health);
     } catch (modelsError) {
       setError(formatUiError("error.readModelsCatalog", "Could not read models catalog", modelsError));
+    }
+  }
+
+  async function loadStartupRequirements(): Promise<StartupRequirementsSnapshot> {
+    const [status, models, health] = await Promise.all([
+      provisioningStatus(),
+      provisioningModels(),
+      fetchRuntimeHealth(),
+    ]);
+
+    setProvisioningState(status);
+    setModelCatalog(models);
+    setRuntimeHealth(health);
+    setStartupRequirementsLoaded(true);
+    setStartupRequirementsError(null);
+
+    return {
+      provisioningStatus: status,
+      modelCatalog: models,
+      runtimeHealth: health,
+    };
+  }
+
+  async function waitForProvisioningRun(
+    starter: () => Promise<{ started: boolean }>,
+  ): Promise<void> {
+    let unlisten: (() => void) | undefined;
+
+    try {
+      const completion = new Promise<void>((resolve, reject) => {
+        void (async () => {
+          unlisten = await subscribeProvisioningStatus((event) => {
+            if (event.state === "completed") {
+              resolve();
+              return;
+            }
+
+            if (event.state === "cancelled") {
+              reject(new Error(event.message || t("provisioning.cancelled", "Provisioning cancelled")));
+              return;
+            }
+
+            if (event.state === "error") {
+              reject(new Error(event.message || t("error.provisioningFailed", "Provisioning failed")));
+            }
+          });
+
+          const result = await starter();
+          if (!result.started) {
+            resolve();
+          }
+        })().catch(reject);
+      });
+
+      await completion;
+    } finally {
+      unlisten?.();
+      await loadStartupRequirements();
+    }
+  }
+
+  async function acceptPrivacyPolicy(): Promise<void> {
+    if (!settings) {
+      return;
+    }
+
+    setAcceptingPrivacyPolicy(true);
+    try {
+      await patchSettings((current) => ({
+        ...current,
+        general: {
+          ...current.general,
+          privacy_policy_version_accepted: PRIVACY_POLICY_VERSION,
+          privacy_policy_accepted_at: new Date().toISOString(),
+        },
+      }));
+      autoInitialSetupAttemptedRef.current = false;
+    } finally {
+      setAcceptingPrivacyPolicy(false);
+    }
+  }
+
+  async function beginInitialSetup(): Promise<void> {
+    setInitialSetupRunning(true);
+    setInitialSetupError(null);
+    setInitialSetupStepLabel(null);
+    setStartupRequirementsError(null);
+
+    try {
+      let snapshot = await loadStartupRequirements();
+
+      if (
+        !snapshot.runtimeHealth.whisper_cli_available
+        || !snapshot.runtimeHealth.whisper_stream_available
+      ) {
+        throw new Error(formatRuntimeNotReadyMessage());
+      }
+
+      if (!snapshot.runtimeHealth.pyannote.ready) {
+        setInitialSetupStepLabel(
+          t("setup.firstLaunch.preparingPyannote", "Preparing bundled diarization runtime..."),
+        );
+        await waitForProvisioningRun(() => provisioningInstallPyannote(false));
+        snapshot = await loadStartupRequirements();
+      }
+
+      for (const model of INITIAL_SETUP_REQUIRED_MODELS) {
+        const entry = findProvisioningModelEntry(snapshot.modelCatalog, model);
+        if (isProvisionedModelReady(entry, snapshot.runtimeHealth.is_apple_silicon)) {
+          continue;
+        }
+
+        setInitialSetupStepLabel(
+          t("setup.firstLaunch.downloadingModel", "Downloading {model}...", {
+            model: entry?.label ?? model,
+          }),
+        );
+        await waitForProvisioningRun(() =>
+          provisioningDownloadModel({
+            model,
+            include_coreml: snapshot.runtimeHealth.is_apple_silicon,
+          }));
+        snapshot = await loadStartupRequirements();
+      }
+
+      if (
+        !snapshot.runtimeHealth.pyannote.ready
+        || getInitialSetupMissingModels(snapshot.modelCatalog, snapshot.runtimeHealth.is_apple_silicon).length > 0
+      ) {
+        throw new Error(
+          t(
+            "setup.firstLaunch.assetsStillMissing",
+            "Initial setup did not complete correctly. Please try again.",
+          ),
+        );
+      }
+
+      setInitialSetupStepLabel(null);
+    } catch (setupError) {
+      setInitialSetupError(
+        formatUiError(
+          "error.firstLaunchSetupFailed",
+          "Initial setup failed",
+          setupError,
+        ),
+      );
+    } finally {
+      setInitialSetupRunning(false);
     }
   }
 
@@ -10272,6 +10530,141 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     return renderDetail();
   }
 
+  function renderStartupGate(): JSX.Element {
+    const bootstrapMessage = provisioning.progress
+      ? `${formatProvisioningAssetLabel(provisioning.progress)} (${provisioning.progress.current}/${provisioning.progress.total})`
+      : provisioning.statusMessage;
+    const blockingError = startupRequirementsError ?? initialSetupError ?? (!settings ? error : null);
+    const requiresPrivacyAcceptance = !settings || !privacyPolicyAccepted;
+    const loadingSettings = !settings && !blockingError;
+    const loadingDiagnostics = settings && privacyPolicyAccepted && !startupRequirementsLoaded && !blockingError;
+    const setupPending = settings && privacyPolicyAccepted && startupRequirementsLoaded && !initialSetupReady;
+
+    return (
+      <main className="startup-shell">
+        <section className="startup-card">
+          <div className="startup-card-head">
+            <span className="startup-kicker">{t("setup.firstLaunch.kicker", "First launch setup")}</span>
+            <h1>{t("setup.firstLaunch.title", "Sbobino is preparing your Mac")}</h1>
+            <p>
+              {requiresPrivacyAcceptance
+                ? t(
+                  "setup.firstLaunch.privacyIntro",
+                  "Review and accept the privacy terms before using the app.",
+                )
+                : t(
+                  "setup.firstLaunch.runtimeIntro",
+                  "Sbobino is finishing the local setup required to run completely on your Mac.",
+                )}
+            </p>
+          </div>
+
+          {requiresPrivacyAcceptance && settings ? (
+            <>
+              <div className="startup-policy-panel">
+                <div className="startup-policy-version">
+                  {t("setup.firstLaunch.policyVersion", "Policy version {version}", {
+                    version: PRIVACY_POLICY_VERSION,
+                  })}
+                </div>
+                <ul className="startup-policy-list">
+                  {PRIVACY_POLICY_SUMMARY.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+              <div className="startup-actions">
+                <button
+                  className="primary-button"
+                  onClick={() => void acceptPrivacyPolicy()}
+                  disabled={acceptingPrivacyPolicy}
+                >
+                  {acceptingPrivacyPolicy
+                    ? t("setup.firstLaunch.accepting", "Saving...")
+                    : t("setup.firstLaunch.accept", "Accept and continue")}
+                </button>
+              </div>
+            </>
+          ) : null}
+
+          {loadingSettings ? (
+            <div className="startup-status-card">
+              <LoadingAnimation />
+              <div>
+                <strong>{t("setup.firstLaunch.loadingSettings", "Loading Sbobino...")}</strong>
+                <p>{t("setup.firstLaunch.loadingSettingsDesc", "Preparing your local workspace and saved settings.")}</p>
+              </div>
+            </div>
+          ) : null}
+
+          {loadingDiagnostics ? (
+            <div className="startup-status-card">
+              <LoadingAnimation />
+              <div>
+                <strong>{t("setup.firstLaunch.inspecting", "Inspecting local runtime...")}</strong>
+                <p>{t("setup.firstLaunch.inspectingDesc", "Checking bundled tools and local prerequisites.")}</p>
+              </div>
+            </div>
+          ) : null}
+
+          {setupPending ? (
+            <div className="startup-status-card">
+              <ProgressRing percentage={provisioning.progress?.percentage ?? 8} size={28} />
+              <div>
+                <strong>{initialSetupStepLabel ?? t("setup.firstLaunch.downloading", "Downloading local models...")}</strong>
+                <p>{bootstrapMessage || t("setup.firstLaunch.downloadingDesc", "This can take a few minutes the first time.")}</p>
+              </div>
+            </div>
+          ) : null}
+
+          {blockingError ? (
+            <div className="startup-error-card">
+              <strong>{t("setup.firstLaunch.setupError", "Setup could not finish")}</strong>
+              <p>{blockingError}</p>
+            </div>
+          ) : null}
+
+          {!requiresPrivacyAcceptance && (blockingError || setupPending) ? (
+            <div className="startup-actions">
+              <button
+                className="primary-button"
+                onClick={() => {
+                  if (!startupRequirementsLoaded) {
+                    void loadStartupRequirements().catch((error) => {
+                      setStartupRequirementsLoaded(false);
+                      setStartupRequirementsError(
+                        formatUiError(
+                          "error.startupRequirementsFailed",
+                          "Could not prepare local runtime requirements",
+                          error,
+                        ),
+                      );
+                    });
+                    return;
+                  }
+                  autoInitialSetupAttemptedRef.current = true;
+                  void beginInitialSetup();
+                }}
+                disabled={initialSetupRunning}
+              >
+                {initialSetupRunning
+                  ? t("setup.firstLaunch.retrying", "Working...")
+                  : t("setup.firstLaunch.retry", "Retry setup")}
+              </button>
+              <button
+                className="secondary-button"
+                onClick={() => void onOpenStandaloneSettingsWindow("local_models")}
+                disabled={initialSetupRunning}
+              >
+                {t("action.openLocalModels", "Open Local Models")}
+              </button>
+            </div>
+          ) : null}
+        </section>
+      </main>
+    );
+  }
+
   if (standaloneSettingsWindow) {
     return (
       <main className="settings-window-shell">
@@ -10311,6 +10704,10 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         />
       </main>
     );
+  }
+
+  if (!settings || !privacyPolicyAccepted || !startupRequirementsLoaded || !initialSetupReady) {
+    return renderStartupGate();
   }
 
   return (

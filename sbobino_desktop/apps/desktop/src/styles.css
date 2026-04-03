@@ -7297,3 +7297,110 @@ body.sidebar-resizing {
   background: rgba(148, 137, 121, 0.3);
   color: rgba(223, 208, 184, 0.98);
 }
+
+.startup-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background:
+    radial-gradient(circle at top, rgba(161, 182, 255, 0.18), transparent 34%),
+    linear-gradient(180deg, rgba(248, 247, 243, 0.98), rgba(238, 233, 224, 0.98));
+}
+
+.startup-card {
+  width: min(720px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 28px;
+  border-radius: 26px;
+  background: rgba(255, 255, 255, 0.86);
+  border: 1px solid rgba(25, 30, 43, 0.08);
+  box-shadow: 0 22px 60px rgba(28, 35, 52, 0.12);
+}
+
+.startup-card-head {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.startup-card-head h1 {
+  margin: 0;
+  font-size: clamp(1.8rem, 3vw, 2.5rem);
+  line-height: 1.08;
+}
+
+.startup-card-head p,
+.startup-status-card p,
+.startup-error-card p {
+  margin: 0;
+  color: var(--text-soft);
+}
+
+.startup-kicker,
+.startup-policy-version {
+  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.startup-policy-panel,
+.startup-status-card,
+.startup-error-card {
+  border-radius: 18px;
+  border: 1px solid rgba(25, 30, 43, 0.08);
+  background: rgba(247, 244, 237, 0.9);
+  padding: 18px 20px;
+}
+
+.startup-policy-list {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.startup-status-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.startup-error-card {
+  background: rgba(255, 241, 236, 0.94);
+  border-color: rgba(215, 92, 37, 0.22);
+}
+
+.startup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+[data-theme="dark"] .startup-shell {
+  background:
+    radial-gradient(circle at top, rgba(100, 138, 255, 0.18), transparent 34%),
+    linear-gradient(180deg, rgba(19, 22, 29, 0.98), rgba(14, 16, 22, 0.98));
+}
+
+[data-theme="dark"] .startup-card {
+  background: rgba(27, 30, 39, 0.9);
+  border-color: rgba(214, 218, 230, 0.08);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.34);
+}
+
+[data-theme="dark"] .startup-policy-panel,
+[data-theme="dark"] .startup-status-card {
+  background: rgba(38, 42, 54, 0.92);
+  border-color: rgba(214, 218, 230, 0.08);
+}
+
+[data-theme="dark"] .startup-error-card {
+  background: rgba(92, 35, 25, 0.44);
+  border-color: rgba(255, 154, 118, 0.22);
+}

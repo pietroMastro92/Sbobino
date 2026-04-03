@@ -25,6 +25,8 @@ function createSettingsFixture(): AppSettings {
     general: {
       auto_update_enabled: true,
       auto_update_repo: "owner/repo",
+      privacy_policy_version_accepted: null,
+      privacy_policy_accepted_at: null,
       appearance_mode: "system",
       app_language: "it",
     },

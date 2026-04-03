@@ -21,6 +21,9 @@ async fn load_creates_default_settings_when_file_is_missing() {
     assert_eq!(settings.model, SpeechModel::Base);
     assert_eq!(settings.language, LanguageCode::Auto);
     assert!(!settings.ai_post_processing);
+    assert_eq!(settings.general.auto_update_repo, "pietroMastro92/sbobino_tauri");
+    assert!(settings.general.privacy_policy_version_accepted.is_none());
+    assert!(settings.general.privacy_policy_accepted_at.is_none());
 }
 
 #[tokio::test]
@@ -35,6 +38,8 @@ async fn save_then_load_round_trips_settings() {
     settings.language = LanguageCode::Fr;
     settings.ai_post_processing = true;
     settings.gemini_model = "gemini-2.5-pro".to_string();
+    settings.general.privacy_policy_version_accepted = Some("2026-04-03".to_string());
+    settings.general.privacy_policy_accepted_at = Some("2026-04-03T12:00:00Z".to_string());
 
     repo.save(&settings).await.expect("save should succeed");
     let loaded = repo.load().await.expect("second load should succeed");
@@ -43,6 +48,14 @@ async fn save_then_load_round_trips_settings() {
     assert_eq!(loaded.language, LanguageCode::Fr);
     assert!(loaded.ai_post_processing);
     assert_eq!(loaded.gemini_model, "gemini-2.5-pro");
+    assert_eq!(
+        loaded.general.privacy_policy_version_accepted.as_deref(),
+        Some("2026-04-03")
+    );
+    assert_eq!(
+        loaded.general.privacy_policy_accepted_at.as_deref(),
+        Some("2026-04-03T12:00:00Z")
+    );
 }
 
 #[tokio::test]

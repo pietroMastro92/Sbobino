@@ -81,7 +81,7 @@ const MODEL_CATALOG: [(&str, &str, &str, &str, &str); 5] = [
 ];
 
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
-const RELEASE_REPOSITORY: &str = "pietroMastro92/sbobbino";
+const RELEASE_REPOSITORY: &str = "pietroMastro92/sbobino_tauri";
 const PYANNOTE_MANIFEST_ASSET: &str = "pyannote-manifest.json";
 const PYANNOTE_RUNTIME_AARCH64_ASSET: &str = "pyannote-runtime-macos-aarch64.zip";
 const PYANNOTE_RUNTIME_X86_64_ASSET: &str = "pyannote-runtime-macos-x86_64.zip";

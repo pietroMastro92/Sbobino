@@ -156,6 +156,8 @@ pub struct PromptTemplate {
 pub struct GeneralSettings {
     pub auto_update_enabled: bool,
     pub auto_update_repo: String,
+    pub privacy_policy_version_accepted: Option<String>,
+    pub privacy_policy_accepted_at: Option<String>,
     pub appearance_mode: AppearanceMode,
     pub app_language: AppLanguage,
 }
@@ -164,7 +166,9 @@ impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
             auto_update_enabled: true,
-            auto_update_repo: "pietroMastro92/sbobbino".to_string(),
+            auto_update_repo: "pietroMastro92/sbobino_tauri".to_string(),
+            privacy_policy_version_accepted: None,
+            privacy_policy_accepted_at: None,
             appearance_mode: AppearanceMode::System,
             app_language: AppLanguage::En,
         }

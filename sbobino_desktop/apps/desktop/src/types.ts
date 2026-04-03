@@ -42,6 +42,8 @@ export type PromptTask = "optimize" | "summary" | "faq" | "emotion_analysis";
 export type GeneralSettings = {
   auto_update_enabled: boolean;
   auto_update_repo: string;
+  privacy_policy_version_accepted: string | null;
+  privacy_policy_accepted_at: string | null;
   appearance_mode: AppearanceMode;
   app_language: AppLanguage;
 };

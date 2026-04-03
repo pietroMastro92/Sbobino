@@ -197,12 +197,18 @@ fn should_treat_legacy_fields_as_source(settings: &AppSettings) -> bool {
         || settings.auto_update_repo != defaults.auto_update_repo;
 
     let sections_match_defaults = json!({
-        "general": &settings.general,
+        "general": {
+            "auto_update_enabled": settings.general.auto_update_enabled,
+            "auto_update_repo": &settings.general.auto_update_repo,
+        },
         "transcription": &settings.transcription,
         "ai": &settings.ai,
         "prompts": &settings.prompts,
     }) == json!({
-        "general": &defaults.general,
+        "general": {
+            "auto_update_enabled": defaults.general.auto_update_enabled,
+            "auto_update_repo": &defaults.general.auto_update_repo,
+        },
         "transcription": &defaults.transcription,
         "ai": &defaults.ai,
         "prompts": &defaults.prompts,
