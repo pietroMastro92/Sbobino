@@ -68,9 +68,9 @@ jobs:
         run: |
           APP_DIR=../../target/aarch64-apple-darwin/release/bundle/macos
           DMG_DIR=../../target/aarch64-apple-darwin/release/bundle/dmg
-          APP_NAME="Sbobino Desktop.app"
+          APP_NAME="Sbobino.app"
           VERSION="${GITHUB_REF_NAME#v}"
-          DMG_NAME="Sbobino Desktop_${VERSION}_aarch64.dmg"
+          DMG_NAME="Sbobino_${VERSION}_aarch64.dmg"
           STAGING_DIR=$(mktemp -d)
 
           mkdir -p "$DMG_DIR"
@@ -78,7 +78,7 @@ jobs:
           ln -s /Applications "$STAGING_DIR/Applications"
 
           hdiutil create \
-            -volname "Sbobino Desktop" \
+            -volname "Sbobino" \
             -srcfolder "$STAGING_DIR" \
             -ov \
             -format UDZO \
@@ -155,23 +155,23 @@ jobs:
 
       - name: Normalize release asset names
         run: |
-          if [[ -f "dist/macos/Sbobino Desktop.app.tar.gz" ]]; then
-            mv "dist/macos/Sbobino Desktop.app.tar.gz" "dist/macos/Sbobino.Desktop.app.tar.gz"
+          if [[ -f "dist/macos/Sbobino.app.tar.gz" ]]; then
+            mv "dist/macos/Sbobino.app.tar.gz" "dist/macos/Sbobino.app.tar.gz"
           fi
-          if [[ -f "dist/macos/Sbobino Desktop.app.tar.gz.sig" ]]; then
-            mv "dist/macos/Sbobino Desktop.app.tar.gz.sig" "dist/macos/Sbobino.Desktop.app.tar.gz.sig"
+          if [[ -f "dist/macos/Sbobino.app.tar.gz.sig" ]]; then
+            mv "dist/macos/Sbobino.app.tar.gz.sig" "dist/macos/Sbobino.app.tar.gz.sig"
           fi
-          if [[ -f "dist/dmg/Sbobino Desktop_${GITHUB_REF_NAME#v}_aarch64.dmg" ]]; then
-            mv "dist/dmg/Sbobino Desktop_${GITHUB_REF_NAME#v}_aarch64.dmg" "dist/dmg/Sbobino.Desktop_${GITHUB_REF_NAME#v}_aarch64.dmg"
+          if [[ -f "dist/dmg/Sbobino_${GITHUB_REF_NAME#v}_aarch64.dmg" ]]; then
+            mv "dist/dmg/Sbobino_${GITHUB_REF_NAME#v}_aarch64.dmg" "dist/dmg/Sbobino_${GITHUB_REF_NAME#v}_aarch64.dmg"
           fi
 
       - name: Prepare release notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           cat > release-notes.md <<EOF
-          ## Sbobino Desktop ${VERSION}
+          ## Sbobino ${VERSION}
 
-          Sbobino Desktop is the first public standalone release for macOS Apple Silicon.
+          Sbobino is the first public standalone release for macOS Apple Silicon.
 
           ### What is included
 
@@ -184,7 +184,7 @@ jobs:
           ### Download and installation
 
           - Download the \`.dmg\` file for the recommended macOS installation flow.
-          - Open the disk image and drag **Sbobino Desktop** into the **Applications** folder.
+          - Open the disk image and drag **Sbobino** into the **Applications** folder.
           - On first launch, accept the privacy terms and let the app complete the guided model setup.
 
           ### Important notes
@@ -198,9 +198,9 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          SIGNATURE=$(tr -d '\n' < "dist/macos/Sbobino.Desktop.app.tar.gz.sig")
+          SIGNATURE=$(tr -d '\n' < "dist/macos/Sbobino.app.tar.gz.sig")
           NOTES=$(cat release-notes.md)
-          URL="https://github.com/pietroMastro92/sbobino_tauri/releases/download/v${VERSION}/Sbobino.Desktop.app.tar.gz"
+          URL="https://github.com/pietroMastro92/sbobino_tauri/releases/download/v${VERSION}/Sbobino.app.tar.gz"
 
           jq -n \
             --arg version "$VERSION" \
@@ -228,9 +228,9 @@ jobs:
           body_path: release-notes.md
           generate_release_notes: false
           files: |
-            dist/dmg/Sbobino.Desktop_*.dmg
-            dist/macos/Sbobino.Desktop.app.tar.gz
-            dist/macos/Sbobino.Desktop.app.tar.gz.sig
+            dist/dmg/Sbobino_*.dmg
+            dist/macos/Sbobino.app.tar.gz
+            dist/macos/Sbobino.app.tar.gz.sig
             dist/pyannote-release/*.zip
             dist/pyannote-release/*.json
             latest.json

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Sbobino Desktop",
+  "productName": "Sbobino",
   "version": "0.1.0",
   "identifier": "com.sbobino.desktop",
   "build": {
@@ -13,7 +13,7 @@
     "macOSPrivateApi": true,
     "windows": [
       {
-        "title": "Sbobino Desktop",
+        "title": "Sbobino",
         "width": 1320,
         "height": 860,
         "minWidth": 560,
