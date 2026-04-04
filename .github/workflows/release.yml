@@ -64,6 +64,22 @@ jobs:
           fi
           npm run tauri:build -- --target aarch64-apple-darwin --bundles app
 
+      - name: Re-sign bundled app and updater artifact
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          APP_DIR=../../target/aarch64-apple-darwin/release/bundle/macos
+          APP_NAME="Sbobino.app"
+          APP_PATH="$APP_DIR/$APP_NAME"
+          UPDATER_TAR="$APP_DIR/Sbobino.app.tar.gz"
+          UPDATER_SIG="$UPDATER_TAR.sig"
+
+          codesign --force --deep --sign - "$APP_PATH"
+          rm -f "$UPDATER_TAR" "$UPDATER_SIG"
+          tar -czf "$UPDATER_TAR" -C "$APP_DIR" "$APP_NAME"
+          npx tauri signer sign "$UPDATER_TAR"
+
       - name: Create standalone macOS DMG
         run: |
           APP_DIR=../../target/aarch64-apple-darwin/release/bundle/macos
