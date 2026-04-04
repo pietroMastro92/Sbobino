@@ -153,6 +153,18 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Normalize release asset names
+        run: |
+          if [[ -f "dist/macos/Sbobino Desktop.app.tar.gz" ]]; then
+            mv "dist/macos/Sbobino Desktop.app.tar.gz" "dist/macos/Sbobino.Desktop.app.tar.gz"
+          fi
+          if [[ -f "dist/macos/Sbobino Desktop.app.tar.gz.sig" ]]; then
+            mv "dist/macos/Sbobino Desktop.app.tar.gz.sig" "dist/macos/Sbobino.Desktop.app.tar.gz.sig"
+          fi
+          if [[ -f "dist/dmg/Sbobino Desktop_${GITHUB_REF_NAME#v}_aarch64.dmg" ]]; then
+            mv "dist/dmg/Sbobino Desktop_${GITHUB_REF_NAME#v}_aarch64.dmg" "dist/dmg/Sbobino.Desktop_${GITHUB_REF_NAME#v}_aarch64.dmg"
+          fi
+
       - name: Prepare release notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -182,6 +194,32 @@ jobs:
           - The app stores local runtime assets on first use to complete the initial setup.
           EOF
 
+      - name: Generate updater feed
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          SIGNATURE=$(tr -d '\n' < "dist/macos/Sbobino.Desktop.app.tar.gz.sig")
+          NOTES=$(cat release-notes.md)
+          URL="https://github.com/pietroMastro92/sbobino_tauri/releases/download/v${VERSION}/Sbobino.Desktop.app.tar.gz"
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$NOTES" \
+            --arg pub_date "$PUB_DATE" \
+            --arg url "$URL" \
+            --arg signature "$SIGNATURE" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": {
+                  url: $url,
+                  signature: $signature
+                }
+              }
+            }' > latest.json
+
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
@@ -190,8 +228,9 @@ jobs:
           body_path: release-notes.md
           generate_release_notes: false
           files: |
-            dist/dmg/*.dmg
-            dist/macos/*.app.tar.gz
-            dist/macos/*.app.tar.gz.sig
+            dist/dmg/Sbobino.Desktop_*.dmg
+            dist/macos/Sbobino.Desktop.app.tar.gz
+            dist/macos/Sbobino.Desktop.app.tar.gz.sig
             dist/pyannote-release/*.zip
             dist/pyannote-release/*.json
+            latest.json
