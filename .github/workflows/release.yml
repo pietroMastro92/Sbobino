@@ -62,7 +62,27 @@ jobs:
             unset APPLE_CERTIFICATE_PASSWORD
             unset APPLE_SIGNING_IDENTITY
           fi
-          npm run tauri:build -- --target aarch64-apple-darwin --bundles dmg,app
+          npm run tauri:build -- --target aarch64-apple-darwin --bundles app
+
+      - name: Create standalone macOS DMG
+        run: |
+          APP_DIR=../../target/aarch64-apple-darwin/release/bundle/macos
+          DMG_DIR=../../target/aarch64-apple-darwin/release/bundle/dmg
+          APP_NAME="Sbobino Desktop.app"
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG_NAME="Sbobino Desktop_${VERSION}_aarch64.dmg"
+          STAGING_DIR=$(mktemp -d)
+
+          mkdir -p "$DMG_DIR"
+          cp -R "$APP_DIR/$APP_NAME" "$STAGING_DIR/"
+          ln -s /Applications "$STAGING_DIR/Applications"
+
+          hdiutil create \
+            -volname "Sbobino Desktop" \
+            -srcfolder "$STAGING_DIR" \
+            -ov \
+            -format UDZO \
+            "$DMG_DIR/$DMG_NAME"
 
       - name: Package pyannote repair assets
         run: |
