@@ -66,7 +66,7 @@ jobs:
 
       - name: Package pyannote repair assets
         run: |
-          ASSET_DIR=src-tauri/target/aarch64-apple-darwin/release/bundle/pyannote-release
+          ASSET_DIR=../../target/aarch64-apple-darwin/release/bundle/pyannote-release
           mkdir -p "$ASSET_DIR"
           ../../scripts/package_pyannote_asset.sh \
             src-tauri/resources/pyannote/python/aarch64-apple-darwin \
@@ -107,7 +107,7 @@ jobs:
             exit 0
           fi
           shopt -s nullglob
-          for dmg in src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg; do
+          for dmg in ../../target/aarch64-apple-darwin/release/bundle/dmg/*.dmg; do
             xcrun notarytool submit "$dmg" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_PASSWORD" \
@@ -121,7 +121,7 @@ jobs:
         with:
           name: sbobino-macos-arm64
           path: |
-            sbobino_desktop/apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/**
+            sbobino_desktop/target/aarch64-apple-darwin/release/bundle/**
 
   publish:
     needs: build
