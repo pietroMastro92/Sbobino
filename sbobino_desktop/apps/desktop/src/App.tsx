@@ -2281,9 +2281,11 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     && runtimeHealth?.whisper_cli_available === true
     && runtimeHealth?.whisper_stream_available === true;
   const pyannoteReady = runtimeHealth?.pyannote.ready ?? false;
+  const pyannoteRequired = runtimeHealth?.pyannote.enabled ?? false;
+  const initialSetupPyannoteReady = !pyannoteRequired || pyannoteReady;
   const missingInitialSetupModels = getInitialSetupMissingModels(modelCatalog, platformIsAppleSilicon);
   const initialSetupModelsReady = missingInitialSetupModels.length === 0;
-  const initialSetupReady = runtimeToolchainReady && pyannoteReady && initialSetupModelsReady;
+  const initialSetupReady = runtimeToolchainReady && initialSetupPyannoteReady && initialSetupModelsReady;
 
   const describeEmotionValence = useCallback((score: number): string => {
     if (score >= 0.35) {
@@ -4637,7 +4639,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         throw new Error(formatRuntimeNotReadyMessage());
       }
 
-      if (!snapshot.runtimeHealth.pyannote.ready) {
+      if (snapshot.runtimeHealth.pyannote.enabled && !snapshot.runtimeHealth.pyannote.ready) {
         setInitialSetupStepLabel(
           t("setup.firstLaunch.preparingPyannote", "Installing speaker diarization runtime..."),
         );
@@ -4664,10 +4666,17 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         snapshot = await loadStartupRequirements();
       }
 
-      if (
-        !snapshot.runtimeHealth.pyannote.ready
-        || getInitialSetupMissingModels(snapshot.modelCatalog, snapshot.runtimeHealth.is_apple_silicon).length > 0
-      ) {
+      if (snapshot.runtimeHealth.pyannote.enabled && !snapshot.runtimeHealth.pyannote.ready) {
+        throw new Error(
+          snapshot.runtimeHealth.pyannote.message
+          || t(
+            "setup.firstLaunch.assetsStillMissing",
+            "Initial setup did not complete correctly. Please try again.",
+          ),
+        );
+      }
+
+      if (getInitialSetupMissingModels(snapshot.modelCatalog, snapshot.runtimeHealth.is_apple_silicon).length > 0) {
         throw new Error(
           t(
             "setup.firstLaunch.assetsStillMissing",

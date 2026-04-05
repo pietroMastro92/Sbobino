@@ -1137,6 +1137,15 @@ impl RuntimeTranscriptionFactory {
         std::fs::create_dir_all(&runtime_dir)
             .map_err(|e| format!("failed to create pyannote runtime directory: {e}"))?;
 
+        let _ = self.managed_pyannote_python_path();
+        let repaired_runtime =
+            match repair_pyannote_python_launcher(&self.managed_pyannote_python_dir()) {
+                Ok(repaired) => repaired,
+                Err(error) => {
+                    warn!("failed to auto-repair pyannote launcher: {error}");
+                    false
+                }
+            };
         let runtime_path = self.managed_pyannote_python_path();
         let runtime_missing = runtime_path.is_none();
         let runtime_invalid = runtime_path
@@ -1154,16 +1163,19 @@ impl RuntimeTranscriptionFactory {
 
         if runtime_missing || runtime_invalid {
             if let Some(source) = self.find_bundled_pyannote_python_source() {
-                copy_directory_recursive(&source, &self.managed_pyannote_python_dir()).map_err(
-                    |e| {
-                        format!(
-                            "failed to install bundled pyannote runtime from '{}' to '{}': {e}",
-                            source.display(),
-                            self.managed_pyannote_python_dir().display()
-                        )
-                    },
-                )?;
-                copied_assets = true;
+                // Skip bundled overrides that still reference an external Python.framework.
+                // A stale or machine-specific bundled runtime must not overwrite a valid managed install.
+                if pyannote_external_framework_reference(&source).is_none() {
+                    copy_directory_recursive(&source, &self.managed_pyannote_python_dir())
+                        .map_err(|e| {
+                            format!(
+                                "failed to install bundled pyannote runtime from '{}' to '{}': {e}",
+                                source.display(),
+                                self.managed_pyannote_python_dir().display()
+                            )
+                        })?;
+                    copied_assets = true;
+                }
             }
         }
 
@@ -1186,7 +1198,15 @@ impl RuntimeTranscriptionFactory {
             && self.pyannote_runtime_validation_error().is_none();
         let model_ready = is_pyannote_model_dir(&self.managed_pyannote_model_dir());
         let manifest_missing = self.read_managed_pyannote_manifest().is_none();
-        let status_missing = self.read_managed_pyannote_status().is_none();
+        let status = self.read_managed_pyannote_status();
+        let status_missing = status.is_none();
+        let status_not_ok = status
+            .as_ref()
+            .map(|value| {
+                let code = value.reason_code.trim();
+                !code.is_empty() && code != "ok"
+            })
+            .unwrap_or(false);
 
         if runtime_ready && model_ready {
             let manifest = ManagedPyannoteManifest {
@@ -1203,7 +1223,7 @@ impl RuntimeTranscriptionFactory {
             if copied_assets || manifest_missing {
                 self.write_managed_pyannote_manifest(&manifest)?;
             }
-            if copied_assets || status_missing {
+            if copied_assets || repaired_runtime || status_missing || status_not_ok {
                 self.write_managed_pyannote_status("ok", "Bundled pyannote override is ready.")?;
             }
         } else if copied_assets || runtime_invalid {
@@ -2070,18 +2090,177 @@ fn parse_external_python_framework_reference(otool_output: &str) -> Option<Strin
     })
 }
 
-fn pyannote_external_framework_reference(runtime_root: &Path) -> Option<String> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-
-    let python_app = runtime_root
+fn pyannote_python_app_binary(runtime_root: &Path) -> PathBuf {
+    runtime_root
         .join("lib")
         .join("Resources")
         .join("Python.app")
         .join("Contents")
         .join("MacOS")
-        .join("Python");
+        .join("Python")
+}
+
+fn parse_pyannote_python_framework_version(reference: &str) -> Option<String> {
+    let marker = "/Python.framework/Versions/";
+    let start = reference.find(marker)? + marker.len();
+    let tail = &reference[start..];
+    let version = tail.split('/').next()?.trim();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
+}
+
+fn parse_otool_rpath_entries(otool_output: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut expect_path = false;
+
+    for line in otool_output.lines() {
+        let trimmed = line.trim();
+        if trimmed == "cmd LC_RPATH" {
+            expect_path = true;
+            continue;
+        }
+
+        if expect_path && trimmed.starts_with("path ") {
+            let path = trimmed
+                .trim_start_matches("path ")
+                .split(" (offset ")
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if !path.is_empty() {
+                result.push(path.to_string());
+            }
+            expect_path = false;
+            continue;
+        }
+
+        if trimmed.starts_with("cmd ") && trimmed != "cmd LC_RPATH" {
+            expect_path = false;
+        }
+    }
+
+    result
+}
+
+fn pyannote_python_app_rpaths(runtime_root: &Path) -> Option<Vec<String>> {
+    if !cfg!(target_os = "macos") {
+        return Some(Vec::new());
+    }
+
+    let python_app = pyannote_python_app_binary(runtime_root);
+    if !python_app.is_file() {
+        return Some(Vec::new());
+    }
+
+    let output = std::process::Command::new("/usr/bin/otool")
+        .arg("-l")
+        .arg(&python_app)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return Some(Vec::new());
+    }
+
+    Some(parse_otool_rpath_entries(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn repair_pyannote_python_launcher(runtime_root: &Path) -> Result<bool, String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(false);
+    }
+
+    let Some(reference) = pyannote_external_framework_reference(runtime_root) else {
+        return Ok(false);
+    };
+
+    let python_app = pyannote_python_app_binary(runtime_root);
+    if !python_app.is_file() {
+        return Ok(false);
+    }
+
+    let version = parse_pyannote_python_framework_version(&reference).ok_or_else(|| {
+        format!("failed to parse Python.framework version from dependency '{reference}'")
+    })?;
+    let libpython_name = format!("libpython{version}.dylib");
+    let embedded_libpython = runtime_root.join("lib").join(&libpython_name);
+    if !embedded_libpython.is_file() {
+        return Err(format!(
+            "pyannote launcher references external framework '{}' but '{}' is missing in '{}'",
+            reference,
+            libpython_name,
+            runtime_root.join("lib").display()
+        ));
+    }
+
+    let relocated_reference = format!("@rpath/{libpython_name}");
+    let change_output = std::process::Command::new("/usr/bin/install_name_tool")
+        .arg("-change")
+        .arg(&reference)
+        .arg(&relocated_reference)
+        .arg(&python_app)
+        .output()
+        .map_err(|e| format!("failed to run install_name_tool -change: {e}"))?;
+    if !change_output.status.success() {
+        return Err(format!(
+            "install_name_tool -change failed: {}",
+            String::from_utf8_lossy(&change_output.stderr).trim()
+        ));
+    }
+
+    let required_rpath = "@executable_path/../../../../";
+    let has_required_rpath = pyannote_python_app_rpaths(runtime_root)
+        .unwrap_or_default()
+        .iter()
+        .any(|entry| entry == required_rpath);
+    if !has_required_rpath {
+        let add_output = std::process::Command::new("/usr/bin/install_name_tool")
+            .arg("-add_rpath")
+            .arg(required_rpath)
+            .arg(&python_app)
+            .output()
+            .map_err(|e| format!("failed to run install_name_tool -add_rpath: {e}"))?;
+        if !add_output.status.success() {
+            let stderr = String::from_utf8_lossy(&add_output.stderr)
+                .trim()
+                .to_string();
+            if !stderr.contains("would duplicate path")
+                && !stderr.contains("already contains")
+                && !stderr.contains("already has LC_RPATH")
+            {
+                return Err(format!("install_name_tool -add_rpath failed: {stderr}"));
+            }
+        }
+    }
+
+    let sign_output = std::process::Command::new("/usr/bin/codesign")
+        .arg("--force")
+        .arg("--sign")
+        .arg("-")
+        .arg(&python_app)
+        .output()
+        .map_err(|e| format!("failed to run codesign for pyannote launcher: {e}"))?;
+    if !sign_output.status.success() {
+        return Err(format!(
+            "codesign failed for '{}': {}",
+            python_app.display(),
+            String::from_utf8_lossy(&sign_output.stderr).trim()
+        ));
+    }
+
+    Ok(true)
+}
+
+fn pyannote_external_framework_reference(runtime_root: &Path) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+
+    let python_app = pyannote_python_app_binary(runtime_root);
     if !python_app.is_file() {
         return None;
     }
@@ -2242,9 +2421,9 @@ fn expand_home(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_external_python_framework_reference, target_triple_suffix, ManagedPyannoteManifest,
-        RuntimeTranscriptionFactory,
-        PYANNOTE_STATUS_FILENAME,
+        parse_external_python_framework_reference, parse_otool_rpath_entries,
+        parse_pyannote_python_framework_version, target_triple_suffix, ManagedPyannoteManifest,
+        RuntimeTranscriptionFactory, PYANNOTE_STATUS_FILENAME,
     };
     use sbobino_domain::{AiProvider, AppSettings, RemoteServiceConfig, RemoteServiceKind};
     use tempfile::tempdir;
@@ -2386,6 +2565,53 @@ mod tests {
             .expect("runtime health should load");
         assert!(health.pyannote.ready);
         assert_eq!(health.pyannote.reason_code, "ok");
+    }
+
+    #[test]
+    fn runtime_health_self_heals_stale_install_incomplete_status_when_runtime_is_ready() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "abc".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "def".to_string(),
+                runtime_arch: super::target_triple_suffix().to_string(),
+                installed_at: "2026-03-13T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status(
+                "pyannote_install_incomplete",
+                "stale status from previous setup run",
+            )
+            .expect("status should write");
+
+        let health = factory
+            .runtime_health()
+            .expect("runtime health should load");
+        assert!(health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "ok");
+
+        let status = factory
+            .read_managed_pyannote_status()
+            .expect("status should still be present");
+        assert_eq!(status.reason_code, "ok");
     }
 
     #[test]
@@ -2660,5 +2886,32 @@ mod tests {
 "#;
 
         assert!(parse_external_python_framework_reference(output).is_none());
+    }
+
+    #[test]
+    fn parse_pyannote_python_framework_version_extracts_expected_version() {
+        let reference = "/Library/Frameworks/Python.framework/Versions/3.11/Python";
+        assert_eq!(
+            parse_pyannote_python_framework_version(reference).as_deref(),
+            Some("3.11")
+        );
+    }
+
+    #[test]
+    fn parse_otool_rpath_entries_extracts_lc_rpath_paths() {
+        let output = r#"
+/tmp/Python:
+Load command 13
+          cmd LC_RPATH
+      cmdsize 32
+         path @executable_path/../../../../ (offset 12)
+Load command 14
+          cmd LC_RPATH
+      cmdsize 32
+         path /usr/lib (offset 12)
+"#;
+
+        let entries = parse_otool_rpath_entries(output);
+        assert_eq!(entries, vec!["@executable_path/../../../../", "/usr/lib"]);
     }
 }
