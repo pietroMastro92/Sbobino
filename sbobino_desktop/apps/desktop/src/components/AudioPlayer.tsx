@@ -90,7 +90,7 @@ function formatTimeWithUnits(
   return parts.join(" ");
 }
 
-function mimeFromPath(path: string): string {
+function mediaMimeFromPath(path: string): string {
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
   switch (extension) {
     case "mp3": return "audio/mpeg";
@@ -100,7 +100,15 @@ function mimeFromPath(path: string): string {
     case "ogg": return "audio/ogg";
     case "opus": return "audio/opus";
     case "flac": return "audio/flac";
-    default: return "audio/*";
+    case "aiff":
+    case "aif": return "audio/aiff";
+    case "wma": return "audio/x-ms-wma";
+    case "mp4":
+    case "m4v": return "video/mp4";
+    case "mov": return "video/quicktime";
+    case "webm": return "video/webm";
+    case "mkv": return "video/x-matroska";
+    default: return "application/octet-stream";
   }
 }
 
@@ -767,7 +775,7 @@ export function AudioPlayer({
         if (sourceVersionRef.current !== sourceVersion) return false;
         const blob = new Blob(
           [new Uint8Array(bytes)],
-          { type: currentSourcePath ? mimeFromPath(currentSourcePath) : "audio/*" },
+          { type: currentSourcePath ? mediaMimeFromPath(currentSourcePath) : "application/octet-stream" },
         );
         const objectUrl = URL.createObjectURL(blob);
         if (fallbackBlobUrlRef.current) URL.revokeObjectURL(fallbackBlobUrlRef.current);

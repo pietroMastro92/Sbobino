@@ -129,6 +129,7 @@ pub struct RuntimeHealth {
     pub missing_models: Vec<String>,
     pub missing_encoders: Vec<String>,
     pub pyannote: PyannoteRuntimeHealth,
+    pub setup_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -930,6 +931,22 @@ impl RuntimeTranscriptionFactory {
             models_dir.join(coreml_encoder).is_dir()
         };
         let pyannote = self.pyannote_health(&settings);
+        let required_models_ready = required_initial_setup_models()
+            .iter()
+            .all(|model_file| models_dir.join(model_file).exists());
+        let required_encoders_ready = if is_apple_silicon_host() {
+            required_initial_setup_encoders()
+                .iter()
+                .all(|encoder_dir| models_dir.join(encoder_dir).is_dir())
+        } else {
+            true
+        };
+        let setup_complete = ffmpeg_available
+            && whisper_cli_available
+            && whisper_stream_available
+            && pyannote.ready
+            && required_models_ready
+            && required_encoders_ready;
 
         Ok(RuntimeHealth {
             host_os: env::consts::OS.to_string(),
@@ -954,6 +971,7 @@ impl RuntimeTranscriptionFactory {
             missing_models: missing_models(&models_dir),
             missing_encoders: missing_encoders(&models_dir),
             pyannote,
+            setup_complete,
         })
     }
 
@@ -987,6 +1005,30 @@ impl RuntimeTranscriptionFactory {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn has_bundled_pyannote_override_assets(&self) -> bool {
+        self.find_bundled_pyannote_python_source().is_some()
+            && self.find_bundled_pyannote_model_source().is_some()
+    }
+
+    pub fn reinstall_managed_pyannote_from_bundled_override(&self) -> Result<bool, String> {
+        if !self.has_bundled_pyannote_override_assets() {
+            return Ok(false);
+        }
+
+        let runtime_dir = self.managed_pyannote_runtime_dir();
+        if runtime_dir.exists() {
+            std::fs::remove_dir_all(&runtime_dir).map_err(|e| {
+                format!(
+                    "failed to remove stale pyannote runtime directory '{}': {e}",
+                    runtime_dir.display()
+                )
+            })?;
+        }
+
+        self.install_bundled_pyannote_override_if_available()?;
+        Ok(true)
     }
 
     fn ensure_embedded_pyannote_script(&self) -> Result<String, String> {
@@ -1278,18 +1320,22 @@ impl RuntimeTranscriptionFactory {
         });
 
         let (ready, reason_code, message) = if let Some((code, message)) = status_override {
-            let fallback = match code.as_str() {
+            let normalized_code = match code.as_str() {
+                "pyannote_install_incomplete" => "pyannote_repair_required".to_string(),
+                _ => code.clone(),
+            };
+            let fallback = match normalized_code.as_str() {
                 "pyannote_checksum_invalid" => {
                     "Pyannote asset verification failed. Reinstall the diarization runtime from Local Models."
                 }
-                "pyannote_install_incomplete" => {
-                    "Pyannote installation is incomplete. Repair the diarization runtime from Local Models."
+                "pyannote_repair_required" => {
+                    "Pyannote installation is incomplete. Repairing the diarization runtime is required."
                 }
                 _ => "Pyannote diarization is not ready.",
             };
             (
                 false,
-                code,
+                normalized_code,
                 if message.is_empty() {
                     fallback.to_string()
                 } else {
@@ -1309,14 +1355,14 @@ impl RuntimeTranscriptionFactory {
                 "Pyannote diarization model is not installed. Install it from Settings > Local Models.".to_string(),
             )
         } else if let Some(error) = runtime_validation_error {
-            (false, "pyannote_install_incomplete".to_string(), error)
+            (false, "pyannote_repair_required".to_string(), error)
         } else if let Some(manifest) = manifest.as_ref() {
             if !pyannote_runtime_arch_matches_host(manifest.runtime_arch.trim()) {
                 (
                     false,
-                    "pyannote_install_incomplete".to_string(),
+                    "pyannote_arch_mismatch".to_string(),
                     format!(
-                        "Pyannote runtime arch mismatch: installed '{}' but host requires '{}'. Reinstall from Settings > Local Models.",
+                        "Pyannote runtime arch mismatch: installed '{}' but host requires '{}'. Repairing the diarization runtime is required.",
                         manifest.runtime_arch.trim(),
                         target_triple_suffix()
                     ),
@@ -1326,9 +1372,9 @@ impl RuntimeTranscriptionFactory {
             {
                 (
                     false,
-                    "pyannote_install_incomplete".to_string(),
+                    "pyannote_version_mismatch".to_string(),
                     format!(
-                        "Pyannote runtime targets app version '{}' but this build is '{}'. Reinstall from Settings > Local Models.",
+                        "Pyannote runtime targets app version '{}' but this build is '{}'. Repairing the diarization runtime is required.",
                         manifest.app_version.trim(),
                         env!("CARGO_PKG_VERSION")
                     ),
@@ -1343,8 +1389,8 @@ impl RuntimeTranscriptionFactory {
         } else {
             (
                 false,
-                "pyannote_install_incomplete".to_string(),
-                "Pyannote installation is incomplete. Repair it from Settings > Local Models."
+                "pyannote_repair_required".to_string(),
+                "Pyannote installation is incomplete and must be repaired before setup can continue."
                     .to_string(),
             )
         };
@@ -1816,6 +1862,17 @@ fn binary_name_variants(base_name: &str) -> Vec<String> {
     }
 
     variants
+}
+
+fn required_initial_setup_models() -> [&'static str; 2] {
+    ["ggml-base.bin", "ggml-large-v3-turbo-q8_0.bin"]
+}
+
+fn required_initial_setup_encoders() -> [&'static str; 2] {
+    [
+        "ggml-base-encoder.mlmodelc",
+        "ggml-large-v3-turbo-encoder.mlmodelc",
+    ]
 }
 
 #[derive(Clone)]
@@ -2823,8 +2880,51 @@ mod tests {
             .runtime_health()
             .expect("runtime health should load");
         assert!(!health.pyannote.ready);
-        assert_eq!(health.pyannote.reason_code, "pyannote_install_incomplete");
+        assert_eq!(health.pyannote.reason_code, "pyannote_repair_required");
         assert!(health.pyannote.message.contains("standard library"));
+    }
+
+    #[test]
+    fn runtime_health_reports_version_mismatch_as_repair_required() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: "0.1.2".to_string(),
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "abc".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "def".to_string(),
+                runtime_arch: super::target_triple_suffix().to_string(),
+                installed_at: "2026-03-13T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status("ok", "ready")
+            .expect("status should write");
+
+        let health = factory
+            .runtime_health()
+            .expect("runtime health should load");
+        assert!(!health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "pyannote_version_mismatch");
+        assert!(health
+            .pyannote
+            .message
+            .contains("Repairing the diarization runtime is required"));
     }
 
     #[test]

@@ -5169,6 +5169,29 @@ body.sidebar-resizing {
   border-radius: 10px;
 }
 
+.export-copy-button {
+  min-width: 98px;
+  height: 36px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 10px;
+}
+
+.export-copy-button.is-copied {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+  background: color-mix(in srgb, var(--detail-active-bg) 72%, var(--surface));
+}
+
+.export-copy-button.is-failed {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 24%, var(--line));
+  background: color-mix(in srgb, rgba(196, 75, 63, 0.12) 72%, var(--surface));
+}
+
 .model-sheet {
   width: min(760px, 94vw);
   max-height: min(720px, 90vh);

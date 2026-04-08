@@ -109,11 +109,22 @@ import {
   testPromptTemplate,
   updateArtifact,
   updateArtifactTimeline,
+  writeSetupReport,
 } from "./lib/tauri";
 import {
   formatProvisioningAssetLabel,
   shouldOfferLocalModelsCta,
 } from "./lib/provisioningUi";
+import {
+  type InitialSetupReport,
+  type InitialSetupStepId,
+  INITIAL_SETUP_REQUIRES_PYANNOTE,
+  findProvisioningModelEntry,
+  getInitialSetupMissingModels,
+  isInitialSetupComplete,
+  isProvisionedModelReady,
+  shouldRepairPyannoteRuntime,
+} from "./lib/initialSetup";
 import {
   getArtifactDiarizationUiState,
   normalizeJobFailureMessage,
@@ -264,38 +275,9 @@ const SETTINGS_PANES: SettingsPane[] = [
   "prompts",
   "advanced",
 ];
-const INITIAL_SETUP_REQUIRED_MODELS: SpeechModel[] = ["base", "large_turbo"];
 
 function hasAcceptedCurrentPrivacyPolicy(settings: AppSettings | null | undefined): boolean {
   return settings?.general.privacy_policy_version_accepted === PRIVACY_POLICY_VERSION;
-}
-
-function isProvisionedModelReady(
-  entry: ProvisioningModelCatalogEntry | undefined,
-  requireCoreml: boolean,
-): boolean {
-  if (!entry?.installed) {
-    return false;
-  }
-  if (!requireCoreml) {
-    return true;
-  }
-  return entry.coreml_installed;
-}
-
-function findProvisioningModelEntry(
-  modelCatalog: ProvisioningModelCatalogEntry[],
-  model: SpeechModel,
-): ProvisioningModelCatalogEntry | undefined {
-  return modelCatalog.find((entry) => entry.key === model);
-}
-
-function getInitialSetupMissingModels(
-  modelCatalog: ProvisioningModelCatalogEntry[],
-  requireCoreml: boolean,
-): SpeechModel[] {
-  return INITIAL_SETUP_REQUIRED_MODELS.filter((model) =>
-    !isProvisionedModelReady(findProvisioningModelEntry(modelCatalog, model), requireCoreml));
 }
 
 function parseStandaloneSettingsPaneFromLocation(): SettingsPane {
@@ -305,6 +287,89 @@ function parseStandaloneSettingsPaneFromLocation(): SettingsPane {
 
 function shouldPreloadSettingsDiagnostics(pane: SettingsPane): boolean {
   return pane === "transcription" || pane === "local_models";
+}
+
+function createInitialSetupReport(): InitialSetupReport {
+  return {
+    build_version: "",
+    privacy_accepted: false,
+    setup_complete: false,
+    final_reason_code: null,
+    final_error: null,
+    runtime_health: null,
+    updated_at: new Date().toISOString(),
+    steps: [
+      {
+        id: "privacy",
+        label: "Privacy policy",
+        status: "pending",
+        detail: null,
+        started_at: null,
+        finished_at: null,
+      },
+      {
+        id: "speech-runtime",
+        label: "Speech runtime",
+        status: "pending",
+        detail: null,
+        started_at: null,
+        finished_at: null,
+      },
+      {
+        id: "pyannote-runtime",
+        label: "Speaker diarization runtime",
+        status: "pending",
+        detail: null,
+        started_at: null,
+        finished_at: null,
+      },
+      {
+        id: "whisper-models",
+        label: "Whisper models",
+        status: "pending",
+        detail: null,
+        started_at: null,
+        finished_at: null,
+      },
+      {
+        id: "final-validation",
+        label: "Final validation",
+        status: "pending",
+        detail: null,
+        started_at: null,
+        finished_at: null,
+      },
+    ],
+  };
+}
+
+function updateInitialSetupReportStep(
+  report: InitialSetupReport,
+  stepId: InitialSetupStepId,
+  status: InitialSetupReport["steps"][number]["status"],
+  detail?: string | null,
+  overrideLabel?: string,
+): InitialSetupReport {
+  const timestamp = new Date().toISOString();
+  return {
+    ...report,
+    updated_at: timestamp,
+    steps: report.steps.map((step) => {
+      if (step.id !== stepId) {
+        return step;
+      }
+      return {
+        ...step,
+        label: overrideLabel ?? step.label,
+        status,
+        detail: detail ?? step.detail,
+        started_at:
+          status === "running" && !step.started_at ? timestamp : step.started_at,
+        finished_at:
+          status === "completed" || status === "failed" ? timestamp : step.finished_at,
+      };
+    }),
+  };
 }
 
 function hasPersistedOptimizedTranscript(artifact: TranscriptArtifact | null | undefined): boolean {
@@ -1348,7 +1413,10 @@ function formatPyannoteHealthMessage(
   }
 
   if (
-    health.reason_code === "pyannote_install_incomplete"
+    health.reason_code === "pyannote_version_mismatch"
+    || health.reason_code === "pyannote_arch_mismatch"
+    || health.reason_code === "pyannote_repair_required"
+    || health.reason_code === "pyannote_install_incomplete"
     || health.reason_code === "pyannote_checksum_invalid"
   ) {
     return t(
@@ -2213,6 +2281,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const [initialSetupRunning, setInitialSetupRunning] = useState(false);
   const [initialSetupError, setInitialSetupError] = useState<string | null>(null);
   const [initialSetupStepLabel, setInitialSetupStepLabel] = useState<string | null>(null);
+  const [initialSetupStepDetail, setInitialSetupStepDetail] = useState<string | null>(null);
   const [acceptingPrivacyPolicy, setAcceptingPrivacyPolicy] = useState(false);
 
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResponse | null>(null);
@@ -2275,17 +2344,14 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
   const detailLayoutRef = useRef<HTMLDivElement | null>(null);
   const autoInitialSetupAttemptedRef = useRef(false);
   const provisioningProgressKindRef = useRef<ProvisioningProgressEvent["asset_kind"] | null>(null);
+  const initialSetupReportRef = useRef<InitialSetupReport>(createInitialSetupReport());
+  const initialSetupStepIdRef = useRef<InitialSetupStepId | null>(null);
 
   const privacyPolicyAccepted = hasAcceptedCurrentPrivacyPolicy(settings);
   const runtimeToolchainReady = runtimeHealth?.ffmpeg_available === true
     && runtimeHealth?.whisper_cli_available === true
     && runtimeHealth?.whisper_stream_available === true;
-  const pyannoteReady = runtimeHealth?.pyannote.ready ?? false;
-  const pyannoteRequired = runtimeHealth?.pyannote.enabled ?? false;
-  const initialSetupPyannoteReady = !pyannoteRequired || pyannoteReady;
-  const missingInitialSetupModels = getInitialSetupMissingModels(modelCatalog, platformIsAppleSilicon);
-  const initialSetupModelsReady = missingInitialSetupModels.length === 0;
-  const initialSetupReady = runtimeToolchainReady && initialSetupPyannoteReady && initialSetupModelsReady;
+  const initialSetupReady = isInitialSetupComplete(privacyPolicyAccepted, runtimeHealth, modelCatalog);
 
   const describeEmotionValence = useCallback((score: number): string => {
     if (score >= 0.35) {
@@ -3249,6 +3315,9 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               : event.reason_code === "pyannote_runtime_missing"
                 || event.reason_code === "pyannote_model_missing"
                 || event.reason_code === "pyannote_install_incomplete"
+                || event.reason_code === "pyannote_repair_required"
+                || event.reason_code === "pyannote_version_mismatch"
+                || event.reason_code === "pyannote_arch_mismatch"
                 || event.reason_code === "pyannote_checksum_invalid"
                 ? t("settings.pyannote.desc")
                 : t("error.provisioningFailed", "Provisioning failed");
@@ -4551,6 +4620,56 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     };
   }
 
+  async function persistInitialSetupReport(
+    mutator: (current: InitialSetupReport) => InitialSetupReport,
+  ): Promise<void> {
+    const next = mutator(initialSetupReportRef.current);
+    initialSetupReportRef.current = next;
+    try {
+      await writeSetupReport(next);
+    } catch (reportError) {
+      console.warn("Failed to persist setup report", reportError);
+    }
+  }
+
+  async function updateInitialSetupStepState(
+    stepId: InitialSetupStepId,
+    status: InitialSetupReport["steps"][number]["status"],
+    label: string,
+    detail?: string | null,
+  ): Promise<void> {
+    initialSetupStepIdRef.current = stepId;
+    setInitialSetupStepLabel(label);
+    setInitialSetupStepDetail(detail ?? null);
+    await persistInitialSetupReport((current) =>
+      updateInitialSetupReportStep(current, stepId, status, detail, label));
+  }
+
+  function inferInitialSetupReasonCode(snapshot: StartupRequirementsSnapshot | null): string {
+    if (!snapshot) {
+      return "setup_incomplete";
+    }
+    if (
+      !snapshot.runtimeHealth.ffmpeg_available
+      || !snapshot.runtimeHealth.whisper_cli_available
+      || !snapshot.runtimeHealth.whisper_stream_available
+    ) {
+      return "runtime_repair_required";
+    }
+    if (INITIAL_SETUP_REQUIRES_PYANNOTE && !snapshot.runtimeHealth.pyannote.ready) {
+      return snapshot.runtimeHealth.pyannote.reason_code || "pyannote_repair_required";
+    }
+    if (
+      getInitialSetupMissingModels(
+        snapshot.modelCatalog,
+        snapshot.runtimeHealth.is_apple_silicon,
+      ).length > 0
+    ) {
+      return "models_missing";
+    }
+    return snapshot.runtimeHealth.setup_complete ? "setup_complete" : "setup_incomplete";
+  }
+
   async function waitForProvisioningRun(
     starter: () => Promise<{ started: boolean }>,
   ): Promise<void> {
@@ -4596,6 +4715,12 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
 
     setAcceptingPrivacyPolicy(true);
     try {
+      await updateInitialSetupStepState(
+        "privacy",
+        "running",
+        t("setup.firstLaunch.accept", "Accept and continue"),
+        t("setup.firstLaunch.privacyIntro", "Review the privacy summary before enabling local setup."),
+      );
       await patchSettings((current) => ({
         ...current,
         general: {
@@ -4603,6 +4728,19 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           privacy_policy_version_accepted: PRIVACY_POLICY_VERSION,
           privacy_policy_accepted_at: new Date().toISOString(),
         },
+      }));
+      await updateInitialSetupStepState(
+        "privacy",
+        "completed",
+        t("setup.firstLaunch.accept", "Accept and continue"),
+        t("setup.firstLaunch.policyVersion", "Policy version {version}", {
+          version: PRIVACY_POLICY_VERSION,
+        }),
+      );
+      await persistInitialSetupReport((current) => ({
+        ...current,
+        privacy_accepted: true,
+        updated_at: new Date().toISOString(),
       }));
       autoInitialSetupAttemptedRef.current = false;
     } finally {
@@ -4614,21 +4752,47 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     setInitialSetupRunning(true);
     setInitialSetupError(null);
     setInitialSetupStepLabel(null);
+    setInitialSetupStepDetail(null);
     setStartupRequirementsError(null);
 
+    let snapshot: StartupRequirementsSnapshot | null = null;
+
     try {
-      let snapshot = await loadStartupRequirements();
+      await persistInitialSetupReport(() => ({
+        ...createInitialSetupReport(),
+        privacy_accepted: privacyPolicyAccepted,
+        runtime_health: runtimeHealth,
+        setup_complete: false,
+        updated_at: new Date().toISOString(),
+      }));
+
+      snapshot = await loadStartupRequirements();
+      const loadedSnapshot = snapshot;
+      await persistInitialSetupReport((current) => ({
+        ...current,
+        runtime_health: loadedSnapshot.runtimeHealth,
+        updated_at: new Date().toISOString(),
+      }));
 
       if (
         !snapshot.runtimeHealth.ffmpeg_available
         || !snapshot.runtimeHealth.whisper_cli_available
         || !snapshot.runtimeHealth.whisper_stream_available
       ) {
-        setInitialSetupStepLabel(
+        await updateInitialSetupStepState(
+          "speech-runtime",
+          "running",
           t("setup.firstLaunch.preparingRuntime", "Installing local transcription runtime..."),
+          t("setup.firstLaunch.inspectingDesc", "Checking local tools and prerequisites."),
         );
         await waitForProvisioningRun(() => provisioningInstallRuntime(false));
         snapshot = await loadStartupRequirements();
+        await updateInitialSetupStepState(
+          "speech-runtime",
+          "completed",
+          t("setup.firstLaunch.preparingRuntime", "Installing local transcription runtime..."),
+          t("provisioning.runtimeReady", "Local transcription runtime is ready"),
+        );
       }
 
       if (
@@ -4639,34 +4803,68 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
         throw new Error(formatRuntimeNotReadyMessage());
       }
 
-      if (snapshot.runtimeHealth.pyannote.enabled && !snapshot.runtimeHealth.pyannote.ready) {
-        setInitialSetupStepLabel(
+      if (INITIAL_SETUP_REQUIRES_PYANNOTE && !snapshot.runtimeHealth.pyannote.ready) {
+        const forceRepair = shouldRepairPyannoteRuntime(snapshot.runtimeHealth.pyannote);
+        await updateInitialSetupStepState(
+          "pyannote-runtime",
+          "running",
           t("setup.firstLaunch.preparingPyannote", "Installing speaker diarization runtime..."),
+          snapshot.runtimeHealth.pyannote.message || t("settings.pyannote.desc"),
         );
-        await waitForProvisioningRun(() => provisioningInstallPyannote(false));
+        await waitForProvisioningRun(() => provisioningInstallPyannote(forceRepair));
         snapshot = await loadStartupRequirements();
+        await updateInitialSetupStepState(
+          "pyannote-runtime",
+          snapshot.runtimeHealth.pyannote.ready ? "completed" : "failed",
+          t("setup.firstLaunch.preparingPyannote", "Installing speaker diarization runtime..."),
+          snapshot.runtimeHealth.pyannote.message,
+        );
       }
 
-      for (const model of INITIAL_SETUP_REQUIRED_MODELS) {
+      await updateInitialSetupStepState(
+        "whisper-models",
+        "running",
+        t("setup.firstLaunch.downloading", "Downloading local models..."),
+        t("setup.firstLaunch.downloadingDesc", "This can take a few minutes the first time."),
+      );
+      for (const model of ["base", "large_turbo"] as SpeechModel[]) {
         const entry = findProvisioningModelEntry(snapshot.modelCatalog, model);
         if (isProvisionedModelReady(entry, snapshot.runtimeHealth.is_apple_silicon)) {
           continue;
         }
 
+        const currentSnapshot = snapshot;
+        initialSetupStepIdRef.current = "whisper-models";
         setInitialSetupStepLabel(
           t("setup.firstLaunch.downloadingModel", "Downloading {model}...", {
             model: entry?.label ?? model,
           }),
         );
+        setInitialSetupStepDetail(
+          t("setup.firstLaunch.downloadingDesc", "This can take a few minutes the first time."),
+        );
         await waitForProvisioningRun(() =>
           provisioningDownloadModel({
             model,
-            include_coreml: snapshot.runtimeHealth.is_apple_silicon,
+            include_coreml: currentSnapshot.runtimeHealth.is_apple_silicon,
           }));
         snapshot = await loadStartupRequirements();
       }
+      await updateInitialSetupStepState(
+        "whisper-models",
+        "completed",
+        t("setup.firstLaunch.downloading", "Downloading local models..."),
+        t("settings.localModels.readyMessage", "Local models are ready"),
+      );
 
-      if (snapshot.runtimeHealth.pyannote.enabled && !snapshot.runtimeHealth.pyannote.ready) {
+      await updateInitialSetupStepState(
+        "final-validation",
+        "running",
+        t("setup.firstLaunch.inspecting", "Inspecting local runtime..."),
+        t("setup.firstLaunch.inspectingDesc", "Checking local tools and prerequisites."),
+      );
+
+      if (INITIAL_SETUP_REQUIRES_PYANNOTE && !snapshot.runtimeHealth.pyannote.ready) {
         throw new Error(
           snapshot.runtimeHealth.pyannote.message
           || t(
@@ -4684,15 +4882,58 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
           ),
         );
       }
+      if (!snapshot.runtimeHealth.setup_complete) {
+        throw new Error(
+          t(
+            "setup.firstLaunch.assetsStillMissing",
+            "Initial setup did not complete correctly. Please try again.",
+          ),
+        );
+      }
 
+      await updateInitialSetupStepState(
+        "final-validation",
+        "completed",
+        t("setup.firstLaunch.inspecting", "Inspecting local runtime..."),
+        t("settings.localModels.readyMessage", "Local models are ready"),
+      );
+      await persistInitialSetupReport((current) => ({
+        ...current,
+        setup_complete: snapshot?.runtimeHealth.setup_complete ?? false,
+        final_reason_code: inferInitialSetupReasonCode(snapshot),
+        final_error: null,
+        runtime_health: snapshot?.runtimeHealth ?? null,
+        updated_at: new Date().toISOString(),
+      }));
+      initialSetupStepIdRef.current = null;
       setInitialSetupStepLabel(null);
+      setInitialSetupStepDetail(null);
     } catch (setupError) {
+      const finalError = formatUiError(
+        "error.firstLaunchSetupFailed",
+        "Initial setup failed",
+        setupError,
+      );
+      const failedStepId = initialSetupStepIdRef.current;
+      if (failedStepId) {
+        const failedStep = initialSetupReportRef.current.steps.find((step) => step.id === failedStepId);
+        await updateInitialSetupStepState(
+          failedStepId,
+          "failed",
+          failedStep?.label ?? initialSetupStepLabel ?? t("setup.firstLaunch.setupError", "Setup could not finish"),
+          finalError,
+        );
+      }
+      await persistInitialSetupReport((current) => ({
+        ...current,
+        setup_complete: false,
+        final_reason_code: inferInitialSetupReasonCode(snapshot),
+        final_error: finalError,
+        runtime_health: snapshot?.runtimeHealth ?? current.runtime_health,
+        updated_at: new Date().toISOString(),
+      }));
       setInitialSetupError(
-        formatUiError(
-          "error.firstLaunchSetupFailed",
-          "Initial setup failed",
-          setupError,
-        ),
+        finalError,
       );
     } finally {
       setInitialSetupRunning(false);
@@ -10618,6 +10859,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
     const bootstrapMessage = provisioning.progress
       ? `${formatProvisioningAssetLabel(provisioning.progress)} (${provisioning.progress.current}/${provisioning.progress.total})`
       : provisioning.statusMessage;
+    const startupStatusDetail = initialSetupStepDetail ?? bootstrapMessage;
     const blockingError = startupRequirementsError ?? initialSetupError ?? (!settings ? error : null);
     const requiresPrivacyAcceptance = !settings || !privacyPolicyAccepted;
     const loadingSettings = !settings && !blockingError;
@@ -10696,7 +10938,7 @@ export function App({ standaloneSettingsWindow = false }: AppProps) {
               <ProgressRing percentage={provisioning.progress?.percentage ?? 8} size={28} />
               <div>
                 <strong>{initialSetupStepLabel ?? t("setup.firstLaunch.downloading", "Downloading local models...")}</strong>
-                <p>{bootstrapMessage || t("setup.firstLaunch.downloadingDesc", "This can take a few minutes the first time.")}</p>
+                <p>{startupStatusDetail || t("setup.firstLaunch.downloadingDesc", "This can take a few minutes the first time.")}</p>
               </div>
             </div>
           ) : null}

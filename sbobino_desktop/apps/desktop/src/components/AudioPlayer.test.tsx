@@ -32,6 +32,7 @@ describe("AudioPlayer", () => {
 
   afterEach(() => {
     changeLanguage("en");
+    vi.restoreAllMocks();
     HTMLMediaElement.prototype.play = originalPlay;
     HTMLMediaElement.prototype.pause = originalPause;
     HTMLMediaElement.prototype.load = originalLoad;
@@ -126,6 +127,27 @@ describe("AudioPlayer", () => {
     await vi.waitFor(() => {
       expect(audio.getAttribute("src")).not.toBe("asset:///tmp/sample.mp3");
     });
+  });
+
+  it("uses the video container MIME when falling back from a local mp4 file", async () => {
+    vi.mocked(readAudioFile).mockResolvedValue([1, 2, 3, 4]);
+    const createObjectUrl = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:video-audio-track");
+
+    const { container } = render(<AudioPlayer inputPath="/tmp/sample.mp4" />);
+    const audio = container.querySelector("audio") as HTMLAudioElement;
+    expect(audio).not.toBeNull();
+
+    fireEvent.error(audio);
+
+    await vi.waitFor(() => {
+      expect(readAudioFile).toHaveBeenCalledWith("/tmp/sample.mp4");
+    });
+
+    expect(createObjectUrl).toHaveBeenCalledTimes(1);
+    const blob = createObjectUrl.mock.calls[0]?.[0];
+    expect(blob).toBeInstanceOf(Blob);
+    expect((blob as Blob).type).toBe("video/mp4");
+
   });
 
   it("does not restart local loading when the metadata callback identity changes", async () => {

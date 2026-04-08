@@ -33,6 +33,7 @@ pub struct RuntimeHealthResponse {
     pub missing_models: Vec<String>,
     pub missing_encoders: Vec<String>,
     pub pyannote: PyannoteRuntimeHealth,
+    pub setup_complete: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -375,5 +376,6 @@ pub async fn get_transcription_runtime_health(
         missing_models: health.missing_models,
         missing_encoders: health.missing_encoders,
         pyannote: health.pyannote,
+        setup_complete: health.setup_complete,
     })
 }

@@ -31,6 +31,7 @@ import type {
   UpdateCheckResponse,
   UpdateSettingsPartialPayload,
 } from "../types";
+import type { InitialSetupReport } from "./initialSetup";
 
 export async function fetchSettings(): Promise<AppSettings> {
   return invoke<AppSettings>("get_settings");
@@ -321,6 +322,10 @@ export async function provisioningCancel(): Promise<void> {
 
 export async function fetchRuntimeHealth(): Promise<RuntimeHealth> {
   return invoke<RuntimeHealth>("get_transcription_runtime_health");
+}
+
+export async function writeSetupReport(report: InitialSetupReport): Promise<void> {
+  return invoke<void>("write_setup_report", { payload: report });
 }
 
 export async function ensureTranscriptionRuntime(): Promise<EnsureRuntimeResponse> {

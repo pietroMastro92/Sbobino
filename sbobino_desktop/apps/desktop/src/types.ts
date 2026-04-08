@@ -449,6 +449,7 @@ export type RuntimeHealth = {
   missing_models: string[];
   missing_encoders: string[];
   pyannote: PyannoteRuntimeHealth;
+  setup_complete: boolean;
 };
 
 export type TranscriptionStartPreflight = {

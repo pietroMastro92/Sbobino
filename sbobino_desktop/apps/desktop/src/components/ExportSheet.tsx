@@ -1,6 +1,7 @@
-import { Braces, Captions, Copy, Download, FileCode2, FileSpreadsheet, FileText, FileType, FileType2, List, X } from "lucide-react";
+import { Braces, Captions, Check, Copy, Download, FileCode2, FileSpreadsheet, FileText, FileType, FileType2, List, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "../i18n";
+import { copyTextToClipboard } from "../lib/clipboard";
 
 export type ExportFormat = "txt" | "docx" | "html" | "pdf" | "json" | "srt" | "vtt" | "csv" | "md";
 export type ExportStyle = "transcript" | "subtitles" | "segments";
@@ -424,6 +425,7 @@ export function ExportSheet({
   const [allowMultipleLines, setAllowMultipleLines] = useState(false);
   const [useOriginalFileName, setUseOriginalFileName] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const { t, language } = useTranslation();
   const prevStyleRef = useRef(style);
   const exportSegments = useMemo(
@@ -512,6 +514,16 @@ export function ExportSheet({
     };
   }, [onClose, open]);
 
+  useEffect(() => {
+    if (copyState === "idle") return;
+    const timeoutId = window.setTimeout(() => {
+      setCopyState("idle");
+    }, 1600);
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [copyState]);
+
   if (!open) {
     return null;
   }
@@ -539,11 +551,8 @@ export function ExportSheet({
   }
 
   async function onCopyContent(): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(exportContent);
-    } catch {
-      // Keep the export sheet responsive even if clipboard fails.
-    }
+    const didCopy = await copyTextToClipboard(exportContent);
+    setCopyState(didCopy ? "copied" : "failed");
   }
 
   const styleLabelCapitalized =
@@ -552,6 +561,12 @@ export function ExportSheet({
       : style === "subtitles"
         ? t("export.subtitles", "Subtitles")
         : t("export.segments", "Segments");
+  const copyButtonLabel =
+    copyState === "copied"
+      ? t("export.copied", "Copied")
+      : copyState === "failed"
+        ? t("export.copyFailed", "Copy failed")
+        : t("export.copy", "Copy");
 
   return (
     <div className="sheet-overlay" onClick={onClose}>
@@ -773,12 +788,14 @@ export function ExportSheet({
 
           <div className="export-actions">
             <button
-              className="secondary-button icon-only"
+              className={`secondary-button export-copy-button ${copyState === "idle" ? "" : `is-${copyState}`}`}
               onClick={() => void onCopyContent()}
               disabled={isExporting}
-              title={t("export.copy", "Copy")}
+              title={copyButtonLabel}
+              aria-label={copyButtonLabel}
             >
-              <Copy size={14} />
+              {copyState === "copied" ? <Check size={14} /> : copyState === "failed" ? <X size={14} /> : <Copy size={14} />}
+              <span aria-live="polite">{copyButtonLabel}</span>
             </button>
             <button className="primary-button" onClick={() => void onConfirm()} disabled={isExporting}>
               <Download size={14} />

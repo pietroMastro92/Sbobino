@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  release-readiness:
     runs-on: macos-14
     defaults:
       run:
@@ -103,6 +103,13 @@ jobs:
             -format UDZO \
             "$DMG_DIR/$DMG_NAME"
 
+      - name: Run release readiness gate
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP_PATH=../../target/aarch64-apple-darwin/release/bundle/macos/Sbobino.app
+          chmod +x ../../scripts/check_release_versions.sh ../../scripts/release_readiness.sh
+          ../../scripts/release_readiness.sh "$VERSION" "$APP_PATH"
+
       - name: Package pyannote repair assets
         run: |
           ASSET_DIR=../../target/aarch64-apple-darwin/release/bundle/pyannote-release
@@ -182,7 +189,7 @@ jobs:
             sbobino_desktop/target/aarch64-apple-darwin/release/bundle/**
 
   publish:
-    needs: build
+    needs: release-readiness
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -205,14 +212,14 @@ jobs:
           - Guided first-launch setup for the local transcription runtime.
           - Automatic first-launch installation of FFmpeg, Whisper CLI, and Whisper Stream.
           - Automatic first-launch download of the required Whisper models.
-          - Automatic first-launch installation of the pyannote diarization runtime and model when speaker diarization is enabled.
+          - Automatic first-launch installation or repair of the pyannote diarization runtime and model.
           - In-app update support for future releases.
 
           ### Download and installation
 
           - Download the \`.dmg\` file for the recommended macOS installation flow.
           - Open the disk image and drag **Sbobino** into the **Applications** folder.
-          - On first launch, accept the privacy terms and let the app complete the guided local runtime setup.
+          - On first launch, accept the privacy terms and let the app complete the guided local runtime setup before entering the main UI.
 
           ### Important notes
 

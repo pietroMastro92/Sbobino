@@ -2,7 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, State};
 use tokio::io::AsyncWriteExt;
@@ -88,6 +88,7 @@ const PYANNOTE_MANIFEST_ASSET: &str = "pyannote-manifest.json";
 const PYANNOTE_RUNTIME_AARCH64_ASSET: &str = "pyannote-runtime-macos-aarch64.zip";
 const PYANNOTE_RUNTIME_X86_64_ASSET: &str = "pyannote-runtime-macos-x86_64.zip";
 const PYANNOTE_MODEL_ASSET: &str = "pyannote-model-community-1.zip";
+const LOCAL_RELEASE_ASSETS_DIR_ENV: &str = "SBOBINO_LOCAL_RELEASE_ASSETS_DIR";
 
 #[derive(Debug, Clone, Deserialize)]
 struct PyannoteReleaseManifest {
@@ -178,6 +179,26 @@ pub struct ProvisioningInstallRuntimePayload {
 #[derive(Debug, Serialize)]
 pub struct ProvisioningStartResponse {
     pub started: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SetupReportStepPayload {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WriteSetupReportPayload {
+    pub privacy_accepted: bool,
+    pub setup_complete: bool,
+    pub final_reason_code: Option<String>,
+    pub final_error: Option<String>,
+    pub runtime_health: Option<serde_json::Value>,
+    pub steps: Vec<SetupReportStepPayload>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -432,8 +453,9 @@ pub async fn provisioning_install_pyannote(
         .runtime_factory
         .runtime_health()
         .map_err(|e| CommandError::new("runtime_health", e))?;
+    let repair_required = force || is_pyannote_repair_reason(&health.pyannote.reason_code);
 
-    if health.pyannote.ready && !force {
+    if health.pyannote.ready && !repair_required {
         emit_provisioning_status(
             &app,
             "completed",
@@ -446,12 +468,22 @@ pub async fn provisioning_install_pyannote(
     let cancel_token = CancellationToken::new();
     *state.provisioning.cancel_token.lock().await = Some(cancel_token.clone());
 
-    spawn_pyannote_provisioning_download(
-        app,
-        state.runtime_factory.clone(),
-        cancel_token,
-        health.pyannote.ready,
-    );
+    if state.runtime_factory.has_bundled_pyannote_override_assets() {
+        spawn_pyannote_bundled_install(
+            app,
+            state.runtime_factory.clone(),
+            cancel_token,
+            repair_required,
+        );
+    } else {
+        spawn_pyannote_provisioning_download(
+            app,
+            state.runtime_factory.clone(),
+            cancel_token,
+            health.pyannote.ready,
+            repair_required,
+        );
+    }
 
     Ok(ProvisioningStartResponse { started: true })
 }
@@ -499,6 +531,40 @@ pub async fn provisioning_cancel(state: State<'_, AppState>) -> Result<(), Comma
         token.cancel();
     }
 
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn write_setup_report(
+    state: State<'_, AppState>,
+    payload: WriteSetupReportPayload,
+) -> Result<(), CommandError> {
+    let report_path = state.runtime_factory.data_dir().join("setup-report.json");
+    let report = serde_json::json!({
+        "build_version": env!("CARGO_PKG_VERSION"),
+        "privacy_accepted": payload.privacy_accepted,
+        "setup_complete": payload.setup_complete,
+        "final_reason_code": payload.final_reason_code,
+        "final_error": payload.final_error,
+        "runtime_health": payload.runtime_health,
+        "steps": payload.steps,
+        "updated_at": Utc::now().to_rfc3339(),
+    });
+    let body = serde_json::to_string_pretty(&report).map_err(|e| {
+        CommandError::new(
+            "setup_report",
+            format!("failed to serialize setup report: {e}"),
+        )
+    })?;
+    tokio::fs::write(&report_path, body).await.map_err(|e| {
+        CommandError::new(
+            "setup_report",
+            format!(
+                "failed to write setup report '{}': {e}",
+                report_path.display()
+            ),
+        )
+    })?;
     Ok(())
 }
 
@@ -661,16 +727,95 @@ fn emit_provisioning_status(
     );
 }
 
+fn spawn_pyannote_bundled_install(
+    app: tauri::AppHandle,
+    runtime_factory: std::sync::Arc<RuntimeTranscriptionFactory>,
+    cancel_token: CancellationToken,
+    _repair_required: bool,
+) {
+    tauri::async_runtime::spawn(async move {
+        if cancel_token.is_cancelled() {
+            emit_provisioning_status(
+                &app,
+                "cancelled",
+                "Pyannote installation cancelled.",
+                Some("cancelled"),
+            );
+            return;
+        }
+
+        let install_result = runtime_factory
+            .reinstall_managed_pyannote_from_bundled_override()
+            .and_then(|installed| {
+                if installed {
+                    Ok(())
+                } else {
+                    Err("Bundled pyannote runtime is not available.".to_string())
+                }
+            });
+
+        if let Err(error) = install_result {
+            emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"));
+            return;
+        }
+
+        let _ = app.emit(
+            "provisioning://progress",
+            ProvisioningProgressEvent {
+                current: 1,
+                total: 2,
+                asset: "bundled-pyannote-runtime".to_string(),
+                asset_kind: "pyannote_runtime".to_string(),
+                stage: "installed".to_string(),
+                percentage: 50,
+            },
+        );
+        let _ = app.emit(
+            "provisioning://progress",
+            ProvisioningProgressEvent {
+                current: 2,
+                total: 2,
+                asset: "bundled-pyannote-model".to_string(),
+                asset_kind: "pyannote_model".to_string(),
+                stage: "installed".to_string(),
+                percentage: 100,
+            },
+        );
+
+        match runtime_factory.runtime_health() {
+            Ok(health) if health.pyannote.ready => emit_provisioning_status(
+                &app,
+                "completed",
+                "Pyannote diarization runtime installed successfully.",
+                None,
+            ),
+            Ok(health) => emit_provisioning_status(
+                &app,
+                "error",
+                &health.pyannote.message,
+                Some(health.pyannote.reason_code.as_str()),
+            ),
+            Err(error) => {
+                emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"))
+            }
+        }
+    });
+}
+
 fn spawn_pyannote_provisioning_download(
     app: tauri::AppHandle,
     runtime_factory: std::sync::Arc<RuntimeTranscriptionFactory>,
     cancel_token: CancellationToken,
     had_ready_install: bool,
+    reset_existing_install: bool,
 ) {
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::new();
         let total = 2usize;
         let runtime_dir = runtime_factory.managed_pyannote_runtime_dir();
+        if reset_existing_install {
+            let _ = tokio::fs::remove_dir_all(&runtime_dir).await;
+        }
         if let Err(error) = tokio::fs::create_dir_all(&runtime_dir).await {
             emit_provisioning_status(
                 &app,
@@ -737,9 +882,15 @@ fn spawn_pyannote_provisioning_download(
                 return;
             }
 
-            let url = release_asset_url(&selection.release_version, &asset.name);
             let archive_path = runtime_dir.join(format!(".download-{}", asset.name));
-            if let Err(error) = download_to_path(&client, &url, &archive_path, &cancel_token).await
+            if let Err(error) = stage_release_asset(
+                &client,
+                &selection.release_version,
+                &asset.name,
+                &archive_path,
+                &cancel_token,
+            )
+            .await
             {
                 let _ = tokio::fs::remove_file(&archive_path).await;
                 if error == "cancelled" {
@@ -925,10 +1076,17 @@ fn spawn_runtime_provisioning_download(
         }
 
         let asset = selection.runtime_asset;
-        let url = release_asset_url(&selection.release_version, &asset.name);
         let archive_path = runtime_dir.join(format!(".download-{}", asset.name));
 
-        if let Err(error) = download_to_path(&client, &url, &archive_path, &cancel_token).await {
+        if let Err(error) = stage_release_asset(
+            &client,
+            &selection.release_version,
+            &asset.name,
+            &archive_path,
+            &cancel_token,
+        )
+        .await
+        {
             let _ = tokio::fs::remove_file(&archive_path).await;
             if error == "cancelled" {
                 emit_provisioning_status(
@@ -1035,18 +1193,13 @@ async fn fetch_pyannote_asset_selection(
     client: &reqwest::Client,
 ) -> Result<PyannoteAssetSelection, String> {
     let version = env!("CARGO_PKG_VERSION").to_string();
-    let manifest_url = release_asset_url(&version, PYANNOTE_MANIFEST_ASSET);
-    let response = client
-        .get(&manifest_url)
-        .send()
-        .await
-        .map_err(|e| format!("failed to fetch pyannote release manifest: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("failed to download pyannote release manifest: {e}"))?;
-    let manifest = response
-        .json::<PyannoteReleaseManifest>()
-        .await
-        .map_err(|e| format!("invalid pyannote release manifest: {e}"))?;
+    let manifest = read_release_manifest::<PyannoteReleaseManifest>(
+        client,
+        &version,
+        PYANNOTE_MANIFEST_ASSET,
+        "pyannote release manifest",
+    )
+    .await?;
 
     if manifest.app_version.trim() != version {
         return Err(format!(
@@ -1103,18 +1256,13 @@ async fn fetch_runtime_asset_selection(
     client: &reqwest::Client,
 ) -> Result<RuntimeAssetSelection, String> {
     let version = env!("CARGO_PKG_VERSION").to_string();
-    let manifest_url = release_asset_url(&version, RUNTIME_MANIFEST_ASSET);
-    let response = client
-        .get(&manifest_url)
-        .send()
-        .await
-        .map_err(|e| format!("failed to fetch runtime release manifest: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("failed to download runtime release manifest: {e}"))?;
-    let manifest = response
-        .json::<RuntimeReleaseManifest>()
-        .await
-        .map_err(|e| format!("invalid runtime release manifest: {e}"))?;
+    let manifest = read_release_manifest::<RuntimeReleaseManifest>(
+        client,
+        &version,
+        RUNTIME_MANIFEST_ASSET,
+        "runtime release manifest",
+    )
+    .await?;
 
     if manifest.app_version.trim() != version {
         return Err(format!(
@@ -1150,6 +1298,78 @@ fn release_asset_url(version: &str, asset_name: &str) -> String {
     format!("https://github.com/{RELEASE_REPOSITORY}/releases/download/v{version}/{asset_name}")
 }
 
+fn local_release_assets_dir() -> Option<PathBuf> {
+    let value = std::env::var_os(LOCAL_RELEASE_ASSETS_DIR_ENV)?;
+    let path = PathBuf::from(value);
+    if path.is_dir() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+async fn read_release_manifest<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    version: &str,
+    asset_name: &str,
+    label: &str,
+) -> Result<T, String> {
+    if let Some(local_root) = local_release_assets_dir() {
+        let manifest_path = local_root.join(asset_name);
+        let body = tokio::fs::read_to_string(&manifest_path)
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to read local {label} '{}': {e}",
+                    manifest_path.display()
+                )
+            })?;
+        serde_json::from_str::<T>(&body).map_err(|e| format!("invalid local {label}: {e}"))
+    } else {
+        let manifest_url = release_asset_url(version, asset_name);
+        let response = client
+            .get(&manifest_url)
+            .send()
+            .await
+            .map_err(|e| format!("failed to fetch {label}: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("failed to download {label}: {e}"))?;
+        response
+            .json::<T>()
+            .await
+            .map_err(|e| format!("invalid {label}: {e}"))
+    }
+}
+
+async fn stage_release_asset(
+    client: &reqwest::Client,
+    version: &str,
+    asset_name: &str,
+    destination: &Path,
+    cancel_token: &CancellationToken,
+) -> Result<(), String> {
+    if let Some(local_root) = local_release_assets_dir() {
+        let source = local_root.join(asset_name);
+        if !source.is_file() {
+            return Err(format!(
+                "local release asset '{}' is missing in '{}'.",
+                asset_name,
+                local_root.display()
+            ));
+        }
+        tokio::fs::copy(&source, destination).await.map_err(|e| {
+            format!(
+                "failed to stage local release asset '{}': {e}",
+                source.display()
+            )
+        })?;
+        Ok(())
+    } else {
+        let url = release_asset_url(version, asset_name);
+        download_to_path(client, &url, destination, cancel_token).await
+    }
+}
+
 fn host_pyannote_runtime_kind() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -1178,6 +1398,17 @@ fn host_pyannote_arch_label() -> &'static str {
     {
         "aarch64-apple-darwin"
     }
+}
+
+fn is_pyannote_repair_reason(reason_code: &str) -> bool {
+    matches!(
+        reason_code.trim(),
+        "pyannote_arch_mismatch"
+            | "pyannote_version_mismatch"
+            | "pyannote_repair_required"
+            | "pyannote_install_incomplete"
+            | "pyannote_checksum_invalid"
+    )
 }
 
 fn verify_file_sha256(path: &Path, expected_sha256: &str) -> Result<(), String> {
