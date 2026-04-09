@@ -432,6 +432,9 @@ export type RuntimeHealth = {
   is_apple_silicon: boolean;
   preferred_engine: TranscriptionEngine;
   configured_engine: TranscriptionEngine;
+  runtime_source: string;
+  managed_runtime_required: boolean;
+  managed_runtime: ManagedRuntimeHealth;
   ffmpeg_path: string;
   ffmpeg_resolved: string;
   ffmpeg_available: boolean;
@@ -450,6 +453,21 @@ export type RuntimeHealth = {
   missing_encoders: string[];
   pyannote: PyannoteRuntimeHealth;
   setup_complete: boolean;
+};
+
+export type ManagedRuntimeBinaryHealth = {
+  resolved_path: string;
+  available: boolean;
+  failure_reason: string;
+  failure_message: string;
+};
+
+export type ManagedRuntimeHealth = {
+  source: string;
+  ready: boolean;
+  ffmpeg: ManagedRuntimeBinaryHealth;
+  whisper_cli: ManagedRuntimeBinaryHealth;
+  whisper_stream: ManagedRuntimeBinaryHealth;
 };
 
 export type TranscriptionStartPreflight = {

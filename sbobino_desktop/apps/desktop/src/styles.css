@@ -5322,6 +5322,18 @@ body.sidebar-resizing {
   min-width: 0;
 }
 
+.settings-health-value-stack {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-health-detail {
+  font-size: 0.78rem;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
 .settings-window-shell {
   width: 100%;
   height: 100vh;

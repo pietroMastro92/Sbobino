@@ -93,9 +93,7 @@ export function isInitialSetupComplete(
     return false;
   }
 
-  const runtimeReady = runtimeHealth.ffmpeg_available
-    && runtimeHealth.whisper_cli_available
-    && runtimeHealth.whisper_stream_available;
+  const runtimeReady = isRuntimeToolchainReady(runtimeHealth);
   const pyannoteReady = !INITIAL_SETUP_REQUIRES_PYANNOTE || runtimeHealth.pyannote.ready;
   const modelsReady = getInitialSetupMissingModels(
     modelCatalog,
@@ -121,4 +119,71 @@ export function canWarmStartFromSetupReport(
     && !report.final_error
     && report.final_reason_code === "setup_complete"
     && Boolean(report.runtime_health?.setup_complete);
+}
+
+export function isRuntimeToolchainReady(
+  runtimeHealth: RuntimeHealth | null | undefined,
+): boolean {
+  if (!runtimeHealth) {
+    return false;
+  }
+
+  const managedRuntime = getManagedRuntime(runtimeHealth);
+  if (runtimeHealth.managed_runtime_required) {
+    return managedRuntime.ready;
+  }
+
+  return runtimeHealth.ffmpeg_available
+    && runtimeHealth.whisper_cli_available
+    && runtimeHealth.whisper_stream_available;
+}
+
+export function getRuntimeToolchainFailureMessage(
+  runtimeHealth: RuntimeHealth | null | undefined,
+): string | null {
+  if (!runtimeHealth) {
+    return null;
+  }
+
+  const managedRuntime = getManagedRuntime(runtimeHealth);
+  if (!managedRuntime.ffmpeg.available) {
+    return managedRuntime.ffmpeg.failure_message || null;
+  }
+  if (!managedRuntime.whisper_cli.available) {
+    return managedRuntime.whisper_cli.failure_message || null;
+  }
+  if (!managedRuntime.whisper_stream.available) {
+    return managedRuntime.whisper_stream.failure_message || null;
+  }
+
+  return null;
+}
+
+function getManagedRuntime(runtimeHealth: RuntimeHealth): RuntimeHealth["managed_runtime"] {
+  const fallbackReady = runtimeHealth.ffmpeg_available
+    && runtimeHealth.whisper_cli_available
+    && runtimeHealth.whisper_stream_available;
+
+  return runtimeHealth.managed_runtime ?? {
+    source: runtimeHealth.runtime_source || "unknown",
+    ready: fallbackReady,
+    ffmpeg: {
+      resolved_path: runtimeHealth.ffmpeg_resolved || runtimeHealth.ffmpeg_path,
+      available: runtimeHealth.ffmpeg_available,
+      failure_reason: "",
+      failure_message: "",
+    },
+    whisper_cli: {
+      resolved_path: runtimeHealth.whisper_cli_resolved || runtimeHealth.whisper_cli_path,
+      available: runtimeHealth.whisper_cli_available,
+      failure_reason: "",
+      failure_message: "",
+    },
+    whisper_stream: {
+      resolved_path: runtimeHealth.whisper_stream_resolved || runtimeHealth.whisper_stream_path,
+      available: runtimeHealth.whisper_stream_available,
+      failure_reason: "",
+      failure_message: "",
+    },
+  };
 }

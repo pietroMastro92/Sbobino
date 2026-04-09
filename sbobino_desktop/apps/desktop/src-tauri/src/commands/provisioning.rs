@@ -19,7 +19,9 @@ use crate::{
     },
     state::AppState,
 };
-use sbobino_infrastructure::{ManagedPyannoteManifest, RuntimeTranscriptionFactory};
+use sbobino_infrastructure::{
+    ManagedPyannoteManifest, ManagedRuntimeHealth, RuntimeTranscriptionFactory,
+};
 
 const REQUIRED_MODELS: [&str; 5] = [
     "ggml-tiny.bin",
@@ -207,6 +209,32 @@ pub struct ProvisioningModelCatalogEntry {
     pub model_file: String,
     pub installed: bool,
     pub coreml_installed: bool,
+}
+
+fn format_managed_runtime_install_error(health: &ManagedRuntimeHealth) -> String {
+    let failing_tool = if !health.ffmpeg.available {
+        Some(("FFmpeg", &health.ffmpeg))
+    } else if !health.whisper_cli.available {
+        Some(("Whisper CLI", &health.whisper_cli))
+    } else if !health.whisper_stream.available {
+        Some(("Whisper Stream", &health.whisper_stream))
+    } else {
+        None
+    };
+
+    if let Some((label, tool)) = failing_tool {
+        let detail = if tool.failure_message.trim().is_empty() {
+            "Managed runtime verification failed.".to_string()
+        } else {
+            tool.failure_message.trim().to_string()
+        };
+        return format!(
+            "{label} could not be verified at '{}': {detail}",
+            tool.resolved_path
+        );
+    }
+
+    "Local runtime was installed but is still not runnable.".to_string()
 }
 
 fn collect_missing_models(models_dir: &Path) -> Vec<String> {
@@ -1181,27 +1209,12 @@ fn spawn_runtime_provisioning_download(
             }
         }
 
-        let health = match runtime_factory.runtime_health() {
-            Ok(value) => value,
-            Err(error) => {
-                emit_provisioning_status(
-                    &app,
-                    "error",
-                    &format!("Runtime installed but verification failed: {error}"),
-                    Some("runtime_install_incomplete"),
-                );
-                return;
-            }
-        };
-
-        if !(health.ffmpeg_available
-            && health.whisper_cli_available
-            && health.whisper_stream_available)
-        {
+        let managed_runtime = runtime_factory.managed_runtime_health();
+        if !managed_runtime.ready {
             emit_provisioning_status(
                 &app,
                 "error",
-                "Local runtime was installed but is still not runnable.",
+                &format_managed_runtime_install_error(&managed_runtime),
                 Some("runtime_install_incomplete"),
             );
             return;
@@ -1944,7 +1957,7 @@ mod tests {
     #[test]
     fn validate_setup_manifest_rejects_mismatched_release_tag() {
         let manifest = SetupReleaseManifest {
-            app_version: "0.1.9".to_string(),
+            app_version: "0.1.10".to_string(),
             release_tag: "v0.1.8".to_string(),
             runtime_manifest: descriptor("runtime-manifest.json", "deadbeef"),
             runtime_asset: descriptor("speech-runtime-macos-aarch64.zip", "deadbeef"),
@@ -1953,7 +1966,7 @@ mod tests {
             pyannote_model_asset: descriptor("pyannote-model-community-1.zip", "deadbeef"),
         };
 
-        let error = validate_setup_manifest("0.1.9", &manifest)
+        let error = validate_setup_manifest("0.1.10", &manifest)
             .expect_err("release tag mismatch should fail");
         assert!(error.contains("release tag"));
     }

@@ -210,7 +210,7 @@ popd >/dev/null
 "$ROOT_DIR/scripts/setup_bundled_pyannote.sh" --force
 
 pushd "$DESKTOP_DIR" >/dev/null
-npm run tauri:build -- --target aarch64-apple-darwin --bundles app
+SBOBINO_RELEASE_PROFILE="$RELEASE_PROFILE" npm run tauri:build -- --target aarch64-apple-darwin --bundles app
 popd >/dev/null
 
 if [[ ! -d "$APP_PATH" ]]; then

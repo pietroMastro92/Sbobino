@@ -5,7 +5,7 @@ use tauri::State;
 use tracing::warn;
 
 use sbobino_domain::{SpeechModel, TranscriptionEngine};
-use sbobino_infrastructure::PyannoteRuntimeHealth;
+use sbobino_infrastructure::{ManagedRuntimeHealth, PyannoteRuntimeHealth};
 
 use crate::{error::CommandError, state::AppState};
 
@@ -16,6 +16,9 @@ pub struct RuntimeHealthResponse {
     pub is_apple_silicon: bool,
     pub preferred_engine: String,
     pub configured_engine: String,
+    pub runtime_source: String,
+    pub managed_runtime_required: bool,
+    pub managed_runtime: ManagedRuntimeHealth,
     pub ffmpeg_path: String,
     pub ffmpeg_resolved: String,
     pub ffmpeg_available: bool,
@@ -71,12 +74,39 @@ fn engine_to_wire(engine: &TranscriptionEngine) -> &'static str {
     }
 }
 
-fn runtime_toolchain_ready(
-    ffmpeg_available: bool,
-    whisper_cli_available: bool,
-    whisper_stream_available: bool,
-) -> bool {
-    ffmpeg_available && whisper_cli_available && whisper_stream_available
+fn runtime_toolchain_ready(health: &sbobino_infrastructure::RuntimeHealth) -> bool {
+    if health.managed_runtime_required {
+        return health.managed_runtime.ready;
+    }
+
+    health.ffmpeg_available && health.whisper_cli_available && health.whisper_stream_available
+}
+
+fn first_managed_runtime_failure(
+    managed_runtime: &ManagedRuntimeHealth,
+) -> Option<(&'static str, &str, &str)> {
+    if !managed_runtime.ffmpeg.available {
+        return Some((
+            "FFmpeg",
+            managed_runtime.ffmpeg.resolved_path.as_str(),
+            managed_runtime.ffmpeg.failure_message.as_str(),
+        ));
+    }
+    if !managed_runtime.whisper_cli.available {
+        return Some((
+            "Whisper CLI",
+            managed_runtime.whisper_cli.resolved_path.as_str(),
+            managed_runtime.whisper_cli.failure_message.as_str(),
+        ));
+    }
+    if !managed_runtime.whisper_stream.available {
+        return Some((
+            "Whisper Stream",
+            managed_runtime.whisper_stream.resolved_path.as_str(),
+            managed_runtime.whisper_stream.failure_message.as_str(),
+        ));
+    }
+    None
 }
 
 fn is_legacy_whisperkit_path(path: &str) -> bool {
@@ -84,28 +114,43 @@ fn is_legacy_whisperkit_path(path: &str) -> bool {
 }
 
 fn runtime_toolchain_message(
-    ffmpeg_available: bool,
-    ffmpeg_resolved: &str,
-    whisper_cli_available: bool,
-    whisper_cli_resolved: &str,
-    whisper_stream_available: bool,
-    whisper_stream_resolved: &str,
+    health: &sbobino_infrastructure::RuntimeHealth,
     setup_note: Option<&str>,
 ) -> String {
-    let mut missing = Vec::new();
-    if !ffmpeg_available {
-        missing.push(format!("FFmpeg is not runnable at '{}'.", ffmpeg_resolved));
+    if health.managed_runtime_required {
+        if let Some((label, path, detail)) = first_managed_runtime_failure(&health.managed_runtime)
+        {
+            let mut message = if detail.trim().is_empty() {
+                format!("{label} is not runnable at '{path}'.")
+            } else {
+                format!("{label} verification failed at '{path}': {}", detail.trim())
+            };
+            if let Some(note) = setup_note {
+                message.push(' ');
+                message.push_str(note);
+            }
+            message.push_str(" Repair the local runtime from Settings > Local Models.");
+            return message;
+        }
     }
-    if !whisper_cli_available {
+
+    let mut missing = Vec::new();
+    if !health.ffmpeg_available {
         missing.push(format!(
-            "Whisper CLI is not runnable at '{}'.",
-            whisper_cli_resolved
+            "FFmpeg is not runnable at '{}'.",
+            health.ffmpeg_resolved
         ));
     }
-    if !whisper_stream_available {
+    if !health.whisper_cli_available {
+        missing.push(format!(
+            "Whisper CLI is not runnable at '{}'.",
+            health.whisper_cli_resolved
+        ));
+    }
+    if !health.whisper_stream_available {
         missing.push(format!(
             "Whisper Stream is not runnable at '{}'.",
-            whisper_stream_resolved
+            health.whisper_stream_resolved
         ));
     }
 
@@ -131,11 +176,7 @@ pub async fn ensure_transcription_runtime(
         .runtime_health()
         .map_err(|e| CommandError::new("runtime_health", e))?;
 
-    if runtime_toolchain_ready(
-        health.ffmpeg_available,
-        health.whisper_cli_available,
-        health.whisper_stream_available,
-    ) {
+    if runtime_toolchain_ready(&health) {
         return Ok(EnsureRuntimeResponse {
             ready: true,
             engine: "whisper_cpp".to_string(),
@@ -214,11 +255,7 @@ pub async fn ensure_transcription_runtime(
         .runtime_health()
         .map_err(|e| CommandError::new("runtime_health", e))?;
 
-    let ready = runtime_toolchain_ready(
-        refreshed.ffmpeg_available,
-        refreshed.whisper_cli_available,
-        refreshed.whisper_stream_available,
-    );
+    let ready = runtime_toolchain_ready(&refreshed);
     let message = if ready {
         if did_setup {
             "Whisper.cpp runtime is ready.".to_string()
@@ -226,15 +263,7 @@ pub async fn ensure_transcription_runtime(
             "Whisper.cpp runtime available.".to_string()
         }
     } else {
-        runtime_toolchain_message(
-            refreshed.ffmpeg_available,
-            &refreshed.ffmpeg_resolved,
-            refreshed.whisper_cli_available,
-            &refreshed.whisper_cli_resolved,
-            refreshed.whisper_stream_available,
-            &refreshed.whisper_stream_resolved,
-            setup_note.as_deref(),
-        )
+        runtime_toolchain_message(&refreshed, setup_note.as_deref())
     };
 
     Ok(EnsureRuntimeResponse {
@@ -267,13 +296,18 @@ pub async fn get_transcription_start_preflight(
         .to_string();
 
     if !health.ffmpeg_available {
+        let message = if health.managed_runtime_required {
+            runtime_toolchain_message(&health, None)
+        } else {
+            format!(
+                "FFmpeg is not runnable at '{}'. Configure FFmpeg path in Settings > Advanced.",
+                health.ffmpeg_resolved
+            )
+        };
         return Ok(StartPreflightResponse {
             allowed: false,
             reason_code: "ffmpeg_missing".to_string(),
-            message: format!(
-                "FFmpeg is not runnable at '{}'. Configure FFmpeg path in Settings > Advanced.",
-                health.ffmpeg_resolved
-            ),
+            message,
             engine: "whisper_cpp".to_string(),
             model_filename,
             model_path,
@@ -284,13 +318,18 @@ pub async fn get_transcription_start_preflight(
     }
 
     if !health.whisper_cli_available {
+        let message = if health.managed_runtime_required {
+            runtime_toolchain_message(&health, None)
+        } else {
+            format!(
+                "Whisper CLI is not runnable at '{}'. Configure Whisper CLI path in Settings > Local Models.",
+                health.whisper_cli_resolved
+            )
+        };
         return Ok(StartPreflightResponse {
             allowed: false,
             reason_code: "whispercpp_missing".to_string(),
-            message: format!(
-                "Whisper CLI is not runnable at '{}'. Configure Whisper CLI path in Settings > Local Models.",
-                health.whisper_cli_resolved
-            ),
+            message,
             engine: "whisper_cpp".to_string(),
             model_filename,
             model_path,
@@ -359,6 +398,9 @@ pub async fn get_transcription_runtime_health(
         is_apple_silicon: health.is_apple_silicon,
         preferred_engine: engine_to_wire(&health.preferred_engine).to_string(),
         configured_engine: engine_to_wire(&health.configured_engine).to_string(),
+        runtime_source: health.runtime_source,
+        managed_runtime_required: health.managed_runtime_required,
+        managed_runtime: health.managed_runtime,
         ffmpeg_path: health.ffmpeg_path,
         ffmpeg_resolved: health.ffmpeg_resolved,
         ffmpeg_available: health.ffmpeg_available,

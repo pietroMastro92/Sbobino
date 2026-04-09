@@ -121,8 +121,10 @@ import {
   type InitialSetupStepId,
   INITIAL_SETUP_REQUIRES_PYANNOTE,
   findProvisioningModelEntry,
+  getRuntimeToolchainFailureMessage,
   getInitialSetupMissingModels,
   isInitialSetupComplete,
+  isRuntimeToolchainReady,
   isProvisionedModelReady,
   shouldRepairPyannoteRuntime,
 } from "./lib/initialSetup";
@@ -1441,7 +1443,11 @@ function formatRealtimeStatusMessage(state: string): string {
   }
 }
 
-function formatRuntimeNotReadyMessage(): string {
+function formatRuntimeNotReadyMessage(runtimeHealth?: RuntimeHealth | null): string {
+  const managedFailure = getRuntimeToolchainFailureMessage(runtimeHealth);
+  if (managedFailure) {
+    return managedFailure;
+  }
   return t(
     "error.runtimeNotReadyDetails",
     "Transcription runtime is not ready. Check FFmpeg, Whisper CLI, and Whisper Stream in Settings > Local Models.",
@@ -2398,9 +2404,7 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
     privacyPolicyAccepted,
     startupGateBypass ? initialBootstrap?.setupReport : null,
   );
-  const runtimeToolchainReady = runtimeHealth?.ffmpeg_available === true
-    && runtimeHealth?.whisper_cli_available === true
-    && runtimeHealth?.whisper_stream_available === true;
+  const runtimeToolchainReady = isRuntimeToolchainReady(runtimeHealth);
   const initialSetupReady = isInitialSetupComplete(privacyPolicyAccepted, runtimeHealth, modelCatalog);
 
   const describeEmotionValence = useCallback((score: number): string => {
@@ -4748,11 +4752,7 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
     if (!snapshot) {
       return "setup_incomplete";
     }
-    if (
-      !snapshot.runtimeHealth.ffmpeg_available
-      || !snapshot.runtimeHealth.whisper_cli_available
-      || !snapshot.runtimeHealth.whisper_stream_available
-    ) {
+    if (!isRuntimeToolchainReady(snapshot.runtimeHealth)) {
       return "runtime_repair_required";
     }
     if (INITIAL_SETUP_REQUIRES_PYANNOTE && !snapshot.runtimeHealth.pyannote.ready) {
@@ -4873,11 +4873,7 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
         updated_at: new Date().toISOString(),
       }));
 
-      if (
-        !snapshot.runtimeHealth.ffmpeg_available
-        || !snapshot.runtimeHealth.whisper_cli_available
-        || !snapshot.runtimeHealth.whisper_stream_available
-      ) {
+      if (!isRuntimeToolchainReady(snapshot.runtimeHealth)) {
         await updateInitialSetupStepState(
           "speech-runtime",
           "running",
@@ -4894,12 +4890,8 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
         );
       }
 
-      if (
-        !snapshot.runtimeHealth.ffmpeg_available
-        || !snapshot.runtimeHealth.whisper_cli_available
-        || !snapshot.runtimeHealth.whisper_stream_available
-      ) {
-        throw new Error(formatRuntimeNotReadyMessage());
+      if (!isRuntimeToolchainReady(snapshot.runtimeHealth)) {
+        throw new Error(formatRuntimeNotReadyMessage(snapshot.runtimeHealth));
       }
 
       if (INITIAL_SETUP_REQUIRES_PYANNOTE && !snapshot.runtimeHealth.pyannote.ready) {
@@ -5260,7 +5252,7 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
         t("error.runtimeSetupTimedOut", "Runtime setup timed out."),
       );
       if (!runtimeStatus.ready) {
-        const failureMessage = formatRuntimeNotReadyMessage();
+        const failureMessage = runtimeStatus.message || formatRuntimeNotReadyMessage(runtimeHealth);
         if (preserveCurrentArtifact) {
           setError(failureMessage);
         } else {
@@ -9816,36 +9808,56 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
                   </span>
                 </div>
                 <div className="settings-health-row">
-                  <span className="settings-health-label">{t("settings.advanced.ffmpegPath", "FFmpeg path")}</span>
+                  <span className="settings-health-label">{t("settings.localModels.runtimeSource", "Runtime source")}</span>
                   <span className="settings-health-value-inline">
+                    <code>{runtimeHealth.runtime_source || "unknown"}</code>
+                    {runtimeHealth.managed_runtime_required ? (
+                      <span className="kind-chip">{t("settings.localModels.managedOnly", "Managed only")}</span>
+                    ) : (
+                      <span className="missing-chip">{t("settings.localModels.devFallbacksAllowed", "Fallbacks allowed")}</span>
+                    )}
+                  </span>
+                </div>
+                <div className="settings-health-row">
+                  <span className="settings-health-label">{t("settings.advanced.ffmpegPath", "FFmpeg path")}</span>
+                  <span className="settings-health-value-inline settings-health-value-stack">
                     <code className="settings-health-value">{runtimeHealth.ffmpeg_resolved || runtimeHealth.ffmpeg_path}</code>
                     {runtimeHealth.ffmpeg_available ? (
                       <span className="kind-chip">{t("settings.localModels.runnable")}</span>
                     ) : (
                       <span className="missing-chip">{t("settings.localModels.unavailable")}</span>
                     )}
+                    {!runtimeHealth.ffmpeg_available && runtimeHealth.managed_runtime?.ffmpeg.failure_message ? (
+                      <span className="settings-health-detail">{runtimeHealth.managed_runtime.ffmpeg.failure_message}</span>
+                    ) : null}
                   </span>
                 </div>
                 <div className="settings-health-row">
                   <span className="settings-health-label">{t("settings.localModels.whisperCli")}</span>
-                  <span className="settings-health-value-inline">
+                  <span className="settings-health-value-inline settings-health-value-stack">
                     <code className="settings-health-value">{runtimeHealth.whisper_cli_resolved || runtimeHealth.whisper_cli_path}</code>
                     {runtimeHealth.whisper_cli_available ? (
                       <span className="kind-chip">{t("settings.localModels.runnable")}</span>
                     ) : (
                       <span className="missing-chip">{t("settings.localModels.unavailable")}</span>
                     )}
+                    {!runtimeHealth.whisper_cli_available && runtimeHealth.managed_runtime?.whisper_cli.failure_message ? (
+                      <span className="settings-health-detail">{runtimeHealth.managed_runtime.whisper_cli.failure_message}</span>
+                    ) : null}
                   </span>
                 </div>
                 <div className="settings-health-row">
                   <span className="settings-health-label">{t("settings.localModels.whisperStream")}</span>
-                  <span className="settings-health-value-inline">
+                  <span className="settings-health-value-inline settings-health-value-stack">
                     <code className="settings-health-value">{runtimeHealth.whisper_stream_resolved || runtimeHealth.whisper_stream_path}</code>
                     {runtimeHealth.whisper_stream_available ? (
                       <span className="kind-chip">{t("settings.localModels.runnable")}</span>
                     ) : (
                       <span className="missing-chip">{t("settings.localModels.unavailable")}</span>
                     )}
+                    {!runtimeHealth.whisper_stream_available && runtimeHealth.managed_runtime?.whisper_stream.failure_message ? (
+                      <span className="settings-health-detail">{runtimeHealth.managed_runtime.whisper_stream.failure_message}</span>
+                    ) : null}
                   </span>
                 </div>
                 <div className="settings-health-row">

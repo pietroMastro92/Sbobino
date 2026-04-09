@@ -145,6 +145,8 @@ bin_dir = os.path.join(root, "runtime", "bin")
 lib_dir = os.path.join(root, "runtime", "lib")
 env = os.environ.copy()
 env["DYLD_LIBRARY_PATH"] = lib_dir
+env["DYLD_FALLBACK_LIBRARY_PATH"] = lib_dir
+env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
 
 def run_probe(binary: str, args: list[str], timeout: int, allow_timeout: bool) -> None:
     candidate = os.path.join(bin_dir, binary)
@@ -169,20 +171,16 @@ def run_probe(binary: str, args: list[str], timeout: int, allow_timeout: bool) -
             f"{binary} exited with code {result.returncode} while validating extracted runtime asset.\n{preview}"
         )
 
-for binary, args, timeout in (
-    ("ffmpeg", ["-version"], 10),
-    ("whisper-cli", ["--help"], 10),
-    ("whisper-stream", ["--help"], 10),
+for binary, args, timeout, cold_timeout in (
+    ("ffmpeg", ["-version"], 60, 45),
+    ("whisper-cli", ["--help"], 30, 15),
+    ("whisper-stream", ["--help"], 30, 15),
 ):
     candidate = os.path.join(bin_dir, binary)
     if not os.path.isfile(candidate):
         raise SystemExit(f"Runtime asset is missing expected binary: {candidate}")
 
-    if binary == "ffmpeg":
-        run_probe(binary, args, timeout, True)
-        run_probe(binary, args, 60, False)
-        continue
-
+    run_probe(binary, args, cold_timeout, True)
     run_probe(binary, args, timeout, False)
 PY
 }
@@ -214,7 +212,10 @@ cargo test -p sbobino-infrastructure runtime_health_reports_version_mismatch_as_
 cargo test -p sbobino-infrastructure runtime_health_reports_install_incomplete_when_python_stdlib_is_missing
 cargo test -p sbobino-infrastructure runtime_health_self_heals_missing_manifest_and_status_from_bundled_override
 cargo test -p sbobino-infrastructure runnable_ffmpeg_probe_accepts_slow_cold_start
-cargo test -p sbobino-infrastructure runnable_non_ffmpeg_probe_rejects_timeout
+cargo test -p sbobino-infrastructure managed_runtime_accepts_slow_whisper_cli_cold_start
+cargo test -p sbobino-infrastructure managed_runtime_accepts_slow_whisper_stream_cold_start
+cargo test -p sbobino-infrastructure public_runtime_health_requires_managed_runtime_binaries
+cargo test -p sbobino-infrastructure public_runtime_health_ignores_configured_host_binaries
 cargo test -p sbobino-desktop install_pyannote_archive_extracts_expected_root
 cargo test -p sbobino-desktop verify_file_sha256_rejects_wrong_checksum
 cargo test -p sbobino-desktop validate_setup_manifest_rejects_mismatched_release_tag

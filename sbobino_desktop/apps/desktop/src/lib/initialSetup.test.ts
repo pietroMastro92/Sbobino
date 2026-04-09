@@ -15,6 +15,30 @@ function createRuntimeHealthFixture(): RuntimeHealth {
     is_apple_silicon: true,
     preferred_engine: "whisper_cpp",
     configured_engine: "whisper_cpp",
+    runtime_source: "managed_release_asset",
+    managed_runtime_required: true,
+    managed_runtime: {
+      source: "managed_release_asset",
+      ready: true,
+      ffmpeg: {
+        resolved_path: "/tmp/ffmpeg",
+        available: true,
+        failure_reason: "",
+        failure_message: "",
+      },
+      whisper_cli: {
+        resolved_path: "/tmp/whisper-cli",
+        available: true,
+        failure_reason: "",
+        failure_message: "",
+      },
+      whisper_stream: {
+        resolved_path: "/tmp/whisper-stream",
+        available: true,
+        failure_reason: "",
+        failure_message: "",
+      },
+    },
     ffmpeg_path: "ffmpeg",
     ffmpeg_resolved: "/tmp/ffmpeg",
     ffmpeg_available: true,
@@ -136,7 +160,7 @@ describe("initialSetup helpers", () => {
 
     expect(
       canWarmStartFromSetupReport(true, {
-        build_version: "0.1.9",
+        build_version: "0.1.10",
         privacy_accepted: true,
         setup_complete: true,
         final_reason_code: "setup_complete",
@@ -150,7 +174,7 @@ describe("initialSetup helpers", () => {
 
     expect(
       canWarmStartFromSetupReport(true, {
-        build_version: "0.1.9",
+        build_version: "0.1.10",
         privacy_accepted: true,
         setup_complete: true,
         final_reason_code: "setup_complete",

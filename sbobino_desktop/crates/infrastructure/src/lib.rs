@@ -48,6 +48,7 @@ pub struct RuntimeTranscriptionFactory {
     data_dir: PathBuf,
     bundle_resources_dir: Option<PathBuf>,
     allow_dev_resource_overrides: bool,
+    runtime_source_policy: RuntimeSourcePolicy,
 }
 
 const REQUIRED_MODEL_FILES: [&str; 5] = [
@@ -105,6 +106,23 @@ pub struct PyannoteRuntimeHealth {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedRuntimeBinaryHealth {
+    pub resolved_path: String,
+    pub available: bool,
+    pub failure_reason: String,
+    pub failure_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagedRuntimeHealth {
+    pub source: String,
+    pub ready: bool,
+    pub ffmpeg: ManagedRuntimeBinaryHealth,
+    pub whisper_cli: ManagedRuntimeBinaryHealth,
+    pub whisper_stream: ManagedRuntimeBinaryHealth,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeHealth {
     pub host_os: String,
@@ -112,6 +130,9 @@ pub struct RuntimeHealth {
     pub is_apple_silicon: bool,
     pub preferred_engine: TranscriptionEngine,
     pub configured_engine: TranscriptionEngine,
+    pub runtime_source: String,
+    pub managed_runtime_required: bool,
+    pub managed_runtime: ManagedRuntimeHealth,
     pub ffmpeg_path: String,
     pub ffmpeg_resolved: String,
     pub ffmpeg_available: bool,
@@ -135,12 +156,19 @@ pub struct RuntimeHealth {
 #[derive(Debug, Clone)]
 struct BinaryResolution {
     resolved_path: String,
+    source: String,
 }
 
 struct RunnableBinaryProbe {
     args: &'static [&'static str],
     timeout: Duration,
     accept_running_after_timeout: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeSourcePolicy {
+    PublicManagedOnly,
+    DevFallbackAllowed,
 }
 
 #[derive(Clone)]
@@ -208,6 +236,7 @@ impl RuntimeTranscriptionFactory {
             data_dir: data_dir.to_path_buf(),
             bundle_resources_dir,
             allow_dev_resource_overrides,
+            runtime_source_policy: detect_runtime_source_policy(allow_dev_resource_overrides),
         })
     }
 
@@ -243,7 +272,9 @@ impl RuntimeTranscriptionFactory {
             platform_settings_changed = true;
         }
 
-        let ffmpeg_path = self.resolve_binary_path(&settings.transcription.ffmpeg_path, "ffmpeg");
+        let ffmpeg_path = self
+            .resolve_transcription_binary_details(&settings.transcription.ffmpeg_path, "ffmpeg")
+            .resolved_path;
         let whisper_cli_reference =
             sanitize_whisper_cli_reference(&settings.transcription.whisper_cli_path);
         if whisper_cli_reference != settings.transcription.whisper_cli_path {
@@ -260,11 +291,44 @@ impl RuntimeTranscriptionFactory {
             settings.whisperkit_cli_path = whisper_stream_reference;
             platform_settings_changed = true;
         }
-        let whisper_cli_path = self.resolve_binary_path(&whisper_cli_reference, "whisper-cli");
+        let whisper_cli_path = self
+            .resolve_transcription_binary_details(&whisper_cli_reference, "whisper-cli")
+            .resolved_path;
         let models_dir = self.resolve_models_dir(&settings.transcription.models_dir);
-        let whisper_cli_runnable = self.binary_path_is_runnable(&whisper_cli_path);
+        let runtime_check = self.managed_runtime_health();
+        let whisper_cli_runnable = if self.managed_runtime_required() {
+            runtime_check.whisper_cli.available
+        } else {
+            self.binary_path_is_runnable(&whisper_cli_path)
+        };
+        let ffmpeg_runnable = if self.managed_runtime_required() {
+            runtime_check.ffmpeg.available
+        } else {
+            self.binary_path_is_runnable(&ffmpeg_path)
+        };
+
+        if !ffmpeg_runnable {
+            if self.managed_runtime_required() {
+                return Err(format_managed_runtime_binary_error(
+                    "FFmpeg",
+                    &runtime_check.ffmpeg,
+                    "Repair the local runtime from Settings > Local Models.",
+                ));
+            }
+            return Err(format!(
+                "FFmpeg is not runnable at '{}'. Configure FFmpeg path in Settings > Advanced.",
+                ffmpeg_path
+            ));
+        }
 
         if !whisper_cli_runnable {
+            if self.managed_runtime_required() {
+                return Err(format_managed_runtime_binary_error(
+                    "Whisper CLI",
+                    &runtime_check.whisper_cli,
+                    "Repair the local runtime from Settings > Local Models.",
+                ));
+            }
             return Err(format!(
                 "Whisper.cpp CLI is not runnable at '{}'. Configure Whisper CLI path in Settings > Local Models.",
                 whisper_cli_path
@@ -831,8 +895,19 @@ impl RuntimeTranscriptionFactory {
             &settings.transcription.whisperkit_cli_path,
             &whisper_cli_reference,
         );
-        let whisper_stream_path =
-            self.resolve_binary_path(&whisper_stream_reference, "whisper-stream");
+        let whisper_stream_path = self
+            .resolve_transcription_binary_details(&whisper_stream_reference, "whisper-stream")
+            .resolved_path;
+        if self.managed_runtime_required() {
+            let runtime_check = self.managed_runtime_health();
+            if !runtime_check.whisper_stream.available {
+                return Err(format_managed_runtime_binary_error(
+                    "Whisper Stream",
+                    &runtime_check.whisper_stream,
+                    "Repair the local runtime from Settings > Local Models.",
+                ));
+            }
+        }
         let models_dir = self.resolve_models_dir(&settings.transcription.models_dir);
         Ok(WhisperStreamEngine::new(whisper_stream_path, models_dir))
     }
@@ -870,7 +945,9 @@ impl RuntimeTranscriptionFactory {
             "Pyannote diarization is enabled, but the managed offline model is unavailable."
                 .to_string()
         })?;
-        let ffmpeg_path = self.resolve_binary_path(&settings.transcription.ffmpeg_path, "ffmpeg");
+        let ffmpeg_path = self
+            .resolve_transcription_binary_details(&settings.transcription.ffmpeg_path, "ffmpeg")
+            .resolved_path;
         let ffmpeg_dir = PathBuf::from(&ffmpeg_path)
             .parent()
             .map(PathBuf::from)
@@ -898,6 +975,71 @@ impl RuntimeTranscriptionFactory {
         Ok(settings)
     }
 
+    pub fn managed_runtime_required(&self) -> bool {
+        matches!(
+            self.runtime_source_policy,
+            RuntimeSourcePolicy::PublicManagedOnly
+        )
+    }
+
+    fn managed_runtime_bin_dir(&self) -> PathBuf {
+        self.data_dir.join("bin")
+    }
+
+    fn managed_runtime_lib_dir(&self) -> PathBuf {
+        self.data_dir.join("lib")
+    }
+
+    fn managed_runtime_binary_path(&self, binary_name: &str) -> PathBuf {
+        let file_name = binary_name_variants(binary_name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| binary_name.to_string());
+        self.managed_runtime_bin_dir().join(file_name)
+    }
+
+    pub fn managed_runtime_health(&self) -> ManagedRuntimeHealth {
+        let lib_dir = self.managed_runtime_lib_dir();
+        let ffmpeg =
+            verify_managed_runtime_binary(&self.managed_runtime_binary_path("ffmpeg"), &lib_dir);
+        let whisper_cli = verify_managed_runtime_binary(
+            &self.managed_runtime_binary_path("whisper-cli"),
+            &lib_dir,
+        );
+        let whisper_stream = verify_managed_runtime_binary(
+            &self.managed_runtime_binary_path("whisper-stream"),
+            &lib_dir,
+        );
+
+        ManagedRuntimeHealth {
+            source: "managed_release_asset".to_string(),
+            ready: ffmpeg.available && whisper_cli.available && whisper_stream.available,
+            ffmpeg,
+            whisper_cli,
+            whisper_stream,
+        }
+    }
+
+    fn resolve_transcription_binary_details(
+        &self,
+        configured: &str,
+        fallback: &str,
+    ) -> BinaryResolution {
+        if self.managed_runtime_required()
+            && matches!(fallback, "ffmpeg" | "whisper-cli" | "whisper-stream")
+        {
+            return BinaryResolution {
+                resolved_path: self
+                    .managed_runtime_binary_path(fallback)
+                    .to_string_lossy()
+                    .to_string(),
+                source: "managed_release_asset".to_string(),
+            };
+        }
+
+        self.resolve_binary_details(configured, fallback)
+    }
+
     pub fn runtime_health(&self) -> Result<RuntimeHealth, String> {
         let settings = self.load_settings()?;
         self.install_bundled_pyannote_override_if_available()?;
@@ -916,17 +1058,28 @@ impl RuntimeTranscriptionFactory {
             &whisper_cli_configured,
         );
 
+        let managed_runtime = self.managed_runtime_health();
         let whisper_cli_resolution =
-            self.resolve_binary_details(&whisper_cli_configured, "whisper-cli");
+            self.resolve_transcription_binary_details(&whisper_cli_configured, "whisper-cli");
         let whisper_stream_resolution =
-            self.resolve_binary_details(&whisper_stream_configured, "whisper-stream");
-        let ffmpeg_resolution =
-            self.resolve_binary_details(&settings.transcription.ffmpeg_path, "ffmpeg");
-        let ffmpeg_available = self.binary_path_is_runnable(&ffmpeg_resolution.resolved_path);
-        let whisper_cli_available =
-            self.binary_path_is_runnable(&whisper_cli_resolution.resolved_path);
-        let whisper_stream_available =
-            self.binary_path_is_runnable(&whisper_stream_resolution.resolved_path);
+            self.resolve_transcription_binary_details(&whisper_stream_configured, "whisper-stream");
+        let ffmpeg_resolution = self
+            .resolve_transcription_binary_details(&settings.transcription.ffmpeg_path, "ffmpeg");
+        let ffmpeg_available = if self.managed_runtime_required() {
+            managed_runtime.ffmpeg.available
+        } else {
+            self.binary_path_is_runnable(&ffmpeg_resolution.resolved_path)
+        };
+        let whisper_cli_available = if self.managed_runtime_required() {
+            managed_runtime.whisper_cli.available
+        } else {
+            self.binary_path_is_runnable(&whisper_cli_resolution.resolved_path)
+        };
+        let whisper_stream_available = if self.managed_runtime_required() {
+            managed_runtime.whisper_stream.available
+        } else {
+            self.binary_path_is_runnable(&whisper_stream_resolution.resolved_path)
+        };
 
         let model_filename = settings.transcription.model.ggml_filename().to_string();
         let model_present = models_dir.join(&model_filename).exists();
@@ -947,12 +1100,22 @@ impl RuntimeTranscriptionFactory {
         } else {
             true
         };
-        let setup_complete = ffmpeg_available
-            && whisper_cli_available
-            && whisper_stream_available
-            && pyannote.ready
-            && required_models_ready
-            && required_encoders_ready;
+        let runtime_ready = if self.managed_runtime_required() {
+            managed_runtime.ready
+        } else {
+            ffmpeg_available && whisper_cli_available && whisper_stream_available
+        };
+        let runtime_source = if self.managed_runtime_required() {
+            managed_runtime.source.clone()
+        } else {
+            summarize_runtime_source([
+                &ffmpeg_resolution,
+                &whisper_cli_resolution,
+                &whisper_stream_resolution,
+            ])
+        };
+        let setup_complete =
+            runtime_ready && pyannote.ready && required_models_ready && required_encoders_ready;
 
         Ok(RuntimeHealth {
             host_os: env::consts::OS.to_string(),
@@ -960,6 +1123,9 @@ impl RuntimeTranscriptionFactory {
             is_apple_silicon: is_apple_silicon_host(),
             preferred_engine: preferred_transcription_engine(),
             configured_engine: settings.transcription.engine.clone(),
+            runtime_source,
+            managed_runtime_required: self.managed_runtime_required(),
+            managed_runtime,
             ffmpeg_path: settings.transcription.ffmpeg_path.clone(),
             ffmpeg_resolved: ffmpeg_resolution.resolved_path,
             ffmpeg_available,
@@ -982,7 +1148,7 @@ impl RuntimeTranscriptionFactory {
     }
 
     pub fn resolve_binary_path(&self, configured: &str, fallback: &str) -> String {
-        self.resolve_binary_details(configured, fallback)
+        self.resolve_transcription_binary_details(configured, fallback)
             .resolved_path
     }
 
@@ -1485,6 +1651,7 @@ impl RuntimeTranscriptionFactory {
             if is_runnable_binary_file(path) {
                 return BinaryResolution {
                     resolved_path: path.to_string_lossy().to_string(),
+                    source: infer_binary_source(path, &self.data_dir),
                 };
             }
         }
@@ -1492,12 +1659,14 @@ impl RuntimeTranscriptionFactory {
         if let Some(path) = self.find_binary_candidate(fallback) {
             return BinaryResolution {
                 resolved_path: path.to_string_lossy().to_string(),
+                source: infer_binary_source(&path, &self.data_dir),
             };
         }
 
         if let Some(path) = configured_candidate {
             return BinaryResolution {
                 resolved_path: path.to_string_lossy().to_string(),
+                source: infer_binary_source(&path, &self.data_dir),
             };
         }
 
@@ -1508,6 +1677,7 @@ impl RuntimeTranscriptionFactory {
         };
         BinaryResolution {
             resolved_path: unresolved,
+            source: "unresolved".to_string(),
         }
     }
 
@@ -1642,6 +1812,206 @@ impl RuntimeTranscriptionFactory {
     }
 }
 
+fn infer_binary_source(candidate: &Path, data_dir: &Path) -> String {
+    let managed_bin_dir = data_dir.join("bin");
+    let managed_lib_dir = data_dir.join("lib");
+    if candidate.starts_with(&managed_bin_dir) || candidate.starts_with(&managed_lib_dir) {
+        return "managed_release_asset".to_string();
+    }
+
+    if candidate.starts_with("/opt/homebrew")
+        || candidate.starts_with("/usr/local")
+        || candidate.starts_with("/usr/bin")
+    {
+        return "host_system".to_string();
+    }
+
+    let candidate_str = candidate.to_string_lossy();
+    if candidate_str.contains("/src-tauri/binaries/") {
+        return "dev_sidecar".to_string();
+    }
+    if candidate_str.contains(".app/Contents/MacOS/") {
+        return "bundle_sidecar".to_string();
+    }
+
+    "configured_path".to_string()
+}
+
+fn summarize_runtime_source<'a, I>(resolutions: I) -> String
+where
+    I: IntoIterator<Item = &'a BinaryResolution>,
+{
+    let sources = resolutions
+        .into_iter()
+        .map(|resolution| resolution.source.as_str())
+        .collect::<HashSet<_>>();
+
+    if sources.len() == 1 {
+        return sources.into_iter().next().unwrap_or("unknown").to_string();
+    }
+
+    "mixed_source_fallback".to_string()
+}
+
+fn format_managed_runtime_binary_error(
+    label: &str,
+    health: &ManagedRuntimeBinaryHealth,
+    recovery_hint: &str,
+) -> String {
+    if health.failure_message.trim().is_empty() {
+        return format!(
+            "{label} is not runnable at '{}'. {recovery_hint}",
+            health.resolved_path
+        );
+    }
+
+    format!(
+        "{label} verification failed at '{}': {} {}",
+        health.resolved_path,
+        health.failure_message.trim(),
+        recovery_hint
+    )
+}
+
+fn verify_managed_runtime_binary(candidate: &Path, lib_dir: &Path) -> ManagedRuntimeBinaryHealth {
+    let resolved_path = candidate.to_string_lossy().to_string();
+
+    let Ok(metadata) = candidate.metadata() else {
+        return ManagedRuntimeBinaryHealth {
+            resolved_path,
+            available: false,
+            failure_reason: "missing_file".to_string(),
+            failure_message: "Managed runtime binary is missing.".to_string(),
+        };
+    };
+
+    if !metadata.is_file() {
+        return ManagedRuntimeBinaryHealth {
+            resolved_path,
+            available: false,
+            failure_reason: "missing_file".to_string(),
+            failure_message: "Managed runtime binary is not a regular file.".to_string(),
+        };
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return ManagedRuntimeBinaryHealth {
+                resolved_path,
+                available: false,
+                failure_reason: "missing_exec_bit".to_string(),
+                failure_message: "Managed runtime binary is missing the executable bit."
+                    .to_string(),
+            };
+        }
+    }
+
+    if !lib_dir.is_dir() {
+        return ManagedRuntimeBinaryHealth {
+            resolved_path,
+            available: false,
+            failure_reason: "missing_runtime_libraries".to_string(),
+            failure_message: format!(
+                "Managed runtime libraries were not found at '{}'.",
+                lib_dir.display()
+            ),
+        };
+    }
+
+    let probe = managed_runnable_binary_probe(candidate);
+    let mut command = std::process::Command::new(candidate);
+    command
+        .args(probe.args)
+        .env("DYLD_LIBRARY_PATH", lib_dir)
+        .env("DYLD_FALLBACK_LIBRARY_PATH", lib_dir)
+        .env(
+            "PATH",
+            candidate
+                .parent()
+                .map(|value| format!("{}:/usr/bin:/bin", value.to_string_lossy()))
+                .unwrap_or_else(|| "/usr/bin:/bin".to_string()),
+        );
+
+    let mut child = match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(process) => process,
+        Err(error) => {
+            return ManagedRuntimeBinaryHealth {
+                resolved_path,
+                available: false,
+                failure_reason: "spawn_failed".to_string(),
+                failure_message: format!("Managed runtime binary could not start: {error}"),
+            };
+        }
+    };
+
+    let deadline = Instant::now() + probe.timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return ManagedRuntimeBinaryHealth {
+                        resolved_path,
+                        available: true,
+                        failure_reason: String::new(),
+                        failure_message: String::new(),
+                    };
+                }
+
+                return ManagedRuntimeBinaryHealth {
+                    resolved_path,
+                    available: false,
+                    failure_reason: "nonzero_exit".to_string(),
+                    failure_message: format!("Managed runtime binary exited with status {status}."),
+                };
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if probe.accept_running_after_timeout {
+                        return ManagedRuntimeBinaryHealth {
+                            resolved_path,
+                            available: true,
+                            failure_reason: String::new(),
+                            failure_message: String::new(),
+                        };
+                    }
+
+                    return ManagedRuntimeBinaryHealth {
+                        resolved_path,
+                        available: false,
+                        failure_reason: "timed_out_before_ready".to_string(),
+                        failure_message: format!(
+                            "Managed runtime binary did not become ready within {} seconds.",
+                            probe.timeout.as_secs()
+                        ),
+                    };
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ManagedRuntimeBinaryHealth {
+                    resolved_path,
+                    available: false,
+                    failure_reason: "wait_failed".to_string(),
+                    failure_message: format!(
+                        "Managed runtime binary failed while waiting for readiness: {error}"
+                    ),
+                };
+            }
+        }
+    }
+}
+
 fn is_runnable_binary_file(candidate: &Path) -> bool {
     let Ok(metadata) = candidate.metadata() else {
         return false;
@@ -1712,6 +2082,27 @@ fn runnable_binary_probe(candidate: &Path) -> RunnableBinaryProbe {
         args: &["--help"],
         timeout: Duration::from_secs(2),
         accept_running_after_timeout: false,
+    }
+}
+
+fn managed_runnable_binary_probe(candidate: &Path) -> RunnableBinaryProbe {
+    let file_name = candidate
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+
+    if file_name.eq_ignore_ascii_case("ffmpeg") {
+        return RunnableBinaryProbe {
+            args: &["-version"],
+            timeout: Duration::from_secs(45),
+            accept_running_after_timeout: true,
+        };
+    }
+
+    RunnableBinaryProbe {
+        args: &["--help"],
+        timeout: Duration::from_secs(15),
+        accept_running_after_timeout: true,
     }
 }
 impl RuntimeTranscriptionFactory {
@@ -1907,6 +2298,27 @@ fn required_initial_setup_encoders() -> [&'static str; 2] {
         "ggml-base-encoder.mlmodelc",
         "ggml-large-v3-turbo-encoder.mlmodelc",
     ]
+}
+
+fn detect_runtime_source_policy(allow_dev_resource_overrides: bool) -> RuntimeSourcePolicy {
+    if !allow_dev_resource_overrides {
+        return RuntimeSourcePolicy::PublicManagedOnly;
+    }
+
+    if let Ok(value) = env::var("SBOBINO_RUNTIME_SOURCE_POLICY") {
+        match value.trim() {
+            "managed-only" => return RuntimeSourcePolicy::PublicManagedOnly,
+            "dev-fallback" => return RuntimeSourcePolicy::DevFallbackAllowed,
+            _ => {}
+        }
+    }
+
+    match option_env!("SBOBINO_RELEASE_PROFILE") {
+        Some("public") => RuntimeSourcePolicy::PublicManagedOnly,
+        Some("standalone-dev") => RuntimeSourcePolicy::DevFallbackAllowed,
+        _ if !cfg!(debug_assertions) => RuntimeSourcePolicy::PublicManagedOnly,
+        _ => RuntimeSourcePolicy::DevFallbackAllowed,
+    }
 }
 
 #[derive(Clone)]
@@ -2611,6 +3023,28 @@ mod tests {
             .expect("encodings marker should write");
     }
 
+    fn prepare_managed_runtime(
+        factory: &RuntimeTranscriptionFactory,
+        ffmpeg_script: &str,
+        whisper_cli_script: &str,
+        whisper_stream_script: &str,
+    ) {
+        std::fs::create_dir_all(factory.managed_runtime_lib_dir())
+            .expect("managed runtime lib dir should exist");
+        write_executable_file(
+            &factory.managed_runtime_binary_path("ffmpeg"),
+            ffmpeg_script,
+        );
+        write_executable_file(
+            &factory.managed_runtime_binary_path("whisper-cli"),
+            whisper_cli_script,
+        );
+        write_executable_file(
+            &factory.managed_runtime_binary_path("whisper-stream"),
+            whisper_stream_script,
+        );
+    }
+
     #[test]
     fn runtime_health_reports_missing_pyannote_runtime_when_enabled() {
         let (_temp, factory) = build_factory();
@@ -3156,6 +3590,121 @@ Load command 14
         assert!(
             !super::is_runnable_binary_file(&whisper_cli),
             "non-ffmpeg probes should still fail on timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_accepts_slow_whisper_cli_cold_start() {
+        let (_temp, factory) = build_factory();
+        prepare_managed_runtime(
+            &factory,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nsleep 3\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+        );
+
+        let health = factory.managed_runtime_health();
+        assert!(health.whisper_cli.available);
+        assert!(health.ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_accepts_slow_whisper_stream_cold_start() {
+        let (_temp, factory) = build_factory();
+        prepare_managed_runtime(
+            &factory,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nsleep 3\nexit 0\n",
+        );
+
+        let health = factory.managed_runtime_health();
+        assert!(health.whisper_stream.available);
+        assert!(health.ready);
+    }
+
+    #[test]
+    fn public_runtime_health_requires_managed_runtime_binaries() {
+        let (_temp, factory) = build_factory();
+        let health = factory
+            .runtime_health()
+            .expect("runtime health should load");
+
+        assert!(health.managed_runtime_required);
+        assert_eq!(health.runtime_source, "managed_release_asset");
+        assert!(!health.managed_runtime.ready);
+        assert_eq!(
+            health.ffmpeg_resolved,
+            factory
+                .managed_runtime_binary_path("ffmpeg")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert!(!health.ffmpeg_available);
+        assert!(!health.whisper_cli_available);
+        assert!(!health.whisper_stream_available);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_runtime_health_ignores_configured_host_binaries() {
+        let (temp, factory) = build_factory();
+        let host_bin_dir = temp.path().join("host-bin");
+        write_executable_file(&host_bin_dir.join("ffmpeg"), "#!/bin/sh\nexit 0\n");
+        write_executable_file(&host_bin_dir.join("whisper-cli"), "#!/bin/sh\nexit 0\n");
+        write_executable_file(&host_bin_dir.join("whisper-stream"), "#!/bin/sh\nexit 0\n");
+
+        prepare_managed_runtime(
+            &factory,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+        );
+
+        let mut settings = AppSettings::default();
+        settings.transcription.ffmpeg_path =
+            host_bin_dir.join("ffmpeg").to_string_lossy().to_string();
+        settings.transcription.whisper_cli_path = host_bin_dir
+            .join("whisper-cli")
+            .to_string_lossy()
+            .to_string();
+        settings.transcription.whisperkit_cli_path = host_bin_dir
+            .join("whisper-stream")
+            .to_string_lossy()
+            .to_string();
+        settings.whisper_cli_path = settings.transcription.whisper_cli_path.clone();
+        settings.whisperkit_cli_path = settings.transcription.whisperkit_cli_path.clone();
+        persist_settings(&factory, &settings);
+
+        let health = factory
+            .runtime_health()
+            .expect("runtime health should load");
+        assert_eq!(health.runtime_source, "managed_release_asset");
+        assert!(health.ffmpeg_available);
+        assert!(health.whisper_cli_available);
+        assert!(health.whisper_stream_available);
+        assert_eq!(
+            health.ffmpeg_resolved,
+            factory
+                .managed_runtime_binary_path("ffmpeg")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(
+            health.whisper_cli_resolved,
+            factory
+                .managed_runtime_binary_path("whisper-cli")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(
+            health.whisper_stream_resolved,
+            factory
+                .managed_runtime_binary_path("whisper-stream")
+                .to_string_lossy()
+                .to_string()
         );
     }
 }
