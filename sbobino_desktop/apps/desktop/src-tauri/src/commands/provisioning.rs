@@ -8,7 +8,17 @@ use tauri::{Emitter, State};
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::{error::CommandError, state::AppState};
+use crate::{
+    error::CommandError,
+    release_assets::{
+        release_asset_url, release_tag, PyannoteReleaseAsset, PyannoteReleaseManifest,
+        ReleaseAssetDescriptor, RuntimeReleaseAsset, RuntimeReleaseManifest, SetupReleaseManifest,
+        PYANNOTE_MANIFEST_ASSET, PYANNOTE_MODEL_ASSET, PYANNOTE_RUNTIME_AARCH64_ASSET,
+        PYANNOTE_RUNTIME_X86_64_ASSET, RUNTIME_AARCH64_ASSET, RUNTIME_MANIFEST_ASSET,
+        SETUP_MANIFEST_ASSET,
+    },
+    state::AppState,
+};
 use sbobino_infrastructure::{ManagedPyannoteManifest, RuntimeTranscriptionFactory};
 
 const REQUIRED_MODELS: [&str; 5] = [
@@ -81,27 +91,7 @@ const MODEL_CATALOG: [(&str, &str, &str, &str, &str); 5] = [
 ];
 
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
-const RELEASE_REPOSITORY: &str = "pietroMastro92/sbobino_tauri";
-const RUNTIME_MANIFEST_ASSET: &str = "runtime-manifest.json";
-const RUNTIME_AARCH64_ASSET: &str = "speech-runtime-macos-aarch64.zip";
-const PYANNOTE_MANIFEST_ASSET: &str = "pyannote-manifest.json";
-const PYANNOTE_RUNTIME_AARCH64_ASSET: &str = "pyannote-runtime-macos-aarch64.zip";
-const PYANNOTE_RUNTIME_X86_64_ASSET: &str = "pyannote-runtime-macos-x86_64.zip";
-const PYANNOTE_MODEL_ASSET: &str = "pyannote-model-community-1.zip";
 const LOCAL_RELEASE_ASSETS_DIR_ENV: &str = "SBOBINO_LOCAL_RELEASE_ASSETS_DIR";
-
-#[derive(Debug, Clone, Deserialize)]
-struct PyannoteReleaseManifest {
-    app_version: String,
-    assets: Vec<PyannoteReleaseAsset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PyannoteReleaseAsset {
-    kind: String,
-    name: String,
-    sha256: String,
-}
 
 #[derive(Debug, Clone)]
 struct PyannoteAssetSelection {
@@ -110,22 +100,17 @@ struct PyannoteAssetSelection {
     release_version: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct RuntimeReleaseManifest {
-    app_version: String,
-    assets: Vec<RuntimeReleaseAsset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RuntimeReleaseAsset {
-    kind: String,
-    name: String,
-    sha256: String,
-}
-
 #[derive(Debug, Clone)]
 struct RuntimeAssetSelection {
     runtime_asset: RuntimeReleaseAsset,
+    release_version: String,
+}
+
+#[derive(Debug, Clone)]
+struct SetupReleaseBundle {
+    setup_manifest: SetupReleaseManifest,
+    runtime_manifest: RuntimeReleaseManifest,
+    pyannote_manifest: PyannoteReleaseManifest,
     release_version: String,
 }
 
@@ -612,7 +597,12 @@ pub async fn read_setup_report(
     })?;
     report.trusted_for_fast_start = report.build_version.trim() == env!("CARGO_PKG_VERSION")
         && report.setup_complete
-        && report.final_error.as_deref().unwrap_or("").trim().is_empty()
+        && report
+            .final_error
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
         && report.final_reason_code.as_deref() == Some("setup_complete");
     Ok(Some(report))
 }
@@ -1241,25 +1231,10 @@ fn spawn_runtime_provisioning_download(
 async fn fetch_pyannote_asset_selection(
     client: &reqwest::Client,
 ) -> Result<PyannoteAssetSelection, String> {
-    let version = env!("CARGO_PKG_VERSION").to_string();
-    let manifest = read_release_manifest::<PyannoteReleaseManifest>(
-        client,
-        &version,
-        PYANNOTE_MANIFEST_ASSET,
-        "pyannote release manifest",
-    )
-    .await?;
-
-    if manifest.app_version.trim() != version {
-        return Err(format!(
-            "Pyannote manifest version '{}' does not match app version '{}'.",
-            manifest.app_version.trim(),
-            version
-        ));
-    }
-
+    let bundle = fetch_setup_release_bundle(client).await?;
     let runtime_kind = host_pyannote_runtime_kind();
-    let runtime_asset = manifest
+    let runtime_asset = bundle
+        .pyannote_manifest
         .assets
         .iter()
         .find(|asset| asset.kind == runtime_kind)
@@ -1270,58 +1245,39 @@ async fn fetch_pyannote_asset_selection(
                 runtime_kind
             )
         })?;
-    let model_asset = manifest
+    validate_manifest_asset_descriptor(
+        &bundle.setup_manifest.pyannote_runtime_asset,
+        &runtime_asset.name,
+        &runtime_asset.sha256,
+        "pyannote runtime asset",
+    )?;
+    let model_asset = bundle
+        .pyannote_manifest
         .assets
         .iter()
         .find(|asset| asset.kind == "pyannote_model")
         .cloned()
         .ok_or_else(|| "Pyannote release manifest is missing the model asset.".to_string())?;
-    let expected_runtime_name = if runtime_kind == "pyannote_runtime_macos_x86_64" {
-        PYANNOTE_RUNTIME_X86_64_ASSET
-    } else {
-        PYANNOTE_RUNTIME_AARCH64_ASSET
-    };
-    if runtime_asset.name != expected_runtime_name {
-        return Err(format!(
-            "Pyannote runtime asset name mismatch: expected '{}', got '{}'.",
-            expected_runtime_name, runtime_asset.name
-        ));
-    }
-    if model_asset.name != PYANNOTE_MODEL_ASSET {
-        return Err(format!(
-            "Pyannote model asset name mismatch: expected '{}', got '{}'.",
-            PYANNOTE_MODEL_ASSET, model_asset.name
-        ));
-    }
+    validate_manifest_asset_descriptor(
+        &bundle.setup_manifest.pyannote_model_asset,
+        &model_asset.name,
+        &model_asset.sha256,
+        "pyannote model asset",
+    )?;
 
     Ok(PyannoteAssetSelection {
         runtime_asset,
         model_asset,
-        release_version: version,
+        release_version: bundle.release_version,
     })
 }
 
 async fn fetch_runtime_asset_selection(
     client: &reqwest::Client,
 ) -> Result<RuntimeAssetSelection, String> {
-    let version = env!("CARGO_PKG_VERSION").to_string();
-    let manifest = read_release_manifest::<RuntimeReleaseManifest>(
-        client,
-        &version,
-        RUNTIME_MANIFEST_ASSET,
-        "runtime release manifest",
-    )
-    .await?;
-
-    if manifest.app_version.trim() != version {
-        return Err(format!(
-            "Runtime manifest version '{}' does not match app version '{}'.",
-            manifest.app_version.trim(),
-            version
-        ));
-    }
-
-    let runtime_asset = manifest
+    let bundle = fetch_setup_release_bundle(client).await?;
+    let runtime_asset = bundle
+        .runtime_manifest
         .assets
         .iter()
         .find(|asset| asset.kind == "speech_runtime_macos_aarch64")
@@ -1329,22 +1285,17 @@ async fn fetch_runtime_asset_selection(
         .ok_or_else(|| {
             "Runtime release manifest is missing the speech runtime asset.".to_string()
         })?;
-
-    if runtime_asset.name != RUNTIME_AARCH64_ASSET {
-        return Err(format!(
-            "Runtime asset name mismatch: expected '{}', got '{}'.",
-            RUNTIME_AARCH64_ASSET, runtime_asset.name
-        ));
-    }
+    validate_manifest_asset_descriptor(
+        &bundle.setup_manifest.runtime_asset,
+        &runtime_asset.name,
+        &runtime_asset.sha256,
+        "runtime asset",
+    )?;
 
     Ok(RuntimeAssetSelection {
         runtime_asset,
-        release_version: version,
+        release_version: bundle.release_version,
     })
-}
-
-fn release_asset_url(version: &str, asset_name: &str) -> String {
-    format!("https://github.com/{RELEASE_REPOSITORY}/releases/download/v{version}/{asset_name}")
 }
 
 fn local_release_assets_dir() -> Option<PathBuf> {
@@ -1357,36 +1308,117 @@ fn local_release_assets_dir() -> Option<PathBuf> {
     }
 }
 
+async fn fetch_setup_release_bundle(
+    client: &reqwest::Client,
+) -> Result<SetupReleaseBundle, String> {
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    let setup_manifest = read_release_manifest::<SetupReleaseManifest>(
+        client,
+        &version,
+        SETUP_MANIFEST_ASSET,
+        "setup release manifest",
+    )
+    .await?;
+    validate_setup_manifest(&version, &setup_manifest)?;
+
+    let runtime_manifest = read_release_manifest_from_descriptor::<RuntimeReleaseManifest>(
+        client,
+        &version,
+        &setup_manifest.runtime_manifest,
+        RUNTIME_MANIFEST_ASSET,
+        "runtime release manifest",
+    )
+    .await?;
+    if runtime_manifest.app_version.trim() != version {
+        return Err(format!(
+            "Runtime manifest version '{}' does not match app version '{}'.",
+            runtime_manifest.app_version.trim(),
+            version
+        ));
+    }
+
+    let pyannote_manifest = read_release_manifest_from_descriptor::<PyannoteReleaseManifest>(
+        client,
+        &version,
+        &setup_manifest.pyannote_manifest,
+        PYANNOTE_MANIFEST_ASSET,
+        "pyannote release manifest",
+    )
+    .await?;
+    if pyannote_manifest.app_version.trim() != version {
+        return Err(format!(
+            "Pyannote manifest version '{}' does not match app version '{}'.",
+            pyannote_manifest.app_version.trim(),
+            version
+        ));
+    }
+
+    Ok(SetupReleaseBundle {
+        setup_manifest,
+        runtime_manifest,
+        pyannote_manifest,
+        release_version: version,
+    })
+}
+
 async fn read_release_manifest<T: DeserializeOwned>(
     client: &reqwest::Client,
     version: &str,
     asset_name: &str,
     label: &str,
 ) -> Result<T, String> {
+    let body = read_release_asset_bytes(client, version, asset_name, label).await?;
+    serde_json::from_slice::<T>(&body).map_err(|e| format!("invalid {label}: {e}"))
+}
+
+async fn read_release_manifest_from_descriptor<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    version: &str,
+    descriptor: &ReleaseAssetDescriptor,
+    expected_name: &str,
+    label: &str,
+) -> Result<T, String> {
+    validate_release_descriptor_name(descriptor, expected_name, label)?;
+    let body = read_release_asset_bytes(client, version, &descriptor.name, label).await?;
+    let actual_sha256 = sha256_bytes_hex(&body);
+    let expected_sha256 = normalize_sha256(&descriptor.sha256);
+    if actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "Checksum mismatch for {} '{}': expected {}, got {}.",
+            label, descriptor.name, expected_sha256, actual_sha256
+        ));
+    }
+    serde_json::from_slice::<T>(&body).map_err(|e| format!("invalid {label}: {e}"))
+}
+
+async fn read_release_asset_bytes(
+    client: &reqwest::Client,
+    version: &str,
+    asset_name: &str,
+    label: &str,
+) -> Result<Vec<u8>, String> {
     if let Some(local_root) = local_release_assets_dir() {
-        let manifest_path = local_root.join(asset_name);
-        let body = tokio::fs::read_to_string(&manifest_path)
-            .await
-            .map_err(|e| {
-                format!(
-                    "failed to read local {label} '{}': {e}",
-                    manifest_path.display()
-                )
-            })?;
-        serde_json::from_str::<T>(&body).map_err(|e| format!("invalid local {label}: {e}"))
+        let asset_path = local_root.join(asset_name);
+        tokio::fs::read(&asset_path).await.map_err(|e| {
+            format!(
+                "failed to read local {label} '{}': {e}",
+                asset_path.display()
+            )
+        })
     } else {
-        let manifest_url = release_asset_url(version, asset_name);
+        let asset_url = release_asset_url(version, asset_name);
         let response = client
-            .get(&manifest_url)
+            .get(&asset_url)
             .send()
             .await
             .map_err(|e| format!("failed to fetch {label}: {e}"))?
             .error_for_status()
             .map_err(|e| format!("failed to download {label}: {e}"))?;
         response
-            .json::<T>()
+            .bytes()
             .await
-            .map_err(|e| format!("invalid {label}: {e}"))
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| format!("failed to read {label}: {e}"))
     }
 }
 
@@ -1417,6 +1449,102 @@ async fn stage_release_asset(
         let url = release_asset_url(version, asset_name);
         download_to_path(client, &url, destination, cancel_token).await
     }
+}
+
+fn validate_setup_manifest(version: &str, manifest: &SetupReleaseManifest) -> Result<(), String> {
+    if manifest.app_version.trim() != version {
+        return Err(format!(
+            "Setup manifest version '{}' does not match app version '{}'.",
+            manifest.app_version.trim(),
+            version
+        ));
+    }
+
+    let expected_tag = release_tag(version);
+    if manifest.release_tag.trim() != expected_tag {
+        return Err(format!(
+            "Setup manifest release tag '{}' does not match expected '{}'.",
+            manifest.release_tag.trim(),
+            expected_tag
+        ));
+    }
+
+    validate_release_descriptor_name(
+        &manifest.runtime_manifest,
+        RUNTIME_MANIFEST_ASSET,
+        "runtime manifest descriptor",
+    )?;
+    validate_release_descriptor_name(
+        &manifest.runtime_asset,
+        RUNTIME_AARCH64_ASSET,
+        "runtime asset descriptor",
+    )?;
+    validate_release_descriptor_name(
+        &manifest.pyannote_manifest,
+        PYANNOTE_MANIFEST_ASSET,
+        "pyannote manifest descriptor",
+    )?;
+    validate_release_descriptor_name(
+        &manifest.pyannote_runtime_asset,
+        if host_pyannote_runtime_kind() == "pyannote_runtime_macos_x86_64" {
+            PYANNOTE_RUNTIME_X86_64_ASSET
+        } else {
+            PYANNOTE_RUNTIME_AARCH64_ASSET
+        },
+        "pyannote runtime asset descriptor",
+    )?;
+    validate_release_descriptor_name(
+        &manifest.pyannote_model_asset,
+        PYANNOTE_MODEL_ASSET,
+        "pyannote model asset descriptor",
+    )?;
+
+    Ok(())
+}
+
+fn validate_release_descriptor_name(
+    descriptor: &ReleaseAssetDescriptor,
+    expected_name: &str,
+    label: &str,
+) -> Result<(), String> {
+    if descriptor.name.trim() != expected_name {
+        return Err(format!(
+            "{} name mismatch: expected '{}', got '{}'.",
+            label, expected_name, descriptor.name
+        ));
+    }
+    if normalize_sha256(&descriptor.sha256).is_empty() {
+        return Err(format!(
+            "{} '{}' is missing a checksum.",
+            label, descriptor.name
+        ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_asset_descriptor(
+    descriptor: &ReleaseAssetDescriptor,
+    actual_name: &str,
+    actual_sha256: &str,
+    label: &str,
+) -> Result<(), String> {
+    if descriptor.name.trim() != actual_name.trim() {
+        return Err(format!(
+            "{} name mismatch: expected '{}', got '{}'.",
+            label, descriptor.name, actual_name
+        ));
+    }
+
+    let expected_sha256 = normalize_sha256(&descriptor.sha256);
+    let actual_sha256 = normalize_sha256(actual_sha256);
+    if expected_sha256 != actual_sha256 {
+        return Err(format!(
+            "{} checksum mismatch for '{}': expected {}, got {}.",
+            label, actual_name, expected_sha256, actual_sha256
+        ));
+    }
+
+    Ok(())
 }
 
 fn host_pyannote_runtime_kind() -> &'static str {
@@ -1460,8 +1588,12 @@ fn is_pyannote_repair_reason(reason_code: &str) -> bool {
     )
 }
 
+fn normalize_sha256(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
 fn verify_file_sha256(path: &Path, expected_sha256: &str) -> Result<(), String> {
-    let expected = expected_sha256.trim().to_ascii_lowercase();
+    let expected = normalize_sha256(expected_sha256);
     if expected.is_empty() {
         return Err(format!(
             "Checksum is missing for '{}'.",
@@ -1489,8 +1621,8 @@ fn verify_file_sha256(path: &Path, expected_sha256: &str) -> Result<(), String> 
 fn sha256_file_hex(path: &Path) -> Result<String, String> {
     let mut file =
         std::fs::File::open(path).map_err(|e| format!("failed to open file for hashing: {e}"))?;
-    let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 16 * 1024];
+    let mut hasher = Sha256::new();
 
     loop {
         let read = file
@@ -1504,6 +1636,13 @@ fn sha256_file_hex(path: &Path) -> Result<String, String> {
 
     let digest = hasher.finalize();
     Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn sha256_bytes_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn install_pyannote_archive(
@@ -1700,9 +1839,20 @@ fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
-    use super::{install_pyannote_archive, sha256_file_hex, verify_file_sha256};
+    use super::{
+        install_pyannote_archive, install_runtime_archive, sha256_file_hex,
+        validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
+    };
+    use crate::release_assets::{ReleaseAssetDescriptor, SetupReleaseManifest};
     use std::io::Write;
     use tempfile::tempdir;
+
+    fn descriptor(name: &str, sha256: &str) -> ReleaseAssetDescriptor {
+        ReleaseAssetDescriptor {
+            name: name.to_string(),
+            sha256: sha256.to_string(),
+        }
+    }
 
     #[test]
     fn verify_file_sha256_rejects_wrong_checksum() {
@@ -1742,5 +1892,82 @@ mod tests {
 
         let installed = destination.join("bin").join("python3");
         assert!(installed.is_file());
+    }
+
+    #[test]
+    fn install_runtime_archive_extracts_expected_layout_and_permissions() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let archive_path = temp.path().join("speech-runtime.zip");
+        let runtime_dir = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir should exist");
+
+        let file = std::fs::File::create(&archive_path).expect("archive should create");
+        let mut zip = zip::ZipWriter::new(file);
+        let dir_options: zip::write::SimpleFileOptions =
+            zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+        let file_options: zip::write::SimpleFileOptions =
+            zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+
+        for directory in ["runtime/", "runtime/bin/", "runtime/lib/"] {
+            zip.add_directory(directory, dir_options)
+                .expect("directory should add");
+        }
+        zip.start_file("runtime/bin/whisper-cli", file_options)
+            .expect("binary should start");
+        zip.write_all(b"#!/bin/sh\nexit 0\n")
+            .expect("binary should write");
+        zip.start_file("runtime/lib/libwhisper.dylib", file_options)
+            .expect("library should start");
+        zip.write_all(b"fake").expect("library should write");
+        zip.finish().expect("zip should finish");
+
+        let destination = runtime_dir.join("bin");
+        install_runtime_archive(&archive_path, &runtime_dir, &destination)
+            .expect("runtime should install");
+
+        let installed_binary = destination.join("whisper-cli");
+        let installed_library = runtime_dir.join("lib").join("libwhisper.dylib");
+        assert!(installed_binary.is_file());
+        assert!(installed_library.is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&installed_binary)
+                .expect("metadata should read")
+                .permissions()
+                .mode();
+            assert_ne!(mode & 0o111, 0, "installed binary should remain executable");
+        }
+    }
+
+    #[test]
+    fn validate_setup_manifest_rejects_mismatched_release_tag() {
+        let manifest = SetupReleaseManifest {
+            app_version: "0.1.8".to_string(),
+            release_tag: "v0.1.9".to_string(),
+            runtime_manifest: descriptor("runtime-manifest.json", "deadbeef"),
+            runtime_asset: descriptor("speech-runtime-macos-aarch64.zip", "deadbeef"),
+            pyannote_manifest: descriptor("pyannote-manifest.json", "deadbeef"),
+            pyannote_runtime_asset: descriptor("pyannote-runtime-macos-aarch64.zip", "deadbeef"),
+            pyannote_model_asset: descriptor("pyannote-model-community-1.zip", "deadbeef"),
+        };
+
+        let error = validate_setup_manifest("0.1.8", &manifest)
+            .expect_err("release tag mismatch should fail");
+        assert!(error.contains("release tag"));
+    }
+
+    #[test]
+    fn validate_manifest_asset_descriptor_rejects_checksum_mismatch() {
+        let descriptor = descriptor("speech-runtime-macos-aarch64.zip", "deadbeef");
+        let error = validate_manifest_asset_descriptor(
+            &descriptor,
+            "speech-runtime-macos-aarch64.zip",
+            "cafebabe",
+            "runtime asset",
+        )
+        .expect_err("checksum mismatch should fail");
+        assert!(error.contains("checksum mismatch"));
     }
 }

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use crate::{error::CommandError, state::AppState};
+use crate::{error::CommandError, release_assets::production_release_repository, state::AppState};
 
 #[derive(Debug, Serialize)]
 pub struct UpdateCheckResponse {
@@ -25,18 +25,9 @@ struct GitHubAsset {
 
 #[tauri::command]
 pub async fn check_updates(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> Result<UpdateCheckResponse, CommandError> {
-    let settings = state
-        .runtime_factory
-        .load_settings()
-        .map_err(|e| CommandError::new("settings", e))?;
-
-    let repo = if settings.general.auto_update_repo.trim().is_empty() {
-        settings.auto_update_repo
-    } else {
-        settings.general.auto_update_repo
-    };
+    let repo = production_release_repository();
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
 
     let current_version = env!("CARGO_PKG_VERSION").to_string();

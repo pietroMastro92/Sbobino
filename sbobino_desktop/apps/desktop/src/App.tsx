@@ -198,6 +198,7 @@ import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
 import { LiveMicrophoneWaveform } from "./components/LiveMicrophoneWaveform";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 import { LoadingAnimation } from "./components/LoadingAnimation";
+import { SetupMatrixIndicator } from "./components/SetupMatrixIndicator";
 import {
   t,
   useTranslation,
@@ -3076,7 +3077,7 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
       try {
         const snapshot = await loadStartupRequirements();
         if (!cancelled) {
-          setStartupGateBypass(snapshot.runtimeHealth.setup_complete ? startupGateBypass : false);
+          setStartupGateBypass((current) => (snapshot.runtimeHealth.setup_complete ? current : false));
         }
       } catch (startupError) {
         if (!cancelled) {
@@ -3086,7 +3087,6 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
             startupError,
           );
           if (warmStartEligible) {
-            setStartupGateBypass(false);
             setError(formatted);
           } else {
             setStartupRequirementsLoaded(false);
@@ -3108,7 +3108,7 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
         window.clearTimeout(deferredDiagnosticsTimer);
       }
     };
-  }, [setError, settings, standaloneSettingsWindow, startupGateBypass, warmStartEligible]);
+  }, [setError, settings, standaloneSettingsWindow, warmStartEligible]);
 
   useEffect(() => {
     if (standaloneSettingsWindow || !settings || !privacyPolicyAccepted) {
@@ -9091,25 +9091,6 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
 
           <div className="settings-row settings-row-block">
             <div>
-              <strong>{t("settings.general.updatesRepo", "Updates repository")}</strong>
-              <small>{t("settings.general.updatesRepoDesc", "GitHub repository used for update checks.")}</small>
-            </div>
-            <input
-              value={settings.general.auto_update_repo}
-              onChange={(event) => {
-                void patchSettings((current) => ({
-                  ...current,
-                  general: {
-                    ...current.general,
-                    auto_update_repo: event.target.value,
-                  },
-                }));
-              }}
-            />
-          </div>
-
-          <div className="settings-row settings-row-block">
-            <div>
               <strong>{t("settings.general.appearanceMode", "Appearance")}</strong>
               <small>{t("settings.general.appearanceDesc", "Choose app theme behavior.")}</small>
             </div>
@@ -11053,7 +11034,10 @@ export function App({ standaloneSettingsWindow = false, initialBootstrap }: AppP
 
           {setupPending ? (
             <div className="startup-status-card">
-              <ProgressRing percentage={provisioning.progress?.percentage ?? 8} size={28} />
+              <SetupMatrixIndicator
+                progress={provisioning.progress?.percentage ?? 8}
+                ariaLabel={t("setup.firstLaunch.progressIndicator", "Local setup progress")}
+              />
               <div>
                 <strong>{initialSetupStepLabel ?? t("setup.firstLaunch.downloading", "Downloading local models...")}</strong>
                 <p>{startupStatusDetail || t("setup.firstLaunch.downloadingDesc", "This can take a few minutes the first time.")}</p>

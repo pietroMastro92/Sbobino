@@ -1547,7 +1547,12 @@ impl RuntimeTranscriptionFactory {
             }
         } else {
             let names = binary_name_variants(trimmed);
-            // Tauri sidecar: binaries are placed next to the app executable
+            for name in &names {
+                candidates.push(self.data_dir.join("bin").join(name));
+                candidates.push(self.data_dir.join(name));
+            }
+            // Tauri sidecar wrappers are a compatibility fallback, but once the
+            // managed runtime is installed we should prefer it over host-level tools.
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(exe_dir) = exe.parent() {
                     for name in &names {
@@ -1555,16 +1560,7 @@ impl RuntimeTranscriptionFactory {
                     }
                 }
             }
-            // Dev fallback: resolve sidecar wrappers directly from src-tauri/binaries
-            // so local runs work without requiring global CLI installations.
-            let dev_sidecar_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../apps/desktop/src-tauri/binaries");
             for name in &names {
-                candidates.push(dev_sidecar_dir.join(name));
-            }
-            for name in &names {
-                candidates.push(self.data_dir.join("bin").join(name));
-                candidates.push(self.data_dir.join(name));
                 candidates.push(PathBuf::from("/opt/homebrew/bin").join(name));
                 candidates.push(PathBuf::from("/usr/local/bin").join(name));
                 candidates.push(PathBuf::from("/usr/bin").join(name));
@@ -1576,6 +1572,14 @@ impl RuntimeTranscriptionFactory {
                         candidates.push(entry.join(name));
                     }
                 }
+            }
+
+            // Dev fallback: resolve sidecar wrappers directly from src-tauri/binaries
+            // so local runs still work without a managed runtime install.
+            let dev_sidecar_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../apps/desktop/src-tauri/binaries");
+            for name in &names {
+                candidates.push(dev_sidecar_dir.join(name));
             }
         }
 

@@ -1,9 +1,12 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing git tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +14,8 @@ permissions:
 jobs:
   release-readiness:
     runs-on: macos-14
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
     defaults:
       run:
         working-directory: sbobino_desktop/apps/desktop
@@ -18,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -28,7 +35,7 @@ jobs:
 
       - name: Check version coherence before packaging
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG_NAME#v}"
           ../../scripts/check_release_versions.sh "$VERSION"
 
       - name: Setup Rust
@@ -93,7 +100,7 @@ jobs:
           APP_DIR=../../target/aarch64-apple-darwin/release/bundle/macos
           DMG_DIR=../../target/aarch64-apple-darwin/release/bundle/dmg
           APP_NAME="Sbobino.app"
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG_NAME#v}"
           DMG_NAME="Sbobino_${VERSION}_aarch64.dmg"
           STAGING_DIR=$(mktemp -d)
 
@@ -110,7 +117,7 @@ jobs:
 
       - name: Run release readiness gate
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG_NAME#v}"
           APP_PATH=../../target/aarch64-apple-darwin/release/bundle/macos/Sbobino.app
           chmod +x ../../scripts/check_release_versions.sh ../../scripts/release_readiness.sh
           ../../scripts/release_readiness.sh "$VERSION" "$APP_PATH"
@@ -127,44 +134,25 @@ jobs:
             src-tauri/resources/pyannote/model \
             model \
             "$ASSET_DIR/pyannote-model-community-1.zip"
-          RUNTIME_SHA=$(shasum -a 256 "$ASSET_DIR/pyannote-runtime-macos-aarch64.zip" | awk '{print $1}')
-          MODEL_SHA=$(shasum -a 256 "$ASSET_DIR/pyannote-model-community-1.zip" | awk '{print $1}')
-          cat >"$ASSET_DIR/pyannote-manifest.json" <<JSON
-          {
-            "app_version": "${GITHUB_REF_NAME#v}",
-            "assets": [
-              {
-                "kind": "pyannote_runtime_macos_aarch64",
-                "name": "pyannote-runtime-macos-aarch64.zip",
-                "sha256": "$RUNTIME_SHA"
-              },
-              {
-                "kind": "pyannote_model",
-                "name": "pyannote-model-community-1.zip",
-                "sha256": "$MODEL_SHA"
-              }
-            ]
-          }
-          JSON
 
       - name: Package local runtime setup assets
         run: |
           ASSET_DIR=../../target/aarch64-apple-darwin/release/bundle/runtime-release
           mkdir -p "$ASSET_DIR"
           ../../scripts/package_macos_runtime_asset.sh "$ASSET_DIR/speech-runtime-macos-aarch64.zip"
-          RUNTIME_SHA=$(shasum -a 256 "$ASSET_DIR/speech-runtime-macos-aarch64.zip" | awk '{print $1}')
-          cat >"$ASSET_DIR/runtime-manifest.json" <<JSON
-          {
-            "app_version": "${GITHUB_REF_NAME#v}",
-            "assets": [
-              {
-                "kind": "speech_runtime_macos_aarch64",
-                "name": "speech-runtime-macos-aarch64.zip",
-                "sha256": "$RUNTIME_SHA"
-              }
-            ]
-          }
-          JSON
+
+      - name: Generate release setup manifests
+        run: |
+          RELEASE_ASSET_DIR=../../target/aarch64-apple-darwin/release/bundle/release-assets
+          PYANNOTE_DIR=../../target/aarch64-apple-darwin/release/bundle/pyannote-release
+          RUNTIME_DIR=../../target/aarch64-apple-darwin/release/bundle/runtime-release
+          mkdir -p "$RELEASE_ASSET_DIR"
+          cp "$PYANNOTE_DIR/pyannote-runtime-macos-aarch64.zip" "$RELEASE_ASSET_DIR/"
+          cp "$PYANNOTE_DIR/pyannote-model-community-1.zip" "$RELEASE_ASSET_DIR/"
+          cp "$RUNTIME_DIR/speech-runtime-macos-aarch64.zip" "$RELEASE_ASSET_DIR/"
+          ../../scripts/generate_release_manifests.sh "${TAG_NAME#v}" "$RELEASE_ASSET_DIR"
+          cp "$RELEASE_ASSET_DIR/pyannote-manifest.json" "$PYANNOTE_DIR/"
+          cp "$RELEASE_ASSET_DIR/runtime-manifest.json" "$RUNTIME_DIR/"
 
       - name: Notarize and staple macOS DMG
         env:
@@ -196,6 +184,8 @@ jobs:
   publish:
     needs: release-readiness
     runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -205,7 +195,7 @@ jobs:
 
       - name: Prepare release notes
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG_NAME#v}"
           cat > release-notes.md <<EOF
           ## Sbobino ${VERSION}
 
@@ -238,7 +228,7 @@ jobs:
 
       - name: Generate updater feed
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG_NAME#v}"
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           SIGNATURE=$(tr -d '\n' < "dist/macos/Sbobino.app.tar.gz.sig")
           NOTES=$(cat release-notes.md)
@@ -265,6 +255,7 @@ jobs:
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag_name }}
           draft: false
           prerelease: false
           body_path: release-notes.md
@@ -273,6 +264,7 @@ jobs:
             dist/dmg/Sbobino_*.dmg
             dist/macos/Sbobino.app.tar.gz
             dist/macos/Sbobino.app.tar.gz.sig
+            dist/release-assets/setup-manifest.json
             dist/pyannote-release/*.zip
             dist/pyannote-release/*.json
             dist/runtime-release/*.zip

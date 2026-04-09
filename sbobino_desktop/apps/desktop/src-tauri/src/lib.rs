@@ -1,6 +1,7 @@
 mod ai_support;
 mod commands;
 mod error;
+mod release_assets;
 mod state;
 
 use std::collections::HashMap;
