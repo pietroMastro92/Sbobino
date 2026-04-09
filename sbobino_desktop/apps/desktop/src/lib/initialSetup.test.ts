@@ -160,7 +160,7 @@ describe("initialSetup helpers", () => {
 
     expect(
       canWarmStartFromSetupReport(true, {
-        build_version: "0.1.10",
+        build_version: "0.1.11",
         privacy_accepted: true,
         setup_complete: true,
         final_reason_code: "setup_complete",
@@ -174,7 +174,7 @@ describe("initialSetup helpers", () => {
 
     expect(
       canWarmStartFromSetupReport(true, {
-        build_version: "0.1.10",
+        build_version: "0.1.11",
         privacy_accepted: true,
         setup_complete: true,
         final_reason_code: "setup_complete",

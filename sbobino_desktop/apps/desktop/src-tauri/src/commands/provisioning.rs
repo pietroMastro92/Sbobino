@@ -1957,7 +1957,7 @@ mod tests {
     #[test]
     fn validate_setup_manifest_rejects_mismatched_release_tag() {
         let manifest = SetupReleaseManifest {
-            app_version: "0.1.10".to_string(),
+            app_version: "0.1.11".to_string(),
             release_tag: "v0.1.8".to_string(),
             runtime_manifest: descriptor("runtime-manifest.json", "deadbeef"),
             runtime_asset: descriptor("speech-runtime-macos-aarch64.zip", "deadbeef"),
@@ -1966,7 +1966,7 @@ mod tests {
             pyannote_model_asset: descriptor("pyannote-model-community-1.zip", "deadbeef"),
         };
 
-        let error = validate_setup_manifest("0.1.10", &manifest)
+        let error = validate_setup_manifest("0.1.11", &manifest)
             .expect_err("release tag mismatch should fail");
         assert!(error.contains("release tag"));
     }

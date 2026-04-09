@@ -9,6 +9,7 @@ fi
 VERSION=$1
 APP_PATH=${2:-}
 RELEASE_PROFILE=${SBOBINO_RELEASE_PROFILE:-public}
+MACOS_RUNTIME_DEPLOYMENT_TARGET=${SBOBINO_MACOS_RUNTIME_DEPLOYMENT_TARGET:-13.0}
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DESKTOP_DIR="$ROOT_DIR/apps/desktop"
@@ -171,6 +172,30 @@ def run_probe(binary: str, args: list[str], timeout: int, allow_timeout: bool) -
             f"{binary} exited with code {result.returncode} while validating extracted runtime asset.\n{preview}"
         )
 
+def generate_test_wav(path: str) -> None:
+    import math
+    import wave
+
+    sample_rate = 16000
+    duration_seconds = 1.0
+    total_samples = int(sample_rate * duration_seconds)
+    frequency = 440.0
+    amplitude = 0.35
+
+    with wave.open(path, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+
+        frames = bytearray()
+        for index in range(total_samples):
+            value = int(
+                max(-1.0, min(1.0, amplitude * math.sin(2.0 * math.pi * frequency * index / sample_rate)))
+                * 32767
+            )
+            frames.extend(int(value).to_bytes(2, byteorder="little", signed=True))
+        wav_file.writeframes(bytes(frames))
+
 for binary, args, timeout, cold_timeout in (
     ("ffmpeg", ["-version"], 60, 45),
     ("whisper-cli", ["--help"], 30, 15),
@@ -182,7 +207,94 @@ for binary, args, timeout, cold_timeout in (
 
     run_probe(binary, args, cold_timeout, True)
     run_probe(binary, args, timeout, False)
+
+input_wav = os.path.join(root, "runtime", "smoke-input.wav")
+output_wav = os.path.join(root, "runtime", "smoke-output.wav")
+generate_test_wav(input_wav)
+
+ffmpeg_result = subprocess.run(
+    [
+        os.path.join(bin_dir, "ffmpeg"),
+        "-y",
+        "-i",
+        input_wav,
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        output_wav,
+    ],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    timeout=120,
+    env=env,
+)
+if ffmpeg_result.returncode != 0:
+    preview = "\n".join(ffmpeg_result.stdout.splitlines()[:40])
+    raise SystemExit(
+        "ffmpeg failed a real conversion while validating the extracted runtime asset.\n"
+        f"{preview}"
+    )
+if not os.path.isfile(output_wav) or os.path.getsize(output_wav) == 0:
+    raise SystemExit("ffmpeg completed but did not produce a valid smoke-test wav output.")
 PY
+}
+
+assert_runtime_asset_portability() {
+  local runtime_zip=$1
+  local runtime_stage
+  runtime_stage=$(mktemp -d)
+  trap 'rm -rf "$runtime_stage"' RETURN
+
+  unzip -q "$runtime_zip" -d "$runtime_stage"
+
+  local binary
+  for binary in ffmpeg whisper-cli whisper-stream; do
+    local candidate="$runtime_stage/runtime/bin/$binary"
+    if [[ ! -x "$candidate" ]]; then
+      echo "Runtime asset is missing expected executable: $candidate" >&2
+      exit 1
+    fi
+
+    local minos
+    minos=$(otool -l "$candidate" | awk '
+      /LC_BUILD_VERSION/ { flag=1; next }
+      flag && $1 == "minos" { print $2; exit }
+      /LC_VERSION_MIN_MACOSX/ { legacy=1; next }
+      legacy && $1 == "version" { print $2; exit }
+    ')
+    if [[ -z "$minos" ]]; then
+      echo "Unable to determine deployment target for $candidate" >&2
+      exit 1
+    fi
+
+    if ! python3 - "$MACOS_RUNTIME_DEPLOYMENT_TARGET" "$minos" <<'PY'
+import sys
+
+def parse(value: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in value.split("."))
+
+supported = parse(sys.argv[1])
+actual = parse(sys.argv[2])
+if actual > supported:
+    raise SystemExit(1)
+PY
+    then
+      echo "$binary in the runtime asset targets macOS $minos, newer than the supported $MACOS_RUNTIME_DEPLOYMENT_TARGET floor." >&2
+      exit 1
+    fi
+
+    local bad_refs
+    bad_refs=$(otool -L "$candidate" | tail -n +2 | awk '{print $1}' | grep -E '^(/opt/homebrew|/usr/local)' || true)
+    if [[ -n "$bad_refs" ]]; then
+      echo "$binary still links against non-portable host paths:" >&2
+      printf ' - %s\n' $bad_refs >&2
+      exit 1
+    fi
+  done
 }
 
 mkdir -p "$ASSET_DIR"
@@ -199,6 +311,7 @@ mkdir -p "$ASSET_DIR"
   model \
   "$PYANNOTE_MODEL_ZIP"
 "$SCRIPTS_DIR/generate_release_manifests.sh" "$VERSION" "$ASSET_DIR"
+assert_runtime_asset_portability "$RUNTIME_ZIP"
 smoke_test_runtime_asset "$RUNTIME_ZIP"
 
 export SBOBINO_LOCAL_RELEASE_ASSETS_DIR="$ASSET_DIR"

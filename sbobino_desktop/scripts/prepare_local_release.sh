@@ -154,15 +154,18 @@ need_cmd() {
 }
 
 need_cmd cargo
+need_cmd clang
+need_cmd cmake
 need_cmd codesign
+need_cmd curl
 need_cmd hdiutil
+need_cmd make
 need_cmd npm
+need_cmd otool
 need_cmd python3
 need_cmd shasum
 need_cmd tar
-need_cmd whisper-cli
-need_cmd ffmpeg
-need_cmd sdl2-config
+need_cmd xcrun
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This local release flow only supports macOS." >&2
