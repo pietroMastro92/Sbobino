@@ -166,7 +166,7 @@ impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
             auto_update_enabled: true,
-            auto_update_repo: "pietroMastro92/sbobino_tauri".to_string(),
+            auto_update_repo: "pietroMastro92/Sbobino".to_string(),
             privacy_policy_version_accepted: None,
             privacy_policy_accepted_at: None,
             appearance_mode: AppearanceMode::System,

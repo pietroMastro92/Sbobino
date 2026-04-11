@@ -56,7 +56,7 @@
       "active": true,
       "dialog": false,
       "endpoints": [
-        "https://github.com/pietroMastro92/sbobino_tauri/releases/latest/download/latest.json"
+        "https://github.com/pietroMastro92/Sbobino/releases/latest/download/latest.json"
       ],
       "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY"
     }

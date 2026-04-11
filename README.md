@@ -1,8 +1,10 @@
-# Sbobino Tauri
+# Sbobino
 
-Sbobino Tauri is a desktop workspace for turning lessons, meetings, interviews, and voice notes into structured, usable knowledge.
+Sbobino is a desktop workspace for turning lessons, meetings, interviews, and voice notes into structured, usable knowledge.
 
 Built with **Tauri v2, Rust, React, and TypeScript**, it combines **local-first transcription**, **speaker-aware processing**, and **AI-assisted post-processing** in a native-style desktop app designed for real study and work workflows.
+
+Its name comes from the Italian verb *sbobinare*: traditionally, to transcribe the contents of a recorded tape. Sbobino keeps that original spirit, but gives it a modern twist: less drudgery, more clarity, and a much better desk companion when the audio is long and your time is short.
 
 ## Who It Is For
 
@@ -182,4 +184,4 @@ Useful technical references live inside `sbobino_desktop/docs`:
 
 ## Status
 
-Sbobino Tauri is evolving as a serious desktop product for people who need to turn spoken content into usable knowledge quickly, clearly, and with more control than a generic transcription tool.
+Sbobino is evolving as a serious desktop product for people who need to turn spoken content into usable knowledge quickly, clearly, and with more control than a generic transcription tool.

@@ -7,7 +7,7 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
 fi
 
 VERSION=$1
-REPO_SLUG=${2:-pietroMastro92/sbobino_tauri}
+REPO_SLUG=${2:-pietroMastro92/Sbobino}
 TAG="v$VERSION"
 BASE_URL="https://github.com/$REPO_SLUG/releases/download/$TAG"
 TEMP_DIR=$(mktemp -d)

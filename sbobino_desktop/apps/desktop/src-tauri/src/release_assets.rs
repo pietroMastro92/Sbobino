@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PRODUCTION_RELEASE_REPOSITORY: &str = "pietroMastro92/sbobino_tauri";
+pub const PRODUCTION_RELEASE_REPOSITORY: &str = "pietroMastro92/Sbobino";
 pub const SETUP_MANIFEST_ASSET: &str = "setup-manifest.json";
 pub const RUNTIME_MANIFEST_ASSET: &str = "runtime-manifest.json";
 pub const RUNTIME_AARCH64_ASSET: &str = "speech-runtime-macos-aarch64.zip";

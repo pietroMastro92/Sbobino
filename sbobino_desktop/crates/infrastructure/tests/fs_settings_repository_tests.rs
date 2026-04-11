@@ -23,7 +23,7 @@ async fn load_creates_default_settings_when_file_is_missing() {
     assert!(!settings.ai_post_processing);
     assert_eq!(
         settings.general.auto_update_repo,
-        "pietroMastro92/sbobino_tauri"
+        "pietroMastro92/Sbobino"
     );
     assert!(settings.general.privacy_policy_version_accepted.is_none());
     assert!(settings.general.privacy_policy_accepted_at.is_none());

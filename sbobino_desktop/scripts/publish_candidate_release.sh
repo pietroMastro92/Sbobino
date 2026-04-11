@@ -16,7 +16,7 @@ if [[ $# -lt 1 || $# -gt 3 ]]; then
 fi
 
 VERSION=$1
-REPO_SLUG=${2:-pietroMastro92/sbobino_tauri}
+REPO_SLUG=${2:-pietroMastro92/Sbobino}
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ASSET_DIR=${3:-"$ROOT_DIR/dist/local-release/v$VERSION"}
 TAG="v$VERSION"

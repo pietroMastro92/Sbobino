@@ -13,7 +13,7 @@
   - `macos-14` -> `aarch64-apple-darwin` (DMG + APP).
 - Produces updater artifacts/signatures (`createUpdaterArtifacts: true` in `tauri.conf.json`).
 - Publishes all generated bundle assets to the GitHub Release for that tag.
-- Production origin is the current public GitHub repository: `pietroMastro92/sbobino_tauri`.
+- Production origin is the current public GitHub repository: `pietroMastro92/Sbobino`.
 - Default recommendation: prepare every release candidate locally first with `./scripts/prepare_local_release.sh <version>`, upload it manually as a GitHub prerelease for the same tag, run remote validation, test that exact prerelease on a second Mac, and only then promote it to stable.
 - Candidate versions are single-use. If a prerelease fails validation on a third-party Mac, retire it and cut a new patch version instead of overwriting a stable release or reusing the same candidate.
 - Required public asset set for every distributable version:
@@ -79,7 +79,7 @@
 
 - `tauri.conf.json` enables updater artifact generation.
 - Updater plugin config is enabled and points to:
-  - `https://github.com/pietroMastro92/sbobino_tauri/releases/latest/download/latest.json`
+  - `https://github.com/pietroMastro92/Sbobino/releases/latest/download/latest.json`
 - The repository version of `tauri.conf.json` intentionally keeps a placeholder `pubkey`; CI injects the real public key during release builds.
 - Local public releases also inject a real updater public key and sign the updater tarball with the stable local Tauri updater keypair. This updater signing is independent from Apple code signing and does not require an Apple Developer account.
 - The repo slug is fixed in production code; normal user settings no longer control where setup or updates are downloaded from.
