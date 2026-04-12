@@ -41,11 +41,8 @@ url = sys.argv[1]
 request = urllib.request.Request(url, headers={"User-Agent": "sbobino-distribution-readiness"})
 with urllib.request.urlopen(request) as response:
     release = json.load(response)
-
-if not release.get("prerelease", False):
-    raise SystemExit(
-        "distribution_readiness.sh only validates candidate prereleases. Promote to stable only after this gate passes on a prerelease."
-    )
+if release.get("draft", False):
+    raise SystemExit("distribution_readiness.sh cannot validate draft releases.")
 PY
 
 ASSETS=(

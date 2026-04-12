@@ -14,8 +14,8 @@
 - Produces updater artifacts/signatures (`createUpdaterArtifacts: true` in `tauri.conf.json`).
 - Publishes all generated bundle assets to the GitHub Release for that tag.
 - Production origin is the current public GitHub repository: `pietroMastro92/Sbobino`.
-- Default recommendation: prepare every release candidate locally first with `./scripts/prepare_local_release.sh <version>`, upload it manually as a GitHub prerelease for the same tag, run remote validation, test that exact prerelease on a second Mac, and only then promote it to stable.
-- Candidate versions are single-use. If a prerelease fails validation on a third-party Mac, retire it and cut a new patch version instead of overwriting a stable release or reusing the same candidate.
+- Default recommendation: prepare every release locally first with `./scripts/prepare_local_release.sh <version>`, publish the GitHub release as stable by default, run remote validation, and test that exact release on a second Mac.
+- Candidate versions are optional. If you intentionally use a prerelease and it fails validation on a third-party Mac, retire it and cut a new patch version instead of overwriting a stable release or reusing the same candidate.
 - Required public asset set for every distributable version:
   - `Sbobino_<version>_aarch64.dmg`
   - `Sbobino.app.tar.gz`
@@ -50,12 +50,12 @@
 - To avoid consuming GitHub Actions minutes, prefer the local release flow:
   - `cd sbobino_desktop`
   - `./scripts/prepare_local_release.sh <version>`
-  - publish the candidate with `./scripts/publish_candidate_release.sh <version>` or create the GitHub prerelease `v<version>` manually
+  - publish the release with `./scripts/publish_candidate_release.sh <version>` or create the GitHub release `v<version>` manually
   - upload the generated files from `dist/local-release/v<version>/`
   - run `./scripts/distribution_readiness.sh <version>`
-  - test that GitHub prerelease on a second Apple Silicon Mac
-  - promote that exact prerelease to stable only after it passes with `./scripts/promote_candidate_release.sh <version>`
-  - if the candidate fails, delete it with `./scripts/retire_failed_candidate.sh <version>` and cut a new patch version
+  - test that GitHub release on a second Apple Silicon Mac
+  - if you intentionally published a prerelease first, promote it only after it passes with `./scripts/promote_candidate_release.sh <version>`
+  - if the release fails, delete/retire it with `./scripts/retire_failed_candidate.sh <version>` and cut a new patch version
   - the default `public` profile keeps pyannote out of the app bundle and installs it from release assets during first launch
   - the script automatically generates and reuses a stable local Tauri updater keypair under the user's config directory when one is not already present
   - `SBOBINO_RELEASE_PROFILE=standalone-dev` is reserved for internal/offline builds that intentionally embed bundled pyannote assets
@@ -98,18 +98,18 @@
 
 ### Distribution Readiness
 - `./scripts/distribution_readiness.sh <version> [repo-slug]`
-- Runs only after the full asset set is uploaded to a GitHub prerelease.
+- Runs only after the full asset set is uploaded to a GitHub release.
 - Verifies HTTP availability, JSON parsing, `app_version` consistency, checksum integrity, updater tarball/signature wiring, and that `setup-manifest.json` points only to assets present in the same release.
 
 ## Stable Release Policy
 
 - Stable GitHub releases are immutable for distribution purposes.
 - Do not replace stable assets in place to repair a bad public release.
-- The only supported correction path is:
-  1. retire the failed prerelease candidate
+- The supported correction path is:
+  1. retire the failed public release
   2. cut a new patch version
-  3. publish and validate a fresh prerelease
-  4. promote only the validated prerelease
+  3. publish and validate a fresh release
+  4. use prerelease promotion only when you intentionally opted into that flow
 
 ## Startup Contract
 

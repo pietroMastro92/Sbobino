@@ -3,14 +3,15 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: publish_candidate_release.sh <version> [repo-slug] [asset-dir]
+Usage: publish_candidate_release.sh <version> [repo-slug] [asset-dir] [--prerelease]
 
-Creates a fresh GitHub prerelease candidate and uploads the full Sbobino asset set.
+Creates a fresh GitHub release and uploads the full Sbobino asset set.
+Use --prerelease only when you explicitly want a candidate release.
 This command refuses to reuse an existing release for the same version.
 EOF
 }
 
-if [[ $# -lt 1 || $# -gt 3 ]]; then
+if [[ $# -lt 1 || $# -gt 4 ]]; then
   usage
   exit 1
 fi
@@ -19,6 +20,7 @@ VERSION=$1
 REPO_SLUG=${2:-pietroMastro92/Sbobino}
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ASSET_DIR=${3:-"$ROOT_DIR/dist/local-release/v$VERSION"}
+RELEASE_KIND=${4:-}
 TAG="v$VERSION"
 
 need_cmd() {
@@ -33,6 +35,12 @@ need_cmd git
 
 if [[ ! -d "$ASSET_DIR" ]]; then
   echo "Candidate asset directory not found: $ASSET_DIR" >&2
+  exit 1
+fi
+
+if [[ -n "$RELEASE_KIND" && "$RELEASE_KIND" != "--prerelease" ]]; then
+  echo "Unsupported option: $RELEASE_KIND" >&2
+  usage
   exit 1
 fi
 
@@ -69,9 +77,12 @@ fi
 
 gh release create "$TAG" \
   --repo "$REPO_SLUG" \
-  --prerelease \
   --title "$TAG" \
   --notes-file "$ASSET_DIR/release-notes.md"
+
+if [[ "$RELEASE_KIND" == "--prerelease" ]]; then
+  gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease
+fi
 
 gh release upload "$TAG" \
   "$ASSET_DIR/Sbobino_${VERSION}_aarch64.dmg" \
@@ -87,12 +98,12 @@ gh release upload "$TAG" \
   --repo "$REPO_SLUG"
 
 cat <<EOF
-Candidate prerelease published successfully:
+Release published successfully:
   repo: $REPO_SLUG
   tag:  $TAG
 
 Next required steps:
   1. ./scripts/distribution_readiness.sh "$VERSION" "$REPO_SLUG"
-  2. Validate the prerelease on a second Apple Silicon Mac
-  3. Promote it only if the clean-room validation passes
+  2. Validate the release on a second Apple Silicon Mac
+  3. Use --prerelease only when you intentionally want a candidate first
 EOF

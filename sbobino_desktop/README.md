@@ -46,22 +46,22 @@ That folder now always includes:
 - `pyannote-model-community-1.zip`
 
 Manual publish contract:
-1. build the candidate locally
-2. publish only a GitHub prerelease for the same `v<version>`
+1. build the release locally
+2. publish the GitHub release for the same `v<version>` as stable by default
 3. upload the full asset set
 4. run `./scripts/distribution_readiness.sh <version>`
-5. test that exact GitHub prerelease on a second Apple Silicon Mac
-6. promote the same prerelease to stable only after it passes
-7. if it fails, delete the prerelease and cut a new patch version
+5. test that exact GitHub release on a second Apple Silicon Mac
+6. use a prerelease only when you explicitly want a candidate-first flow
+7. if it fails, retire that release and cut a new patch version
 
 Helper scripts:
-- `./scripts/publish_candidate_release.sh <version>`
+- `./scripts/publish_candidate_release.sh <version>` publishes a stable release by default
 - `./scripts/promote_candidate_release.sh <version>`
 - `./scripts/retire_failed_candidate.sh <version>`
 
 Stable release policy:
 - never overwrite or “fix in place” a stable GitHub release
-- stable always comes from promoting an already tested prerelease
+- prereleases are optional and no longer the default publish mode
 - the default promotion flow removes older stable releases so only the latest validated stable remains public
 
 Set `SBOBINO_RELEASE_PROFILE=standalone-dev` only for internal/offline builds that intentionally embed bundled pyannote assets.

@@ -374,7 +374,7 @@ EOF
 fi
 
 cat >"$OUTPUT_DIR/UPLOAD_TO_GITHUB.md" <<EOF
-# Candidate GitHub publish for v$VERSION
+# GitHub publish for v$VERSION
 
 Nothing in this folder has been published automatically.
 
@@ -382,7 +382,7 @@ Nothing in this folder has been published automatically.
 
 1. Create or reuse the Git tag locally: \`git tag -a v$VERSION -m "Sbobino v$VERSION"\`
 2. Push only when you are ready: \`git push origin v$VERSION\`
-3. Publish only as a GitHub prerelease candidate. Do not create or edit a stable release for this version.
+3. Publish the GitHub release as stable by default. Use a prerelease only if you explicitly want a candidate first.
 4. Upload these files from \`$OUTPUT_DIR\`:
    - \`Sbobino_${VERSION}_aarch64.dmg\`
    - \`Sbobino.app.tar.gz\`
@@ -396,8 +396,8 @@ Nothing in this folder has been published automatically.
    - \`pyannote-manifest.json\`
    - \`release-notes.md\` (use this exact file as the GitHub release body)
 5. Run \`./scripts/distribution_readiness.sh "$VERSION"\` from \`sbobino_desktop/\`.
-6. Test the GitHub prerelease on a second Apple Silicon Mac before promoting it to stable.
-7. If the candidate fails on the second Mac, delete the prerelease and cut a new patch version. Do not overwrite a stable release in place.
+6. Test that exact GitHub release on a second Apple Silicon Mac.
+7. If it fails on the second Mac, retire it and cut a new patch version. Do not overwrite a stable release in place.
 
 ## gh CLI example
 
