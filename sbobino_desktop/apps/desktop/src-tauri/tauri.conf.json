@@ -26,19 +26,19 @@
       }
     ],
     "security": {
-      "capabilities": ["default"]
+      "capabilities": [
+        "default"
+      ]
     }
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "targets": "all",
     "macOS": {
       "infoPlist": "Info.plist"
     },
-    "resources": [
-      "resources/pyannote"
-    ],
+    "resources": [],
     "externalBin": [
       "binaries/whisper-cli",
       "binaries/whisperkit-cli",

@@ -1,12 +1,23 @@
 # Sbobino
 
+<div align="center">
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pietromastro)
+
+![Tauri](https://img.shields.io/badge/Tauri-24C8D8?style=for-the-badge&logo=tauri&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)
+![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
+
+</div>
+
 Sbobino is a desktop workspace for turning lessons, meetings, interviews, and voice notes into structured, usable knowledge.
 
 Built with **Tauri v2, Rust, React, and TypeScript**, it combines **local-first transcription**, **speaker-aware processing**, and **AI-assisted post-processing** in a native-style desktop app designed for real study and work workflows.
 
 Its name comes from the Italian verb *sbobinare*: traditionally, to transcribe the contents of a recorded tape. Sbobino keeps that original spirit, but gives it a modern twist: less drudgery, more clarity, and a much better desk companion when the audio is long and your time is short.
 
-## Who It Is For
+## 👥 Who It Is For
 
 Sbobino is especially useful for:
 
@@ -14,7 +25,7 @@ Sbobino is especially useful for:
 - **Professionals** who want to capture meetings, interviews, calls, or brainstorming sessions and turn them into structured outputs, action-oriented summaries, and searchable knowledge
 - **Knowledge workers** who need a practical bridge between raw audio and documents they can actually reuse
 
-## Why It Matters
+## ✨ Why It Matters
 
 Most transcription tools stop at raw text.
 
@@ -29,87 +40,87 @@ Sbobino is built to go further:
 
 The goal is simple: reduce the time between “I recorded something important” and “I now have material I can study, share, or work from.”
 
-## Core Capabilities
+## 🎯 Core Capabilities
 
-### Local-first transcription
+### 🎙️ Local-first transcription
 
 - Transcribe local audio files in a desktop workflow
 - Track progress live while jobs are running
 - Manage active, queued, and completed transcriptions
 - Reopen and continue working on previous transcripts from history
 
-### Transcript improvement
+### 📝 Transcript improvement
 
 - Refine transcript wording with AI-assisted post-processing
 - Switch between original and optimized transcript versions
 - Trim audio and generate focused child transcripts from specific regions
 
-### Study and work outputs
+### 📊 Study and work outputs
 
 - Generate structured summaries from long recordings
 - Produce FAQs and supporting transcript-derived artifacts
 - Chat with the transcript to extract facts, clarify points, or recover context
 - Keep output aligned with the prompt language and selected formatting behavior
 
-### Speaker-aware workflow
+### 🗣️ Speaker-aware workflow
 
 - Browse timestamped segments
 - Assign and manage speaker labels
 - Use local pyannote diarization when runtime assets are installed
 - Keep transcript structure easier to review for lessons, meetings, and interviews
 
-### Professional export
+### 📤 Professional export
 
 - Export in formats such as `txt`, `docx`, `html`, `pdf`, `md`, `csv`, `json`, `srt`, and `vtt`
 - Export full transcripts, subtitles, or segment-oriented documents
 - Include summaries and FAQs in exported outputs when available
 
-## Practical Use Cases
+## 💼 Practical Use Cases
 
-### For students
+### 🎓 For students
 
 - Turn lectures into readable notes
 - Create study summaries after class
 - Recover key explanations from long recordings
 - Export clean material for revision and sharing
 
-### For work
+### 🏢 For work
 
 - Turn meetings into structured notes
 - Capture interviews and conversations with better traceability
 - Generate summaries, FAQs, and working documents faster
 - Keep a searchable local archive of spoken knowledge
 
-## Product Principles
+## 🧭 Product Principles
 
-- **Local-first where it matters**
+- **Local-first where it matters**  
   Runtime assets and transcription workflows are designed to run locally on the machine.
 
-- **Useful beyond transcription**
+- **Useful beyond transcription**  
   The app is meant to transform recordings into outputs that support studying, reporting, and decision-making.
 
-- **Desktop-native experience**
+- **Desktop-native experience**  
   Tauri keeps the app lightweight while Rust handles orchestration, runtime integration, and reliability-sensitive flows.
 
-- **Structured architecture**
+- **Structured architecture**  
   The codebase is organized for maintainability, long-term iteration, and production-grade desktop evolution.
 
-## Architecture
+## 🏗️ Architecture
 
 The project is organized as a Rust workspace with a clean layered structure:
 
-- `sbobino_desktop/crates/domain`
+- `sbobino_desktop/crates/domain`  
   Core business entities and rules
-- `sbobino_desktop/crates/application`
+- `sbobino_desktop/crates/application`  
   Use cases, orchestration, and ports
-- `sbobino_desktop/crates/infrastructure`
+- `sbobino_desktop/crates/infrastructure`  
   Adapters for transcription engines, AI providers, persistence, and runtime integration
-- `sbobino_desktop/apps/desktop`
+- `sbobino_desktop/apps/desktop`  
   React + TypeScript frontend
-- `sbobino_desktop/apps/desktop/src-tauri`
+- `sbobino_desktop/apps/desktop/src-tauri`  
   Tauri command layer and desktop runtime composition
 
-## Repository Layout
+## 📂 Repository Layout
 
 ```text
 .
@@ -125,7 +136,7 @@ The project is organized as a Rust workspace with a clean layered structure:
 │   └── scripts/
 ```
 
-## Getting Started
+## 🚀 Getting Started
 
 ### Prerequisites
 
@@ -155,7 +166,7 @@ Optional:
 - install speaker diarization assets from `Settings > Local Models > Speaker Diarization`
 - configure AI services in `Settings > AI Services`
 
-## Development Commands
+## 🛠️ Development Commands
 
 ### Frontend
 
@@ -173,23 +184,30 @@ cargo test -p sbobino-application --test transcription_service_tests
 cargo check -p sbobino-desktop
 ```
 
-## Documentation
+## 📖 Documentation
 
 Useful technical references live inside `sbobino_desktop/docs`:
 
-- [Architecture](./sbobino_desktop/docs/architecture.md)
-- [Release and migration notes](./sbobino_desktop/docs/release-and-migration.md)
-- [Feature migration matrix](./sbobino_desktop/docs/feature-migration-matrix.md)
-- [Workspace README](./sbobino_desktop/README.md)
+- 📐 [Architecture](./sbobino_desktop/docs/architecture.md)
+- 🚢 [Release and migration notes](./sbobino_desktop/docs/release-and-migration.md)
+- ✅ [Feature migration matrix](./sbobino_desktop/docs/feature-migration-matrix.md)
+- 📎 [Workspace README](./sbobino_desktop/README.md)
 
-## Supporting development
+## 💜 Supporting development
 
 Every kind of support for Sbobino’s development is welcome—whether you use the app, share feedback, or contribute time or resources.
 
-**Ways to help:** open [GitHub Issues](https://github.com/pietroMastro92/Sbobino/issues) for bugs and ideas, submit pull requests (see [Workspace README](./sbobino_desktop/README.md) for setup), star the repository if it is useful to you, and spread the word.
+- 🐛 **Issues & ideas** — [GitHub Issues](https://github.com/pietroMastro92/Sbobino/issues)
+- 🔀 **Contribute** — pull requests welcome; see [Workspace README](./sbobino_desktop/README.md)
+- ⭐ **Visibility** — star the repo if Sbobino is useful to you
+- 📣 **Spread the word** — tell others who live in audio and notes
 
-**Buy me a coffee:** [buymeacoffee.com/pietromastro](https://buymeacoffee.com/pietromastro)
+### ☕ Buy Me a Coffee
 
-## Status
+If you want to fuel development with a coffee:
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pietromastro)
+
+## 📌 Status
 
 Sbobino is evolving as a serious desktop product for people who need to turn spoken content into usable knowledge quickly, clearly, and with more control than a generic transcription tool.
