@@ -2466,9 +2466,10 @@ fn detect_runtime_source_policy(allow_dev_resource_overrides: bool) -> RuntimeSo
     match option_env!("SBOBINO_RELEASE_PROFILE") {
         Some("public") => RuntimeSourcePolicy::PublicManagedOnly,
         Some("standalone-dev") => RuntimeSourcePolicy::DevFallbackAllowed,
-        // Local release builds should stay self-contained unless the build explicitly
-        // opts into the public managed-only contract used by GitHub-distributed artifacts.
-        _ if !cfg!(debug_assertions) => RuntimeSourcePolicy::DevFallbackAllowed,
+        // Distributed release builds must default to the managed runtime only.
+        // Falling back to host/Homebrew binaries creates exactly the kind of
+        // machine-specific behavior that breaks public releases.
+        _ if !cfg!(debug_assertions) => RuntimeSourcePolicy::PublicManagedOnly,
         _ => RuntimeSourcePolicy::DevFallbackAllowed,
     }
 }
