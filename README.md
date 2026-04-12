@@ -3,6 +3,7 @@
 <div align="center">
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pietromastro)
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-30363D?style=for-the-badge&logo=githubsponsors&logoColor=ea4aaa)](https://github.com/sponsors/pietroMastro92)
 
 ![Tauri](https://img.shields.io/badge/Tauri-24C8D8?style=for-the-badge&logo=tauri&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)
@@ -207,6 +208,14 @@ Every kind of support for Sbobino’s development is welcome—whether you use t
 If you want to fuel development with a coffee:
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pietromastro)
+
+### 💖 GitHub Sponsors
+
+Official embed (may not render on github.com README; use the badge above or the link if you only see a blank area):
+
+<iframe src="https://github.com/sponsors/pietroMastro92/button" title="Sponsor pietroMastro92" height="32" width="114" style="border: 0; border-radius: 6px;"></iframe>
+
+[![Sponsor pietroMastro92 on GitHub](https://img.shields.io/badge/Sponsor%20on%20GitHub-30363D?style=for-the-badge&logo=githubsponsors&logoColor=ea4aaa)](https://github.com/sponsors/pietroMastro92)
 
 ## 📌 Status
 
