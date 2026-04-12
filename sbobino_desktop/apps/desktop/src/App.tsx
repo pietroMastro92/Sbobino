@@ -18,6 +18,7 @@ import {
   check as checkAppUpdate,
   type Update as TauriUpdate,
 } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   ArrowLeft,
   AudioLines,
@@ -92,6 +93,7 @@ import {
   provisioningModels,
   provisioningStart,
   provisioningStatus,
+  reconcilePostUpdateRuntime,
   renameArtifact,
   resetPromptTemplates,
   resumeRealtime,
@@ -142,6 +144,15 @@ import {
   normalizeJobFailureMessage,
 } from "./lib/diarizationUi";
 import { loadInitialAppBootstrapData } from "./lib/appBootstrap";
+import {
+  readDismissedUpdateVersion,
+  readLastSeenAppVersion,
+  readSharedUpdateSnapshot,
+  shouldShowUpdateBanner,
+  writeDismissedUpdateVersion,
+  writeLastSeenAppVersion,
+  writeSharedUpdateSnapshot,
+} from "./lib/updateState";
 import {
   moveSpeakerColorMapEntry,
   normalizeSpeakerColorKey,
@@ -515,6 +526,7 @@ const LEFT_SIDEBAR_MIN_WIDTH = 160;
 const LEFT_SIDEBAR_MAX_WIDTH = 320;
 const RIGHT_SIDEBAR_MIN_WIDTH = 220;
 const RIGHT_SIDEBAR_MAX_WIDTH = 420;
+const AUTO_UPDATE_POLL_INTERVAL_MS = 30 * 60 * 1000;
 
 function guessAppleSiliconFromUA(): boolean {
   const ua = (navigator.userAgent ?? "").toLowerCase();
@@ -2584,6 +2596,8 @@ export function App({
       initialBootstrap?.setupReport?.runtime_health ??
       null,
   );
+  const currentBuildVersion =
+    runtimeHealth?.app_version ?? initialBootstrap?.setupReport?.build_version ?? null;
   const platformIsAppleSilicon =
     runtimeHealth?.is_apple_silicon ?? guessAppleSiliconFromUA();
   const transcriptionEngineOptions = useMemo(
@@ -2644,20 +2658,27 @@ export function App({
   const [acceptingPrivacyPolicy, setAcceptingPrivacyPolicy] = useState(false);
 
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResponse | null>(
-    null,
+    () => readSharedUpdateSnapshot()?.updateInfo ?? null,
   );
   const [nativeUpdate, setNativeUpdate] = useState<TauriUpdate | null>(null);
   const [updateSource, setUpdateSource] = useState<"native" | "github" | null>(
-    null,
+    () => readSharedUpdateSnapshot()?.updateSource ?? null,
   );
-  const [checkingUpdates, setCheckingUpdates] = useState(false);
-  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [checkingUpdates, setCheckingUpdates] = useState(
+    () => readSharedUpdateSnapshot()?.checking ?? false,
+  );
+  const [installingUpdate, setInstallingUpdate] = useState(
+    () => readSharedUpdateSnapshot()?.installing ?? false,
+  );
   const [updateDownloadPercent, setUpdateDownloadPercent] = useState<
     number | null
-  >(null);
+  >(() => readSharedUpdateSnapshot()?.downloadPercent ?? null);
   const [updateStatusMessage, setUpdateStatusMessage] = useState<string | null>(
-    null,
+    () => readSharedUpdateSnapshot()?.statusMessage ?? null,
   );
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<
+    string | null
+  >(() => readDismissedUpdateVersion());
   const [aiCapabilityStatus, setAiCapabilityStatus] =
     useState<AiCapabilityStatus | null>(null);
   const [aiServicesAcknowledged, setAiServicesAcknowledged] = useState(false);
@@ -2690,6 +2711,7 @@ export function App({
   const copiedChatResetTimerRef = useRef<number | null>(null);
   const chatMessageSerialRef = useRef(0);
   const promptTestDefaultInputRef = useRef(getDefaultPromptTestInput());
+  const previousAutoUpdateEnabledRef = useRef<boolean | null>(null);
   const [summaryIncludeTimestamps, setSummaryIncludeTimestamps] = useState(
     defaultSummaryControls.includeTimestamps,
   );
@@ -3213,6 +3235,19 @@ export function App({
         const shouldPrimeModelCatalog = standaloneSettingsWindow
           ? initialStandaloneSettingsPane === "local_models"
           : !warmStartEligible;
+        const bootVersion = initialBootstrap?.setupReport?.build_version ?? null;
+        const previousSeenVersion = readLastSeenAppVersion();
+        if (
+          bootVersion &&
+          previousSeenVersion &&
+          previousSeenVersion !== bootVersion
+        ) {
+          try {
+            await reconcilePostUpdateRuntime();
+          } catch {
+            // keep startup resilient if release-manifest reconciliation is temporarily unavailable
+          }
+        }
         const initialSettingsPromise = fetchSettingsSnapshot();
         const initialRuntimeHealthPromise = shouldPrimeSettingsDiagnostics
           ? fetchRuntimeHealth()
@@ -3247,6 +3282,7 @@ export function App({
           initialRuntimeHealthResult.value
         ) {
           setRuntimeHealth(initialRuntimeHealthResult.value);
+          writeLastSeenAppVersion(initialRuntimeHealthResult.value.app_version);
         }
         if (
           initialProvisioningResult.status === "fulfilled" &&
@@ -3306,6 +3342,9 @@ export function App({
               if (bootstrap.modelCatalog) {
                 setModelCatalog(bootstrap.modelCatalog);
               }
+              if (bootstrap.runtimeHealth?.app_version) {
+                writeLastSeenAppVersion(bootstrap.runtimeHealth.app_version);
+              }
             });
           } catch {
             // keep app interactive even if non-essential bootstrap data fails
@@ -3345,6 +3384,99 @@ export function App({
     setSettings,
     standaloneSettingsWindow,
     warmStartEligible,
+  ]);
+
+  useEffect(() => {
+    writeSharedUpdateSnapshot({
+      updateInfo,
+      updateSource,
+      statusMessage: updateStatusMessage,
+      checking: checkingUpdates,
+      installing: installingUpdate,
+      downloadPercent: updateDownloadPercent,
+      syncedAt: Date.now(),
+    });
+  }, [
+    checkingUpdates,
+    installingUpdate,
+    updateDownloadPercent,
+    updateInfo,
+    updateSource,
+    updateStatusMessage,
+  ]);
+
+  useEffect(() => {
+    if (!currentBuildVersion) {
+      return;
+    }
+    writeLastSeenAppVersion(currentBuildVersion);
+  }, [currentBuildVersion]);
+
+  useEffect(() => {
+    const latestVersion = updateInfo?.latest_version ?? null;
+    if (
+      latestVersion &&
+      dismissedUpdateVersion &&
+      dismissedUpdateVersion !== latestVersion
+    ) {
+      setDismissedUpdateVersion(null);
+      writeDismissedUpdateVersion(null);
+    }
+  }, [dismissedUpdateVersion, updateInfo?.latest_version]);
+
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null) {
+        return;
+      }
+
+      if (event.key === "sbobino.update.dismissedVersion") {
+        setDismissedUpdateVersion(readDismissedUpdateVersion());
+        return;
+      }
+
+      if (event.key !== "sbobino.update.sharedState") {
+        return;
+      }
+
+      const snapshot = readSharedUpdateSnapshot();
+      if (!snapshot) {
+        return;
+      }
+
+      setUpdateInfo(snapshot.updateInfo);
+      setUpdateSource(snapshot.updateSource);
+      setUpdateStatusMessage(snapshot.statusMessage);
+      setCheckingUpdates(snapshot.checking);
+      setInstallingUpdate(snapshot.installing);
+      setUpdateDownloadPercent(snapshot.downloadPercent);
+
+      if (snapshot.updateSource === "native" && snapshot.updateInfo?.has_update) {
+        void syncNativeUpdateForVersion(snapshot.updateInfo.latest_version);
+      } else if (!snapshot.updateInfo?.has_update) {
+        setNativeUpdate(null);
+      }
+    };
+
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  useEffect(() => {
+    if (
+      updateSource === "native" &&
+      updateInfo?.has_update &&
+      !nativeUpdate &&
+      !installingUpdate
+    ) {
+      void syncNativeUpdateForVersion(updateInfo.latest_version);
+    }
+  }, [
+    installingUpdate,
+    nativeUpdate,
+    updateInfo?.has_update,
+    updateInfo?.latest_version,
+    updateSource,
   ]);
 
   useEffect(() => {
@@ -3517,6 +3649,40 @@ export function App({
       unlisten?.();
     };
   }, [setSettings]);
+
+  useEffect(() => {
+    const enabled = Boolean(settings?.general.auto_update_enabled);
+    if (previousAutoUpdateEnabledRef.current === false && enabled) {
+      void refreshUpdates(true);
+    }
+    previousAutoUpdateEnabledRef.current = enabled;
+  }, [settings?.general.auto_update_enabled]);
+
+  useEffect(() => {
+    if (!settings?.general.auto_update_enabled) {
+      return;
+    }
+
+    const triggerRefresh = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      void refreshUpdates(true);
+    };
+
+    const intervalId = window.setInterval(
+      triggerRefresh,
+      AUTO_UPDATE_POLL_INTERVAL_MS,
+    );
+    window.addEventListener("focus", triggerRefresh);
+    document.addEventListener("visibilitychange", triggerRefresh);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", triggerRefresh);
+      document.removeEventListener("visibilitychange", triggerRefresh);
+    };
+  }, [settings?.general.auto_update_enabled]);
 
   useEffect(() => {
     if (!settings) {
@@ -5490,6 +5656,7 @@ export function App({
     try {
       const health = await fetchRuntimeHealth();
       setRuntimeHealth(health);
+      writeLastSeenAppVersion(health.app_version);
     } catch (healthError) {
       setError(
         formatUiError(
@@ -5509,6 +5676,7 @@ export function App({
       ]);
       setModelCatalog(models);
       setRuntimeHealth(health);
+      writeLastSeenAppVersion(health.app_version);
     } catch (modelsError) {
       setError(
         formatUiError(
@@ -5530,6 +5698,7 @@ export function App({
     setProvisioningState(status);
     setModelCatalog(models);
     setRuntimeHealth(health);
+    writeLastSeenAppVersion(health.app_version);
     setStartupRequirementsLoaded(true);
     setStartupRequirementsError(null);
 
@@ -8107,6 +8276,26 @@ export function App({
     }
   }
 
+  async function syncNativeUpdateForVersion(
+    expectedVersion?: string | null,
+  ): Promise<void> {
+    if (import.meta.env.DEV || !expectedVersion) {
+      return;
+    }
+
+    try {
+      const native = await checkAppUpdate();
+      if (native && native.version === expectedVersion) {
+        setNativeUpdate(native);
+        return;
+      }
+    } catch {
+      // best-effort hydration for secondary windows
+    }
+
+    setNativeUpdate(null);
+  }
+
   async function onRefreshUpdates(): Promise<void> {
     await refreshUpdates(false);
   }
@@ -8172,6 +8361,30 @@ export function App({
           : previous,
       );
       setNativeUpdate(null);
+      setUpdateStatusMessage(
+        t(
+          "settings.general.restartingAfterUpdate",
+          "Restarting to apply update...",
+        ),
+      );
+      try {
+        await relaunch();
+        return;
+      } catch (relaunchError) {
+        setError(
+          formatUiError(
+            "error.updateInstallFailed",
+            "Update install failed",
+            relaunchError,
+          ),
+        );
+        setUpdateStatusMessage(
+          t(
+            "settings.general.updateInstalled",
+            "Update installed. Restart the app to apply it.",
+          ),
+        );
+      }
     } catch (installError) {
       setError(
         formatUiError(
@@ -8184,6 +8397,12 @@ export function App({
     } finally {
       setInstallingUpdate(false);
     }
+  }
+
+  function dismissUpdateBanner(): void {
+    const version = updateInfo?.latest_version ?? null;
+    setDismissedUpdateVersion(version);
+    writeDismissedUpdateVersion(version);
   }
 
   async function onRunPromptTest(): Promise<void> {
@@ -10954,6 +11173,87 @@ export function App({
     );
   }
 
+  const showGlobalUpdateBanner = shouldShowUpdateBanner(
+    updateInfo,
+    installingUpdate,
+    checkingUpdates,
+    dismissedUpdateVersion,
+  );
+
+  function renderGlobalUpdateBanner(): JSX.Element | null {
+    if (!showGlobalUpdateBanner) {
+      return null;
+    }
+
+    const latestVersion = updateInfo?.latest_version ?? "";
+    const bannerTitle = checkingUpdates
+      ? t("updates.banner.checkingTitle", "Checking for updates")
+      : installingUpdate
+        ? t("updates.banner.installingTitle", "Installing update")
+        : updateInfo?.has_update
+          ? t("updates.banner.availableTitle", "Update {version} available", {
+              version: latestVersion,
+            })
+          : t("updates.banner.readyTitle", "Updater active");
+    const bannerMessage = updateStatusMessage ??
+      (checkingUpdates
+        ? t(
+            "updates.banner.checkingBody",
+            "Sbobino is checking for a newer version in the background.",
+          )
+        : installingUpdate
+          ? t(
+              "updates.banner.installingBody",
+              "The update is being downloaded and applied automatically.",
+            )
+          : updateInfo?.has_update
+            ? t(
+                "updates.banner.availableBody",
+                "Install version {version} now or download it manually.",
+                { version: latestVersion },
+              )
+            : "");
+
+    return (
+      <div
+        className={`app-update-banner ${installingUpdate ? "is-progress" : "is-available"}`}
+      >
+        <div className="app-update-banner-copy">
+          <strong>{bannerTitle}</strong>
+          <span>{bannerMessage}</span>
+        </div>
+        <div className="app-update-banner-actions">
+          {updateInfo?.has_update && nativeUpdate ? (
+            <button
+              className="primary-button"
+              onClick={() => void onInstallUpdate()}
+              disabled={installingUpdate || checkingUpdates}
+            >
+              {installingUpdate
+                ? t("updates.banner.installingAction", "Installing...")
+                : t("settings.general.downloadAndInstall", "Download & Install")}
+            </button>
+          ) : null}
+          {updateInfo?.has_update && updateInfo.download_url ? (
+            <a
+              className="secondary-button"
+              href={updateInfo.download_url}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {t("settings.general.manualDownload", "Manual Download")}
+            </a>
+          ) : null}
+          {updateInfo?.has_update && !installingUpdate ? (
+            <button className="secondary-button" onClick={dismissUpdateBanner}>
+              {t("updates.banner.later", "Later")}
+            </button>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
   function renderSettingsGeneral(): JSX.Element {
     if (!settings) {
       return (
@@ -13617,6 +13917,7 @@ export function App({
       <main className="settings-window-shell">
         <section className="settings-window-frame">
           <header className="settings-window-header" data-tauri-drag-region />
+          {renderGlobalUpdateBanner()}
           {renderSettings()}
           {error ? (
             <div className="error-banner settings-window-error">
@@ -13937,6 +14238,7 @@ export function App({
             </header>
           ) : null}
 
+          {renderGlobalUpdateBanner()}
           <div className="main-content">{renderContent()}</div>
 
           {error ? (

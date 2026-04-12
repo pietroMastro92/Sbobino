@@ -30,6 +30,7 @@ sha2.workspace = true
 cpal.workspace = true
 tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
 docx-rs = "0.4"
 printpdf = "0.8"

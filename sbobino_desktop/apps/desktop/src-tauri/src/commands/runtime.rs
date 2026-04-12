@@ -12,6 +12,7 @@ use crate::{error::CommandError, state::AppState};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeHealthResponse {
+    pub app_version: String,
     pub host_os: String,
     pub host_arch: String,
     pub is_apple_silicon: bool,
@@ -518,6 +519,7 @@ pub async fn get_transcription_runtime_health(
         .map_err(|e| CommandError::new("runtime_health", e))?;
 
     Ok(RuntimeHealthResponse {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         host_os: health.host_os,
         host_arch: health.host_arch,
         is_apple_silicon: health.is_apple_silicon,

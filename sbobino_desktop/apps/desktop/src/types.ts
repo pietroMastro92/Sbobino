@@ -433,6 +433,7 @@ export type ProvisioningModelCatalogEntry = {
 };
 
 export type RuntimeHealth = {
+  app_version: string;
   host_os: string;
   host_arch: string;
   is_apple_silicon: boolean;
@@ -527,6 +528,11 @@ export type UpdateCheckResponse = {
   current_version: string;
   latest_version: string | null;
   download_url: string | null;
+};
+
+export type PostUpdateReconcileResponse = {
+  reconciled: boolean;
+  requires_repair: boolean;
 };
 
 export type UpdateSettingsPartialPayload = {

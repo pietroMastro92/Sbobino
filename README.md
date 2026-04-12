@@ -182,6 +182,14 @@ Useful technical references live inside `sbobino_desktop/docs`:
 - [Feature migration matrix](./sbobino_desktop/docs/feature-migration-matrix.md)
 - [Workspace README](./sbobino_desktop/README.md)
 
+## Supporting development
+
+Every kind of support for Sbobino’s development is welcome—whether you use the app, share feedback, or contribute time or resources.
+
+**Ways to help:** open [GitHub Issues](https://github.com/pietroMastro92/Sbobino/issues) for bugs and ideas, submit pull requests (see [Workspace README](./sbobino_desktop/README.md) for setup), star the repository if it is useful to you, and spread the word.
+
+**Buy me a coffee:** [Buy Me a Coffee](https://buymeacoffee.com/your-page) — replace `your-page` in this URL with the slug from your Buy Me a Coffee page (the part after `buymeacoffee.com/`).
+
 ## Status
 
 Sbobino is evolving as a serious desktop product for people who need to turn spoken content into usable knowledge quickly, clearly, and with more control than a generic transcription tool.

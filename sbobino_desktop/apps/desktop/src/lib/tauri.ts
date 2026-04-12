@@ -12,6 +12,7 @@ import type {
   ImportAppBackupResponse,
   EnsureRuntimeResponse,
   JobProgress,
+  PostUpdateReconcileResponse,
   PromptTask,
   PromptTemplate,
   ProvisioningProgressEvent,
@@ -297,6 +298,10 @@ export async function provisioningStart(include_coreml = true): Promise<{ starte
 
 export async function provisioningModels(): Promise<ProvisioningModelCatalogEntry[]> {
   return invoke<ProvisioningModelCatalogEntry[]>("provisioning_models");
+}
+
+export async function reconcilePostUpdateRuntime(): Promise<PostUpdateReconcileResponse> {
+  return invoke<PostUpdateReconcileResponse>("reconcile_post_update_runtime");
 }
 
 export async function provisioningDownloadModel(payload: {

@@ -4833,6 +4833,53 @@ body.sidebar-resizing {
   background: rgba(248, 113, 113, 0.2);
 }
 
+.app-update-banner {
+  margin: 18px 18px 0;
+  border-radius: 14px;
+  border: 1px solid rgba(79, 120, 214, 0.18);
+  background: linear-gradient(180deg, rgba(236, 244, 255, 0.96), rgba(244, 248, 255, 0.94));
+  color: var(--text);
+  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.app-update-banner.is-progress {
+  border-color: rgba(86, 129, 224, 0.22);
+  background: linear-gradient(180deg, rgba(232, 242, 255, 0.98), rgba(239, 246, 255, 0.94));
+}
+
+.app-update-banner-copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.app-update-banner-copy strong {
+  font-size: 0.92rem;
+}
+
+.app-update-banner-copy span {
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+
+.app-update-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+[data-theme="dark"] .app-update-banner {
+  border-color: rgba(96, 146, 255, 0.22);
+  background: linear-gradient(180deg, rgba(32, 45, 72, 0.92), rgba(24, 34, 54, 0.9));
+}
+
 .active-job-chip {
   margin: 0 18px 18px;
   border: 1px solid #c4dbef;

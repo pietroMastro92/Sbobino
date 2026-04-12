@@ -1368,6 +1368,58 @@ impl RuntimeTranscriptionFactory {
             .map_err(|e| format!("failed to write pyannote status: {e}"))
     }
 
+    pub fn reconcile_managed_pyannote_release_assets(
+        &self,
+        release_version: &str,
+        expected_runtime_asset: &str,
+        expected_runtime_sha256: &str,
+        expected_model_asset: &str,
+        expected_model_sha256: &str,
+    ) -> Result<bool, String> {
+        let Some(mut manifest) = self.read_managed_pyannote_manifest() else {
+            return Ok(false);
+        };
+
+        let current_version = env!("CARGO_PKG_VERSION");
+        if release_version.trim() != current_version
+            || manifest.source == PYANNOTE_BUNDLED_OVERRIDE_SOURCE
+            || manifest.app_version.trim() == current_version
+            || !pyannote_runtime_arch_matches_host(manifest.runtime_arch.trim())
+            || !pyannote_versions_share_major_minor(manifest.app_version.trim(), current_version)
+        {
+            return Ok(false);
+        }
+
+        let runtime_installed = self.managed_pyannote_python_path().is_some();
+        let model_installed = is_pyannote_model_dir(&self.managed_pyannote_model_dir());
+        if !runtime_installed || !model_installed || self.pyannote_runtime_validation_error().is_some()
+        {
+            return Ok(false);
+        }
+
+        let runtime_matches = manifest.runtime_asset.trim() == expected_runtime_asset.trim()
+            && sha256_matches(manifest.runtime_sha256.trim(), expected_runtime_sha256.trim());
+        let model_matches = manifest.model_asset.trim() == expected_model_asset.trim()
+            && sha256_matches(manifest.model_sha256.trim(), expected_model_sha256.trim());
+
+        if runtime_matches && model_matches {
+            manifest.app_version = current_version.to_string();
+            self.write_managed_pyannote_manifest(&manifest)?;
+            self.write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")?;
+            return Ok(true);
+        }
+
+        self.write_managed_pyannote_status(
+            "pyannote_version_mismatch",
+            &format!(
+                "Pyannote assets installed for app version '{}' do not match the assets shipped with '{}'. Repairing the diarization runtime is required.",
+                manifest.app_version.trim(),
+                current_version
+            ),
+        )?;
+        Ok(false)
+    }
+
     fn managed_pyannote_python_path(&self) -> Option<String> {
         let _ = ensure_embedded_libpython_is_present(&self.managed_pyannote_python_dir());
         let _ = ensure_embedded_pyannote_stdlib_is_present(&self.managed_pyannote_python_dir());
@@ -1574,10 +1626,19 @@ impl RuntimeTranscriptionFactory {
                 Some((code.to_string(), value.message.trim().to_string()))
             }
         });
+        let can_self_heal_status_override = status_override
+            .as_ref()
+            .map(|(code, _)| {
+                !matches!(
+                    code.as_str(),
+                    "pyannote_version_mismatch" | "pyannote_arch_mismatch"
+                )
+            })
+            .unwrap_or(false);
         let manifest_matches_host = manifest.as_ref().map_or(false, |value| {
             pyannote_runtime_arch_matches_host(value.runtime_arch.trim())
                 && (value.source == PYANNOTE_BUNDLED_OVERRIDE_SOURCE
-                    || value.app_version.trim() == env!("CARGO_PKG_VERSION"))
+                    || pyannote_manifest_supports_current_patch(value))
         });
         let cached_runtime_layout_ready = pyannote_python_home(&managed_python_root).is_some();
         let should_trust_cached_ready_status = runtime_installed
@@ -1610,6 +1671,7 @@ impl RuntimeTranscriptionFactory {
             && model_installed
             && runtime_validation_error.is_none()
             && manifest_matches_host
+            && can_self_heal_status_override
         {
             let _ =
                 self.write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.");
@@ -1675,7 +1737,7 @@ impl RuntimeTranscriptionFactory {
                     ),
                 )
             } else if manifest.source != PYANNOTE_BUNDLED_OVERRIDE_SOURCE
-                && manifest.app_version.trim() != env!("CARGO_PKG_VERSION")
+                && !pyannote_manifest_supports_current_patch(manifest)
             {
                 (
                     false,
@@ -2410,6 +2472,40 @@ fn pyannote_runtime_arch_matches_host(installed_arch: &str) -> bool {
     }
 
     false
+}
+
+fn sha256_matches(left: &str, right: &str) -> bool {
+    !left.trim().is_empty()
+        && !right.trim().is_empty()
+        && left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn pyannote_versions_share_major_minor(installed_version: &str, current_version: &str) -> bool {
+    let parse = |value: &str| {
+        let mut segments = value.trim().split('.');
+        let major = segments.next()?.to_string();
+        let minor = segments.next()?.to_string();
+        Some((major, minor))
+    };
+
+    match (parse(installed_version), parse(current_version)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn pyannote_manifest_supports_current_patch(manifest: &ManagedPyannoteManifest) -> bool {
+    let current_version = env!("CARGO_PKG_VERSION");
+    if manifest.app_version.trim() == current_version {
+        return true;
+    }
+
+    manifest.source != PYANNOTE_BUNDLED_OVERRIDE_SOURCE
+        && pyannote_versions_share_major_minor(manifest.app_version.trim(), current_version)
+        && !manifest.runtime_asset.trim().is_empty()
+        && !manifest.runtime_sha256.trim().is_empty()
+        && !manifest.model_asset.trim().is_empty()
+        && !manifest.model_sha256.trim().is_empty()
 }
 
 fn binary_name_variants(base_name: &str) -> Vec<String> {
@@ -3901,7 +3997,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_health_reports_version_mismatch_as_repair_required() {
+    fn runtime_health_accepts_patch_compatible_pyannote_manifest() {
         let (_temp, factory) = build_factory();
         persist_enabled_diarization(&factory);
 
@@ -3935,12 +4031,100 @@ mod tests {
         let health = factory
             .runtime_health()
             .expect("runtime health should load");
+        assert!(health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "ok");
+    }
+
+    #[test]
+    fn runtime_health_reports_major_minor_version_mismatch_as_repair_required() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: "0.2.0".to_string(),
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "abc".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "def".to_string(),
+                runtime_arch: super::target_triple_suffix().to_string(),
+                installed_at: "2026-03-13T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status("ok", "ready")
+            .expect("status should write");
+
+        let health = factory
+            .runtime_health()
+            .expect("runtime health should load");
         assert!(!health.pyannote.ready);
         assert_eq!(health.pyannote.reason_code, "pyannote_version_mismatch");
-        assert!(health
-            .pyannote
-            .message
-            .contains("Repairing the diarization runtime is required"));
+    }
+
+    #[test]
+    fn reconcile_managed_pyannote_release_assets_updates_patch_compatible_manifest() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: "0.1.13".to_string(),
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "abc123".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "def456".to_string(),
+                runtime_arch: super::target_triple_suffix().to_string(),
+                installed_at: "2026-03-13T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status("ok", "ready")
+            .expect("status should write");
+
+        let reconciled = factory
+            .reconcile_managed_pyannote_release_assets(
+                env!("CARGO_PKG_VERSION"),
+                "pyannote-runtime-macos-aarch64.zip",
+                "abc123",
+                "pyannote-model-community-1.zip",
+                "def456",
+            )
+            .expect("reconcile should succeed");
+
+        assert!(reconciled);
+        let manifest = factory
+            .read_managed_pyannote_manifest()
+            .expect("manifest should exist");
+        assert_eq!(manifest.app_version, env!("CARGO_PKG_VERSION"));
+        let status = factory
+            .read_managed_pyannote_status()
+            .expect("status should exist");
+        assert_eq!(status.reason_code, "ok");
     }
 
     #[test]

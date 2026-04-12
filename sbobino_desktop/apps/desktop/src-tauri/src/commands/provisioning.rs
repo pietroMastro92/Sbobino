@@ -132,6 +132,12 @@ pub struct ProvisioningStatusResponse {
     pub pyannote: sbobino_infrastructure::PyannoteRuntimeHealth,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PostUpdateReconcileResponse {
+    pub reconciled: bool,
+    pub requires_repair: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProvisioningProgressEvent {
     pub current: usize,
@@ -491,6 +497,53 @@ pub async fn provisioning_models(
             }
         })
         .collect())
+}
+
+#[tauri::command]
+pub async fn reconcile_post_update_runtime(
+    state: State<'_, AppState>,
+) -> Result<PostUpdateReconcileResponse, CommandError> {
+    let manifest_before = state.runtime_factory.read_managed_pyannote_manifest();
+    let should_attempt_pyannote_reconcile = manifest_before
+        .as_ref()
+        .map(|manifest| {
+            manifest.source != "bundled_override"
+                && manifest.app_version.trim() != env!("CARGO_PKG_VERSION")
+        })
+        .unwrap_or(false);
+
+    if should_attempt_pyannote_reconcile {
+        let client = reqwest::Client::new();
+        if let Ok(selection) = fetch_pyannote_asset_selection(&client).await {
+            let reconciled = state
+                .runtime_factory
+                .reconcile_managed_pyannote_release_assets(
+                    &selection.release_version,
+                    &selection.runtime_asset.name,
+                    &selection.runtime_asset.sha256,
+                    &selection.model_asset.name,
+                    &selection.model_asset.sha256,
+                )
+                .map_err(|e| CommandError::new("reconcile_post_update_runtime", e))?;
+            let health = state
+                .runtime_factory
+                .runtime_health()
+                .map_err(|e| CommandError::new("runtime_health", e))?;
+            return Ok(PostUpdateReconcileResponse {
+                reconciled,
+                requires_repair: health.pyannote.enabled && !health.pyannote.ready,
+            });
+        }
+    }
+
+    let health = state
+        .runtime_factory
+        .runtime_health()
+        .map_err(|e| CommandError::new("runtime_health", e))?;
+    Ok(PostUpdateReconcileResponse {
+        reconciled: false,
+        requires_repair: health.pyannote.enabled && !health.pyannote.ready,
+    })
 }
 
 #[tauri::command]

@@ -11,6 +11,7 @@ import {
 
 function createRuntimeHealthFixture(): RuntimeHealth {
   return {
+    app_version: "0.1.14",
     host_os: "macos",
     host_arch: "aarch64",
     is_apple_silicon: true,

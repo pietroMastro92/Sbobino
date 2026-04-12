@@ -24,7 +24,7 @@ use crate::commands::backup::{export_app_backup, import_app_backup};
 use crate::commands::provisioning::{
     provisioning_cancel, provisioning_download_model, provisioning_install_pyannote,
     provisioning_install_runtime, provisioning_models, provisioning_start, provisioning_status,
-    read_setup_report, write_setup_report,
+    read_setup_report, reconcile_post_update_runtime, write_setup_report,
 };
 use crate::commands::realtime::{
     list_realtime_sessions, load_realtime_session, pause_realtime, resume_realtime, start_realtime,
@@ -50,6 +50,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
@@ -168,6 +169,7 @@ pub fn run() {
             load_realtime_session,
             provisioning_status,
             provisioning_models,
+            reconcile_post_update_runtime,
             provisioning_start,
             provisioning_download_model,
             provisioning_install_pyannote,
