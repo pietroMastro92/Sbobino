@@ -211,9 +211,7 @@ If you want to fuel development with a coffee:
 
 ### 💖 GitHub Sponsors
 
-Official embed (may not render on github.com README; use the badge above or the link if you only see a blank area):
-
-<iframe src="https://github.com/sponsors/pietroMastro92/button" title="Sponsor pietroMastro92" height="32" width="114" style="border: 0; border-radius: 6px;"></iframe>
+GitHub does not allow `<iframe>` embeds in README files (they would show as raw HTML). Use the button below instead:
 
 [![Sponsor pietroMastro92 on GitHub](https://img.shields.io/badge/Sponsor%20on%20GitHub-30363D?style=for-the-badge&logo=githubsponsors&logoColor=ea4aaa)](https://github.com/sponsors/pietroMastro92)
 
