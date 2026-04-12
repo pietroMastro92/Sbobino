@@ -188,7 +188,7 @@ Every kind of support for Sbobino’s development is welcome—whether you use t
 
 **Ways to help:** open [GitHub Issues](https://github.com/pietroMastro92/Sbobino/issues) for bugs and ideas, submit pull requests (see [Workspace README](./sbobino_desktop/README.md) for setup), star the repository if it is useful to you, and spread the word.
 
-**Buy me a coffee:** [Buy Me a Coffee](https://buymeacoffee.com/your-page) — replace `your-page` in this URL with the slug from your Buy Me a Coffee page (the part after `buymeacoffee.com/`).
+**Buy me a coffee:** [buymeacoffee.com/pietromastro](https://buymeacoffee.com/pietromastro)
 
 ## Status
 
