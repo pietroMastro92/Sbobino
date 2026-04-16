@@ -182,9 +182,7 @@ fn runtime_toolchain_message(
     message
 }
 
-async fn normalize_runtime_settings_for_whisper_cpp(
-    state: &AppState,
-) -> (bool, Option<String>) {
+async fn normalize_runtime_settings_for_whisper_cpp(state: &AppState) -> (bool, Option<String>) {
     let mut did_setup = false;
     let mut setup_note = None::<String>;
 
@@ -322,9 +320,9 @@ pub async fn get_realtime_start_readiness(
 
     let model_filename = selected_model.ggml_filename().to_string();
     let model_path = PathBuf::from(&live_health.models_dir_resolved)
-    .join(&model_filename)
-    .to_string_lossy()
-    .to_string();
+        .join(&model_filename)
+        .to_string_lossy()
+        .to_string();
 
     if !live_health.ffmpeg_available {
         return Ok(RealtimeStartReadinessResponse {

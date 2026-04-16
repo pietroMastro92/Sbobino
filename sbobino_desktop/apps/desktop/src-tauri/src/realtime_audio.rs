@@ -240,12 +240,7 @@ pub fn start_input_preview(
         loop {
             match shutdown_rx.recv_timeout(Duration::from_millis(45)) {
                 Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    emit_level_event(
-                        &app_handle,
-                        "idle",
-                        0.0,
-                        "Microphone preview stopped.",
-                    );
+                    emit_level_event(&app_handle, "idle", 0.0, "Microphone preview stopped.");
                     break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {

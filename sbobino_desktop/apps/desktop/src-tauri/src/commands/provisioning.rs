@@ -273,7 +273,7 @@ fn available_disk_space_bytes(path: &Path) -> Result<u64, String> {
         ));
     }
     let stats = unsafe { stats.assume_init() };
-    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize))
 }
 
 #[cfg(not(unix))]
@@ -2301,7 +2301,7 @@ async fn download_to_path(
 fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        return extract_zip_archive_with_ditto(archive_path, destination);
+        extract_zip_archive_with_ditto(archive_path, destination)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2518,7 +2518,7 @@ mod tests {
     #[test]
     fn validate_setup_manifest_rejects_mismatched_release_tag() {
         let manifest = SetupReleaseManifest {
-            app_version: "0.1.15".to_string(),
+            app_version: "0.1.16".to_string(),
             release_tag: "v0.1.8".to_string(),
             pyannote_compat_level: 1,
             runtime_manifest: descriptor("runtime-manifest.json", "deadbeef"),
@@ -2528,7 +2528,7 @@ mod tests {
             pyannote_model_asset: descriptor("pyannote-model-community-1.zip", "deadbeef"),
         };
 
-        let error = validate_setup_manifest("0.1.15", &manifest)
+        let error = validate_setup_manifest("0.1.16", &manifest)
             .expect_err("release tag mismatch should fail");
         assert!(error.contains("release tag"));
     }
@@ -2564,7 +2564,7 @@ mod tests {
                 expanded_size_bytes: Some(120),
             },
             compat_level: 1,
-            release_version: "0.1.15".to_string(),
+            release_version: "0.1.16".to_string(),
         };
 
         assert_eq!(

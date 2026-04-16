@@ -138,7 +138,6 @@ impl TranscriptionService {
             let progress_callback = {
                 let emit_progress = emit_progress.clone();
                 let job_id = request.job_id.clone();
-                let total_audio_seconds = total_audio_seconds;
                 let last_emitted_seconds = Arc::new(Mutex::new(0_f32));
                 let last_emitted_seconds_ref = last_emitted_seconds.clone();
 
@@ -362,7 +361,7 @@ impl TranscriptionService {
             .map_err(|e| ApplicationError::Validation(e.to_string()))?;
             artifact.audio_duration_seconds = total_audio_seconds;
             artifact.parent_artifact_id = request.parent_id.clone();
-            artifact.processing_engine = Some(request.engine.as_ref().to_string());
+            artifact.processing_engine = Some(request.engine.as_str().to_string());
             artifact.processing_model = Some(request.model.ggml_filename().to_string());
             artifact.processing_language = Some(request.language.as_whisper_code().to_string());
             artifact.whisper_options_json = serde_json::to_string(&request.whisper_options).ok();
@@ -522,6 +521,7 @@ impl TranscriptionService {
         std::env::temp_dir().join(format!("{stem}-{job_id}.wav"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit(
         &self,
         callback: &Arc<dyn Fn(JobProgress) + Send + Sync>,

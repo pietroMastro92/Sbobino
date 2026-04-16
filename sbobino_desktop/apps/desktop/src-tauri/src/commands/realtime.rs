@@ -77,7 +77,12 @@ pub struct RealtimeStatusEvent {
     pub message: String,
 }
 
-async fn stop_realtime_preview(app: &tauri::AppHandle, state: &AppState, final_state: &str, message: &str) {
+async fn stop_realtime_preview(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    final_state: &str,
+    message: &str,
+) {
     if let Some(preview) = state.realtime.preview.lock().await.take() {
         preview.stop(app, final_state, message);
     }
@@ -88,9 +93,8 @@ async fn start_realtime_preview(
     state: &AppState,
 ) -> Result<(), CommandError> {
     stop_realtime_preview(app, state, "idle", "Microphone preview reset.").await;
-    let preview = start_input_preview(app).map_err(|error| {
-        CommandError::from(ApplicationError::SpeechToText(error.message))
-    })?;
+    let preview = start_input_preview(app)
+        .map_err(|error| CommandError::from(ApplicationError::SpeechToText(error.message)))?;
     *state.realtime.preview.lock().await = Some(preview);
     Ok(())
 }
@@ -162,13 +166,7 @@ pub async fn start_realtime(
 
     sleep(Duration::from_millis(350)).await;
     if !engine.is_running().await {
-        stop_realtime_preview(
-            &app,
-            &state,
-            "idle",
-            "Microphone preview stopped.",
-        )
-        .await;
+        stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
         let diagnostics = engine.snapshot_diagnostics().await;
         let detail = if diagnostics.is_empty() {
             "Realtime transcription stopped immediately. Verify microphone access and that at least one audio input device is available.".to_string()

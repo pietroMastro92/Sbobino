@@ -1329,8 +1329,7 @@ async fn optimize_with_rag(
 
     let concurrency_limit = enhancer
         .summary_chunk_concurrency_limit()
-        .max(1)
-        .min(OPTIMIZE_CHUNK_CONCURRENCY_LIMIT);
+        .clamp(1, OPTIMIZE_CHUNK_CONCURRENCY_LIMIT);
     let chunk_concurrency = chunks.len().clamp(1, concurrency_limit);
 
     let current_sections = stream::iter(chunks.into_iter())
@@ -1410,8 +1409,7 @@ async fn summarize_with_rag(
     let total = chunks.len();
     let chunk_concurrency_limit = enhancer
         .summary_chunk_concurrency_limit()
-        .max(1)
-        .min(SUMMARY_CHUNK_CONCURRENCY_LIMIT);
+        .clamp(1, SUMMARY_CHUNK_CONCURRENCY_LIMIT);
     let chunk_concurrency = total.clamp(1, chunk_concurrency_limit);
     let chunk_notes = stream::iter(chunks.into_iter().enumerate())
         .map(|(index, chunk)| async move {
@@ -1939,7 +1937,7 @@ fn resolve_export_speaker_color(
     let speaker_key = normalized_export_speaker_id(segment)?;
     if let Some(color) = speaker_colors
         .get(&speaker_key)
-        .and_then(|value| sanitize_speaker_color_value(value))
+        .and_then(sanitize_speaker_color_value)
     {
         return Some(color);
     }
@@ -2089,6 +2087,7 @@ fn export_html(path: &Path, language: &str, document: &ExportDocument) -> Result
         .map_err(|e| CommandError::new("export", format!("failed to export html: {e}")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn export_json(
     path: &Path,
     artifact: &TranscriptArtifact,
@@ -2406,6 +2405,7 @@ fn build_primary_section_styled_lines(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_export_document(
     language: &str,
     title: &str,

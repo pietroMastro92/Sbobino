@@ -318,8 +318,7 @@ async fn synthesize_from_chunks(
     let total = chunks.len();
     let chunk_concurrency_limit = enhancer
         .summary_chunk_concurrency_limit()
-        .max(1)
-        .min(SUMMARY_CHUNK_CONCURRENCY_LIMIT);
+        .clamp(1, SUMMARY_CHUNK_CONCURRENCY_LIMIT);
     let chunk_concurrency = total.clamp(1, chunk_concurrency_limit);
 
     let synthesis_started = Instant::now();

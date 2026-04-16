@@ -571,9 +571,8 @@ impl SqliteArtifactRepository {
 
         Ok(AudioImportResult {
             available: true,
-            backfill_status: if legacy_backfill {
-                ArtifactAudioBackfillStatus::Imported
-            } else {
+            backfill_status: {
+                let _ = legacy_backfill;
                 ArtifactAudioBackfillStatus::Imported
             },
             encrypted_rel_path: Some(format!("{artifact_id}/source.enc")),

@@ -226,7 +226,7 @@ impl WhisperCppEngine {
             .replace("[2K]", "")
             .replace("[BLANK_AUDIO]", "")
             .split('\r')
-            .last()
+            .next_back()
             .unwrap_or("")
             .trim()
             .to_string()
@@ -239,7 +239,7 @@ impl WhisperCppEngine {
         while let Some(ch) = chars.next() {
             if ch == '\u{001b}' && chars.peek() == Some(&'[') {
                 let _ = chars.next();
-                while let Some(next) = chars.next() {
+                for next in chars.by_ref() {
                     if next == 'm' {
                         break;
                     }
@@ -670,6 +670,7 @@ impl WhisperCppEngine {
             .stderr(std::process::Stdio::piped());
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_whisper_cli_attempt(
         &self,
         input_wav: &Path,
@@ -864,6 +865,7 @@ impl WhisperCppEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn transcribe_with_cli(
         &self,
         input_wav: &Path,
@@ -924,6 +926,7 @@ fn status_signal_is_crash(_status: Option<ExitStatus>) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{WhisperCppEngine, PROCESS_IDLE_TIMEOUT_MAX, PROCESS_IDLE_TIMEOUT_MIN};
 

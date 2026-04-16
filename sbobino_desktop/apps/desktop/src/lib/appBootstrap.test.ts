@@ -123,7 +123,7 @@ function createProvisioningFixture(): ProvisioningStatus {
 
 function createRuntimeHealthFixture(): RuntimeHealth {
   return {
-    app_version: "0.1.15",
+    app_version: "0.1.16",
     host_os: "macos",
     host_arch: "aarch64",
     is_apple_silicon: true,

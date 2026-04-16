@@ -639,8 +639,7 @@ async fn synthesize_from_chunks(
         1,
         enhancer
             .summary_chunk_concurrency_limit()
-            .max(1)
-            .min(EMOTION_CHUNK_CONCURRENCY_LIMIT),
+            .clamp(1, EMOTION_CHUNK_CONCURRENCY_LIMIT),
     );
 
     let chunk_notes = futures_util::stream::iter(chunks.iter().cloned().enumerate())
@@ -806,9 +805,9 @@ fn parse_emotion_output(
     if result.reflection_prompts.is_empty() {
         result.reflection_prompts = local.reflection_prompts.clone();
     }
-    if result.narrative_markdown.trim().is_empty() {
-        result.narrative_markdown = build_local_narrative(local, input, options);
-    } else if narrative_looks_like_structured_payload(&result.narrative_markdown) {
+    if result.narrative_markdown.trim().is_empty()
+        || narrative_looks_like_structured_payload(&result.narrative_markdown)
+    {
         result.narrative_markdown = build_local_narrative(local, input, options);
     }
 
@@ -1284,7 +1283,6 @@ fn collect_analysis_segments(
         .prepared
         .timeline_segments
         .iter()
-        .into_iter()
         .map(|value| SegmentEmotionEvidence {
             segment_index: value.source_index,
             speaker_label: if options.include_speakers || options.speaker_dynamics {

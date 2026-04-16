@@ -75,7 +75,7 @@ pub enum TranscriptionEngine {
 }
 
 impl TranscriptionEngine {
-    pub fn as_ref(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::WhisperCpp => "whisper_cpp",
         }

@@ -36,21 +36,21 @@ describe("updateState", () => {
   });
 
   it("persists version markers in local storage", () => {
-    writeLastSeenAppVersion("0.1.15");
-    writeDismissedUpdateVersion("0.1.15");
-    writeLastAutoMigratedPyannoteVersion("0.1.15");
+    writeLastSeenAppVersion("0.1.16");
+    writeDismissedUpdateVersion("0.1.16");
+    writeLastAutoMigratedPyannoteVersion("0.1.16");
 
-    expect(readLastSeenAppVersion()).toBe("0.1.15");
-    expect(readDismissedUpdateVersion()).toBe("0.1.15");
-    expect(readLastAutoMigratedPyannoteVersion()).toBe("0.1.15");
+    expect(readLastSeenAppVersion()).toBe("0.1.16");
+    expect(readDismissedUpdateVersion()).toBe("0.1.16");
+    expect(readLastAutoMigratedPyannoteVersion()).toBe("0.1.16");
   });
 
   it("persists the shared updater snapshot", () => {
     writeSharedUpdateSnapshot({
       updateInfo: {
         has_update: true,
-        current_version: "0.1.15",
-        latest_version: "0.1.15",
+        current_version: "0.1.16",
+        latest_version: "0.1.16",
         download_url: null,
       },
       updateSource: "native",
@@ -64,8 +64,8 @@ describe("updateState", () => {
     expect(readSharedUpdateSnapshot()).toEqual({
       updateInfo: {
         has_update: true,
-        current_version: "0.1.15",
-        latest_version: "0.1.15",
+        current_version: "0.1.16",
+        latest_version: "0.1.16",
         download_url: null,
       },
       updateSource: "native",
@@ -82,13 +82,13 @@ describe("updateState", () => {
       shouldShowUpdateBanner(
         {
           has_update: true,
-          current_version: "0.1.15",
-          latest_version: "0.1.15",
+          current_version: "0.1.16",
+          latest_version: "0.1.16",
           download_url: null,
         },
         false,
         false,
-        "0.1.15",
+        "0.1.16",
       ),
     ).toBe(false);
 
@@ -96,13 +96,13 @@ describe("updateState", () => {
       shouldShowUpdateBanner(
         {
           has_update: true,
-          current_version: "0.1.15",
+          current_version: "0.1.16",
           latest_version: "0.1.16",
           download_url: null,
         },
         false,
         false,
-        "0.1.15",
+        "0.1.16",
       ),
     ).toBe(true);
   });

@@ -1664,7 +1664,7 @@ impl RuntimeTranscriptionFactory {
             .as_ref()
             .map(|(code, _)| !matches!(code.as_str(), "pyannote_arch_mismatch"))
             .unwrap_or(false);
-        let manifest_matches_host = manifest.as_ref().map_or(false, |value| {
+        let manifest_matches_host = manifest.as_ref().is_some_and(|value| {
             pyannote_runtime_arch_matches_host(value.runtime_arch.trim())
                 && (value.source == PYANNOTE_BUNDLED_OVERRIDE_SOURCE
                     || pyannote_manifest_supports_current_compat(value))
@@ -2061,10 +2061,10 @@ impl RuntimeTranscriptionFactory {
 
     fn resolve_existing_binary_path(&self, resolved_path: &str) -> Option<PathBuf> {
         let candidate = PathBuf::from(resolved_path);
-        if candidate.is_absolute() || resolved_path.contains('/') || resolved_path.contains('\\') {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+        if (candidate.is_absolute() || resolved_path.contains('/') || resolved_path.contains('\\'))
+            && candidate.is_file()
+        {
+            return Some(candidate);
         }
 
         self.find_binary_candidate(resolved_path)

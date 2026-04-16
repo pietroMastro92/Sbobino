@@ -15,6 +15,7 @@ pub trait AudioTranscoder: Send + Sync {
 
 #[async_trait]
 pub trait SpeechToTextEngine: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     async fn transcribe(
         &self,
         input_wav: &Path,

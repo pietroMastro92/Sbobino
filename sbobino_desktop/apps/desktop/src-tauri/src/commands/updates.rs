@@ -108,8 +108,8 @@ mod tests {
                 browser_download_url: "https://example.com/runtime.zip".to_string(),
             },
             GitHubAsset {
-                name: "Sbobino_0.1.15_aarch64.dmg".to_string(),
-                browser_download_url: "https://example.com/Sbobino_0.1.15_aarch64.dmg".to_string(),
+                name: "Sbobino_0.1.16_aarch64.dmg".to_string(),
+                browser_download_url: "https://example.com/Sbobino_0.1.16_aarch64.dmg".to_string(),
             },
             GitHubAsset {
                 name: "pyannote-runtime-macos-aarch64.zip".to_string(),
@@ -118,8 +118,8 @@ mod tests {
         ];
 
         let selected =
-            select_manual_download_asset("0.1.15", &assets).expect("expected a dmg asset");
-        assert_eq!(selected.name, "Sbobino_0.1.15_aarch64.dmg");
+            select_manual_download_asset("0.1.16", &assets).expect("expected a dmg asset");
+        assert_eq!(selected.name, "Sbobino_0.1.16_aarch64.dmg");
     }
 
     #[test]
@@ -135,12 +135,12 @@ mod tests {
             },
         ];
 
-        assert!(select_manual_download_asset("0.1.15", &assets).is_none());
+        assert!(select_manual_download_asset("0.1.16", &assets).is_none());
     }
 
     #[test]
     fn compare_versions_handles_patch_updates() {
-        assert_eq!(compare_versions("0.1.15", "0.1.14"), 1);
+        assert_eq!(compare_versions("0.1.16", "0.1.15"), 1);
         assert_eq!(compare_versions("0.1.13", "0.1.13"), 0);
         assert_eq!(compare_versions("0.1.12", "0.1.13"), -1);
     }

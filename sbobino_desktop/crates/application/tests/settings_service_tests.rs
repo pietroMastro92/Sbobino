@@ -153,22 +153,24 @@ async fn update_partial_accepts_all_remote_service_kinds() {
         RemoteServiceKind::Custom,
     ];
 
-    let mut ai = AiSettings::default();
-    ai.active_provider = AiProvider::None;
-    ai.remote_services = kinds
-        .iter()
-        .enumerate()
-        .map(|(index, kind)| RemoteServiceConfig {
-            id: format!("svc_{index}"),
-            kind: kind.clone(),
-            label: format!("{kind:?}"),
-            enabled: true,
-            api_key: None,
-            has_api_key: false,
-            model: None,
-            base_url: None,
-        })
-        .collect();
+    let ai = AiSettings {
+        active_provider: AiProvider::None,
+        remote_services: kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| RemoteServiceConfig {
+                id: format!("svc_{index}"),
+                kind: kind.clone(),
+                label: format!("{kind:?}"),
+                enabled: true,
+                api_key: None,
+                has_api_key: false,
+                model: None,
+                base_url: None,
+            })
+            .collect(),
+        ..AiSettings::default()
+    };
 
     let updated = service
         .update_partial(None, None, Some(ai), None)

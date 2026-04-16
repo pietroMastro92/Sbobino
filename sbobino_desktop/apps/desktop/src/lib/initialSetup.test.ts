@@ -11,7 +11,7 @@ import {
 
 function createRuntimeHealthFixture(): RuntimeHealth {
   return {
-    app_version: "0.1.15",
+    app_version: "0.1.16",
     host_os: "macos",
     host_arch: "aarch64",
     is_apple_silicon: true,
@@ -164,7 +164,7 @@ describe("initialSetup helpers", () => {
 
     expect(
       canWarmStartFromSetupReport(true, {
-        build_version: "0.1.15",
+        build_version: "0.1.16",
         privacy_accepted: true,
         setup_complete: true,
         final_reason_code: "setup_complete",
@@ -178,7 +178,7 @@ describe("initialSetup helpers", () => {
 
     expect(
       canWarmStartFromSetupReport(true, {
-        build_version: "0.1.15",
+        build_version: "0.1.16",
         privacy_accepted: true,
         setup_complete: true,
         final_reason_code: "setup_complete",
