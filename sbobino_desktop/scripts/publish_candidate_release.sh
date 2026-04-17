@@ -3,16 +3,15 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: publish_candidate_release.sh <version> [repo-slug] [asset-dir] [--prerelease]
+Usage: publish_candidate_release.sh <version> [repo-slug] [asset-dir]
 
-Creates a fresh GitHub release and uploads the full Sbobino asset set.
-Use --prerelease only when you explicitly want a candidate release.
+Creates a fresh GitHub prerelease candidate and uploads the full Sbobino asset set.
 This command refuses to reuse an existing release for the same version.
-It also refuses to publish if pre-release readiness proof is missing or invalid.
+It also refuses to publish if pre-release readiness proof or validation templates are missing or invalid.
 EOF
 }
 
-if [[ $# -lt 1 || $# -gt 4 ]]; then
+if [[ $# -lt 1 || $# -gt 3 ]]; then
   usage
   exit 1
 fi
@@ -21,7 +20,6 @@ VERSION=$1
 REPO_SLUG=${2:-pietroMastro92/Sbobino}
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ASSET_DIR=${3:-"$ROOT_DIR/dist/local-release/v$VERSION"}
-RELEASE_KIND=${4:-}
 TAG="v$VERSION"
 
 need_cmd() {
@@ -39,12 +37,6 @@ if [[ ! -d "$ASSET_DIR" ]]; then
   exit 1
 fi
 
-if [[ -n "$RELEASE_KIND" && "$RELEASE_KIND" != "--prerelease" ]]; then
-  echo "Unsupported option: $RELEASE_KIND" >&2
-  usage
-  exit 1
-fi
-
 required_assets=(
   "Sbobino_${VERSION}_aarch64.dmg"
   "Sbobino.app.tar.gz"
@@ -58,6 +50,8 @@ required_assets=(
   "pyannote-model-community-1.zip"
   "release-notes.md"
   "release-readiness-proof.json"
+  "AS-CLEAN-THIRD-MAC.validation-report.json"
+  "AS-UPGRADE-MAC.validation-report.json"
 )
 
 for asset in "${required_assets[@]}"; do
@@ -159,6 +153,45 @@ def assert_descriptor_matches_asset(descriptor_key: str, release_asset: dict, la
 assert_descriptor_matches_asset("runtime_asset", runtime_release, "runtime asset")
 assert_descriptor_matches_asset("pyannote_runtime_asset", pyannote_runtime, "pyannote runtime asset")
 assert_descriptor_matches_asset("pyannote_model_asset", pyannote_model, "pyannote model asset")
+
+expected_reports = {
+    "AS-CLEAN-THIRD-MAC.validation-report.json": {
+        "machine_class": "AS-CLEAN-THIRD-MAC",
+        "required_scenarios": [
+            "clean_room_install",
+            "warm_restart",
+            "functional_diarization_smoke",
+        ],
+    },
+    "AS-UPGRADE-MAC.validation-report.json": {
+        "machine_class": "AS-UPGRADE-MAC",
+        "required_scenarios": [
+            "update_path_validation",
+        ],
+    },
+}
+
+for name, expectation in expected_reports.items():
+    report = json.loads((asset_dir / name).read_text(encoding="utf-8"))
+    if int(report.get("schema_version", 0)) != 1:
+        raise SystemExit(f"{name} has an unsupported schema_version.")
+    if report.get("version") != version:
+        raise SystemExit(f"{name} version does not match requested release version.")
+    if report.get("release_tag") != expected_tag:
+        raise SystemExit(f"{name} release_tag does not match requested release tag.")
+    if report.get("machine_class") != expectation["machine_class"]:
+        raise SystemExit(f"{name} machine_class is incorrect.")
+    if str(report.get("status", "")).strip().lower() != "pending":
+        raise SystemExit(f"{name} must start as pending before candidate validation.")
+    scenario_results = report.get("scenario_results")
+    if not isinstance(scenario_results, dict):
+        raise SystemExit(f"{name} is missing scenario_results.")
+    required_scenarios = report.get("required_scenarios")
+    if required_scenarios != expectation["required_scenarios"]:
+        raise SystemExit(f"{name} required_scenarios do not match the expected matrix.")
+    for scenario in expectation["required_scenarios"]:
+        if str(scenario_results.get(scenario, "")).strip().lower() != "pending":
+            raise SystemExit(f"{name} scenario {scenario} must start as pending.")
 PY
 
 if gh release view "$TAG" --repo "$REPO_SLUG" >/dev/null 2>&1; then
@@ -174,11 +207,8 @@ fi
 gh release create "$TAG" \
   --repo "$REPO_SLUG" \
   --title "$TAG" \
-  --notes-file "$ASSET_DIR/release-notes.md"
-
-if [[ "$RELEASE_KIND" == "--prerelease" ]]; then
-  gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease
-fi
+  --notes-file "$ASSET_DIR/release-notes.md" \
+  --prerelease
 
 gh release upload "$TAG" \
   "$ASSET_DIR/Sbobino_${VERSION}_aarch64.dmg" \
@@ -192,15 +222,18 @@ gh release upload "$TAG" \
   "$ASSET_DIR/pyannote-model-community-1.zip" \
   "$ASSET_DIR/pyannote-manifest.json" \
   "$ASSET_DIR/release-readiness-proof.json" \
+  "$ASSET_DIR/AS-CLEAN-THIRD-MAC.validation-report.json" \
+  "$ASSET_DIR/AS-UPGRADE-MAC.validation-report.json" \
   --repo "$REPO_SLUG"
 
 cat <<EOF
-Release published successfully:
+Prerelease candidate published successfully:
   repo: $REPO_SLUG
   tag:  $TAG
 
 Next required steps:
   1. ./scripts/distribution_readiness.sh "$VERSION" "$REPO_SLUG"
-  2. Validate the release on a second Apple Silicon Mac
-  3. Use --prerelease only when you intentionally want a candidate first
+  2. Validate the exact GitHub prerelease on AS-CLEAN-THIRD-MAC and AS-UPGRADE-MAC
+  3. Re-upload the two validation report JSON assets with status=passed
+  4. ./scripts/promote_candidate_release.sh "$VERSION" "$REPO_SLUG"
 EOF

@@ -192,6 +192,7 @@ Useful technical references live inside `sbobino_desktop/docs`:
 - 📐 [Architecture](./sbobino_desktop/docs/architecture.md)
 - 🚢 [Release and migration notes](./sbobino_desktop/docs/release-and-migration.md)
 - ✅ [Feature migration matrix](./sbobino_desktop/docs/feature-migration-matrix.md)
+- 🗂️ [GitHub backlog epics](./sbobino_desktop/docs/github-backlog/README.md)
 - 📎 [Workspace README](./sbobino_desktop/README.md)
 
 ## 💜 Supporting development

@@ -14,8 +14,8 @@
 - Produces updater artifacts/signatures (`createUpdaterArtifacts: true` in `tauri.conf.json`).
 - Publishes all generated bundle assets to the GitHub Release for that tag.
 - Production origin is the current public GitHub repository: `pietroMastro92/Sbobino`.
-- Default recommendation: prepare every release locally first with `./scripts/prepare_local_release.sh <version>`, publish the GitHub release as stable by default, run remote validation, and test that exact release on a second Mac.
-- Candidate versions are optional. If you intentionally use a prerelease and it fails validation on a third-party Mac, retire it and cut a new patch version instead of overwriting a stable release or reusing the same candidate.
+- Default recommendation: prepare every release locally first with `./scripts/prepare_local_release.sh <version>`, publish the GitHub release as a prerelease candidate, run remote validation, validate that exact release on the Apple Silicon matrix, then promote only after the validation reports are uploaded as passed.
+- Candidate validation is mandatory. If a prerelease fails validation on a third-party Mac, retire it and cut a new patch version instead of overwriting a stable release or reusing the same candidate.
 - Required public asset set for every distributable version:
   - `Sbobino_<version>_aarch64.dmg`
   - `Sbobino.app.tar.gz`
@@ -27,12 +27,15 @@
   - `pyannote-runtime-macos-aarch64.zip`
   - `pyannote-model-community-1.zip`
   - `pyannote-manifest.json`
+  - `AS-CLEAN-THIRD-MAC.validation-report.json`
+  - `AS-UPGRADE-MAC.validation-report.json`
 - `setup-manifest.json` is the single bootstrap contract for first-launch setup and repair. Runtime and pyannote manifests are no longer treated as independent entrypoints.
 
 ### Legal / attribution artifacts
 
 - Third-party licenses and version pins: [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) (update when runtime or pyannote pins change).
 - Suggested GitHub Release body text: [`github-release-template.md`](github-release-template.md).
+- Distribution validation matrix and clean-room policy: [`distribution-validation-plan.md`](distribution-validation-plan.md).
 
 ## Signing and Notarization
 
@@ -55,11 +58,12 @@
 - To avoid consuming GitHub Actions minutes, prefer the local release flow:
   - `cd sbobino_desktop`
   - `./scripts/prepare_local_release.sh <version>`
-  - publish the release with `./scripts/publish_candidate_release.sh <version>` or create the GitHub release `v<version>` manually
+  - publish the prerelease candidate with `./scripts/publish_candidate_release.sh <version>`
   - upload the generated files from `dist/local-release/v<version>/`
   - run `./scripts/distribution_readiness.sh <version>`
-  - test that GitHub release on a second Apple Silicon Mac
-  - if you intentionally published a prerelease first, promote it only after it passes with `./scripts/promote_candidate_release.sh <version>`
+  - validate that GitHub prerelease on `AS-CLEAN-THIRD-MAC` and `AS-UPGRADE-MAC`
+  - re-upload both validation report JSON assets with `status=passed`
+  - promote it only after it passes with `./scripts/promote_candidate_release.sh <version>`
   - if the release fails, delete/retire it with `./scripts/retire_failed_candidate.sh <version>` and cut a new patch version
   - the default `public` profile keeps pyannote out of the app bundle and installs it from release assets during first launch
   - the script automatically generates and reuses a stable local Tauri updater keypair under the user's config directory when one is not already present
@@ -105,16 +109,19 @@
 - `./scripts/distribution_readiness.sh <version> [repo-slug]`
 - Runs only after the full asset set is uploaded to a GitHub release.
 - Verifies HTTP availability, JSON parsing, `app_version` consistency, checksum integrity, updater tarball/signature wiring, and that `setup-manifest.json` points only to assets present in the same release.
+- This gate validates artifact integrity only. Stable distribution additionally requires the Apple Silicon clean-room and upgrade scenarios in [`distribution-validation-plan.md`](distribution-validation-plan.md).
 
 ## Stable Release Policy
 
 - Stable GitHub releases are immutable for distribution purposes.
 - Do not replace stable assets in place to repair a bad public release.
+- A release is considered distributable only if the full Apple Silicon matrix in [`distribution-validation-plan.md`](distribution-validation-plan.md) is green on the exact public assets.
+- Stable promotion is blocked unless the release contains `AS-CLEAN-THIRD-MAC.validation-report.json` and `AS-UPGRADE-MAC.validation-report.json`, both marked `passed`.
 - The supported correction path is:
   1. retire the failed public release
   2. cut a new patch version
   3. publish and validate a fresh release
-  4. use prerelease promotion only when you intentionally opted into that flow
+  4. promote the validated prerelease to stable
 
 ## Startup Contract
 

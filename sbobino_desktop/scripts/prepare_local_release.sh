@@ -386,6 +386,55 @@ proof = {
     json.dumps(proof, indent=2) + "\n",
     encoding="utf-8",
 )
+
+validation_templates = {
+    "AS-CLEAN-THIRD-MAC.validation-report.json": {
+        "schema_version": 1,
+        "version": version,
+        "release_tag": f"v{version}",
+        "release_url": "",
+        "machine_class": "AS-CLEAN-THIRD-MAC",
+        "status": "pending",
+        "tester": "",
+        "macos_version": "",
+        "tested_at_utc": "",
+        "notes": "",
+        "required_scenarios": [
+            "clean_room_install",
+            "warm_restart",
+            "functional_diarization_smoke",
+        ],
+        "scenario_results": {
+            "clean_room_install": "pending",
+            "warm_restart": "pending",
+            "functional_diarization_smoke": "pending",
+        },
+    },
+    "AS-UPGRADE-MAC.validation-report.json": {
+        "schema_version": 1,
+        "version": version,
+        "release_tag": f"v{version}",
+        "release_url": "",
+        "machine_class": "AS-UPGRADE-MAC",
+        "status": "pending",
+        "tester": "",
+        "macos_version": "",
+        "tested_at_utc": "",
+        "notes": "",
+        "required_scenarios": [
+            "update_path_validation",
+        ],
+        "scenario_results": {
+            "update_path_validation": "pending",
+        },
+    },
+}
+
+for filename, payload in validation_templates.items():
+    (output_dir / filename).write_text(
+        json.dumps(payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
 PY
 
 cat >"$OUTPUT_DIR/release-notes.md" <<EOF
@@ -430,7 +479,7 @@ Nothing in this folder has been published automatically.
 
 1. Create or reuse the Git tag locally: \`git tag -a v$VERSION -m "Sbobino v$VERSION"\`
 2. Push only when you are ready: \`git push origin v$VERSION\`
-3. Publish the GitHub release as stable by default. Use a prerelease only if you explicitly want a candidate first.
+3. Publish the GitHub release as a prerelease candidate first. Stable promotion is blocked until Apple Silicon validation reports are uploaded with \`status=passed\`.
 4. Upload these files from \`$OUTPUT_DIR\`:
    - \`Sbobino_${VERSION}_aarch64.dmg\`
    - \`Sbobino.app.tar.gz\`
@@ -443,10 +492,23 @@ Nothing in this folder has been published automatically.
    - \`pyannote-model-community-1.zip\`
    - \`pyannote-manifest.json\`
    - \`release-readiness-proof.json\`
+   - \`AS-CLEAN-THIRD-MAC.validation-report.json\`
+   - \`AS-UPGRADE-MAC.validation-report.json\`
    - \`release-notes.md\` (use this exact file as the GitHub release body)
 5. Run \`./scripts/distribution_readiness.sh "$VERSION"\` from \`sbobino_desktop/\`.
-6. Test that exact GitHub release on a second Apple Silicon Mac.
-7. If it fails on the second Mac, retire it and cut a new patch version. Do not overwrite a stable release in place.
+6. Validate that exact GitHub release against \`docs/distribution-validation-plan.md\` on:
+   - \`AS-CLEAN-THIRD-MAC\`
+   - \`AS-UPGRADE-MAC\`
+7. Update both validation report JSON files with:
+   - the GitHub release URL
+   - tester name
+   - macOS version
+   - \`tested_at_utc\`
+   - per-scenario results
+   - top-level \`status\` set to \`passed\` only when every mandatory scenario passed
+8. Re-upload those two JSON files to the same GitHub prerelease with \`gh release upload --clobber\`.
+9. Promote to stable only with \`./scripts/promote_candidate_release.sh "$VERSION"\`.
+10. If validation fails, retire the prerelease and cut a new patch version. Do not overwrite a stable release in place.
 
 ## gh CLI example
 
@@ -454,6 +516,13 @@ Nothing in this folder has been published automatically.
 ./scripts/publish_candidate_release.sh "$VERSION"
 
 ./scripts/distribution_readiness.sh "$VERSION"
+
+gh release upload "v$VERSION" \
+  "$OUTPUT_DIR/AS-CLEAN-THIRD-MAC.validation-report.json" \
+  "$OUTPUT_DIR/AS-UPGRADE-MAC.validation-report.json" \
+  --clobber
+
+./scripts/promote_candidate_release.sh "$VERSION"
 \`\`\`
 EOF
 
@@ -493,6 +562,33 @@ Homebrew, host Python, or previously installed Sbobino runtime assets.
 
 - If every step passes, the prerelease can be promoted to stable.
 - If any step fails, delete the prerelease and cut a new patch version.
+- This checklist is the minimum clean-room pass. Stable release still requires the full Apple Silicon matrix in \`docs/distribution-validation-plan.md\`, including update-path validation.
+EOF
+
+cat >"$OUTPUT_DIR/UPGRADE_VALIDATION.md" <<EOF
+# Upgrade validation for v$VERSION
+
+Run this checklist on an Apple Silicon Mac that already has the latest public
+Sbobino version installed with working runtime, whisper models, and pyannote.
+
+## Before update
+
+1. Confirm the existing public version can open normally.
+2. Confirm `Settings > Local Models` reports pyannote \`Ready\`.
+3. Run one short diarized transcription to verify the pre-update baseline.
+
+## Candidate validation
+
+1. Update to \`v$VERSION\` using the real shipped flow.
+2. Launch the updated app.
+3. Open `Settings > Local Models`.
+4. Run one diarized transcription.
+
+## Decision rule
+
+- Pass only if the update completes without manual repair and pyannote stays usable the same way as before.
+- If any step fails, delete the prerelease and cut a new patch version.
+- Record the result in \`AS-UPGRADE-MAC.validation-report.json\` before promotion.
 EOF
 
 cat <<EOF
@@ -509,6 +605,8 @@ Artifacts:
   - pyannote-model-community-1.zip
   - pyannote-manifest.json
   - release-readiness-proof.json
+  - AS-CLEAN-THIRD-MAC.validation-report.json
+  - AS-UPGRADE-MAC.validation-report.json
 EOF
 
 if [[ -f "$OUTPUT_DIR/Sbobino.app.tar.gz.sig" ]]; then

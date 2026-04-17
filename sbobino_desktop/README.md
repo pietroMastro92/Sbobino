@@ -11,6 +11,7 @@ This repository is the production-grade rewrite of the original Python Sbobino a
 - `apps/desktop/src-tauri`: Tauri command host and runtime composition
 - `docs/architecture.md`: architecture and dependency rules
 - `docs/release-and-migration.md`: release pipeline and migration plan
+- `docs/distribution-validation-plan.md`: Apple Silicon clean-room distribution matrix and future Intel/Windows expansion path
 - `docs/feature-migration-matrix.md`: feature-by-feature parity checklist
 - `THIRD_PARTY_NOTICES.md`: licenses and attribution for FFmpeg, whisper.cpp, pyannote, Hugging Face models, and related runtime components
 - `docs/github-release-template.md`: copy-paste text for GitHub Release notes (third-party disclaimer + links)
@@ -47,24 +48,27 @@ That folder now always includes:
 - `pyannote-runtime-macos-aarch64.zip`
 - `pyannote-model-community-1.zip`
 - `release-readiness-proof.json` (generated only when `release_readiness.sh` passed)
+- `AS-CLEAN-THIRD-MAC.validation-report.json` (template, must be uploaded back as `passed`)
+- `AS-UPGRADE-MAC.validation-report.json` (template, must be uploaded back as `passed`)
 
 Manual publish contract:
 1. build the release locally
-2. publish the GitHub release for the same `v<version>` as stable by default
+2. publish the GitHub release for the same `v<version>` as a prerelease candidate
 3. upload the full asset set
 4. run `./scripts/distribution_readiness.sh <version>`
-5. test that exact GitHub release on a second Apple Silicon Mac
-6. use a prerelease only when you explicitly want a candidate-first flow
-7. if it fails, retire that release and cut a new patch version
+5. test that exact GitHub release against the Apple Silicon matrix in `docs/distribution-validation-plan.md`
+6. update and re-upload both Apple Silicon validation reports with `status=passed`
+7. promote to stable only with `./scripts/promote_candidate_release.sh <version>`
+8. if it fails, retire that release and cut a new patch version
 
 Helper scripts:
-- `./scripts/publish_candidate_release.sh <version>` publishes a stable release by default and refuses publishing if readiness proof/checksums/manifests are inconsistent
+- `./scripts/publish_candidate_release.sh <version>` publishes a prerelease candidate and refuses publishing if readiness proof/checksums/manifests/templates are inconsistent
 - `./scripts/promote_candidate_release.sh <version>`
 - `./scripts/retire_failed_candidate.sh <version>`
 
 Stable release policy:
 - never overwrite or “fix in place” a stable GitHub release
-- prereleases are optional and no longer the default publish mode
+- prerelease candidate validation is mandatory before stable promotion
 - the default promotion flow removes older stable releases so only the latest validated stable remains public
 
 Set `SBOBINO_RELEASE_PROFILE=standalone-dev` only for internal/offline builds that intentionally embed bundled pyannote assets.
