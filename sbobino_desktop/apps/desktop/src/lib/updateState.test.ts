@@ -97,7 +97,7 @@ describe("updateState", () => {
         {
           has_update: true,
           current_version: "0.1.16",
-          latest_version: "0.1.16",
+          latest_version: "0.1.17",
           download_url: null,
         },
         false,

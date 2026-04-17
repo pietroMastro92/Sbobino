@@ -92,7 +92,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        import torch
+        import torch  # noqa: F401 - explicit dependency preflight check
         from pyannote.audio import Pipeline
     except Exception as error:
         sys.stderr.write(

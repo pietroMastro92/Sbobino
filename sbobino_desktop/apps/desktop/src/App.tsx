@@ -113,6 +113,7 @@ import {
   subscribeProvisioningStatus,
   subscribeRealtimeDelta,
   subscribeRealtimeInputLevel,
+  subscribeMenuCheckUpdates,
   subscribeRealtimeSaved,
   subscribeRealtimeStatus,
   subscribeSettingsNavigate,
@@ -3727,6 +3728,24 @@ export function App({
       document.removeEventListener("visibilitychange", triggerRefresh);
     };
   }, [settings?.general.auto_update_enabled]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    void (async () => {
+      try {
+        unlisten = await subscribeMenuCheckUpdates(() => {
+          void onRefreshUpdates();
+        });
+      } catch {
+        // menu listener is best-effort in non-native environments
+      }
+    })();
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (!settings) {
@@ -8344,6 +8363,8 @@ export function App({
   }
 
   async function onRefreshUpdates(): Promise<void> {
+    setDismissedUpdateVersion(null);
+    writeDismissedUpdateVersion(null);
     await refreshUpdates(false);
   }
 
@@ -11240,10 +11261,43 @@ export function App({
                 { version: latestVersion },
               )
             : "");
+    const canInstallFromBanner = Boolean(
+      updateInfo?.has_update &&
+        nativeUpdate &&
+        !installingUpdate &&
+        !checkingUpdates,
+    );
+    const canDismissBanner = Boolean(updateInfo?.has_update && !installingUpdate);
+
+    const onBannerClick = (event: ReactMouseEvent<HTMLDivElement>) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("button, a")) {
+        return;
+      }
+      if (!canInstallFromBanner) {
+        return;
+      }
+      void onInstallUpdate();
+    };
+
+    const onBannerKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (!canInstallFromBanner) {
+        return;
+      }
+      if (event.key !== "Enter" && event.key !== " ") {
+        return;
+      }
+      event.preventDefault();
+      void onInstallUpdate();
+    };
 
     return (
       <div
-        className={`app-update-banner ${installingUpdate ? "is-progress" : "is-available"}`}
+        className={`app-update-banner ${installingUpdate ? "is-progress" : "is-available"} ${canInstallFromBanner ? "is-clickable" : ""}`}
+        onClick={onBannerClick}
+        onKeyDown={onBannerKeyDown}
+        role={canInstallFromBanner ? "button" : undefined}
+        tabIndex={canInstallFromBanner ? 0 : undefined}
       >
         <div className="app-update-banner-copy">
           <strong>{bannerTitle}</strong>
@@ -11271,9 +11325,13 @@ export function App({
               {t("settings.general.manualDownload", "Manual Download")}
             </a>
           ) : null}
-          {updateInfo?.has_update && !installingUpdate ? (
-            <button className="secondary-button" onClick={dismissUpdateBanner}>
-              {t("updates.banner.later", "Later")}
+          {canDismissBanner ? (
+            <button
+              className="update-banner-close"
+              onClick={dismissUpdateBanner}
+              title={t("action.dismiss", "Dismiss")}
+            >
+              <X size={14} />
             </button>
           ) : null}
         </div>

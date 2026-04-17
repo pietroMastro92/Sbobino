@@ -10,6 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tauri::Manager;
+#[cfg(target_os = "macos")]
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    Emitter,
+};
 use tokio::sync::Mutex;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -45,6 +50,54 @@ use crate::commands::window::open_settings_window;
 use crate::state::{ProvisioningRuntime, RealtimeRuntime};
 use sbobino_infrastructure::adapters::whisper_stream::WhisperStreamEngine;
 
+#[cfg(target_os = "macos")]
+const MENU_CHECK_UPDATES_ID: &str = "app_menu_check_updates";
+#[cfg(target_os = "macos")]
+const MENU_CHECK_UPDATES_EVENT: &str = "app://menu-check-updates";
+
+#[cfg(target_os = "macos")]
+fn setup_macos_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let menu = Menu::default(app)?;
+    let check_updates_item = MenuItem::with_id(
+        app,
+        MENU_CHECK_UPDATES_ID,
+        "Verifica disponibilita aggiornamenti...",
+        true,
+        None::<&str>,
+    )?;
+    let separator = PredefinedMenuItem::separator(app)?;
+
+    if let Some(app_submenu) = menu
+        .items()?
+        .into_iter()
+        .find_map(|item| item.as_submenu().cloned())
+    {
+        let insert_position = app_submenu.items()?.len().min(2);
+        app_submenu.insert(&check_updates_item, insert_position)?;
+        app_submenu.insert(&separator, insert_position + 1)?;
+    } else {
+        menu.append(&check_updates_item)?;
+    }
+
+    app.set_menu(menu)?;
+
+    app.on_menu_event(|app_handle, event| {
+        if event.id() != MENU_CHECK_UPDATES_ID {
+            return;
+        }
+        if let Some(main_window) = app_handle.get_webview_window("main") {
+            let _ = main_window.show();
+            let _ = main_window.unminimize();
+            let _ = main_window.set_focus();
+            let _ = main_window.emit(MENU_CHECK_UPDATES_EVENT, ());
+        } else {
+            let _ = app_handle.emit(MENU_CHECK_UPDATES_EVENT, ());
+        }
+    });
+
+    Ok(())
+}
+
 pub fn run() {
     init_tracing();
 
@@ -72,6 +125,10 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            setup_macos_app_menu(&app.handle())
+                .map_err(|error| std::io::Error::other(format!("menu setup failure: {error}")))?;
+
             #[cfg(target_os = "macos")]
             if let Some(window) = app.get_webview_window("main") {
                 use window_vibrancy::{

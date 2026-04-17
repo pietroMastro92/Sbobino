@@ -35,6 +35,7 @@ import type {
   UpdateSettingsPartialPayload,
 } from "../types";
 import type { InitialSetupReport } from "./initialSetup";
+const MENU_CHECK_UPDATES_EVENT = "app://menu-check-updates";
 
 export async function fetchSettings(): Promise<AppSettings> {
   return invoke<AppSettings>("get_settings");
@@ -385,6 +386,15 @@ export async function openSettingsWindow(pane?: string): Promise<boolean> {
     return invoke<boolean>("open_settings_window");
   }
   return invoke<boolean>("open_settings_window", { payload: { pane } });
+}
+
+export async function subscribeMenuCheckUpdates(
+  onRequested: () => void,
+): Promise<() => void> {
+  const unlisten = await listen<void>(MENU_CHECK_UPDATES_EVENT, () => {
+    onRequested();
+  });
+  return unlisten;
 }
 
 export async function subscribeSettingsUpdated(

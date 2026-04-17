@@ -1,5 +1,3 @@
-import os
-
 with open("/Users/pietromastro/Documents/sbobino_tauri/icon_source.b64", "r") as f:
     b64_data = f.read().replace('\n', '')
 
