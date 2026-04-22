@@ -685,15 +685,22 @@ validate_intel_primary() {
   fi
 
   local plist_version
+  local bundle_executable
   plist_version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$mount_dir/Sbobino.app/Contents/Info.plist")
   if [[ "$plist_version" != "$VERSION" ]]; then
     hdiutil detach "$mount_dir" -quiet || true
     fail_validation "Mounted app bundle version '$plist_version' does not match expected version '$VERSION'."
   fi
 
-  if [[ ! -x "$mount_dir/Sbobino.app/Contents/MacOS/Sbobino" ]]; then
+  bundle_executable=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$mount_dir/Sbobino.app/Contents/Info.plist")
+  if [[ -z "${bundle_executable// }" ]]; then
     hdiutil detach "$mount_dir" -quiet || true
-    fail_validation "Mounted app bundle is missing the Sbobino executable."
+    fail_validation "Mounted app bundle does not declare CFBundleExecutable."
+  fi
+
+  if [[ ! -x "$mount_dir/Sbobino.app/Contents/MacOS/$bundle_executable" ]]; then
+    hdiutil detach "$mount_dir" -quiet || true
+    fail_validation "Mounted app bundle is missing the '$bundle_executable' executable."
   fi
 
   hdiutil detach "$mount_dir" -quiet || true
