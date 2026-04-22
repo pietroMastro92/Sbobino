@@ -270,6 +270,34 @@ settings_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 }
 
+set_speaker_diarization_enabled() {
+  local enabled=${1:-0}
+  mkdir -p "$DATA_DIR"
+  python3 - <<'PY' "$SETTINGS_PATH" "$enabled"
+import json
+import sys
+from pathlib import Path
+
+settings_path = Path(sys.argv[1])
+enabled = sys.argv[2] == "1"
+
+payload = {}
+if settings_path.exists():
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+
+transcription = payload.setdefault("transcription", {})
+speaker = transcription.setdefault("speaker_diarization", {})
+speaker["enabled"] = enabled
+speaker.setdefault("device", "cpu")
+speaker.setdefault("speaker_colors", {})
+
+settings_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
 launch_app() {
   open "$APP_PATH"
 }
@@ -496,18 +524,19 @@ validate_as_third() {
   seed_privacy_acceptance
   launch_app
   wait_for_setup_report_success "$TIMEOUT_SECONDS"
-  wait_for_runtime_health_ready "$TIMEOUT_SECONDS" 1
+  wait_for_runtime_health_ready "$TIMEOUT_SECONDS" 0
   SCENARIO_CLEAN_ROOM_INSTALL="passed"
 
   quit_app
+  set_speaker_diarization_enabled 1
   launch_app
-  wait_for_runtime_health_ready 180 1
+  wait_for_runtime_health_ready 900 1
   SCENARIO_WARM_RESTART="passed"
 
   run_diarization_smoke
   SCENARIO_FUNCTIONAL_DIARIZATION_SMOKE="passed"
 
-  record_success "passed" "Third Apple Silicon machine completed clean-room install, warm restart, and diarization smoke on the public candidate."
+  record_success "passed" "Third Apple Silicon machine completed clean-room install, enabled diarization without blocking the app, and passed the first pyannote smoke after background setup."
 }
 
 validate_as_primary() {
@@ -521,6 +550,7 @@ validate_as_primary() {
   clear_install_state
   install_app_from_dmg "$previous_version"
   seed_privacy_acceptance
+  set_speaker_diarization_enabled 1
   launch_app
   wait_for_setup_report_success "$TIMEOUT_SECONDS"
   wait_for_runtime_health_ready "$TIMEOUT_SECONDS" 1
@@ -529,6 +559,7 @@ validate_as_primary() {
 
   install_app_from_dmg "$VERSION"
   seed_privacy_acceptance
+  set_speaker_diarization_enabled 1
   launch_app
   wait_for_runtime_health_ready 900 1
   SCENARIO_UPDATE_PATH_VALIDATION="passed"

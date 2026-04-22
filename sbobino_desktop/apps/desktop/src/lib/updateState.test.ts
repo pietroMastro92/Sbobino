@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  matchesPyannoteAutoActionMarker,
   readDismissedUpdateVersion,
-  readLastAutoMigratedPyannoteVersion,
+  readLastPyannoteAutoActionMarker,
   readLastSeenAppVersion,
   readSharedUpdateSnapshot,
   shouldShowUpdateBanner,
   writeDismissedUpdateVersion,
-  writeLastAutoMigratedPyannoteVersion,
+  writeLastPyannoteAutoActionMarker,
   writeLastSeenAppVersion,
   writeSharedUpdateSnapshot,
 } from "./updateState";
@@ -38,11 +39,47 @@ describe("updateState", () => {
   it("persists version markers in local storage", () => {
     writeLastSeenAppVersion("0.1.16");
     writeDismissedUpdateVersion("0.1.16");
-    writeLastAutoMigratedPyannoteVersion("0.1.16");
+    writeLastPyannoteAutoActionMarker({
+      appVersion: "0.1.16",
+      trigger: "post_update",
+      reasonCode: "pyannote_version_mismatch",
+    });
 
     expect(readLastSeenAppVersion()).toBe("0.1.16");
     expect(readDismissedUpdateVersion()).toBe("0.1.16");
-    expect(readLastAutoMigratedPyannoteVersion()).toBe("0.1.16");
+    expect(readLastPyannoteAutoActionMarker()).toEqual({
+      appVersion: "0.1.16",
+      trigger: "post_update",
+      reasonCode: "pyannote_version_mismatch",
+    });
+  });
+
+  it("compares pyannote auto-action markers by version, trigger, and reason", () => {
+    const current = {
+      appVersion: "0.1.16",
+      trigger: "post_update" as const,
+      reasonCode: "pyannote_version_mismatch",
+    };
+
+    expect(matchesPyannoteAutoActionMarker(current, current)).toBe(true);
+    expect(
+      matchesPyannoteAutoActionMarker(current, {
+        ...current,
+        reasonCode: "pyannote_checksum_invalid",
+      }),
+    ).toBe(false);
+    expect(
+      matchesPyannoteAutoActionMarker(current, {
+        ...current,
+        trigger: "startup",
+      }),
+    ).toBe(false);
+    expect(
+      matchesPyannoteAutoActionMarker(current, {
+        ...current,
+        appVersion: "0.1.17",
+      }),
+    ).toBe(false);
   });
 
   it("persists the shared updater snapshot", () => {

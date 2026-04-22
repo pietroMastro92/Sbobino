@@ -3148,6 +3148,58 @@ fn is_host_managed_reference(value: &str) -> bool {
     value.starts_with("/opt/homebrew") || value.starts_with("/usr/local")
 }
 
+fn pyannote_native_binary_paths(runtime_root: &Path) -> Vec<PathBuf> {
+    let mut search_roots = Vec::new();
+    if let Some(version_dir_name) = pyannote_python_version_dir_name(runtime_root) {
+        let stdlib_dir = runtime_root.join("lib").join(version_dir_name);
+        for relative in ["lib-dynload", "site-packages"] {
+            let candidate = stdlib_dir.join(relative);
+            if candidate.is_dir() {
+                search_roots.push(candidate);
+            }
+        }
+    }
+
+    let embedded_dylibs_dir = runtime_root.join("lib").join("embedded-dylibs");
+    if embedded_dylibs_dir.is_dir() {
+        search_roots.push(embedded_dylibs_dir);
+    }
+
+    let mut binaries = Vec::new();
+    let mut seen = HashSet::<PathBuf>::new();
+    let mut pending = search_roots;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+
+            let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if extension != "so" && extension != "dylib" {
+                continue;
+            }
+
+            let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+            if seen.insert(canonical.clone()) {
+                binaries.push(canonical);
+            }
+        }
+    }
+
+    binaries.sort();
+    binaries
+}
+
 fn pyannote_torchcodec_binary_paths(runtime_root: &Path) -> Vec<PathBuf> {
     let Some(torchcodec_dir) = pyannote_torchcodec_dir(runtime_root) else {
         return Vec::new();
@@ -3172,6 +3224,74 @@ fn pyannote_torchcodec_binary_paths(runtime_root: &Path) -> Vec<PathBuf> {
     }
     binaries.sort();
     binaries
+}
+
+fn validate_portable_pyannote_native_dependencies(runtime_root: &Path) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+
+    for binary in pyannote_native_binary_paths(runtime_root) {
+        let deps_output = std::process::Command::new("/usr/bin/otool")
+            .arg("-L")
+            .arg(&binary)
+            .output()
+            .map_err(|e| {
+                format!(
+                    "failed to inspect pyannote native dependencies for '{}': {e}",
+                    binary.display()
+                )
+            })?;
+        if !deps_output.status.success() {
+            return Err(format!(
+                "failed to inspect pyannote native dependencies for '{}': {}",
+                binary.display(),
+                String::from_utf8_lossy(&deps_output.stderr).trim()
+            ));
+        }
+        if let Some(dep) =
+            parse_otool_linked_library_entries(&String::from_utf8_lossy(&deps_output.stdout))
+                .into_iter()
+                .find(|entry| is_host_managed_reference(entry))
+        {
+            return Err(format!(
+                "Pyannote runtime still links '{}' against host path '{}'. Repair or reinstall it from Settings > Local Models.",
+                binary.display(),
+                dep
+            ));
+        }
+
+        let rpath_output = std::process::Command::new("/usr/bin/otool")
+            .arg("-l")
+            .arg(&binary)
+            .output()
+            .map_err(|e| {
+                format!(
+                    "failed to inspect pyannote native rpaths for '{}': {e}",
+                    binary.display()
+                )
+            })?;
+        if !rpath_output.status.success() {
+            return Err(format!(
+                "failed to inspect pyannote native rpaths for '{}': {}",
+                binary.display(),
+                String::from_utf8_lossy(&rpath_output.stderr).trim()
+            ));
+        }
+        if let Some(rpath) =
+            parse_otool_rpath_entries(&String::from_utf8_lossy(&rpath_output.stdout))
+                .into_iter()
+                .find(|entry| is_host_managed_reference(entry))
+        {
+            return Err(format!(
+                "Pyannote runtime still exposes host LC_RPATH '{}' in '{}'. Repair or reinstall it from Settings > Local Models.",
+                rpath,
+                binary.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_embedded_torchcodec_ffmpeg(runtime_root: &Path) -> Result<(), String> {
@@ -3268,17 +3388,38 @@ fn validate_embedded_torchcodec_ffmpeg(runtime_root: &Path) -> Result<(), String
 }
 
 fn parse_external_python_framework_reference(otool_output: &str) -> Option<String> {
-    otool_output.lines().skip(1).find_map(|line| {
-        let dependency = line.split_whitespace().next()?;
-        if dependency.starts_with('/')
-            && dependency.contains("Python.framework/Versions/")
-            && dependency.ends_with("/Python")
-        {
-            Some(dependency.to_string())
-        } else {
-            None
-        }
-    })
+    parse_otool_linked_library_entries(otool_output)
+        .into_iter()
+        .find_map(|dependency| {
+            if dependency.starts_with('/')
+                && dependency.contains("Python.framework/Versions/")
+                && dependency.ends_with("/Python")
+            {
+                Some(dependency)
+            } else {
+                None
+            }
+        })
+}
+
+fn parse_otool_linked_library_entries(otool_output: &str) -> Vec<String> {
+    otool_output
+        .lines()
+        .filter_map(|line| {
+            let dependency = line.trim();
+            if dependency.is_empty() || dependency.ends_with(':') {
+                None
+            } else {
+                dependency
+                    .split(" (")
+                    .next()
+                    .and_then(|value| value.split_whitespace().next())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+            }
+        })
+        .collect()
 }
 
 fn pyannote_python_app_binary(runtime_root: &Path) -> PathBuf {
@@ -3516,6 +3657,7 @@ fn validate_pyannote_python_runtime(
         "Pyannote runtime is missing the bundled Python standard library. Repair or reinstall it from Settings > Local Models.".to_string()
     })?;
 
+    validate_portable_pyannote_native_dependencies(runtime_root)?;
     validate_embedded_torchcodec_ffmpeg(runtime_root)?;
 
     let mut command = std::process::Command::new(python_binary);
@@ -3645,8 +3787,9 @@ fn expand_home(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_external_python_framework_reference, parse_otool_rpath_entries,
-        parse_pyannote_python_framework_version, pyannote_runtime_arch_matches_host,
+        parse_external_python_framework_reference, parse_otool_linked_library_entries,
+        parse_otool_rpath_entries, parse_pyannote_python_framework_version,
+        pyannote_native_binary_paths, pyannote_runtime_arch_matches_host,
         pyannote_runtime_validation_script, target_triple_suffix, ManagedPyannoteManifest,
         ReconcileManagedPyannoteReleaseOutcome, RuntimeSourcePolicy, RuntimeTranscriptionFactory,
         PYANNOTE_COMPAT_LEVEL, PYANNOTE_STATUS_FILENAME,
@@ -4694,6 +4837,26 @@ Load command 14
     }
 
     #[test]
+    fn parse_otool_linked_library_entries_extracts_dependency_paths() {
+        let output = r#"
+/tmp/_sqlite3.cpython-311-darwin.so:
+    /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib (compatibility version 9.0.0, current version 9.6.0)
+    /usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1356.0.0)
+    @loader_path/../../../../embedded-dylibs/libcrypto.3.dylib (compatibility version 3.0.0, current version 3.0.0)
+"#;
+
+        let entries = parse_otool_linked_library_entries(output);
+        assert_eq!(
+            entries,
+            vec![
+                "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib",
+                "/usr/lib/libSystem.B.dylib",
+                "@loader_path/../../../../embedded-dylibs/libcrypto.3.dylib",
+            ]
+        );
+    }
+
+    #[test]
     fn is_host_managed_reference_detects_non_portable_paths() {
         assert!(super::is_host_managed_reference(
             "/opt/homebrew/opt/ffmpeg/lib/libavutil.60.dylib"
@@ -4707,6 +4870,43 @@ Load command 14
         assert!(!super::is_host_managed_reference(
             "/usr/lib/libSystem.B.dylib"
         ));
+    }
+
+    #[test]
+    fn pyannote_native_binary_paths_include_dynload_site_packages_and_embedded_dylibs() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let runtime_root = temp.path();
+        let stdlib_dir = runtime_root.join("lib").join("python3.11");
+        let dynload = stdlib_dir.join("lib-dynload");
+        let site_packages = stdlib_dir.join("site-packages").join("pkg");
+        let embedded = runtime_root.join("lib").join("embedded-dylibs");
+
+        std::fs::create_dir_all(&dynload).expect("dynload dir should exist");
+        std::fs::create_dir_all(&site_packages).expect("site-packages dir should exist");
+        std::fs::create_dir_all(&embedded).expect("embedded dylibs dir should exist");
+
+        let sqlite = dynload.join("_sqlite3.cpython-311-darwin.so");
+        let extension = site_packages.join("_portable_native.so");
+        let embedded_lib = embedded.join("libsqlite3.dylib");
+        let ignored = stdlib_dir.join("README.txt");
+
+        std::fs::write(&sqlite, b"").expect("sqlite shim should be created");
+        std::fs::write(&extension, b"").expect("extension shim should be created");
+        std::fs::write(&embedded_lib, b"").expect("embedded lib should be created");
+        std::fs::write(&ignored, b"ignore").expect("ignored file should be created");
+
+        let mut paths = pyannote_native_binary_paths(runtime_root);
+        paths.sort();
+
+        let sqlite = std::fs::canonicalize(&sqlite).expect("sqlite path should resolve");
+        let extension = std::fs::canonicalize(&extension).expect("extension path should resolve");
+        let embedded_lib =
+            std::fs::canonicalize(&embedded_lib).expect("embedded lib path should resolve");
+
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&sqlite));
+        assert!(paths.contains(&extension));
+        assert!(paths.contains(&embedded_lib));
     }
 
     #[cfg(target_os = "macos")]

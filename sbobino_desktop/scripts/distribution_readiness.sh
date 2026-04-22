@@ -249,6 +249,84 @@ import pathlib
 import subprocess
 
 root = pathlib.Path(os.environ["PYANNOTE_RUNTIME_ROOT"])
+host_prefixes = ("/opt/homebrew", "/usr/local")
+
+
+def parse_otool_dependencies(output: str) -> list[str]:
+    refs: list[str] = []
+    for line in output.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        ref = stripped.split(" (", 1)[0].split(" ", 1)[0].strip()
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+def parse_otool_rpaths(output: str) -> list[str]:
+    refs: list[str] = []
+    previous = ""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if previous == "cmd LC_RPATH" and stripped.startswith("path "):
+            refs.append(stripped.split("path ", 1)[1].split(" (offset ", 1)[0])
+        previous = stripped
+    return refs
+
+
+def iter_runtime_native_binaries() -> list[pathlib.Path]:
+    binaries: list[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
+    search_roots = []
+    for version_dir in sorted((root / "lib").glob("python3.*")):
+        for relative in ("lib-dynload", "site-packages"):
+            candidate = version_dir / relative
+            if candidate.is_dir():
+                search_roots.append(candidate)
+    embedded_dir = root / "lib" / "embedded-dylibs"
+    if embedded_dir.is_dir():
+        search_roots.append(embedded_dir)
+
+    for search_root in search_roots:
+        for binary in sorted(search_root.rglob("*")):
+            if not binary.is_file() or binary.suffix not in {".so", ".dylib"}:
+                continue
+            resolved = binary.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            binaries.append(resolved)
+    return binaries
+
+
+for binary in iter_runtime_native_binaries():
+    deps = subprocess.run(
+        ["/usr/bin/otool", "-L", str(binary)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).stdout
+    for dep in parse_otool_dependencies(deps):
+        if dep.startswith(host_prefixes):
+            raise SystemExit(
+                f"Remote pyannote runtime still links a native module against a host path: {binary} -> {dep}"
+            )
+
+    rpath_output = subprocess.run(
+        ["/usr/bin/otool", "-l", str(binary)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).stdout
+    for rpath in parse_otool_rpaths(rpath_output):
+        if rpath.startswith(host_prefixes):
+            raise SystemExit(
+                f"Remote pyannote runtime still exposes a host LC_RPATH: {binary} -> {rpath}"
+            )
+
 torchcodec_dir = root / "lib" / "python3.11" / "site-packages" / "torchcodec"
 if torchcodec_dir.is_dir():
     binaries = sorted(
@@ -264,9 +342,8 @@ if torchcodec_dir.is_dir():
             stderr=subprocess.STDOUT,
             text=True,
         ).stdout
-        for line in deps.splitlines()[1:]:
-            dep = line.strip().split(" ", 1)[0]
-            if dep.startswith("/opt/homebrew") or dep.startswith("/usr/local"):
+        for dep in parse_otool_dependencies(deps):
+            if dep.startswith(host_prefixes):
                 raise SystemExit(
                     f"Remote pyannote runtime still links torchcodec against a host path: {binary} -> {dep}"
                 )
@@ -278,16 +355,11 @@ if torchcodec_dir.is_dir():
             stderr=subprocess.STDOUT,
             text=True,
         ).stdout
-        previous = ""
-        for line in rpath_output.splitlines():
-            stripped = line.strip()
-            if previous == "cmd LC_RPATH" and stripped.startswith("path "):
-                rpath = stripped.split("path ", 1)[1].split(" (offset ", 1)[0]
-                if rpath.startswith("/opt/homebrew") or rpath.startswith("/usr/local"):
-                    raise SystemExit(
-                        f"Remote pyannote runtime still exposes a host LC_RPATH: {binary} -> {rpath}"
-                    )
-            previous = stripped
+        for rpath in parse_otool_rpaths(rpath_output):
+            if rpath.startswith(host_prefixes):
+                raise SystemExit(
+                    f"Remote pyannote runtime still exposes a host LC_RPATH: {binary} -> {rpath}"
+                )
 
     for name in (
         "libavutil.60.dylib",

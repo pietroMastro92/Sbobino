@@ -18,6 +18,8 @@ import type {
   ProvisioningProgressEvent,
   ProvisioningModelCatalogEntry,
   ProvisioningStatus,
+  PyannoteBackgroundActionResponse,
+  PyannoteBackgroundActionTrigger,
   RealtimeDelta,
   RealtimeInputLevelEvent,
   RealtimeStartReadiness,
@@ -303,6 +305,14 @@ export async function provisioningModels(): Promise<ProvisioningModelCatalogEntr
 
 export async function reconcilePostUpdateRuntime(): Promise<PostUpdateReconcileResponse> {
   return invoke<PostUpdateReconcileResponse>("reconcile_post_update_runtime");
+}
+
+export async function planPyannoteBackgroundAction(
+  trigger: PyannoteBackgroundActionTrigger,
+): Promise<PyannoteBackgroundActionResponse> {
+  return invoke<PyannoteBackgroundActionResponse>("plan_pyannote_background_action", {
+    trigger,
+  });
 }
 
 export async function provisioningDownloadModel(payload: {

@@ -141,6 +141,24 @@ pub struct PostUpdateReconcileResponse {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PyannoteBackgroundActionTrigger {
+    Startup,
+    PostUpdate,
+    EnableDiarization,
+    JobRequiresDiarization,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PyannoteBackgroundActionResponse {
+    pub status: String,
+    pub should_start: bool,
+    pub force_reinstall: bool,
+    pub reason_code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProvisioningProgressEvent {
     pub current: usize,
@@ -631,12 +649,26 @@ pub async fn provisioning_models(
         .collect())
 }
 
-#[tauri::command]
-pub async fn reconcile_post_update_runtime(
-    state: State<'_, AppState>,
-) -> Result<PostUpdateReconcileResponse, CommandError> {
-    let manifest_before = state.runtime_factory.read_managed_pyannote_manifest();
-    let should_attempt_pyannote_reconcile = manifest_before
+fn pyannote_background_action_response(
+    status: &str,
+    should_start: bool,
+    force_reinstall: bool,
+    reason_code: &str,
+    message: impl Into<String>,
+) -> PyannoteBackgroundActionResponse {
+    PyannoteBackgroundActionResponse {
+        status: status.to_string(),
+        should_start,
+        force_reinstall,
+        reason_code: reason_code.trim().to_string(),
+        message: message.into(),
+    }
+}
+
+fn should_attempt_post_update_pyannote_reconcile(
+    manifest_before: Option<&ManagedPyannoteManifest>,
+) -> bool {
+    manifest_before
         .as_ref()
         .map(|manifest| {
             manifest.source != "bundled_override"
@@ -644,13 +676,33 @@ pub async fn reconcile_post_update_runtime(
                     || normalize_pyannote_compat_level(manifest.compat_level)
                         != PYANNOTE_COMPAT_LEVEL)
         })
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if should_attempt_pyannote_reconcile {
+fn infer_pyannote_reconcile_reason_code(message: &str) -> &'static str {
+    let normalized = message.trim().to_ascii_lowercase();
+    if normalized.contains("compatibility mismatch") {
+        "pyannote_version_mismatch"
+    } else if normalized.contains("checksum") {
+        "pyannote_checksum_invalid"
+    } else {
+        "pyannote_repair_required"
+    }
+}
+
+async fn plan_pyannote_background_action_inner(
+    runtime_factory: &std::sync::Arc<RuntimeTranscriptionFactory>,
+    trigger: PyannoteBackgroundActionTrigger,
+) -> Result<PyannoteBackgroundActionResponse, CommandError> {
+    let manifest_before = runtime_factory.read_managed_pyannote_manifest();
+    let status_before = runtime_factory.read_managed_pyannote_status();
+
+    if matches!(trigger, PyannoteBackgroundActionTrigger::PostUpdate)
+        && should_attempt_post_update_pyannote_reconcile(manifest_before.as_ref())
+    {
         let client = reqwest::Client::new();
         if let Ok(selection) = fetch_pyannote_asset_selection(&client).await {
-            let outcome = state
-                .runtime_factory
+            let outcome = runtime_factory
                 .reconcile_managed_pyannote_release_assets(
                     &selection.release_version,
                     selection.compat_level,
@@ -659,53 +711,175 @@ pub async fn reconcile_post_update_runtime(
                     &selection.model_asset.name,
                     &selection.model_asset.sha256,
                 )
-                .map_err(|e| CommandError::new("reconcile_post_update_runtime", e))?;
-            return Ok(match outcome {
-                ReconcileManagedPyannoteReleaseOutcome::NoAction => PostUpdateReconcileResponse {
-                    status: "ok_no_action".to_string(),
-                    migration_started: false,
-                    message: None,
-                },
+                .map_err(|e| CommandError::new("plan_pyannote_background_action", e))?;
+            match outcome {
+                ReconcileManagedPyannoteReleaseOutcome::NoAction => {}
                 ReconcileManagedPyannoteReleaseOutcome::ManifestUpdated => {
-                    PostUpdateReconcileResponse {
-                        status: "ok_migrated_manifest".to_string(),
-                        migration_started: false,
-                        message: Some(
-                            "Pyannote metadata was updated for this app version.".to_string(),
-                        ),
-                    }
+                    return Ok(pyannote_background_action_response(
+                        "migrate_manifest",
+                        false,
+                        false,
+                        "pyannote_manifest_migrated",
+                        "Pyannote metadata was updated for this app version.",
+                    ));
                 }
                 ReconcileManagedPyannoteReleaseOutcome::NeedsMigration { message } => {
-                    PostUpdateReconcileResponse {
-                        status: "needs_auto_migration".to_string(),
-                        migration_started: false,
-                        message: Some(message),
-                    }
+                    let reason_code = infer_pyannote_reconcile_reason_code(&message);
+                    return Ok(pyannote_background_action_response(
+                        "migrate_assets",
+                        true,
+                        true,
+                        reason_code,
+                        message,
+                    ));
                 }
-            });
+            }
         }
     }
 
-    let health = state
-        .runtime_factory
+    let health = runtime_factory
         .runtime_health()
-        .map_err(|e| CommandError::new("runtime_health", e))?;
-    if health.pyannote.enabled
-        && !health.pyannote.ready
-        && is_pyannote_repair_reason(&health.pyannote.reason_code)
-    {
-        return Ok(PostUpdateReconcileResponse {
-            status: "needs_auto_migration".to_string(),
-            migration_started: false,
-            message: Some(health.pyannote.message),
-        });
+        .map_err(|e| CommandError::new("plan_pyannote_background_action", e))?;
+
+    if health.pyannote.ready {
+        return Ok(pyannote_background_action_response(
+            "none",
+            false,
+            false,
+            "ok",
+            "Pyannote diarization runtime is ready.",
+        ));
     }
 
-    Ok(PostUpdateReconcileResponse {
-        status: "ok_no_action".to_string(),
-        migration_started: false,
-        message: None,
-    })
+    let reason_code = health.pyannote.reason_code.trim();
+    let message = health.pyannote.message.clone();
+    let has_existing_pyannote_state = health.pyannote.runtime_installed
+        || health.pyannote.model_installed
+        || manifest_before.is_some()
+        || status_before.is_some();
+
+    if has_existing_pyannote_state {
+        if matches!(
+            reason_code,
+            "pyannote_version_mismatch" | "pyannote_checksum_invalid"
+        ) {
+            return Ok(pyannote_background_action_response(
+                "migrate_assets",
+                true,
+                true,
+                reason_code,
+                message,
+            ));
+        }
+
+        if is_pyannote_repair_reason(reason_code)
+            || matches!(
+                reason_code,
+                "pyannote_runtime_missing" | "pyannote_model_missing"
+            )
+        {
+            return Ok(pyannote_background_action_response(
+                "repair_existing",
+                true,
+                true,
+                if reason_code.is_empty() {
+                    "pyannote_repair_required"
+                } else {
+                    reason_code
+                },
+                message,
+            ));
+        }
+    }
+
+    if health.pyannote.enabled
+        && matches!(
+            reason_code,
+            "" | "pyannote_runtime_missing" | "pyannote_model_missing"
+        )
+    {
+        return Ok(pyannote_background_action_response(
+            "install_missing",
+            true,
+            false,
+            if reason_code.is_empty() {
+                "pyannote_runtime_missing"
+            } else {
+                reason_code
+            },
+            if message.trim().is_empty() {
+                "Pyannote diarization runtime is not installed yet.".to_string()
+            } else {
+                message
+            },
+        ));
+    }
+
+    if health.pyannote.enabled && is_pyannote_repair_reason(reason_code) {
+        return Ok(pyannote_background_action_response(
+            "repair_existing",
+            true,
+            true,
+            reason_code,
+            message,
+        ));
+    }
+
+    Ok(pyannote_background_action_response(
+        "none",
+        false,
+        false,
+        if health.pyannote.enabled {
+            reason_code
+        } else {
+            "pyannote_disabled"
+        },
+        if health.pyannote.enabled {
+            message
+        } else {
+            "Speaker diarization is disabled, so pyannote does not need background work right now."
+                .to_string()
+        },
+    ))
+}
+
+#[tauri::command]
+pub async fn plan_pyannote_background_action(
+    state: State<'_, AppState>,
+    trigger: PyannoteBackgroundActionTrigger,
+) -> Result<PyannoteBackgroundActionResponse, CommandError> {
+    plan_pyannote_background_action_inner(&state.runtime_factory, trigger).await
+}
+
+#[tauri::command]
+pub async fn reconcile_post_update_runtime(
+    state: State<'_, AppState>,
+) -> Result<PostUpdateReconcileResponse, CommandError> {
+    let action = plan_pyannote_background_action_inner(
+        &state.runtime_factory,
+        PyannoteBackgroundActionTrigger::PostUpdate,
+    )
+    .await?;
+
+    let response = match action.status.as_str() {
+        "migrate_manifest" => PostUpdateReconcileResponse {
+            status: "ok_migrated_manifest".to_string(),
+            migration_started: false,
+            message: Some(action.message),
+        },
+        "install_missing" | "repair_existing" | "migrate_assets" => PostUpdateReconcileResponse {
+            status: "needs_auto_migration".to_string(),
+            migration_started: false,
+            message: Some(action.message),
+        },
+        _ => PostUpdateReconcileResponse {
+            status: "ok_no_action".to_string(),
+            migration_started: false,
+            message: None,
+        },
+    };
+
+    Ok(response)
 }
 
 #[tauri::command]
@@ -2449,16 +2623,187 @@ fn extract_zip_archive_with_zip_crate(
 mod tests {
     use super::{
         estimate_pyannote_required_free_bytes, install_pyannote_archive, install_runtime_archive,
-        prepare_pyannote_runtime_stage, prepare_pyannote_runtime_swap,
-        promote_staged_pyannote_runtime, rollback_pyannote_runtime_swap, sha256_file_hex,
-        validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
-        PyannoteAssetSelection,
+        plan_pyannote_background_action_inner, prepare_pyannote_runtime_stage,
+        prepare_pyannote_runtime_swap, promote_staged_pyannote_runtime,
+        rollback_pyannote_runtime_swap, sha256_file_hex, validate_manifest_asset_descriptor,
+        validate_setup_manifest, verify_file_sha256, PyannoteAssetSelection,
+        PyannoteBackgroundActionTrigger,
     };
     use crate::release_assets::{
-        PyannoteReleaseAsset, ReleaseAssetDescriptor, SetupReleaseManifest,
+        PyannoteReleaseAsset, PyannoteReleaseManifest, ReleaseAssetDescriptor, RuntimeReleaseAsset,
+        RuntimeReleaseManifest, SetupReleaseManifest, PYANNOTE_COMPAT_LEVEL,
+        PYANNOTE_MANIFEST_ASSET, RUNTIME_MANIFEST_ASSET, SETUP_MANIFEST_ASSET,
     };
+    use sbobino_domain::AppSettings;
+    use sbobino_infrastructure::{ManagedPyannoteManifest, RuntimeTranscriptionFactory};
     use std::io::Write;
+    use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::tempdir;
+
+    fn release_assets_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn build_runtime_factory() -> (tempfile::TempDir, Arc<RuntimeTranscriptionFactory>) {
+        std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
+        std::env::set_var("SBOBINO_RUNTIME_SOURCE_POLICY", "managed-only");
+        let temp = tempdir().expect("failed to create tempdir");
+        let data_dir = temp.path().join("app-data");
+        let factory = Arc::new(
+            RuntimeTranscriptionFactory::new(&data_dir, None)
+                .expect("runtime factory should initialize"),
+        );
+        (temp, factory)
+    }
+
+    fn persist_settings(factory: &RuntimeTranscriptionFactory, diarization_enabled: bool) {
+        let mut settings = AppSettings::default();
+        settings.transcription.speaker_diarization.enabled = diarization_enabled;
+        settings.sync_legacy_from_sections();
+        let body = serde_json::to_string_pretty(&settings).expect("settings should serialize");
+        std::fs::write(factory.data_dir().join("settings.json"), body)
+            .expect("settings should persist");
+    }
+
+    fn write_executable_file(path: &std::path::Path, contents: &str) {
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("executable file should have a parent directory"),
+        )
+        .expect("parent directory should exist");
+        std::fs::write(path, contents).expect("executable should write");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path)
+                .expect("metadata should exist")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("permissions should update");
+        }
+    }
+
+    fn write_fake_pyannote_stdlib(runtime_root: &std::path::Path, version_dir_name: &str) {
+        let stdlib_root = runtime_root.join("lib").join(version_dir_name);
+        std::fs::create_dir_all(stdlib_root.join("encodings"))
+            .expect("stdlib encodings dir should exist");
+        std::fs::create_dir_all(stdlib_root.join("lib-dynload"))
+            .expect("stdlib lib-dynload dir should exist");
+        std::fs::create_dir_all(stdlib_root.join("collections"))
+            .expect("stdlib collections dir should exist");
+        std::fs::write(
+            runtime_root.join("pyvenv.cfg"),
+            format!("home = {}\n", runtime_root.join("bin").display()),
+        )
+        .expect("pyvenv should write");
+        std::fs::write(
+            stdlib_root.join("encodings").join("__init__.py"),
+            "# test\n",
+        )
+        .expect("encodings init should write");
+        std::fs::write(stdlib_root.join("types.py"), "# test\n").expect("types should write");
+        std::fs::write(stdlib_root.join("traceback.py"), "# test\n")
+            .expect("traceback should write");
+        std::fs::write(
+            stdlib_root.join("collections").join("__init__.py"),
+            "# test\n",
+        )
+        .expect("collections init should write");
+        std::fs::write(stdlib_root.join("collections").join("abc.py"), "# test\n")
+            .expect("collections abc should write");
+    }
+
+    fn prepare_ready_pyannote_install(
+        factory: &RuntimeTranscriptionFactory,
+        manifest: ManagedPyannoteManifest,
+        status_reason_code: &str,
+    ) {
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&manifest)
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status(status_reason_code, "ready")
+            .expect("status should write");
+    }
+
+    fn write_local_pyannote_release_manifests(
+        root: &std::path::Path,
+        runtime_sha256: &str,
+        model_sha256: &str,
+    ) {
+        let runtime_manifest = RuntimeReleaseManifest {
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            assets: vec![RuntimeReleaseAsset {
+                kind: "speech_runtime_macos_aarch64".to_string(),
+                name: "speech-runtime-macos-aarch64.zip".to_string(),
+                sha256: "runtime-sha".to_string(),
+                size_bytes: None,
+                expanded_size_bytes: None,
+            }],
+        };
+        let runtime_manifest_body =
+            serde_json::to_vec_pretty(&runtime_manifest).expect("runtime manifest should encode");
+        let runtime_manifest_sha = super::sha256_bytes_hex(&runtime_manifest_body);
+        std::fs::write(root.join(RUNTIME_MANIFEST_ASSET), runtime_manifest_body)
+            .expect("runtime manifest should write");
+
+        let pyannote_manifest = PyannoteReleaseManifest {
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            compat_level: PYANNOTE_COMPAT_LEVEL,
+            assets: vec![
+                PyannoteReleaseAsset {
+                    kind: super::host_pyannote_runtime_kind().to_string(),
+                    name: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                    sha256: runtime_sha256.to_string(),
+                    size_bytes: None,
+                    expanded_size_bytes: None,
+                },
+                PyannoteReleaseAsset {
+                    kind: "pyannote_model".to_string(),
+                    name: "pyannote-model-community-1.zip".to_string(),
+                    sha256: model_sha256.to_string(),
+                    size_bytes: None,
+                    expanded_size_bytes: None,
+                },
+            ],
+        };
+        let pyannote_manifest_body =
+            serde_json::to_vec_pretty(&pyannote_manifest).expect("pyannote manifest should encode");
+        let pyannote_manifest_sha = super::sha256_bytes_hex(&pyannote_manifest_body);
+        std::fs::write(root.join(PYANNOTE_MANIFEST_ASSET), pyannote_manifest_body)
+            .expect("pyannote manifest should write");
+
+        let setup_manifest = SetupReleaseManifest {
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            release_tag: format!("v{}", env!("CARGO_PKG_VERSION")),
+            pyannote_compat_level: PYANNOTE_COMPAT_LEVEL,
+            runtime_manifest: descriptor(RUNTIME_MANIFEST_ASSET, &runtime_manifest_sha),
+            runtime_asset: descriptor("speech-runtime-macos-aarch64.zip", "runtime-sha"),
+            pyannote_manifest: descriptor(PYANNOTE_MANIFEST_ASSET, &pyannote_manifest_sha),
+            pyannote_runtime_asset: descriptor(
+                "pyannote-runtime-macos-aarch64.zip",
+                runtime_sha256,
+            ),
+            pyannote_model_asset: descriptor("pyannote-model-community-1.zip", model_sha256),
+        };
+        let setup_manifest_body =
+            serde_json::to_vec_pretty(&setup_manifest).expect("setup manifest should encode");
+        std::fs::write(root.join(SETUP_MANIFEST_ASSET), setup_manifest_body)
+            .expect("setup manifest should write");
+    }
 
     fn descriptor(name: &str, sha256: &str) -> ReleaseAssetDescriptor {
         ReleaseAssetDescriptor {
@@ -2467,6 +2812,202 @@ mod tests {
             size_bytes: None,
             expanded_size_bytes: None,
         }
+    }
+
+    #[tokio::test]
+    async fn plan_pyannote_background_action_skips_missing_install_when_diarization_disabled() {
+        let (_temp, factory) = build_runtime_factory();
+        persist_settings(&factory, false);
+
+        let action = plan_pyannote_background_action_inner(
+            &factory,
+            PyannoteBackgroundActionTrigger::Startup,
+        )
+        .await
+        .expect("planner should succeed");
+
+        assert_eq!(action.status, "none");
+        assert!(!action.should_start);
+        assert_eq!(action.reason_code, "pyannote_disabled");
+    }
+
+    #[tokio::test]
+    async fn plan_pyannote_background_action_installs_missing_runtime_when_diarization_enabled() {
+        let (_temp, factory) = build_runtime_factory();
+        persist_settings(&factory, true);
+
+        let action = plan_pyannote_background_action_inner(
+            &factory,
+            PyannoteBackgroundActionTrigger::Startup,
+        )
+        .await
+        .expect("planner should succeed");
+
+        assert_eq!(action.status, "install_missing");
+        assert!(action.should_start);
+        assert!(!action.force_reinstall);
+        assert_eq!(action.reason_code, "pyannote_runtime_missing");
+    }
+
+    #[tokio::test]
+    async fn plan_pyannote_background_action_reports_real_compat_mismatch_as_asset_migration() {
+        let (_temp, factory) = build_runtime_factory();
+        persist_settings(&factory, true);
+        prepare_ready_pyannote_install(
+            &factory,
+            ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL + 1,
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "runtime-sha".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "model-sha".to_string(),
+                runtime_arch: super::host_pyannote_arch_label().to_string(),
+                installed_at: "2026-04-21T00:00:00Z".to_string(),
+            },
+            "ok",
+        );
+
+        let action = plan_pyannote_background_action_inner(
+            &factory,
+            PyannoteBackgroundActionTrigger::Startup,
+        )
+        .await
+        .expect("planner should succeed");
+
+        assert_eq!(action.status, "migrate_assets");
+        assert!(action.should_start);
+        assert!(action.force_reinstall);
+        assert_eq!(action.reason_code, "pyannote_version_mismatch");
+    }
+
+    #[tokio::test]
+    async fn plan_pyannote_background_action_self_heals_stale_incomplete_status() {
+        let (_temp, factory) = build_runtime_factory();
+        persist_settings(&factory, true);
+        prepare_ready_pyannote_install(
+            &factory,
+            ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL,
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "runtime-sha".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "model-sha".to_string(),
+                runtime_arch: super::host_pyannote_arch_label().to_string(),
+                installed_at: "2026-04-21T00:00:00Z".to_string(),
+            },
+            "pyannote_install_incomplete",
+        );
+
+        let action = plan_pyannote_background_action_inner(
+            &factory,
+            PyannoteBackgroundActionTrigger::Startup,
+        )
+        .await
+        .expect("planner should succeed");
+
+        assert_eq!(action.status, "none");
+        assert!(!action.should_start);
+        assert_eq!(action.reason_code, "ok");
+    }
+
+    #[tokio::test]
+    async fn plan_pyannote_background_action_requests_manifest_only_migration_on_patch_update() {
+        let (_guard, _temp, factory) = {
+            let guard = release_assets_env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (temp, factory) = build_runtime_factory();
+            (guard, temp, factory)
+        };
+        persist_settings(&factory, true);
+        prepare_ready_pyannote_install(
+            &factory,
+            ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: "0.1.0".to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL,
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "runtime-sha".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "model-sha".to_string(),
+                runtime_arch: super::host_pyannote_arch_label().to_string(),
+                installed_at: "2026-04-21T00:00:00Z".to_string(),
+            },
+            "ok",
+        );
+
+        let release_assets_dir = factory.data_dir().join("release-assets");
+        std::fs::create_dir_all(&release_assets_dir).expect("release assets dir should exist");
+        write_local_pyannote_release_manifests(&release_assets_dir, "runtime-sha", "model-sha");
+        std::env::set_var(super::LOCAL_RELEASE_ASSETS_DIR_ENV, &release_assets_dir);
+
+        let action = plan_pyannote_background_action_inner(
+            &factory,
+            PyannoteBackgroundActionTrigger::PostUpdate,
+        )
+        .await
+        .expect("planner should succeed");
+
+        std::env::remove_var(super::LOCAL_RELEASE_ASSETS_DIR_ENV);
+
+        assert_eq!(action.status, "migrate_manifest");
+        assert!(!action.should_start);
+        assert!(!action.force_reinstall);
+        assert_eq!(action.reason_code, "pyannote_manifest_migrated");
+    }
+
+    #[tokio::test]
+    async fn plan_pyannote_background_action_requests_asset_migration_on_checksum_mismatch() {
+        let (_guard, _temp, factory) = {
+            let guard = release_assets_env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (temp, factory) = build_runtime_factory();
+            (guard, temp, factory)
+        };
+        persist_settings(&factory, true);
+        prepare_ready_pyannote_install(
+            &factory,
+            ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: "0.1.0".to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL,
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "installed-runtime-sha".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "installed-model-sha".to_string(),
+                runtime_arch: super::host_pyannote_arch_label().to_string(),
+                installed_at: "2026-04-21T00:00:00Z".to_string(),
+            },
+            "ok",
+        );
+
+        let release_assets_dir = factory.data_dir().join("release-assets");
+        std::fs::create_dir_all(&release_assets_dir).expect("release assets dir should exist");
+        write_local_pyannote_release_manifests(
+            &release_assets_dir,
+            "expected-runtime-sha",
+            "expected-model-sha",
+        );
+        std::env::set_var(super::LOCAL_RELEASE_ASSETS_DIR_ENV, &release_assets_dir);
+
+        let action = plan_pyannote_background_action_inner(
+            &factory,
+            PyannoteBackgroundActionTrigger::PostUpdate,
+        )
+        .await
+        .expect("planner should succeed");
+
+        std::env::remove_var(super::LOCAL_RELEASE_ASSETS_DIR_ENV);
+
+        assert_eq!(action.status, "migrate_assets");
+        assert!(action.should_start);
+        assert!(action.force_reinstall);
+        assert_eq!(action.reason_code, "pyannote_checksum_invalid");
     }
 
     #[test]

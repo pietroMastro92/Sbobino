@@ -530,6 +530,25 @@ export type UpdateCheckResponse = {
   download_url: string | null;
 };
 
+export type PyannoteBackgroundActionTrigger =
+  | "startup"
+  | "post_update"
+  | "enable_diarization"
+  | "job_requires_diarization";
+
+export type PyannoteBackgroundActionResponse = {
+  status:
+    | "none"
+    | "install_missing"
+    | "repair_existing"
+    | "migrate_manifest"
+    | "migrate_assets";
+  should_start: boolean;
+  force_reinstall: boolean;
+  reason_code: string;
+  message: string;
+};
+
 export type PostUpdateReconcileResponse = {
   status: "ok_no_action" | "ok_migrated_manifest" | "needs_auto_migration";
   migration_started: boolean;

@@ -1,4 +1,7 @@
-import type { UpdateCheckResponse } from "../types";
+import type {
+  PyannoteBackgroundActionTrigger,
+  UpdateCheckResponse,
+} from "../types";
 
 export type SharedUpdateSource = "native" | "github" | null;
 
@@ -15,8 +18,14 @@ export type SharedUpdateSnapshot = {
 export const LAST_SEEN_APP_VERSION_STORAGE_KEY = "sbobino.update.lastSeenAppVersion";
 export const DISMISSED_UPDATE_VERSION_STORAGE_KEY = "sbobino.update.dismissedVersion";
 export const SHARED_UPDATE_STATE_STORAGE_KEY = "sbobino.update.sharedState";
-export const LAST_AUTO_MIGRATED_PYANNOTE_VERSION_STORAGE_KEY =
-  "sbobino.update.lastAutoMigratedPyannoteVersion";
+export const LAST_PYANNOTE_AUTO_ACTION_STORAGE_KEY =
+  "sbobino.update.lastPyannoteAutoAction";
+
+export type PyannoteAutoActionMarker = {
+  appVersion: string;
+  trigger: PyannoteBackgroundActionTrigger;
+  reasonCode: string;
+};
 
 function readStorageValue(key: string): string | null {
   if (typeof window === "undefined") {
@@ -44,14 +53,60 @@ export function writeLastSeenAppVersion(version: string | null): void {
   writeStorageValue(LAST_SEEN_APP_VERSION_STORAGE_KEY, version?.trim() || null);
 }
 
-export function readLastAutoMigratedPyannoteVersion(): string | null {
-  return readStorageValue(LAST_AUTO_MIGRATED_PYANNOTE_VERSION_STORAGE_KEY);
+export function readLastPyannoteAutoActionMarker(): PyannoteAutoActionMarker | null {
+  const raw = readStorageValue(LAST_PYANNOTE_AUTO_ACTION_STORAGE_KEY);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<PyannoteAutoActionMarker>;
+    if (
+      typeof parsed.appVersion !== "string" ||
+      typeof parsed.trigger !== "string" ||
+      typeof parsed.reasonCode !== "string"
+    ) {
+      return null;
+    }
+    return {
+      appVersion: parsed.appVersion.trim(),
+      trigger: parsed.trigger as PyannoteBackgroundActionTrigger,
+      reasonCode: parsed.reasonCode.trim(),
+    };
+  } catch {
+    return null;
+  }
 }
 
-export function writeLastAutoMigratedPyannoteVersion(version: string | null): void {
+export function writeLastPyannoteAutoActionMarker(
+  marker: PyannoteAutoActionMarker | null,
+): void {
+  if (!marker) {
+    writeStorageValue(LAST_PYANNOTE_AUTO_ACTION_STORAGE_KEY, null);
+    return;
+  }
+
   writeStorageValue(
-    LAST_AUTO_MIGRATED_PYANNOTE_VERSION_STORAGE_KEY,
-    version?.trim() || null,
+    LAST_PYANNOTE_AUTO_ACTION_STORAGE_KEY,
+    JSON.stringify({
+      appVersion: marker.appVersion.trim(),
+      trigger: marker.trigger,
+      reasonCode: marker.reasonCode.trim(),
+    }),
+  );
+}
+
+export function matchesPyannoteAutoActionMarker(
+  marker: PyannoteAutoActionMarker | null,
+  candidate: PyannoteAutoActionMarker,
+): boolean {
+  if (!marker) {
+    return false;
+  }
+  return (
+    marker.appVersion === candidate.appVersion &&
+    marker.trigger === candidate.trigger &&
+    marker.reasonCode === candidate.reasonCode
   );
 }
 

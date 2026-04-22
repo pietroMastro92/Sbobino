@@ -259,6 +259,7 @@ import sys
 
 root = pathlib.Path(sys.argv[1]) / "python"
 python = root / "bin" / "python3"
+host_prefixes = ("/opt/homebrew", "/usr/local")
 if not python.is_file():
     raise SystemExit(f"Pyannote runtime asset is missing expected binary: {python}")
 
@@ -278,10 +279,89 @@ if not stdlib_dirs:
 pyvenv_cfg = root / "pyvenv.cfg"
 if pyvenv_cfg.exists():
     body = pyvenv_cfg.read_text(encoding="utf-8")
-    for forbidden in ("/opt/homebrew", "/usr/local", "/var/folders/"):
+    for forbidden in (*host_prefixes, "/var/folders/"):
         if forbidden in body:
             raise SystemExit(
                 f"Pyannote runtime asset still contains machine-specific pyvenv.cfg paths ({forbidden})."
+            )
+
+
+def parse_otool_dependencies(output: str) -> list[str]:
+    refs: list[str] = []
+    for line in output.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        ref = stripped.split(" (", 1)[0].split(" ", 1)[0].strip()
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+def parse_otool_rpaths(output: str) -> list[str]:
+    refs: list[str] = []
+    previous = ""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if previous == "cmd LC_RPATH" and stripped.startswith("path "):
+            refs.append(stripped.split("path ", 1)[1].split(" (offset ", 1)[0])
+        previous = stripped
+    return refs
+
+
+def runtime_binary_roots() -> list[pathlib.Path]:
+    roots: list[pathlib.Path] = []
+    for stdlib_dir in stdlib_dirs:
+        for relative in ("lib-dynload", "site-packages"):
+            candidate = stdlib_dir / relative
+            if candidate.is_dir():
+                roots.append(candidate)
+    embedded_dir = root / "lib" / "embedded-dylibs"
+    if embedded_dir.is_dir():
+        roots.append(embedded_dir)
+    return roots
+
+
+def iter_runtime_native_binaries() -> list[pathlib.Path]:
+    binaries: list[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
+    for search_root in runtime_binary_roots():
+        for binary in sorted(search_root.rglob("*")):
+            if not binary.is_file() or binary.suffix not in {".so", ".dylib"}:
+                continue
+            resolved = binary.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            binaries.append(resolved)
+    return binaries
+
+
+for binary in iter_runtime_native_binaries():
+    deps = subprocess.run(
+        ["/usr/bin/otool", "-L", str(binary)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).stdout
+    for dep in parse_otool_dependencies(deps):
+        if dep.startswith(host_prefixes):
+            raise SystemExit(
+                f"Pyannote runtime asset still links a native module against a host path: {binary} -> {dep}"
+            )
+
+    rpath_output = subprocess.run(
+        ["/usr/bin/otool", "-l", str(binary)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).stdout
+    for rpath in parse_otool_rpaths(rpath_output):
+        if rpath.startswith(host_prefixes):
+            raise SystemExit(
+                f"Pyannote runtime asset still exposes a host LC_RPATH: {binary} -> {rpath}"
             )
 
 torchcodec_dir = stdlib_dirs[0] / "site-packages" / "torchcodec"
@@ -299,9 +379,8 @@ if torchcodec_dir.is_dir():
             stderr=subprocess.STDOUT,
             text=True,
         ).stdout
-        for line in deps.splitlines()[1:]:
-            dep = line.strip().split(" ", 1)[0]
-            if dep.startswith("/opt/homebrew") or dep.startswith("/usr/local"):
+        for dep in parse_otool_dependencies(deps):
+            if dep.startswith(host_prefixes):
                 raise SystemExit(
                     f"Pyannote runtime asset still links torchcodec against a host path: {binary} -> {dep}"
                 )
@@ -313,16 +392,11 @@ if torchcodec_dir.is_dir():
             stderr=subprocess.STDOUT,
             text=True,
         ).stdout
-        previous = ""
-        for line in rpath_output.splitlines():
-            stripped = line.strip()
-            if previous == "cmd LC_RPATH" and stripped.startswith("path "):
-                rpath = stripped.split("path ", 1)[1].split(" (offset ", 1)[0]
-                if rpath.startswith("/opt/homebrew") or rpath.startswith("/usr/local"):
-                    raise SystemExit(
-                        f"Pyannote runtime asset still exposes a host LC_RPATH: {binary} -> {rpath}"
-                    )
-            previous = stripped
+        for rpath in parse_otool_rpaths(rpath_output):
+            if rpath.startswith(host_prefixes):
+                raise SystemExit(
+                    f"Pyannote runtime asset still exposes a host LC_RPATH: {binary} -> {rpath}"
+                )
 
     for name in (
         "libavutil.60.dylib",
@@ -450,7 +524,7 @@ smoke_test_pyannote_runtime_asset "$PYANNOTE_RUNTIME_ZIP"
 export SBOBINO_LOCAL_RELEASE_ASSETS_DIR="$ASSET_DIR"
 
 pushd "$DESKTOP_DIR" >/dev/null
-npm test -- initialSetup provisioningUi appBootstrap
+npm test -- initialSetup provisioningUi appBootstrap updateState
 popd >/dev/null
 
 pushd "$ROOT_DIR" >/dev/null
@@ -466,6 +540,12 @@ cargo test -p sbobino-infrastructure managed_runtime_accepts_slow_whisper_stream
 cargo test -p sbobino-infrastructure public_runtime_health_requires_managed_runtime_binaries
 cargo test -p sbobino-infrastructure public_runtime_health_ignores_configured_host_binaries
 cargo test -p sbobino-infrastructure runtime_health_trusts_cached_ready_pyannote_status_on_warm_start
+cargo test -p sbobino-desktop plan_pyannote_background_action_skips_missing_install_when_diarization_disabled
+cargo test -p sbobino-desktop plan_pyannote_background_action_installs_missing_runtime_when_diarization_enabled
+cargo test -p sbobino-desktop plan_pyannote_background_action_reports_real_compat_mismatch_as_asset_migration
+cargo test -p sbobino-desktop plan_pyannote_background_action_self_heals_stale_incomplete_status
+cargo test -p sbobino-desktop plan_pyannote_background_action_requests_manifest_only_migration_on_patch_update
+cargo test -p sbobino-desktop plan_pyannote_background_action_requests_asset_migration_on_checksum_mismatch
 cargo test -p sbobino-desktop install_pyannote_archive_extracts_expected_root
 cargo test -p sbobino-desktop promote_staged_pyannote_runtime_swaps_only_after_staging_finishes
 cargo test -p sbobino-desktop pyannote_runtime_swap_rolls_back_previous_install_on_failure

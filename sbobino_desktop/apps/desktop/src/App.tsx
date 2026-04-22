@@ -86,6 +86,7 @@ import {
   listRecentArtifacts,
   openSettingsWindow,
   pauseRealtime,
+  planPyannoteBackgroundAction,
   provisioningCancel,
   provisioningDownloadModel,
   provisioningInstallPyannote,
@@ -93,7 +94,6 @@ import {
   provisioningModels,
   provisioningStart,
   provisioningStatus,
-  reconcilePostUpdateRuntime,
   renameArtifact,
   resetPromptTemplates,
   resumeRealtime,
@@ -146,13 +146,14 @@ import {
 } from "./lib/diarizationUi";
 import { loadInitialAppBootstrapData } from "./lib/appBootstrap";
 import {
+  matchesPyannoteAutoActionMarker,
   readDismissedUpdateVersion,
-  readLastAutoMigratedPyannoteVersion,
+  readLastPyannoteAutoActionMarker,
   readLastSeenAppVersion,
   readSharedUpdateSnapshot,
   shouldShowUpdateBanner,
   writeDismissedUpdateVersion,
-  writeLastAutoMigratedPyannoteVersion,
+  writeLastPyannoteAutoActionMarker,
   writeLastSeenAppVersion,
   writeSharedUpdateSnapshot,
 } from "./lib/updateState";
@@ -196,6 +197,8 @@ import type {
   ProvisioningProgressEvent,
   ProvisioningModelCatalogEntry,
   ProvisioningStatus,
+  PyannoteBackgroundActionResponse,
+  PyannoteBackgroundActionTrigger,
   RealtimeDelta,
   RealtimeInputLevelEvent,
   RemoteServiceConfig,
@@ -529,7 +532,7 @@ const LEFT_SIDEBAR_MAX_WIDTH = 320;
 const RIGHT_SIDEBAR_MIN_WIDTH = 220;
 const RIGHT_SIDEBAR_MAX_WIDTH = 420;
 const AUTO_UPDATE_POLL_INTERVAL_MS = 30 * 60 * 1000;
-const PYANNOTE_AUTO_MIGRATION_FAILURE_REASON_CODES = new Set([
+const PYANNOTE_AUTO_ACTION_FAILURE_REASON_CODES = new Set([
   "pyannote_install_incomplete",
   "pyannote_checksum_invalid",
   "pyannote_runtime_missing",
@@ -538,6 +541,32 @@ const PYANNOTE_AUTO_MIGRATION_FAILURE_REASON_CODES = new Set([
   "pyannote_version_mismatch",
   "pyannote_arch_mismatch",
 ]);
+
+function getPyannoteBackgroundActionStatusMessage(
+  action: PyannoteBackgroundActionResponse,
+): string {
+  switch (action.status) {
+    case "install_missing":
+      return t(
+        "provisioning.installingPyannote",
+        "Installing pyannote diarization runtime...",
+      );
+    case "repair_existing":
+    case "migrate_assets":
+      return t(
+        "provisioning.repairingPyannote",
+        "Repairing pyannote diarization runtime...",
+      );
+    case "migrate_manifest":
+      return (
+        action.message ||
+        t("settings.pyannote.desc")
+      );
+    case "none":
+    default:
+      return t("settings.pyannote.desc");
+  }
+}
 
 function guessAppleSiliconFromUA(): boolean {
   const ua = (navigator.userAgent ?? "").toLowerCase();
@@ -2780,6 +2809,7 @@ export function App({
   const provisioningProgressKindRef = useRef<
     ProvisioningProgressEvent["asset_kind"] | null
   >(null);
+  const pyannoteProvisioningActiveRef = useRef(false);
   const initialSetupReportRef = useRef<InitialSetupReport>(
     initialBootstrap?.setupReport ?? createInitialSetupReport(),
   );
@@ -3242,70 +3272,7 @@ export function App({
         const shouldPrimeModelCatalog = standaloneSettingsWindow
           ? initialStandaloneSettingsPane === "local_models"
           : !warmStartEligible;
-        const bootVersion = initialBootstrap?.setupReport?.build_version ?? null;
         const previousSeenVersion = readLastSeenAppVersion();
-        if (
-          bootVersion &&
-          previousSeenVersion &&
-          previousSeenVersion !== bootVersion
-        ) {
-          try {
-            const reconcile = await reconcilePostUpdateRuntime();
-            if (reconcile.status === "needs_auto_migration") {
-              const lastAutoMigratedVersion =
-                readLastAutoMigratedPyannoteVersion();
-              if (lastAutoMigratedVersion !== bootVersion) {
-                writeLastAutoMigratedPyannoteVersion(bootVersion);
-                setProvisioning((previous) => ({
-                  ...previous,
-                  running: true,
-                  progress: null,
-                  statusMessage:
-                    reconcile.message ??
-                    t(
-                      "provisioning.repairingPyannote",
-                      "Repairing pyannote diarization runtime...",
-                    ),
-                }));
-                void provisioningInstallPyannote(true)
-                  .then((result) => {
-                    if (result.started || disposed) {
-                      return;
-                    }
-                    writeLastAutoMigratedPyannoteVersion(null);
-                    setProvisioning((previous) => ({
-                      ...previous,
-                      running: false,
-                      statusMessage:
-                        reconcile.message ??
-                        t("settings.pyannote.desc"),
-                    }));
-                  })
-                  .catch((error) => {
-                    console.warn(
-                      "Automatic pyannote migration failed after update:",
-                      error,
-                    );
-                    writeLastAutoMigratedPyannoteVersion(null);
-                    if (disposed) {
-                      return;
-                    }
-                    setProvisioning((previous) => ({
-                      ...previous,
-                      running: false,
-                      statusMessage:
-                        reconcile.message ??
-                        t("settings.pyannote.desc"),
-                    }));
-                  });
-              }
-            } else {
-              writeLastAutoMigratedPyannoteVersion(null);
-            }
-          } catch {
-            // keep startup resilient if release-manifest reconciliation is temporarily unavailable
-          }
-        }
         const initialSettingsPromise = fetchSettingsSnapshot();
         const initialRuntimeHealthPromise = shouldPrimeSettingsDiagnostics
           ? fetchRuntimeHealth()
@@ -3356,6 +3323,22 @@ export function App({
         }
         if (normalized.general.app_language) {
           changeLanguage(normalized.general.app_language);
+        }
+
+        const resolvedBuildVersion =
+          initialRuntimeHealthResult.status === "fulfilled" &&
+          initialRuntimeHealthResult.value
+            ? initialRuntimeHealthResult.value.app_version
+            : currentBuildVersion;
+        if (resolvedBuildVersion) {
+          const pyannoteTrigger: PyannoteBackgroundActionTrigger =
+            previousSeenVersion && previousSeenVersion !== resolvedBuildVersion
+              ? "post_update"
+              : "startup";
+          void maybeStartPyannoteBackgroundAction(
+            pyannoteTrigger,
+            resolvedBuildVersion,
+          );
         }
 
         void (async () => {
@@ -4213,6 +4196,12 @@ export function App({
       const uProvisioningProgress = await subscribeProvisioningProgress(
         (event) => {
           provisioningProgressKindRef.current = event.asset_kind;
+          if (
+            event.asset_kind === "pyannote_runtime" ||
+            event.asset_kind === "pyannote_model"
+          ) {
+            pyannoteProvisioningActiveRef.current = true;
+          }
           setProvisioning((previous) => ({
             ...previous,
             running: true,
@@ -4228,14 +4217,21 @@ export function App({
       }
 
       const uProvisioningStatus = await subscribeProvisioningStatus((event) => {
-        const pyannoteAutoMigrationFailed =
+        const pyannoteProvisioningFailed =
           event.state !== "completed" &&
           event.state !== "cancelled" &&
-          PYANNOTE_AUTO_MIGRATION_FAILURE_REASON_CODES.has(
+          PYANNOTE_AUTO_ACTION_FAILURE_REASON_CODES.has(
             event.reason_code ?? "",
           );
-        if (pyannoteAutoMigrationFailed) {
-          writeLastAutoMigratedPyannoteVersion(null);
+        const wasPyannoteProvisioning =
+          pyannoteProvisioningActiveRef.current ||
+          provisioningProgressKindRef.current === "pyannote_runtime" ||
+          provisioningProgressKindRef.current === "pyannote_model";
+        if (pyannoteProvisioningFailed || (wasPyannoteProvisioning && event.state !== "running")) {
+          writeLastPyannoteAutoActionMarker(null);
+        }
+        if (wasPyannoteProvisioning && event.state !== "running") {
+          pyannoteProvisioningActiveRef.current = false;
         }
 
         const localizedStatusMessage =
@@ -5824,8 +5820,70 @@ export function App({
       : "setup_incomplete";
   }
 
+  async function maybeStartPyannoteBackgroundAction(
+    trigger: PyannoteBackgroundActionTrigger,
+    appVersionOverride?: string | null,
+  ): Promise<void> {
+    const appVersion = appVersionOverride ?? currentBuildVersion;
+    if (!appVersion) {
+      return;
+    }
+
+    try {
+      const action = await planPyannoteBackgroundAction(trigger);
+      if (action.status === "migrate_manifest") {
+        void refreshRuntimeHealth();
+        return;
+      }
+      if (!action.should_start) {
+        return;
+      }
+
+      const marker = {
+        appVersion,
+        trigger,
+        reasonCode: action.reason_code || "pyannote_repair_required",
+      };
+      if (
+        matchesPyannoteAutoActionMarker(
+          readLastPyannoteAutoActionMarker(),
+          marker,
+        )
+      ) {
+        return;
+      }
+
+      writeLastPyannoteAutoActionMarker(marker);
+      pyannoteProvisioningActiveRef.current = true;
+      setProvisioning((previous) => ({
+        ...previous,
+        running: true,
+        progress: null,
+        statusMessage: getPyannoteBackgroundActionStatusMessage(action),
+      }));
+
+      const result = await provisioningInstallPyannote(action.force_reinstall);
+      if (result.started) {
+        return;
+      }
+
+      pyannoteProvisioningActiveRef.current = false;
+      writeLastPyannoteAutoActionMarker(null);
+      setProvisioning((previous) => ({
+        ...previous,
+        running: false,
+        statusMessage: action.message || t("settings.pyannote.desc"),
+      }));
+    } catch (error) {
+      pyannoteProvisioningActiveRef.current = false;
+      writeLastPyannoteAutoActionMarker(null);
+      console.warn(`Automatic pyannote action '${trigger}' failed:`, error);
+    }
+  }
+
   async function waitForProvisioningRun(
     starter: () => Promise<{ started: boolean }>,
+    options?: { waitForExistingRun?: boolean },
   ): Promise<void> {
     let unlisten: (() => void) | undefined;
 
@@ -5859,7 +5917,7 @@ export function App({
           });
 
           const result = await starter();
-          if (!result.started) {
+          if (!result.started && !options?.waitForExistingRun) {
             resolve();
           }
         })().catch(reject);
@@ -5870,6 +5928,38 @@ export function App({
       unlisten?.();
       await loadStartupRequirements();
     }
+  }
+
+  async function ensurePyannoteReadyForDiarizedJob(): Promise<void> {
+    const action = await planPyannoteBackgroundAction("job_requires_diarization");
+    if (action.status === "migrate_manifest") {
+      await refreshRuntimeHealth();
+      return;
+    }
+    if (!action.should_start) {
+      return;
+    }
+
+    setProvisioning((previous) => ({
+      ...previous,
+      running: true,
+      progress: null,
+      statusMessage: getPyannoteBackgroundActionStatusMessage(action),
+    }));
+
+    if (pyannoteProvisioningActiveRef.current) {
+      await waitForProvisioningRun(
+        async () => ({ started: false }),
+        { waitForExistingRun: true },
+      );
+      return;
+    }
+
+    pyannoteProvisioningActiveRef.current = true;
+    await waitForProvisioningRun(
+      () => provisioningInstallPyannote(action.force_reinstall),
+      { waitForExistingRun: false },
+    );
   }
 
   async function acceptPrivacyPolicy(): Promise<void> {
@@ -6233,18 +6323,29 @@ export function App({
       current: SpeakerDiarizationSettings,
     ) => SpeakerDiarizationSettings,
   ): Promise<void> {
+    if (!settings) {
+      return;
+    }
+
+    const previousDiarization = sanitizeSpeakerDiarizationSettings(
+      settings.transcription.speaker_diarization ??
+        getDefaultSpeakerDiarizationSettings(),
+    );
+    const nextDiarization = sanitizeSpeakerDiarizationSettings(
+      mutator(previousDiarization),
+    );
+
     await patchSettings((current) => ({
       ...current,
       transcription: {
         ...current.transcription,
-        speaker_diarization: sanitizeSpeakerDiarizationSettings(
-          mutator(
-            current.transcription.speaker_diarization ??
-              getDefaultSpeakerDiarizationSettings(),
-          ),
-        ),
+        speaker_diarization: nextDiarization,
       },
     }));
+
+    if (!previousDiarization.enabled && nextDiarization.enabled) {
+      void maybeStartPyannoteBackgroundAction("enable_diarization");
+    }
     void refreshRuntimeHealth();
   }
 
@@ -6371,6 +6472,32 @@ export function App({
         }
         if (runtimeStatus.did_setup) {
           void refreshRuntimeHealth();
+        }
+
+        if (settings.transcription.speaker_diarization?.enabled) {
+          try {
+            await ensurePyannoteReadyForDiarizedJob();
+          } catch (pyannoteError) {
+            const failureMessage = formatUiError(
+              "error.pyannoteInstallFailed",
+              "Pyannote install failed",
+              pyannoteError,
+            );
+            if (preserveCurrentArtifact) {
+              setError(failureMessage);
+            } else {
+              presentTranscriptionFailure(
+                failureMessage,
+                nextDetailContext,
+              );
+            }
+            if (options?.queuedJobId) {
+              setQueueItems((previous) =>
+                previous.filter((entry) => entry.job_id !== options.queuedJobId),
+              );
+            }
+            return;
+          }
         }
 
         let preflight: TranscriptionStartPreflight | null = null;
@@ -8217,6 +8344,7 @@ export function App({
 
   async function onInstallPyannote(force = false): Promise<void> {
     try {
+      pyannoteProvisioningActiveRef.current = true;
       setProvisioning((previous) => ({
         ...previous,
         running: true,
@@ -8233,6 +8361,7 @@ export function App({
       }));
       await provisioningInstallPyannote(force);
     } catch (installError) {
+      pyannoteProvisioningActiveRef.current = false;
       setProvisioning((previous) => ({
         ...previous,
         running: false,

@@ -63,6 +63,7 @@ need_cmd codesign
 need_cmd otool
 need_cmd curl
 need_cmd shasum
+need_cmd python3
 
 TORCHCODEC_FFMPEG_BASE_URL="https://pytorch.s3.amazonaws.com/torchcodec/ffmpeg/2025-03-14/macos_arm64"
 TORCHCODEC_FFMPEG_VERSION="8.0"
@@ -262,6 +263,260 @@ assert_torchcodec_runtime_is_portable() {
       exit 1
     fi
   done
+}
+
+bundle_portable_python_native_dependencies() {
+  local runtime_dir=$1
+  python3 - <<'PY' "$runtime_dir"
+import os
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+runtime_root = Path(sys.argv[1]).resolve()
+embedded_dir = runtime_root / "lib" / "embedded-dylibs"
+host_prefixes = ("/opt/homebrew", "/usr/local")
+
+
+def run_command(args: list[str], *, check: bool = True) -> str:
+    completed = subprocess.run(
+        args,
+        check=check,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return completed.stdout
+
+
+def parse_otool_dependencies(output: str) -> list[str]:
+    refs: list[str] = []
+    for line in output.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        ref = stripped.split(" (", 1)[0].split(" ", 1)[0].strip()
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+def parse_otool_rpaths(output: str) -> list[str]:
+    refs: list[str] = []
+    previous = ""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if previous == "cmd LC_RPATH" and stripped.startswith("path "):
+            refs.append(stripped.split("path ", 1)[1].split(" (offset ", 1)[0])
+        previous = stripped
+    return refs
+
+
+def candidate_binaries() -> list[Path]:
+    roots: list[Path] = []
+    for version_dir in sorted((runtime_root / "lib").glob("python3.*")):
+        for relative in ("lib-dynload", "site-packages"):
+            candidate = version_dir / relative
+            if candidate.is_dir():
+                roots.append(candidate)
+    if embedded_dir.is_dir():
+        roots.append(embedded_dir)
+
+    binaries: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix not in {".so", ".dylib"}:
+                continue
+            resolved = str(path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            binaries.append(path.resolve())
+    return binaries
+
+
+def loader_reference(binary: Path, target: Path) -> str:
+    relative = os.path.relpath(target, start=binary.parent).replace(os.sep, "/")
+    return f"@loader_path/{relative}"
+
+
+def patch_install_id(path: Path) -> None:
+    run_command(
+        [
+            "/usr/bin/install_name_tool",
+            "-id",
+            f"@rpath/{path.name}",
+            str(path),
+        ]
+    )
+
+
+def codesign(path: Path) -> None:
+    run_command(
+        [
+            "/usr/bin/codesign",
+            "--force",
+            "--sign",
+            "-",
+            str(path),
+        ]
+    )
+
+
+def ensure_owner_writable(path: Path) -> None:
+    mode = path.stat().st_mode
+    if not (mode & stat.S_IWUSR):
+        path.chmod(mode | stat.S_IWUSR)
+
+
+pending = candidate_binaries()
+processed: set[Path] = set()
+
+while pending:
+    binary = pending.pop(0)
+    if binary in processed or not binary.exists():
+        continue
+    processed.add(binary)
+
+    try:
+        deps_output = run_command(["/usr/bin/otool", "-L", str(binary)])
+    except subprocess.CalledProcessError:
+        continue
+
+    changed = False
+    for dep in parse_otool_dependencies(deps_output):
+        if not dep.startswith(host_prefixes):
+            continue
+        source = Path(dep)
+        if not source.exists():
+            raise SystemExit(
+                f"Host-managed dylib '{dep}' required by '{binary}' is missing on the build machine."
+            )
+        embedded_dir.mkdir(parents=True, exist_ok=True)
+        target = embedded_dir / source.name
+        if target.exists():
+            ensure_owner_writable(target)
+        else:
+            shutil.copy2(source, target)
+            ensure_owner_writable(target)
+            patch_install_id(target)
+        new_ref = loader_reference(binary, target)
+        run_command(
+            [
+                "/usr/bin/install_name_tool",
+                "-change",
+                dep,
+                new_ref,
+                str(binary),
+            ]
+        )
+        pending.append(target.resolve())
+        changed = True
+
+    try:
+        rpath_output = run_command(["/usr/bin/otool", "-l", str(binary)])
+    except subprocess.CalledProcessError:
+        rpath_output = ""
+
+    for rpath in parse_otool_rpaths(rpath_output):
+        if not rpath.startswith(host_prefixes):
+            continue
+        run_command(
+            [
+                "/usr/bin/install_name_tool",
+                "-delete_rpath",
+                rpath,
+                str(binary),
+            ]
+        )
+        changed = True
+
+    if binary.parent == embedded_dir:
+        patch_install_id(binary)
+        changed = True
+
+    if changed:
+        codesign(binary)
+PY
+}
+
+assert_python_native_runtime_is_portable() {
+  local runtime_dir=$1
+  python3 - <<'PY' "$runtime_dir"
+import subprocess
+import sys
+from pathlib import Path
+
+runtime_root = Path(sys.argv[1]).resolve()
+host_prefixes = ("/opt/homebrew", "/usr/local")
+
+
+def parse_otool_dependencies(output: str) -> list[str]:
+    refs: list[str] = []
+    for line in output.splitlines()[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        ref = stripped.split(" (", 1)[0].split(" ", 1)[0].strip()
+        if ref:
+            refs.append(ref)
+    return refs
+
+
+def parse_otool_rpaths(output: str) -> list[str]:
+    refs: list[str] = []
+    previous = ""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if previous == "cmd LC_RPATH" and stripped.startswith("path "):
+            refs.append(stripped.split("path ", 1)[1].split(" (offset ", 1)[0])
+        previous = stripped
+    return refs
+
+
+roots = []
+for version_dir in sorted((runtime_root / "lib").glob("python3.*")):
+    for relative in ("lib-dynload", "site-packages"):
+        candidate = version_dir / relative
+        if candidate.is_dir():
+            roots.append(candidate)
+embedded_dir = runtime_root / "lib" / "embedded-dylibs"
+if embedded_dir.is_dir():
+    roots.append(embedded_dir)
+
+for root in roots:
+    for binary in sorted(root.rglob("*")):
+        if not binary.is_file() or binary.suffix not in {".so", ".dylib"}:
+            continue
+        deps_output = subprocess.run(
+            ["/usr/bin/otool", "-L", str(binary)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        ).stdout
+        for dep in parse_otool_dependencies(deps_output):
+            if dep.startswith(host_prefixes):
+                raise SystemExit(
+                    f"Bundled pyannote runtime still links against a host-managed path: {binary} -> {dep}"
+                )
+
+        rpath_output = subprocess.run(
+            ["/usr/bin/otool", "-l", str(binary)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        ).stdout
+        for rpath in parse_otool_rpaths(rpath_output):
+            if rpath.startswith(host_prefixes):
+                raise SystemExit(
+                    f"Bundled pyannote runtime still exposes a host LC_RPATH: {binary} -> {rpath}"
+                )
+PY
 }
 
 resolve_python_executable() {
@@ -491,7 +746,13 @@ PY
 
 echo "Bundling TorchCodec FFmpeg runtime"
 bundle_torchcodec_ffmpeg_runtime "$STAGE_RUNTIME_DIR" "$VERSION_DIR_NAME"
+
+echo "Bundling portable Python native dependencies"
+bundle_portable_python_native_dependencies "$STAGE_RUNTIME_DIR"
+
+echo "Asserting standalone portability for bundled Python native modules"
 assert_torchcodec_runtime_is_portable "$STAGE_RUNTIME_DIR" "$VERSION_DIR_NAME"
+assert_python_native_runtime_is_portable "$STAGE_RUNTIME_DIR"
 
 echo "Verifying bundled pyannote runtime"
 env -i \

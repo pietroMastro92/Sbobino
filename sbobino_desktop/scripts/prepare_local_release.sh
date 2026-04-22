@@ -446,8 +446,8 @@ gh release upload "v$VERSION" \
 \`\`\`
 EOF
 
-cat >"$OUTPUT_DIR/CLEAN_ROOM_VALIDATION.md" <<EOF
-# Clean-room validation for v$VERSION
+cat >"$OUTPUT_DIR/CLEAN_ROOM_VALIDATION.md" <<'EOF'
+# Clean-room validation for v__VERSION__
 
 Run this checklist on a different Apple Silicon Mac that does not rely on
 Homebrew, host Python, or previously installed Sbobino runtime assets.
@@ -463,7 +463,7 @@ Homebrew, host Python, or previously installed Sbobino runtime assets.
 
 ## Candidate validation
 
-1. Download \`Sbobino_${VERSION}_aarch64.dmg\` from the GitHub prerelease.
+1. Download `Sbobino___VERSION___aarch64.dmg` from the GitHub prerelease.
 2. Install the app into \`/Applications\`.
 3. Launch the app and complete first-launch setup.
 4. Confirm first launch:
@@ -475,7 +475,7 @@ Homebrew, host Python, or previously installed Sbobino runtime assets.
 6. Confirm second launch:
    - no first-launch setup screen appears
    - no heavy startup checking blocks the UI
-   - Settings > Local Models opens without a new full runtime inspection on arrival
+   - `Settings > Local Models` opens without a new full runtime inspection on arrival
    - runtime paths point to app-managed directories under Application Support
 
 ## Decision rule
@@ -485,8 +485,20 @@ Homebrew, host Python, or previously installed Sbobino runtime assets.
 - This checklist is the minimum clean-room pass. Stable release still requires the full Apple Silicon matrix in \`docs/distribution-validation-plan.md\`, including update-path validation.
 EOF
 
-cat >"$OUTPUT_DIR/UPGRADE_VALIDATION.md" <<EOF
-# Upgrade validation for v$VERSION
+python3 - "$OUTPUT_DIR/CLEAN_ROOM_VALIDATION.md" "$VERSION" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+version = sys.argv[2]
+content = path.read_text()
+content = content.replace("__VERSION__", version)
+content = content.replace("___VERSION___", version)
+path.write_text(content)
+PY
+
+cat >"$OUTPUT_DIR/UPGRADE_VALIDATION.md" <<'EOF'
+# Upgrade validation for v__VERSION__
 
 Run this checklist on an Apple Silicon Mac that already has the latest public
 Sbobino version installed with working runtime, whisper models, and pyannote.
@@ -499,7 +511,7 @@ Sbobino version installed with working runtime, whisper models, and pyannote.
 
 ## Candidate validation
 
-1. Update to \`v$VERSION\` using the real shipped flow.
+1. Update to `v__VERSION__` using the real shipped flow.
 2. Launch the updated app.
 3. Open `Settings > Local Models`.
 4. Run one diarized transcription.
@@ -510,6 +522,18 @@ Sbobino version installed with working runtime, whisper models, and pyannote.
 - If any step fails, delete the prerelease and cut a new patch version.
 - Record the result in \`AS-PRIMARY.validation-report.json\` before promotion.
 EOF
+
+python3 - "$OUTPUT_DIR/UPGRADE_VALIDATION.md" "$VERSION" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+version = sys.argv[2]
+content = path.read_text()
+content = content.replace("__VERSION__", version)
+content = content.replace("___VERSION___", version)
+path.write_text(content)
+PY
 
 cat <<EOF
 Local release prepared successfully in:
