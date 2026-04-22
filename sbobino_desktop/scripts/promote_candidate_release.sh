@@ -7,6 +7,10 @@ Usage: promote_candidate_release.sh <version> [repo-slug]
 
 Promotes a previously validated GitHub prerelease candidate to stable and
 removes older stable releases by default.
+
+Environment:
+  LOCAL_STABLE_RELEASES_TO_KEEP  Number of local dist/local-release versions to keep after
+                                 a successful stable promotion. Default: 2.
 EOF
 }
 
@@ -18,6 +22,9 @@ fi
 VERSION=$1
 REPO_SLUG=${2:-pietroMastro92/Sbobino}
 TAG="v$VERSION"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+LOCAL_RELEASE_ROOT=${LOCAL_RELEASE_ROOT:-"$SCRIPT_DIR/../dist/local-release"}
+LOCAL_STABLE_RELEASES_TO_KEEP=${LOCAL_STABLE_RELEASES_TO_KEEP:-2}
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -28,6 +35,11 @@ need_cmd() {
 
 need_cmd gh
 need_cmd python3
+
+if [[ ! "$LOCAL_STABLE_RELEASES_TO_KEEP" =~ ^[0-9]+$ ]] || [[ "$LOCAL_STABLE_RELEASES_TO_KEEP" -lt 1 ]]; then
+  echo "LOCAL_STABLE_RELEASES_TO_KEEP must be a positive integer." >&2
+  exit 1
+fi
 
 RELEASE_JSON=$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets,isPrerelease,name,tagName,url)
 if [[ -z "$RELEASE_JSON" ]]; then
@@ -240,10 +252,60 @@ if [[ -n "${OLDER_STABLE_TAGS// }" ]]; then
   done <<<"$OLDER_STABLE_TAGS"
 fi
 
+LOCAL_RELEASE_DIRS_TO_DELETE=$(python3 - <<'PY' "$LOCAL_RELEASE_ROOT" "$TAG" "$LOCAL_STABLE_RELEASES_TO_KEEP"
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+current_tag = sys.argv[2]
+keep_count = int(sys.argv[3])
+
+if not root.is_dir():
+    raise SystemExit(0)
+
+version_pattern = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+def version_key(path: pathlib.Path) -> tuple[int, int, int]:
+    match = version_pattern.fullmatch(path.name)
+    if not match:
+        return (-1, -1, -1)
+    return tuple(int(part) for part in match.groups())
+
+release_dirs = [
+    path
+    for path in root.iterdir()
+    if path.is_dir() and version_pattern.fullmatch(path.name)
+]
+release_dirs.sort(key=version_key, reverse=True)
+
+keep_names = {path.name for path in release_dirs[:keep_count]}
+keep_names.add(current_tag)
+
+for path in release_dirs:
+    if path.name not in keep_names:
+        print(path)
+PY
+)
+
+LOCAL_RELEASES_REMOVED=0
+if [[ -n "${LOCAL_RELEASE_DIRS_TO_DELETE// }" ]]; then
+  while IFS= read -r local_release_dir; do
+    [[ -z "$local_release_dir" ]] && continue
+    rm -rf "$local_release_dir"
+    echo "Removed stale local release artifacts: $local_release_dir"
+    LOCAL_RELEASES_REMOVED=$((LOCAL_RELEASES_REMOVED + 1))
+  done <<<"$LOCAL_RELEASE_DIRS_TO_DELETE"
+fi
+
 cat <<EOF
 Candidate promoted to stable:
   repo: $REPO_SLUG
   tag:  $TAG
 
 Older stable releases were removed to keep the latest validated version as the only stable public release.
+Local release retention:
+  root:        $LOCAL_RELEASE_ROOT
+  keep latest: $LOCAL_STABLE_RELEASES_TO_KEEP
+  removed:     $LOCAL_RELEASES_REMOVED
 EOF

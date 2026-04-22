@@ -68,6 +68,7 @@
   - validate that GitHub prerelease on `AS-PRIMARY`, `AS-THIRD`, and `INTEL-PRIMARY`
   - re-upload all machine validation report JSON assets with `status=passed` or `soft_pass` for `INTEL-PRIMARY`
   - promote it only after it passes with `./scripts/promote_candidate_release.sh <version>`
+  - stable promotion also trims old local `dist/local-release/v*` directories to the latest `2` by default; override with `LOCAL_STABLE_RELEASES_TO_KEEP=<n>` when needed
   - if the release fails, delete/retire it with `./scripts/retire_failed_candidate.sh <version>` and cut a new patch version
   - the default `public` profile keeps pyannote out of the app bundle and installs it from release assets during first launch
   - the script automatically generates and reuses a stable local Tauri updater keypair under the user's config directory when one is not already present

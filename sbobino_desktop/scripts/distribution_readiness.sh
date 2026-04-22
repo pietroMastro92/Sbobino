@@ -28,7 +28,28 @@ need_cmd() {
 need_cmd curl
 need_cmd python3
 need_cmd shasum
-need_cmd ditto
+
+extract_zip() {
+  local archive_path=$1
+  local destination=$2
+
+  mkdir -p "$destination"
+  if command -v ditto >/dev/null 2>&1; then
+    /usr/bin/ditto -x -k "$archive_path" "$destination"
+    return
+  fi
+
+  python3 - "$archive_path" "$destination" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+archive = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+with zipfile.ZipFile(archive) as zf:
+    zf.extractall(destination)
+PY
+}
 
 RELEASE_API_URL="https://api.github.com/repos/$REPO_SLUG/releases/tags/$TAG"
 
@@ -236,7 +257,7 @@ PY
 
 PYANNOTE_SMOKE_DIR="$TEMP_DIR/pyannote-smoke"
 mkdir -p "$PYANNOTE_SMOKE_DIR"
-/usr/bin/ditto -x -k "$TEMP_DIR/pyannote-runtime-macos-aarch64.zip" "$PYANNOTE_SMOKE_DIR"
+extract_zip "$TEMP_DIR/pyannote-runtime-macos-aarch64.zip" "$PYANNOTE_SMOKE_DIR"
 
 PATH="/usr/bin:/bin" \
 PYANNOTE_RUNTIME_ROOT="$PYANNOTE_SMOKE_DIR/python" \

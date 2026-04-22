@@ -317,7 +317,7 @@ jobs:
         working-directory: sbobino_desktop
         run: |
           VERSION="${TAG_NAME#v}"
-          ./scripts/distribution_readiness.sh "$VERSION" "$GITHUB_REPOSITORY"
+          bash ./scripts/distribution_readiness.sh "$VERSION" "$GITHUB_REPOSITORY"
 
       - name: Write distribution readiness proof
         working-directory: sbobino_desktop
@@ -355,7 +355,7 @@ jobs:
         working-directory: sbobino_desktop
         run: |
           VERSION="${TAG_NAME#v}"
-          ./scripts/run_release_machine_validation.sh \
+          bash ./scripts/run_release_machine_validation.sh \
             AS-PRIMARY \
             "$VERSION" \
             "$GITHUB_REPOSITORY" \
@@ -388,7 +388,7 @@ jobs:
         working-directory: sbobino_desktop
         run: |
           VERSION="${TAG_NAME#v}"
-          ./scripts/run_release_machine_validation.sh \
+          bash ./scripts/run_release_machine_validation.sh \
             AS-THIRD \
             "$VERSION" \
             "$GITHUB_REPOSITORY" \
@@ -421,7 +421,7 @@ jobs:
         working-directory: sbobino_desktop
         run: |
           VERSION="${TAG_NAME#v}"
-          ./scripts/run_release_machine_validation.sh \
+          bash ./scripts/run_release_machine_validation.sh \
             INTEL-PRIMARY \
             "$VERSION" \
             "$GITHUB_REPOSITORY" \

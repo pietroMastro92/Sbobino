@@ -67,7 +67,7 @@ Manual publish contract:
 
 Helper scripts:
 - `./scripts/publish_candidate_release.sh <version>` publishes a prerelease candidate and refuses publishing if readiness proof/checksums/manifests/templates are inconsistent
-- `./scripts/promote_candidate_release.sh <version>`
+- `./scripts/promote_candidate_release.sh <version>` promotes the candidate, removes older public stable releases, and trims old local `dist/local-release/v*` directories down to the latest `2` by default; override with `LOCAL_STABLE_RELEASES_TO_KEEP=<n>`
 - `./scripts/run_release_machine_validation.sh <machine-class> <version>` validates the exact public candidate on `AS-PRIMARY`, `AS-THIRD`, or `INTEL-PRIMARY`
 - `./scripts/install_self_hosted_runner_macos.sh <machine-class>` installs and registers a macOS self-hosted runner with the right labels
 - `./scripts/preflight_self_hosted_runner.sh <machine-class>` checks whether a machine is truly ready to serve as a release runner
