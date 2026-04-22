@@ -353,10 +353,10 @@ jobs:
 
   validate-as-third:
     needs: publish-candidate
-    runs-on: [self-hosted, macos, apple-silicon, as-third]
+    runs-on: macos-14
     env:
       TAG_NAME: ${{ inputs.tag_name }}
-      SBOBINO_VALIDATION_FIXTURE_AUDIO: ${{ vars.SBOBINO_VALIDATION_FIXTURE_AUDIO }}
+      SBOBINO_VALIDATION_RUNNER_LABEL: github-hosted,macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -386,9 +386,10 @@ jobs:
 
   validate-intel-primary:
     needs: publish-candidate
-    runs-on: [self-hosted, macos, x64, intel-primary]
+    runs-on: macos-15-intel
     env:
       TAG_NAME: ${{ inputs.tag_name }}
+      SBOBINO_VALIDATION_RUNNER_LABEL: github-hosted,macos-15-intel
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -305,12 +305,15 @@ def parse_otool_dependencies(output: str) -> list[str]:
 
 def parse_otool_rpaths(output: str) -> list[str]:
     refs: list[str] = []
-    previous = ""
+    in_rpath = False
     for line in output.splitlines():
         stripped = line.strip()
-        if previous == "cmd LC_RPATH" and stripped.startswith("path "):
+        if stripped == "cmd LC_RPATH":
+            in_rpath = True
+            continue
+        if in_rpath and stripped.startswith("path "):
             refs.append(stripped.split("path ", 1)[1].split(" (offset ", 1)[0])
-        previous = stripped
+            in_rpath = False
     return refs
 
 
@@ -468,12 +471,15 @@ def parse_otool_dependencies(output: str) -> list[str]:
 
 def parse_otool_rpaths(output: str) -> list[str]:
     refs: list[str] = []
-    previous = ""
+    in_rpath = False
     for line in output.splitlines():
         stripped = line.strip()
-        if previous == "cmd LC_RPATH" and stripped.startswith("path "):
+        if stripped == "cmd LC_RPATH":
+            in_rpath = True
+            continue
+        if in_rpath and stripped.startswith("path "):
             refs.append(stripped.split("path ", 1)[1].split(" (offset ", 1)[0])
-        previous = stripped
+            in_rpath = False
     return refs
 
 

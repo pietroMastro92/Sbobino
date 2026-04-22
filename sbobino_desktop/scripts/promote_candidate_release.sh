@@ -104,7 +104,7 @@ expected_reports = {
     "AS-PRIMARY.validation-report.json": {
         "machine_class": "AS-PRIMARY",
         "allowed_statuses": {"passed"},
-        "runner_label": "self-hosted,macos,apple-silicon,as-primary",
+        "runner_labels": {"self-hosted,macos,apple-silicon,as-primary"},
         "required_scenarios": [
             "update_path_validation",
             "warm_restart",
@@ -114,7 +114,11 @@ expected_reports = {
     "AS-THIRD.validation-report.json": {
         "machine_class": "AS-THIRD",
         "allowed_statuses": {"passed"},
-        "runner_label": "self-hosted,macos,apple-silicon,as-third",
+        "runner_labels": {
+            "self-hosted,macos,apple-silicon,as-third",
+            "github-hosted,macos-14",
+            "github-hosted,macos-15",
+        },
         "required_scenarios": [
             "clean_room_install",
             "warm_restart",
@@ -124,7 +128,11 @@ expected_reports = {
     "INTEL-PRIMARY.validation-report.json": {
         "machine_class": "INTEL-PRIMARY",
         "allowed_statuses": {"passed", "soft_pass"},
-        "runner_label": "self-hosted,macos,x64,intel-primary",
+        "runner_labels": {
+            "self-hosted,macos,x64,intel-primary",
+            "github-hosted,macos-13",
+            "github-hosted,macos-15-intel",
+        },
         "required_scenarios": [
             "release_metadata_validation",
             "bootstrap_layer_validation",
@@ -188,7 +196,7 @@ for report_name, expectation in expected_reports.items():
         raise SystemExit(
             f"Stable promotion blocked: {report_name} release_url does not match the public release URL."
         )
-    if str(report.get("runner_label", "")).strip() != expectation["runner_label"]:
+    if str(report.get("runner_label", "")).strip() not in expectation["runner_labels"]:
         raise SystemExit(f"Stable promotion blocked: {report_name} runner_label mismatch.")
     required_scenarios = report.get("required_scenarios")
     if required_scenarios != expectation["required_scenarios"]:

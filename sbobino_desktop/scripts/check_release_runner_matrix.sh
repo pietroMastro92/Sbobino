@@ -33,6 +33,10 @@ import sys
 
 runners = json.loads(sys.argv[1]).get("runners", [])
 repo_slug = sys.argv[2]
+
+def normalize_label(value: str) -> str:
+    return str(value or "").strip().casefold()
+
 required = {
     "AS-PRIMARY": {"self-hosted", "macos", "apple-silicon", "as-primary"},
     "AS-THIRD": {"self-hosted", "macos", "apple-silicon", "as-third"},
@@ -42,12 +46,20 @@ required = {
 matched = {}
 for machine_class, labels_expected in required.items():
     for runner in runners:
-        labels = {label.get("name") for label in runner.get("labels", []) if label.get("name")}
+        labels = {
+            normalize_label(label.get("name"))
+            for label in runner.get("labels", [])
+            if label.get("name")
+        }
         if labels_expected.issubset(labels) and runner.get("status") == "online":
             matched[machine_class] = {
                 "name": runner.get("name", "unknown"),
                 "busy": bool(runner.get("busy")),
-                "labels": sorted(labels),
+                "labels": sorted(
+                    label.get("name")
+                    for label in runner.get("labels", [])
+                    if label.get("name")
+                ),
             }
             break
 

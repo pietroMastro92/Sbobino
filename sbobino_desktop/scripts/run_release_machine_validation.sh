@@ -46,6 +46,7 @@ COMMIT_SHA=${GITHUB_SHA:-$(git -C "$ROOT_DIR/.." rev-parse HEAD 2>/dev/null || t
 OS_NAME="macOS"
 OS_VERSION="$(sw_vers -productVersion) ($(uname -m))"
 TESTER=${GITHUB_ACTOR:-$(whoami)}
+RUNNER_LABEL_OVERRIDE=${SBOBINO_VALIDATION_RUNNER_LABEL:-}
 
 FINAL_STATUS="failed"
 REPORT_NOTES=""
@@ -167,6 +168,7 @@ definitions = {
 }
 
 definition = definitions[machine_class]
+runner_label = os.environ.get("RUNNER_LABEL_OVERRIDE", "").strip() or definition["runner_label"]
 payload = {
     "schema_version": 1,
     "version": version,
@@ -178,7 +180,7 @@ payload = {
     "tester": tester,
     "os_name": os_name,
     "os_version": os_version,
-    "runner_label": definition["runner_label"],
+    "runner_label": runner_label,
     "tested_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "notes": notes,
     "required_scenarios": definition["required"],
@@ -223,6 +225,131 @@ download_asset() {
     --show-error \
     --output "$destination" \
     "$url"
+}
+
+extract_archive_single_root() {
+  local archive_path=$1
+  local destination=$2
+  local stage_dir
+  stage_dir=$(mktemp -d "$TMP_DIR/extract.XXXXXX")
+
+  if ! /usr/bin/ditto -x -k "$archive_path" "$stage_dir"; then
+    rm -rf "$stage_dir"
+    fail_validation "Failed to extract archive '$archive_path'."
+  fi
+
+  local extracted_root
+  extracted_root=$(python3 - <<'PY' "$stage_dir"
+from pathlib import Path
+import sys
+
+stage_dir = Path(sys.argv[1])
+roots = [path for path in stage_dir.iterdir() if path.is_dir() and path.name != "__MACOSX"]
+if len(roots) != 1:
+    raise SystemExit(1)
+print(roots[0])
+PY
+)
+  if [[ -z "${extracted_root// }" ]]; then
+    rm -rf "$stage_dir"
+    fail_validation "Archive '$archive_path' did not expand to a single root directory."
+  fi
+
+  rm -rf "$destination"
+  mkdir -p "$(dirname "$destination")"
+  mv "$extracted_root" "$destination"
+  rm -rf "$stage_dir"
+}
+
+install_release_pyannote_baseline() {
+  local asset_version=$1
+  local manifest_version=$2
+  local runtime_root="$DATA_DIR/runtime/pyannote"
+  local manifest_download="$TMP_DIR/pyannote-manifest-${asset_version}.json"
+  local runtime_download="$TMP_DIR/pyannote-runtime-${asset_version}.zip"
+  local model_download="$TMP_DIR/pyannote-model-${asset_version}.zip"
+
+  download_asset "$asset_version" "pyannote-manifest.json" "$manifest_download"
+  download_asset "$asset_version" "pyannote-runtime-macos-aarch64.zip" "$runtime_download"
+  download_asset "$asset_version" "pyannote-model-community-1.zip" "$model_download"
+
+  rm -rf "$runtime_root"
+  mkdir -p "$runtime_root"
+  extract_archive_single_root "$runtime_download" "$runtime_root/python"
+  extract_archive_single_root "$model_download" "$runtime_root/model"
+
+  python3 - <<'PY' "$manifest_download" "$runtime_root/manifest.json" "$runtime_root/status.json" "$manifest_version"
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+release_manifest_path = Path(sys.argv[1])
+managed_manifest_path = Path(sys.argv[2])
+status_path = Path(sys.argv[3])
+manifest_version = str(sys.argv[4]).strip()
+
+release_manifest = json.loads(release_manifest_path.read_text(encoding="utf-8"))
+assets = {asset.get("kind"): asset for asset in release_manifest.get("assets", [])}
+runtime_asset = assets.get("pyannote_runtime_macos_aarch64")
+model_asset = assets.get("pyannote_model")
+if not isinstance(runtime_asset, dict) or not isinstance(model_asset, dict):
+    raise SystemExit("Pyannote release manifest is missing required assets.")
+
+installed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+managed_manifest = {
+    "source": "release_asset",
+    "app_version": manifest_version,
+    "compat_level": int(release_manifest.get("compat_level", 1) or 1),
+    "runtime_asset": str(runtime_asset.get("name", "")).strip(),
+    "runtime_sha256": str(runtime_asset.get("sha256", "")).strip(),
+    "model_asset": str(model_asset.get("name", "")).strip(),
+    "model_sha256": str(model_asset.get("sha256", "")).strip(),
+    "runtime_arch": "aarch64-apple-darwin",
+    "installed_at": installed_at,
+}
+managed_manifest_path.write_text(json.dumps(managed_manifest, indent=2) + "\n", encoding="utf-8")
+
+status_payload = {
+    "reason_code": "ok",
+    "message": "Pyannote diarization runtime is ready.",
+    "updated_at": installed_at,
+}
+status_path.write_text(json.dumps(status_payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+capture_runtime_health_reason_code() {
+  local snapshot_path=$1
+  python3 - <<'PY' "$snapshot_path"
+import json
+import sys
+
+snapshot = json.load(open(sys.argv[1], encoding="utf-8"))
+print(str(snapshot.get("health", {}).get("pyannote", {}).get("reason_code", "")).strip())
+PY
+}
+
+capture_runtime_health_message() {
+  local snapshot_path=$1
+  python3 - <<'PY' "$snapshot_path"
+import json
+import sys
+
+snapshot = json.load(open(sys.argv[1], encoding="utf-8"))
+print(str(snapshot.get("health", {}).get("pyannote", {}).get("message", "")).strip())
+PY
+}
+
+capture_runtime_health_ready_flag() {
+  local snapshot_path=$1
+  python3 - <<'PY' "$snapshot_path"
+import json
+import sys
+
+snapshot = json.load(open(sys.argv[1], encoding="utf-8"))
+print("1" if snapshot.get("health", {}).get("pyannote", {}).get("ready") else "0")
+PY
 }
 
 install_app_from_dmg() {
@@ -409,10 +536,49 @@ PY
   done
 }
 
-run_diarization_smoke() {
-  if [[ -z "${FIXTURE_AUDIO// }" ]]; then
-    fail_validation "SBOBINO_VALIDATION_FIXTURE_AUDIO is required for Apple Silicon diarization smoke."
+ensure_fixture_audio() {
+  if [[ -n "${FIXTURE_AUDIO// }" && -f "$FIXTURE_AUDIO" ]]; then
+    return 0
   fi
+
+  if ! command -v say >/dev/null 2>&1 || ! command -v afconvert >/dev/null 2>&1; then
+    fail_validation "SBOBINO_VALIDATION_FIXTURE_AUDIO is not set and this runner cannot synthesize the diarization fixture."
+  fi
+
+  local part1_aiff="$TMP_DIR/fixture-speaker-1.aiff"
+  local part2_aiff="$TMP_DIR/fixture-speaker-2.aiff"
+  local part1_wav="$TMP_DIR/fixture-speaker-1.wav"
+  local part2_wav="$TMP_DIR/fixture-speaker-2.wav"
+  local output_wav="$TMP_DIR/fixture-two-speakers.wav"
+
+  say -v Samantha -o "$part1_aiff" "Hello, this is the first speaker. We are validating pyannote on a clean macOS machine."
+  say -v Daniel -o "$part2_aiff" "Hi, this is the second speaker. The release should keep diarization working without manual repair."
+  afconvert -f WAVE -d LEI16@16000 -c 1 "$part1_aiff" "$part1_wav"
+  afconvert -f WAVE -d LEI16@16000 -c 1 "$part2_aiff" "$part2_wav"
+
+  python3 - <<'PY' "$part1_wav" "$part2_wav" "$output_wav"
+import wave
+import sys
+
+first, second, output = sys.argv[1:4]
+
+with wave.open(first, "rb") as source_a, wave.open(second, "rb") as source_b:
+    params_a = source_a.getparams()
+    params_b = source_b.getparams()
+    if params_a[:4] != params_b[:4]:
+        raise SystemExit("Generated fixture clips do not share the same WAV parameters.")
+    frames = source_a.readframes(source_a.getnframes()) + source_b.readframes(source_b.getnframes())
+
+with wave.open(output, "wb") as destination:
+    destination.setparams(params_a)
+    destination.writeframes(frames)
+PY
+
+  FIXTURE_AUDIO="$output_wav"
+}
+
+run_diarization_smoke() {
+  ensure_fixture_audio
   if [[ ! -f "$FIXTURE_AUDIO" ]]; then
     fail_validation "Diarization fixture not found at '$FIXTURE_AUDIO'."
   fi
@@ -551,9 +717,29 @@ validate_as_primary() {
   install_app_from_dmg "$previous_version"
   seed_privacy_acceptance
   set_speaker_diarization_enabled 1
+  install_release_pyannote_baseline "$previous_version" "$previous_version"
   launch_app
   wait_for_setup_report_success "$TIMEOUT_SECONDS"
-  wait_for_runtime_health_ready "$TIMEOUT_SECONDS" 1
+  local baseline_snapshot="$TMP_DIR/as-primary-baseline-health.json"
+  capture_runtime_health "$baseline_snapshot"
+  if [[ "$(capture_runtime_health_ready_flag "$baseline_snapshot")" != "1" ]]; then
+    local baseline_reason
+    baseline_reason=$(capture_runtime_health_reason_code "$baseline_snapshot")
+    if [[ "$baseline_reason" == "pyannote_repair_required" || "$baseline_reason" == "pyannote_runtime_missing" || "$baseline_reason" == "pyannote_model_missing" || "$baseline_reason" == "pyannote_checksum_invalid" || "$baseline_reason" == "pyannote_version_mismatch" ]]; then
+      quit_app
+      rm -f "$SETUP_REPORT_PATH"
+      install_release_pyannote_baseline "$VERSION" "$previous_version"
+      local repaired_baseline_snapshot="$TMP_DIR/as-primary-repaired-baseline-health.json"
+      capture_runtime_health "$repaired_baseline_snapshot"
+      if [[ "$(capture_runtime_health_ready_flag "$repaired_baseline_snapshot")" != "1" ]]; then
+        fail_validation "Primary Apple Silicon fallback baseline remained pyannote-unready before upgrade: $(capture_runtime_health_message "$repaired_baseline_snapshot")"
+      fi
+    else
+      fail_validation "Primary Apple Silicon baseline on v${previous_version} is not pyannote-ready before upgrade: $(capture_runtime_health_message "$baseline_snapshot")"
+    fi
+  else
+    wait_for_runtime_health_ready "$TIMEOUT_SECONDS" 1
+  fi
   run_diarization_smoke
   quit_app
 

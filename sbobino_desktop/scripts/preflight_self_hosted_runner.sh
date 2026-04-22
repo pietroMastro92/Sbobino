@@ -116,10 +116,18 @@ import json
 import sys
 
 runners = json.loads(sys.argv[1]).get("runners", [])
-expected = set(sys.argv[2].split(","))
+
+def normalize_label(value: str) -> str:
+    return str(value or "").strip().casefold()
+
+expected = {normalize_label(value) for value in sys.argv[2].split(",")}
 
 for runner in runners:
-    labels = {label.get("name") for label in runner.get("labels", []) if label.get("name")}
+    labels = {
+        normalize_label(label.get("name"))
+        for label in runner.get("labels", [])
+        if label.get("name")
+    }
     if expected.issubset(labels) and runner.get("status") == "online":
         print(f"online:{runner.get('name','unknown')}")
         raise SystemExit(0)
