@@ -362,6 +362,17 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Ensure legacy baseline build prerequisites
+        run: |
+          if command -v cmake >/dev/null 2>&1; then
+            exit 0
+          fi
+          if ! command -v brew >/dev/null 2>&1; then
+            echo "cmake is required for the 0.1.16 upgrade baseline build, and Homebrew is unavailable on AS-PRIMARY." >&2
+            exit 1
+          fi
+          brew install cmake
+
       - name: Run AS-PRIMARY validation
         working-directory: sbobino_desktop
         run: |
