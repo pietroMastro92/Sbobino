@@ -15,6 +15,15 @@ Environment variables:
   SBOBINO_VALIDATION_DATA_DIR        Override app data dir
   SBOBINO_VALIDATION_APP_PATH        Override installed app path
   SBOBINO_VALIDATION_FIXTURE_AUDIO   Audio fixture used for diarization smoke on Apple Silicon
+  SBOBINO_VALIDATION_LEGACY_UPGRADE_BASELINE_VERSION
+                                    Baseline app version used for native in-app
+                                    update validation on AS-PRIMARY
+  SBOBINO_VALIDATION_LEGACY_UPGRADE_BASELINE_DMG
+                                    Optional local DMG path for the legacy
+                                    baseline used by AS-PRIMARY
+  SBOBINO_VALIDATION_NATIVE_UPDATE_TIMEOUT_SECONDS
+                                    Timeout for the native in-app update leg on
+                                    AS-PRIMARY (default: 1800)
   SBOBINO_VALIDATION_TIMEOUT_SECONDS Timeout for setup/runtime readiness waits (default: 2400)
   SBOBINO_VALIDATION_PRIVACY_VERSION Privacy policy version to seed into settings.json
 EOF
@@ -34,6 +43,9 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DATA_DIR=${SBOBINO_VALIDATION_DATA_DIR:-"$HOME/Library/Application Support/com.sbobino.desktop"}
 APP_PATH=${SBOBINO_VALIDATION_APP_PATH:-"/Applications/Sbobino.app"}
 FIXTURE_AUDIO=${SBOBINO_VALIDATION_FIXTURE_AUDIO:-}
+LEGACY_UPGRADE_BASELINE_VERSION=${SBOBINO_VALIDATION_LEGACY_UPGRADE_BASELINE_VERSION:-0.1.16}
+LEGACY_UPGRADE_BASELINE_DMG=${SBOBINO_VALIDATION_LEGACY_UPGRADE_BASELINE_DMG:-}
+NATIVE_UPDATE_TIMEOUT_SECONDS=${SBOBINO_VALIDATION_NATIVE_UPDATE_TIMEOUT_SECONDS:-1800}
 TIMEOUT_SECONDS=${SBOBINO_VALIDATION_TIMEOUT_SECONDS:-2400}
 PRIVACY_POLICY_VERSION=${SBOBINO_VALIDATION_PRIVACY_VERSION:-2026-04-03}
 TAG="v$VERSION"
@@ -47,11 +59,12 @@ OS_NAME="macOS"
 OS_VERSION="$(sw_vers -productVersion) ($(uname -m))"
 TESTER=${GITHUB_ACTOR:-$(whoami)}
 RUNNER_LABEL_OVERRIDE=${SBOBINO_VALIDATION_RUNNER_LABEL:-}
+REPO_ROOT=$(cd "$ROOT_DIR/.." && pwd)
 
 FINAL_STATUS="failed"
 REPORT_NOTES=""
 
-SCENARIO_UPDATE_PATH_VALIDATION="pending"
+SCENARIO_NATIVE_UPGRADE_FROM_LEGACY_BASELINE="pending"
 SCENARIO_CLEAN_ROOM_INSTALL="pending"
 SCENARIO_WARM_RESTART="pending"
 SCENARIO_FUNCTIONAL_DIARIZATION_SMOKE="pending"
@@ -93,7 +106,7 @@ write_report() {
     "$OS_NAME" \
     "$OS_VERSION" \
     "$REPORT_NOTES" \
-    "$SCENARIO_UPDATE_PATH_VALIDATION" \
+    "$SCENARIO_NATIVE_UPGRADE_FROM_LEGACY_BASELINE" \
     "$SCENARIO_CLEAN_ROOM_INSTALL" \
     "$SCENARIO_WARM_RESTART" \
     "$SCENARIO_FUNCTIONAL_DIARIZATION_SMOKE" \
@@ -118,7 +131,7 @@ from pathlib import Path
     os_name,
     os_version,
     notes,
-    update_path_validation,
+    native_upgrade_from_legacy_baseline,
     clean_room_install,
     warm_restart,
     functional_diarization_smoke,
@@ -130,12 +143,12 @@ from pathlib import Path
 definitions = {
     "AS-PRIMARY": {
         "required": [
-            "update_path_validation",
+            "native_upgrade_from_legacy_baseline",
             "warm_restart",
             "functional_diarization_smoke",
         ],
         "results": {
-            "update_path_validation": update_path_validation,
+            "native_upgrade_from_legacy_baseline": native_upgrade_from_legacy_baseline,
             "warm_restart": warm_restart,
             "functional_diarization_smoke": functional_diarization_smoke,
         },
@@ -208,7 +221,13 @@ record_success() {
 
 quit_app() {
   osascript -e 'tell application "Sbobino" to quit' >/dev/null 2>&1 || true
-  pkill -f "/Applications/Sbobino.app/Contents/MacOS/Sbobino" >/dev/null 2>&1 || true
+  local bundle_executable=""
+  if [[ -f "$APP_PATH/Contents/Info.plist" ]]; then
+    bundle_executable=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)
+  fi
+  if [[ -n "${bundle_executable// }" ]]; then
+    pkill -f "$APP_PATH/Contents/MacOS/$bundle_executable" >/dev/null 2>&1 || true
+  fi
   sleep 2
 }
 
@@ -226,6 +245,45 @@ download_asset() {
     --show-error \
     --output "$destination" \
     "$url"
+}
+
+try_download_asset() {
+  local version_arg=$1
+  local asset_name=$2
+  local destination=$3
+  local url="https://github.com/$REPO_SLUG/releases/download/v${version_arg}/${asset_name}"
+  curl \
+    --fail \
+    --location \
+    --retry 1 \
+    --retry-delay 1 \
+    --silent \
+    --show-error \
+    --output "$destination" \
+    "$url" >/dev/null 2>&1
+}
+
+read_bundle_executable() {
+  if [[ ! -f "$APP_PATH/Contents/Info.plist" ]]; then
+    return 1
+  fi
+  /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP_PATH/Contents/Info.plist" 2>/dev/null
+}
+
+read_installed_app_version() {
+  if [[ ! -f "$APP_PATH/Contents/Info.plist" ]]; then
+    return 1
+  fi
+  /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Contents/Info.plist" 2>/dev/null
+}
+
+capture_app_pid() {
+  local bundle_executable
+  bundle_executable=$(read_bundle_executable 2>/dev/null || true)
+  if [[ -z "${bundle_executable// }" ]]; then
+    return 0
+  fi
+  pgrep -f "$APP_PATH/Contents/MacOS/$bundle_executable" | head -n 1 || true
 }
 
 extract_archive_single_root() {
@@ -356,9 +414,14 @@ PY
 install_app_from_dmg() {
   local version_arg=$1
   local dmg_path="$TMP_DIR/Sbobino_${version_arg}_aarch64.dmg"
-  local mount_dir="$TMP_DIR/mount-${version_arg}"
-  mkdir -p "$mount_dir"
   download_asset "$version_arg" "Sbobino_${version_arg}_aarch64.dmg" "$dmg_path"
+  install_app_from_dmg_path "$dmg_path"
+}
+
+install_app_from_dmg_path() {
+  local dmg_path=$1
+  local mount_dir="$TMP_DIR/mount-$(basename "$dmg_path" .dmg)"
+  mkdir -p "$mount_dir"
   hdiutil attach "$dmg_path" -nobrowse -mountpoint "$mount_dir" -quiet
   rm -rf "$APP_PATH"
   /usr/bin/ditto "$mount_dir/Sbobino.app" "$APP_PATH"
@@ -370,6 +433,188 @@ clear_install_state() {
   quit_app
   rm -rf "$APP_PATH"
   rm -rf "$DATA_DIR"
+}
+
+prepare_legacy_upgrade_baseline_dmg() {
+  if [[ -n "${LEGACY_UPGRADE_BASELINE_DMG// }" ]]; then
+    if [[ ! -f "$LEGACY_UPGRADE_BASELINE_DMG" ]]; then
+      fail_validation "Configured legacy baseline DMG was not found at '$LEGACY_UPGRADE_BASELINE_DMG'."
+    fi
+    echo "$LEGACY_UPGRADE_BASELINE_DMG"
+    return 0
+  fi
+
+  local downloaded_dmg="$TMP_DIR/Sbobino_${LEGACY_UPGRADE_BASELINE_VERSION}_legacy-baseline.dmg"
+  if try_download_asset \
+    "$LEGACY_UPGRADE_BASELINE_VERSION" \
+    "Sbobino_${LEGACY_UPGRADE_BASELINE_VERSION}_aarch64.dmg" \
+    "$downloaded_dmg"; then
+    echo "$downloaded_dmg"
+    return 0
+  fi
+
+  local baseline_tag="v${LEGACY_UPGRADE_BASELINE_VERSION}"
+  local worktree_dir="$TMP_DIR/legacy-upgrade-baseline"
+  local release_dir="$worktree_dir/sbobino_desktop"
+  local candidate_feed_url="https://github.com/$REPO_SLUG/releases/download/$TAG/latest.json"
+
+  if ! git -C "$REPO_ROOT" rev-parse "$baseline_tag" >/dev/null 2>&1; then
+    fail_validation "Legacy baseline tag '$baseline_tag' is not available locally and no public DMG was found."
+  fi
+
+  git -C "$REPO_ROOT" worktree add --detach "$worktree_dir" "$baseline_tag" >/dev/null
+  python3 - <<'PY' "$release_dir/apps/desktop/src-tauri/tauri.conf.json" "$candidate_feed_url"
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+candidate_feed_url = sys.argv[2]
+payload = json.loads(config_path.read_text(encoding="utf-8"))
+payload.setdefault("plugins", {}).setdefault("updater", {})["endpoints"] = [candidate_feed_url]
+config_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+
+  if ! (
+    cd "$release_dir"
+    ./scripts/prepare_local_release.sh "$LEGACY_UPGRADE_BASELINE_VERSION"
+  ); then
+    git -C "$REPO_ROOT" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
+    fail_validation "Failed to build the validation baseline app from $baseline_tag."
+  fi
+
+  local built_dmg="$release_dir/dist/local-release/v${LEGACY_UPGRADE_BASELINE_VERSION}/Sbobino_${LEGACY_UPGRADE_BASELINE_VERSION}_aarch64.dmg"
+  if [[ ! -f "$built_dmg" ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
+    fail_validation "Legacy baseline build did not produce '$built_dmg'."
+  fi
+
+  cp "$built_dmg" "$downloaded_dmg"
+  git -C "$REPO_ROOT" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
+  echo "$downloaded_dmg"
+}
+
+trigger_update_menu_refresh() {
+  osascript <<'APPLESCRIPT' >/dev/null 2>&1
+tell application "Sbobino" to activate
+tell application "System Events"
+  tell process "Sbobino"
+    try
+      click menu item "Verifica disponibilita aggiornamenti..." of menu 1 of menu bar item 1 of menu bar 1
+      return
+    end try
+  end tell
+end tell
+APPLESCRIPT
+}
+
+click_native_update_button() {
+  local result
+  result=$(osascript <<'APPLESCRIPT'
+set buttonNames to {"Download & Install", "Scarica e installa", "Descargar e instalar", "Herunterladen und installieren"}
+tell application "Sbobino" to activate
+tell application "System Events"
+  tell process "Sbobino"
+    if not (exists window 1) then
+      return "window-missing"
+    end if
+    repeat with wantedName in buttonNames
+      try
+        click first button of (entire contents of window 1) whose name is wantedName
+        return "clicked"
+      end try
+    end repeat
+  end tell
+end tell
+return "not-found"
+APPLESCRIPT
+)
+  [[ "$result" == "clicked" ]]
+}
+
+read_update_banner_hint() {
+  osascript <<'APPLESCRIPT' 2>/dev/null || true
+set interestingSnippets to {"update", "install", "aggiorn", "scarica", "download", "actualizacion", "aktual"}
+tell application "System Events"
+  tell process "Sbobino"
+    if not (exists window 1) then
+      return ""
+    end if
+    set textItems to {}
+    repeat with uiItem in (entire contents of window 1)
+      try
+        set candidateText to value of uiItem as text
+        set end of textItems to candidateText
+      end try
+      try
+        set candidateTitle to name of uiItem as text
+        set end of textItems to candidateTitle
+      end try
+    end repeat
+  end tell
+end tell
+repeat with candidateText in textItems
+  repeat with snippet in interestingSnippets
+    if (candidateText as text) contains (snippet as text) then
+      return candidateText as text
+    end if
+  end repeat
+end repeat
+return ""
+APPLESCRIPT
+}
+
+trigger_native_update_and_wait() {
+  local target_version=$1
+  local started_at
+  local click_deadline
+  local old_pid
+  local observed_click=0
+  local observed_version_switch=0
+  local observed_relaunch=0
+  local old_version=""
+
+  old_pid=$(capture_app_pid)
+  old_version=$(read_installed_app_version 2>/dev/null || true)
+  started_at=$(date +%s)
+  click_deadline=$((started_at + 180))
+
+  while true; do
+    local now
+    now=$(date +%s)
+    if (( observed_click == 0 )); then
+      if click_native_update_button; then
+        observed_click=1
+      elif (( now > click_deadline )); then
+        trigger_update_menu_refresh || true
+        click_deadline=$((now + 60))
+      fi
+    fi
+
+    local current_version=""
+    local current_pid=""
+    current_version=$(read_installed_app_version 2>/dev/null || true)
+    current_pid=$(capture_app_pid)
+
+    if [[ "$current_version" == "$target_version" ]]; then
+      observed_version_switch=1
+    fi
+    if (( observed_version_switch == 1 )) && [[ -n "${current_pid// }" ]]; then
+      if [[ -z "${old_pid// }" || "$current_pid" != "$old_pid" ]]; then
+        observed_relaunch=1
+      fi
+    fi
+    if (( observed_click == 1 && observed_version_switch == 1 && observed_relaunch == 1 )); then
+      return 0
+    fi
+
+    if (( now - started_at > NATIVE_UPDATE_TIMEOUT_SECONDS )); then
+      local banner_hint=""
+      banner_hint=$(read_update_banner_hint)
+      fail_validation "Timed out waiting for native in-app update from v${old_version:-unknown} to v${target_version}. clicked=${observed_click} version_switched=${observed_version_switch} relaunch=${observed_relaunch} current_bundle_version=${current_version:-missing} banner_hint=${banner_hint:-none}"
+    fi
+    sleep 5
+  done
 }
 
 seed_privacy_acceptance() {
@@ -740,14 +985,14 @@ validate_as_primary() {
     fail_validation "AS-PRIMARY validation must run on an Apple Silicon Mac."
   fi
 
-  local previous_version
-  previous_version=$(find_previous_stable_version)
+  local baseline_dmg
+  baseline_dmg=$(prepare_legacy_upgrade_baseline_dmg)
 
   clear_install_state
-  install_app_from_dmg "$previous_version"
+  install_app_from_dmg_path "$baseline_dmg"
   seed_privacy_acceptance
   set_speaker_diarization_enabled 1
-  install_release_pyannote_baseline "$previous_version" "$previous_version"
+  install_release_pyannote_baseline "$VERSION" "$LEGACY_UPGRADE_BASELINE_VERSION"
   launch_app
   wait_for_setup_report_success "$TIMEOUT_SECONDS"
   local baseline_snapshot="$TMP_DIR/as-primary-baseline-health.json"
@@ -758,27 +1003,23 @@ validate_as_primary() {
     if [[ "$baseline_reason" == "pyannote_repair_required" || "$baseline_reason" == "pyannote_runtime_missing" || "$baseline_reason" == "pyannote_model_missing" || "$baseline_reason" == "pyannote_checksum_invalid" || "$baseline_reason" == "pyannote_version_mismatch" ]]; then
       quit_app
       rm -f "$SETUP_REPORT_PATH"
-      install_release_pyannote_baseline "$VERSION" "$previous_version"
+      install_release_pyannote_baseline "$VERSION" "$LEGACY_UPGRADE_BASELINE_VERSION"
       local repaired_baseline_snapshot="$TMP_DIR/as-primary-repaired-baseline-health.json"
       capture_runtime_health "$repaired_baseline_snapshot"
       if [[ "$(capture_runtime_health_ready_flag "$repaired_baseline_snapshot")" != "1" ]]; then
         fail_validation "Primary Apple Silicon fallback baseline remained pyannote-unready before upgrade: $(capture_runtime_health_message "$repaired_baseline_snapshot")"
       fi
     else
-      fail_validation "Primary Apple Silicon baseline on v${previous_version} is not pyannote-ready before upgrade: $(capture_runtime_health_message "$baseline_snapshot")"
+      fail_validation "Primary Apple Silicon baseline on v${LEGACY_UPGRADE_BASELINE_VERSION} is not pyannote-ready before upgrade: $(capture_runtime_health_message "$baseline_snapshot")"
     fi
   else
     wait_for_runtime_health_ready "$TIMEOUT_SECONDS" 1
   fi
   run_diarization_smoke
-  quit_app
 
-  install_app_from_dmg "$VERSION"
-  seed_privacy_acceptance
-  set_speaker_diarization_enabled 1
-  launch_app
+  trigger_native_update_and_wait "$VERSION"
   wait_for_runtime_health_ready 900 1
-  SCENARIO_UPDATE_PATH_VALIDATION="passed"
+  SCENARIO_NATIVE_UPGRADE_FROM_LEGACY_BASELINE="passed"
 
   quit_app
   launch_app
@@ -788,7 +1029,7 @@ validate_as_primary() {
   run_diarization_smoke
   SCENARIO_FUNCTIONAL_DIARIZATION_SMOKE="passed"
 
-  record_success "passed" "Primary Apple Silicon machine upgraded from v${previous_version} to the public candidate and preserved runtime + pyannote usability."
+  record_success "passed" "Primary Apple Silicon machine completed a native in-app upgrade from v${LEGACY_UPGRADE_BASELINE_VERSION} to the public candidate and preserved runtime + pyannote usability."
 }
 
 case "$MACHINE_CLASS" in

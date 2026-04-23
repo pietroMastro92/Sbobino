@@ -167,12 +167,17 @@ describe("initialSetup helpers", () => {
         build_version: "0.1.16",
         privacy_accepted: true,
         setup_complete: true,
+        startup_gate_complete: true,
+        validated_build_version: "0.1.16",
         final_reason_code: "setup_complete",
         final_error: null,
+        last_validation_reason_code: "post_update_validation_complete",
+        last_validation_error: null,
         runtime_health: runtimeHealth,
         steps: [],
         updated_at: new Date().toISOString(),
         trusted_for_fast_start: true,
+        requires_post_update_validation: false,
       }),
     ).toBe(true);
 
@@ -181,12 +186,40 @@ describe("initialSetup helpers", () => {
         build_version: "0.1.16",
         privacy_accepted: true,
         setup_complete: true,
+        startup_gate_complete: true,
+        validated_build_version: "0.1.15",
         final_reason_code: "setup_complete",
         final_error: "stale",
+        last_validation_reason_code: "post_update_validation_failed",
+        last_validation_error: "stale",
         runtime_health: runtimeHealth,
         steps: [],
         updated_at: new Date().toISOString(),
         trusted_for_fast_start: true,
+        requires_post_update_validation: true,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not warm start when the startup gate never completed", () => {
+    const runtimeHealth = createRuntimeHealthFixture();
+
+    expect(
+      canWarmStartFromSetupReport(true, {
+        build_version: "0.1.16",
+        privacy_accepted: true,
+        setup_complete: false,
+        startup_gate_complete: false,
+        validated_build_version: null,
+        final_reason_code: "setup_incomplete",
+        final_error: "setup failed",
+        last_validation_reason_code: "post_update_validation_failed",
+        last_validation_error: "setup failed",
+        runtime_health: runtimeHealth,
+        steps: [],
+        updated_at: new Date().toISOString(),
+        trusted_for_fast_start: false,
+        requires_post_update_validation: false,
       }),
     ).toBe(false);
   });

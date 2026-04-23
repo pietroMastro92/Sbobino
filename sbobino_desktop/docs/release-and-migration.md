@@ -115,7 +115,7 @@
 - Runs only after the full asset set is uploaded to a GitHub release.
 - Verifies HTTP availability, JSON parsing, `app_version` consistency, checksum integrity, updater tarball/signature wiring, and that `setup-manifest.json` points only to assets present in the same release.
 - A passed run must be captured as `distribution-readiness-proof.json` and uploaded back to the same prerelease candidate.
-- This gate validates artifact integrity only. Stable distribution additionally requires the Apple Silicon clean-room and upgrade scenarios in [`distribution-validation-plan.md`](distribution-validation-plan.md).
+- This gate validates artifact integrity only. Stable distribution additionally requires the Apple Silicon clean-room flow and the native legacy-upgrade scenario from `0.1.16` in [`distribution-validation-plan.md`](distribution-validation-plan.md).
 
 ## Stable Release Policy
 

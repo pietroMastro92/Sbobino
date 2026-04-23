@@ -141,6 +141,11 @@ import {
   shouldBlockMainUiDuringStartup,
 } from "./lib/initialSetup";
 import {
+  createNativeUpdateTimeoutError,
+  isNativeUpdateTimeoutError,
+  resolveNativeUpdateInstallTimeoutMs,
+} from "./lib/nativeUpdater";
+import {
   getArtifactDiarizationUiState,
   normalizeJobFailureMessage,
 } from "./lib/diarizationUi";
@@ -331,8 +336,12 @@ function createInitialSetupReport(): InitialSetupReport {
     build_version: "",
     privacy_accepted: false,
     setup_complete: false,
+    startup_gate_complete: false,
+    validated_build_version: null,
     final_reason_code: null,
     final_error: null,
+    last_validation_reason_code: null,
+    last_validation_error: null,
     runtime_health: null,
     updated_at: new Date().toISOString(),
     steps: [
@@ -532,6 +541,10 @@ const LEFT_SIDEBAR_MAX_WIDTH = 320;
 const RIGHT_SIDEBAR_MIN_WIDTH = 220;
 const RIGHT_SIDEBAR_MAX_WIDTH = 420;
 const AUTO_UPDATE_POLL_INTERVAL_MS = 30 * 60 * 1000;
+const NATIVE_UPDATE_INSTALL_TIMEOUT_MS =
+  resolveNativeUpdateInstallTimeoutMs(
+    import.meta.env.VITE_NATIVE_UPDATE_INSTALL_TIMEOUT_MS,
+  );
 const PYANNOTE_AUTO_ACTION_FAILURE_REASON_CODES = new Set([
   "pyannote_install_incomplete",
   "pyannote_checksum_invalid",
@@ -2685,6 +2698,17 @@ export function App({
   const [startupRequirementsError, setStartupRequirementsError] = useState<
     string | null
   >(null);
+  const [requiresPostUpdateValidation, setRequiresPostUpdateValidation] =
+    useState(() => Boolean(initialBootstrap?.setupReport?.requires_post_update_validation));
+  const [postUpdateValidationRunning, setPostUpdateValidationRunning] =
+    useState(false);
+  const [postUpdateValidationVisible, setPostUpdateValidationVisible] =
+    useState(false);
+  const [postUpdateValidationError, setPostUpdateValidationError] = useState<
+    string | null
+  >(() => initialBootstrap?.setupReport?.last_validation_error ?? null);
+  const [postUpdateValidationAttempt, setPostUpdateValidationAttempt] =
+    useState(0);
   const [initialSetupRunning, setInitialSetupRunning] = useState(false);
   const [initialSetupError, setInitialSetupError] = useState<string | null>(
     null,
@@ -2810,6 +2834,7 @@ export function App({
     ProvisioningProgressEvent["asset_kind"] | null
   >(null);
   const pyannoteProvisioningActiveRef = useRef(false);
+  const postUpdateValidationTimerRef = useRef<number | null>(null);
   const initialSetupReportRef = useRef<InitialSetupReport>(
     initialBootstrap?.setupReport ?? createInitialSetupReport(),
   );
@@ -2826,6 +2851,12 @@ export function App({
     runtimeHealth,
     modelCatalog,
   );
+  const clearPostUpdateValidationTimer = useCallback(() => {
+    if (postUpdateValidationTimerRef.current !== null) {
+      window.clearTimeout(postUpdateValidationTimerRef.current);
+      postUpdateValidationTimerRef.current = null;
+    }
+  }, []);
 
   const describeEmotionValence = useCallback(
     (score: number): string => {
@@ -3286,6 +3317,16 @@ export function App({
         const initialSettings = await initialSettingsPromise;
         if (disposed) return;
 
+        const normalized = normalizeSettings(initialSettings);
+        setSettings(normalized);
+        if (normalized.general.app_language) {
+          changeLanguage(normalized.general.app_language);
+        }
+        if (warmStartEligible) {
+          setStartupRequirementsLoaded(true);
+          setStartupRequirementsError(null);
+        }
+
         const [initialRuntimeHealthResult, initialModelCatalogResult] =
           await Promise.allSettled([
           initialRuntimeHealthPromise,
@@ -3293,8 +3334,6 @@ export function App({
         ]);
         if (disposed) return;
 
-        const normalized = normalizeSettings(initialSettings);
-        setSettings(normalized);
         if (
           initialRuntimeHealthResult.status === "fulfilled" &&
           initialRuntimeHealthResult.value
@@ -3321,18 +3360,18 @@ export function App({
           setStartupRequirementsLoaded(true);
           setStartupRequirementsError(null);
         }
-        if (normalized.general.app_language) {
-          changeLanguage(normalized.general.app_language);
-        }
-
         const resolvedBuildVersion =
           initialRuntimeHealthResult.status === "fulfilled" &&
           initialRuntimeHealthResult.value
             ? initialRuntimeHealthResult.value.app_version
             : currentBuildVersion;
-        if (resolvedBuildVersion) {
+        if (
+          resolvedBuildVersion &&
+          !(warmStartEligible && requiresPostUpdateValidation)
+        ) {
           const pyannoteTrigger: PyannoteBackgroundActionTrigger =
-            previousSeenVersion && previousSeenVersion !== resolvedBuildVersion
+            requiresPostUpdateValidation ||
+            (previousSeenVersion && previousSeenVersion !== resolvedBuildVersion)
               ? "post_update"
               : "startup";
           void maybeStartPyannoteBackgroundAction(
@@ -3407,6 +3446,7 @@ export function App({
   }, [
     initialBootstrap?.setupReport,
     initialStandaloneSettingsPane,
+    requiresPostUpdateValidation,
     setArtifacts,
     setError,
     setSettings,
@@ -3789,6 +3829,116 @@ export function App({
       cancelled = true;
     };
   }, [setError, settings, standaloneSettingsWindow, warmStartEligible]);
+
+  useEffect(() => {
+    if (
+      standaloneSettingsWindow ||
+      !settings ||
+      !privacyPolicyAccepted ||
+      !warmStartEligible ||
+      !requiresPostUpdateValidation
+    ) {
+      clearPostUpdateValidationTimer();
+      setPostUpdateValidationRunning(false);
+      setPostUpdateValidationVisible(false);
+      return;
+    }
+
+    let cancelled = false;
+    clearPostUpdateValidationTimer();
+    setPostUpdateValidationRunning(true);
+    setPostUpdateValidationVisible(false);
+    setPostUpdateValidationError(null);
+    postUpdateValidationTimerRef.current = window.setTimeout(() => {
+      if (!cancelled) {
+        setPostUpdateValidationVisible(true);
+      }
+    }, 1200);
+
+    void (async () => {
+      let snapshot: StartupRequirementsSnapshot | null = null;
+      try {
+        snapshot = await loadStartupRequirements({ includeModelCatalog: false });
+        if (cancelled) {
+          return;
+        }
+
+        if (!snapshot.runtimeHealth.setup_complete) {
+          const failureMessage = formatPostUpdateValidationFailure(snapshot);
+          await persistInitialSetupReport((current) => ({
+            ...current,
+            startup_gate_complete:
+              current.startup_gate_complete || current.setup_complete,
+            last_validation_reason_code: inferPostUpdateValidationReasonCode(snapshot),
+            last_validation_error: failureMessage,
+            runtime_health: snapshot?.runtimeHealth ?? current.runtime_health,
+            updated_at: new Date().toISOString(),
+          }));
+          setPostUpdateValidationError(failureMessage);
+          setPostUpdateValidationVisible(true);
+          return;
+        }
+
+        const validatedRuntimeHealth = snapshot.runtimeHealth;
+        await persistInitialSetupReport((current) => ({
+          ...current,
+          setup_complete:
+            current.setup_complete || validatedRuntimeHealth.setup_complete,
+          startup_gate_complete: true,
+          validated_build_version: validatedRuntimeHealth.app_version,
+          last_validation_reason_code: inferPostUpdateValidationReasonCode(snapshot),
+          last_validation_error: null,
+          runtime_health: validatedRuntimeHealth,
+          updated_at: new Date().toISOString(),
+        }));
+        setRequiresPostUpdateValidation(false);
+        setPostUpdateValidationVisible(false);
+        setPostUpdateValidationError(null);
+        void maybeStartPyannoteBackgroundAction(
+          "post_update",
+          validatedRuntimeHealth.app_version,
+        );
+      } catch (validationError) {
+        if (cancelled) {
+          return;
+        }
+        const formatted = formatUiError(
+          "error.postUpdateValidationFailed",
+          "Could not finish post-update runtime checks",
+          validationError,
+        );
+        await persistInitialSetupReport((current) => ({
+          ...current,
+          startup_gate_complete:
+            current.startup_gate_complete || current.setup_complete,
+          last_validation_reason_code: inferPostUpdateValidationReasonCode(snapshot),
+          last_validation_error: formatted,
+          runtime_health: snapshot?.runtimeHealth ?? current.runtime_health,
+          updated_at: new Date().toISOString(),
+        }));
+        setPostUpdateValidationError(formatted);
+        setPostUpdateValidationVisible(true);
+      } finally {
+        if (!cancelled) {
+          clearPostUpdateValidationTimer();
+          setPostUpdateValidationRunning(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      clearPostUpdateValidationTimer();
+    };
+  }, [
+    clearPostUpdateValidationTimer,
+    postUpdateValidationAttempt,
+    privacyPolicyAccepted,
+    requiresPostUpdateValidation,
+    settings,
+    standaloneSettingsWindow,
+    warmStartEligible,
+  ]);
 
   useEffect(() => {
     if (standaloneSettingsWindow || !settings || !privacyPolicyAccepted) {
@@ -5753,14 +5903,19 @@ export function App({
     }
   }
 
-  async function loadStartupRequirements(): Promise<StartupRequirementsSnapshot> {
+  async function loadStartupRequirements(options?: {
+    includeModelCatalog?: boolean;
+  }): Promise<StartupRequirementsSnapshot> {
+    const includeModelCatalog = options?.includeModelCatalog !== false;
     const [models, health] = await Promise.all([
-      provisioningModels(),
+      includeModelCatalog ? provisioningModels() : Promise.resolve(modelCatalog),
       fetchRuntimeHealth(),
     ]);
 
     syncProvisioningFromRuntimeHealth(health);
-    setModelCatalog(models);
+    if (includeModelCatalog) {
+      setModelCatalog(models);
+    }
     setRuntimeHealth(health);
     writeLastSeenAppVersion(health.app_version);
     setStartupRequirementsLoaded(true);
@@ -5818,6 +5973,39 @@ export function App({
     return snapshot.runtimeHealth.setup_complete
       ? "setup_complete"
       : "setup_incomplete";
+  }
+
+  function inferPostUpdateValidationReasonCode(
+    snapshot: StartupRequirementsSnapshot | null,
+  ): string {
+    if (!snapshot) {
+      return "post_update_validation_failed";
+    }
+    if (snapshot.runtimeHealth.setup_complete) {
+      return "post_update_validation_complete";
+    }
+    if (!isRuntimeToolchainReady(snapshot.runtimeHealth)) {
+      return "runtime_repair_required";
+    }
+    return "post_update_validation_incomplete";
+  }
+
+  function formatPostUpdateValidationFailure(
+    snapshot: StartupRequirementsSnapshot | null,
+  ): string {
+    if (!snapshot) {
+      return t(
+        "startup.postUpdate.validationFailed",
+        "Sbobino could not finish the post-update checks. You can keep using the app and retry from Settings > Local Models.",
+      );
+    }
+    if (!isRuntimeToolchainReady(snapshot.runtimeHealth)) {
+      return formatRuntimeNotReadyMessage(snapshot.runtimeHealth);
+    }
+    return t(
+      "startup.postUpdate.validationIncomplete",
+      "Sbobino found missing local components after the update. You can keep using the app and repair them from Settings > Local Models.",
+    );
   }
 
   async function maybeStartPyannoteBackgroundAction(
@@ -6020,6 +6208,8 @@ export function App({
         privacy_accepted: privacyPolicyAccepted,
         runtime_health: runtimeHealth,
         setup_complete: false,
+        startup_gate_complete: false,
+        validated_build_version: null,
         updated_at: new Date().toISOString(),
       }));
 
@@ -6158,11 +6348,18 @@ export function App({
       await persistInitialSetupReport((current) => ({
         ...current,
         setup_complete: snapshot?.runtimeHealth.setup_complete ?? false,
+        startup_gate_complete: snapshot?.runtimeHealth.setup_complete ?? false,
+        validated_build_version: snapshot?.runtimeHealth.app_version ?? null,
         final_reason_code: inferInitialSetupReasonCode(snapshot),
         final_error: null,
+        last_validation_reason_code: "post_update_validation_complete",
+        last_validation_error: null,
         runtime_health: snapshot?.runtimeHealth ?? null,
         updated_at: new Date().toISOString(),
       }));
+      setRequiresPostUpdateValidation(false);
+      setPostUpdateValidationError(null);
+      setPostUpdateValidationVisible(false);
       initialSetupStepIdRef.current = null;
       setInitialSetupStepLabel(null);
       setInitialSetupStepDetail(null);
@@ -6189,8 +6386,12 @@ export function App({
       await persistInitialSetupReport((current) => ({
         ...current,
         setup_complete: false,
+        startup_gate_complete: false,
+        validated_build_version: null,
         final_reason_code: inferInitialSetupReasonCode(snapshot),
         final_error: finalError,
+        last_validation_reason_code: inferPostUpdateValidationReasonCode(snapshot),
+        last_validation_error: finalError,
         runtime_health: snapshot?.runtimeHealth ?? current.runtime_health,
         updated_at: new Date().toISOString(),
       }));
@@ -8510,16 +8711,28 @@ export function App({
     try {
       let expectedBytes = 0;
       let downloadedBytes = 0;
-      await nativeUpdate.downloadAndInstall((event) => {
+      let installStage = "download";
+      let lastEvent: string | null = null;
+      console.info("[updater] native install started", {
+        version: nativeUpdate.version,
+      });
+      const downloadAndInstallPromise = nativeUpdate.downloadAndInstall((event) => {
+        lastEvent = event.event;
         if (event.event === "Started") {
+          installStage = "download";
           expectedBytes = event.data.contentLength ?? 0;
           downloadedBytes = 0;
+          console.info("[updater] download started", {
+            contentLength: expectedBytes,
+            version: nativeUpdate.version,
+          });
           setUpdateStatusMessage(
             t("settings.general.downloadingUpdate", "Downloading update..."),
           );
           return;
         }
         if (event.event === "Progress") {
+          installStage = "download";
           downloadedBytes += event.data.chunkLength;
           if (expectedBytes > 0) {
             const percent = Math.max(
@@ -8534,12 +8747,49 @@ export function App({
           return;
         }
         if (event.event === "Finished") {
+          installStage = "install";
+          console.info("[updater] download finished; handing off to installer", {
+            downloadedBytes,
+            expectedBytes,
+            version: nativeUpdate.version,
+          });
           setUpdateDownloadPercent(100);
           setUpdateStatusMessage(
             t("settings.general.installingUpdate", "Installing update..."),
           );
         }
       });
+      void downloadAndInstallPromise.then(
+        () => {
+          console.info("[updater] native install resolved", {
+            stage: installStage,
+            lastEvent,
+            version: nativeUpdate.version,
+          });
+        },
+        (error) => {
+          console.error("[updater] native install rejected", {
+            stage: installStage,
+            lastEvent,
+            version: nativeUpdate.version,
+            error,
+          });
+        },
+      );
+      await Promise.race([
+        downloadAndInstallPromise,
+        new Promise<never>((_, reject) => {
+          window.setTimeout(() => {
+            reject(
+              createNativeUpdateTimeoutError(
+                NATIVE_UPDATE_INSTALL_TIMEOUT_MS,
+                installStage,
+                lastEvent,
+              ),
+            );
+          }, NATIVE_UPDATE_INSTALL_TIMEOUT_MS);
+        }),
+      ]);
 
       setUpdateStatusMessage(
         t(
@@ -8565,9 +8815,16 @@ export function App({
         ),
       );
       try {
+        console.info("[updater] requesting relaunch", {
+          version: nativeUpdate.version,
+        });
         await relaunch();
         return;
       } catch (relaunchError) {
+        console.error("[updater] relaunch failed after install", {
+          version: nativeUpdate.version,
+          error: relaunchError,
+        });
         setError(
           formatUiError(
             "error.updateInstallFailed",
@@ -8583,6 +8840,18 @@ export function App({
         );
       }
     } catch (installError) {
+      if (isNativeUpdateTimeoutError(installError)) {
+        console.error("[updater] native install timed out", installError);
+        setNativeUpdate(null);
+        setUpdateStatusMessage(
+          t(
+            "settings.general.updateInstallTimedOut",
+            "Update installation timed out. Retry or download it manually.",
+          ),
+        );
+      } else {
+        setUpdateStatusMessage(null);
+      }
       setError(
         formatUiError(
           "error.updateInstallFailed",
@@ -8590,7 +8859,6 @@ export function App({
           installError,
         ),
       );
-      setUpdateStatusMessage(null);
     } finally {
       setInstallingUpdate(false);
     }
@@ -11356,6 +11624,68 @@ export function App({
     checkingUpdates,
     dismissedUpdateVersion,
   );
+
+  function renderPostUpdateValidationBanner(): JSX.Element | null {
+    if (!warmStartEligible) {
+      return null;
+    }
+    if (!postUpdateValidationError && !postUpdateValidationVisible) {
+      return null;
+    }
+
+    const bannerTitle = postUpdateValidationError
+      ? t(
+          "startup.postUpdate.bannerErrorTitle",
+          "Post-update checks need attention",
+        )
+      : t(
+          "startup.postUpdate.bannerTitle",
+          "Finishing post-update checks",
+        );
+    const bannerMessage = postUpdateValidationError
+      ? postUpdateValidationError
+      : t(
+          "startup.postUpdate.bannerBody",
+          "Sbobino is validating the updated local runtime in the background.",
+        );
+
+    return (
+      <div
+        className={`app-update-banner ${postUpdateValidationError ? "is-available" : "is-progress"}`}
+      >
+        <div className="app-update-banner-copy">
+          <strong>{bannerTitle}</strong>
+          <span>{bannerMessage}</span>
+        </div>
+        <div className="app-update-banner-actions">
+          {postUpdateValidationError ? (
+            <button
+              className="primary-button"
+              onClick={() => {
+                setPostUpdateValidationError(null);
+                setPostUpdateValidationVisible(false);
+                setPostUpdateValidationAttempt((value) => value + 1);
+              }}
+              disabled={postUpdateValidationRunning}
+            >
+              {postUpdateValidationRunning
+                ? t("startup.postUpdate.retrying", "Retrying...")
+                : t("startup.postUpdate.retry", "Retry checks")}
+            </button>
+          ) : null}
+          {postUpdateValidationError &&
+          shouldOfferLocalModelsCta(postUpdateValidationError) ? (
+            <button
+              className="secondary-button"
+              onClick={() => void onOpenStandaloneSettingsWindow("local_models")}
+            >
+              {t("action.openLocalModels", "Open Local Models")}
+            </button>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
 
   function renderGlobalUpdateBanner(): JSX.Element | null {
     if (!showGlobalUpdateBanner) {
@@ -14132,6 +14462,7 @@ export function App({
         <section className="settings-window-frame">
           <header className="settings-window-header" data-tauri-drag-region />
           {renderGlobalUpdateBanner()}
+          {renderPostUpdateValidationBanner()}
           {renderSettings()}
           {error ? (
             <div className="error-banner settings-window-error">
@@ -14453,6 +14784,7 @@ export function App({
           ) : null}
 
           {renderGlobalUpdateBanner()}
+          {renderPostUpdateValidationBanner()}
           <div className="main-content">{renderContent()}</div>
 
           {error ? (

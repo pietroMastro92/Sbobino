@@ -2257,6 +2257,8 @@ const translationAdditions: AllTranslations = {
     "settings.general.downloadingUpdate": "Downloading update...",
     "settings.general.installing": "Installing{suffix}",
     "settings.general.installingUpdate": "Installing update...",
+    "settings.general.updateInstallTimedOut":
+      "Update installation timed out. Retry or download it manually.",
     "settings.general.manualDownload": "Manual Download",
     "settings.general.restartingAfterUpdate": "Restarting to apply update...",
     "settings.general.updateAvailable": "Update {version} available",
@@ -2554,6 +2556,8 @@ const translationAdditions: AllTranslations = {
     "settings.general.downloadingUpdate": "Scaricamento aggiornamento...",
     "settings.general.installing": "Installazione{suffix}",
     "settings.general.installingUpdate": "Installazione aggiornamento...",
+    "settings.general.updateInstallTimedOut":
+      "L'installazione dell'aggiornamento e scaduta. Riprova o scaricalo manualmente.",
     "settings.general.manualDownload": "Scarica manualmente",
     "settings.general.restartingAfterUpdate": "Riavvio per applicare l'aggiornamento...",
     "settings.general.updateAvailable": "Aggiornamento {version} disponibile",
@@ -2851,6 +2855,8 @@ const translationAdditions: AllTranslations = {
     "settings.general.downloadingUpdate": "Descargando actualización...",
     "settings.general.installing": "Instalando{suffix}",
     "settings.general.installingUpdate": "Instalando actualización...",
+    "settings.general.updateInstallTimedOut":
+      "La instalacion de la actualizacion excedio el tiempo. Reintenta o descargala manualmente.",
     "settings.general.manualDownload": "Descarga manual",
     "settings.general.restartingAfterUpdate": "Reiniciando para aplicar la actualización...",
     "settings.general.updateAvailable": "Actualización {version} disponible",
@@ -3148,6 +3154,8 @@ const translationAdditions: AllTranslations = {
     "settings.general.downloadingUpdate": "Update wird heruntergeladen...",
     "settings.general.installing": "Installiere{suffix}",
     "settings.general.installingUpdate": "Update wird installiert...",
+    "settings.general.updateInstallTimedOut":
+      "Die Installation des Updates hat zu lange gedauert. Versuchen Sie es erneut oder laden Sie es manuell herunter.",
     "settings.general.manualDownload": "Manuell herunterladen",
     "settings.general.restartingAfterUpdate": "Die App wird neu gestartet, um das Update anzuwenden...",
     "settings.general.updateAvailable": "Update {version} verfügbar",

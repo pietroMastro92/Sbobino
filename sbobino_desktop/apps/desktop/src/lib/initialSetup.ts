@@ -37,12 +37,17 @@ export type InitialSetupReport = {
   build_version: string;
   privacy_accepted: boolean;
   setup_complete: boolean;
+  startup_gate_complete?: boolean;
+  validated_build_version?: string | null;
   final_reason_code: string | null;
   final_error: string | null;
+  last_validation_reason_code?: string | null;
+  last_validation_error?: string | null;
   runtime_health: RuntimeHealth | null;
   steps: InitialSetupReportStep[];
   updated_at: string;
   trusted_for_fast_start?: boolean;
+  requires_post_update_validation?: boolean;
 };
 
 const PYANNOTE_REPAIR_REASON_CODES = new Set([
@@ -127,11 +132,7 @@ export function canWarmStartFromSetupReport(
     return false;
   }
 
-  return (
-    report.setup_complete &&
-    !report.final_error &&
-    report.final_reason_code === "setup_complete"
-  );
+  return Boolean(report.startup_gate_complete ?? report.setup_complete);
 }
 
 export function shouldBlockMainUiDuringStartup(payload: {

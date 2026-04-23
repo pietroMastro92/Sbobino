@@ -27,12 +27,12 @@ def build_validation_templates(version: str, tag: str, commit_sha: str) -> dict[
             "tested_at_utc": "",
             "notes": "",
             "required_scenarios": [
-                "update_path_validation",
+                "native_upgrade_from_legacy_baseline",
                 "warm_restart",
                 "functional_diarization_smoke",
             ],
             "scenario_results": {
-                "update_path_validation": "pending",
+                "native_upgrade_from_legacy_baseline": "pending",
                 "warm_restart": "pending",
                 "functional_diarization_smoke": "pending",
             },

@@ -217,7 +217,7 @@ A stable Apple Silicon release is allowed only if:
 
 1. `release_readiness.sh` passes.
 2. `distribution_readiness.sh` passes.
-3. `AS-PRIMARY` passes update-path validation, warm restart, and diarization smoke.
+3. `AS-PRIMARY` passes the native legacy-upgrade scenario from `0.1.16`, warm restart, and diarization smoke.
 4. `AS-THIRD` passes clean-room install, warm restart, and diarization smoke.
 5. `INTEL-PRIMARY` passes release metadata and bootstrap-layer validation, with `soft_pass` allowed when arm64 execution is `not_applicable`.
 6. No mandatory scenario requires terminal repair or manual filesystem intervention.

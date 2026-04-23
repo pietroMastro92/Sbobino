@@ -118,7 +118,7 @@ expected_reports = {
         "allowed_statuses": {"passed"},
         "runner_labels": {"self-hosted,macos,apple-silicon,as-primary"},
         "required_scenarios": [
-            "update_path_validation",
+            "native_upgrade_from_legacy_baseline",
             "warm_restart",
             "functional_diarization_smoke",
         ],

@@ -500,8 +500,16 @@ pub struct SetupReportStepPayload {
 pub struct WriteSetupReportPayload {
     pub privacy_accepted: bool,
     pub setup_complete: bool,
+    #[serde(default)]
+    pub startup_gate_complete: bool,
+    #[serde(default)]
+    pub validated_build_version: Option<String>,
     pub final_reason_code: Option<String>,
     pub final_error: Option<String>,
+    #[serde(default)]
+    pub last_validation_reason_code: Option<String>,
+    #[serde(default)]
+    pub last_validation_error: Option<String>,
     pub runtime_health: Option<serde_json::Value>,
     pub steps: Vec<SetupReportStepPayload>,
 }
@@ -511,13 +519,23 @@ pub struct ReadSetupReportResponse {
     pub build_version: String,
     pub privacy_accepted: bool,
     pub setup_complete: bool,
+    #[serde(default)]
+    pub startup_gate_complete: bool,
+    #[serde(default)]
+    pub validated_build_version: Option<String>,
     pub final_reason_code: Option<String>,
     pub final_error: Option<String>,
+    #[serde(default)]
+    pub last_validation_reason_code: Option<String>,
+    #[serde(default)]
+    pub last_validation_error: Option<String>,
     pub runtime_health: Option<serde_json::Value>,
     pub steps: Vec<SetupReportStepPayload>,
     pub updated_at: String,
     #[serde(default)]
     pub trusted_for_fast_start: bool,
+    #[serde(default)]
+    pub requires_post_update_validation: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1122,8 +1140,12 @@ pub async fn write_setup_report(
         "build_version": env!("CARGO_PKG_VERSION"),
         "privacy_accepted": payload.privacy_accepted,
         "setup_complete": payload.setup_complete,
+        "startup_gate_complete": payload.startup_gate_complete,
+        "validated_build_version": payload.validated_build_version,
         "final_reason_code": payload.final_reason_code,
         "final_error": payload.final_error,
+        "last_validation_reason_code": payload.last_validation_reason_code,
+        "last_validation_error": payload.last_validation_error,
         "runtime_health": payload.runtime_health,
         "steps": payload.steps,
         "updated_at": Utc::now().to_rfc3339(),
@@ -1144,6 +1166,40 @@ pub async fn write_setup_report(
         )
     })?;
     Ok(())
+}
+
+fn hydrate_setup_report_runtime_flags(report: &mut ReadSetupReportResponse) {
+    let startup_gate_complete = report.startup_gate_complete || report.setup_complete;
+    report.startup_gate_complete = startup_gate_complete;
+
+    let explicit_validated_build = report
+        .validated_build_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let legacy_validated_build = if startup_gate_complete
+        && report
+            .final_error
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        && report.final_reason_code.as_deref() == Some("setup_complete")
+    {
+        Some(report.build_version.trim().to_string())
+    } else {
+        None
+    };
+    report.validated_build_version = explicit_validated_build.or(legacy_validated_build);
+    report.trusted_for_fast_start = report.privacy_accepted && startup_gate_complete;
+    report.requires_post_update_validation = startup_gate_complete
+        && report
+            .validated_build_version
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            != env!("CARGO_PKG_VERSION");
 }
 
 #[tauri::command]
@@ -1174,16 +1230,7 @@ pub async fn read_setup_report(
             ),
         )
     })?;
-    report.trusted_for_fast_start = report.build_version.trim() == env!("CARGO_PKG_VERSION")
-        && report.privacy_accepted
-        && report.setup_complete
-        && report
-            .final_error
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-        && report.final_reason_code.as_deref() == Some("setup_complete");
+    hydrate_setup_report_runtime_flags(&mut report);
     Ok(Some(report))
 }
 
@@ -2622,12 +2669,13 @@ fn extract_zip_archive_with_zip_crate(
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_pyannote_required_free_bytes, install_pyannote_archive, install_runtime_archive,
-        plan_pyannote_background_action_inner, prepare_pyannote_runtime_stage,
-        prepare_pyannote_runtime_swap, promote_staged_pyannote_runtime,
-        rollback_pyannote_runtime_swap, sha256_file_hex, validate_manifest_asset_descriptor,
-        validate_setup_manifest, verify_file_sha256, PyannoteAssetSelection,
-        PyannoteBackgroundActionTrigger,
+        estimate_pyannote_required_free_bytes, hydrate_setup_report_runtime_flags,
+        install_pyannote_archive, install_runtime_archive, plan_pyannote_background_action_inner,
+        prepare_pyannote_runtime_stage, prepare_pyannote_runtime_swap,
+        promote_staged_pyannote_runtime, rollback_pyannote_runtime_swap, sha256_file_hex,
+        validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
+        PyannoteAssetSelection, PyannoteBackgroundActionTrigger, ReadSetupReportResponse,
+        SetupReportStepPayload,
     };
     use crate::release_assets::{
         PyannoteReleaseAsset, PyannoteReleaseManifest, ReleaseAssetDescriptor, RuntimeReleaseAsset,
@@ -2812,6 +2860,61 @@ mod tests {
             size_bytes: None,
             expanded_size_bytes: None,
         }
+    }
+
+    fn setup_report_fixture() -> ReadSetupReportResponse {
+        ReadSetupReportResponse {
+            build_version: "0.1.16".to_string(),
+            privacy_accepted: true,
+            setup_complete: true,
+            startup_gate_complete: false,
+            validated_build_version: None,
+            final_reason_code: Some("setup_complete".to_string()),
+            final_error: None,
+            last_validation_reason_code: None,
+            last_validation_error: None,
+            runtime_health: None,
+            steps: Vec::<SetupReportStepPayload>::new(),
+            updated_at: "2026-04-23T00:00:00Z".to_string(),
+            trusted_for_fast_start: false,
+            requires_post_update_validation: false,
+        }
+    }
+
+    #[test]
+    fn hydrate_setup_report_runtime_flags_trusts_legacy_completed_report_across_updates() {
+        let mut report = setup_report_fixture();
+        hydrate_setup_report_runtime_flags(&mut report);
+
+        assert!(report.trusted_for_fast_start);
+        assert_eq!(report.validated_build_version.as_deref(), Some("0.1.16"));
+        assert!(report.requires_post_update_validation);
+    }
+
+    #[test]
+    fn hydrate_setup_report_runtime_flags_marks_same_build_report_as_fully_validated() {
+        let mut report = setup_report_fixture();
+        report.build_version = env!("CARGO_PKG_VERSION").to_string();
+        hydrate_setup_report_runtime_flags(&mut report);
+
+        assert!(report.trusted_for_fast_start);
+        assert_eq!(
+            report.validated_build_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(!report.requires_post_update_validation);
+    }
+
+    #[test]
+    fn hydrate_setup_report_runtime_flags_does_not_trust_incomplete_setup() {
+        let mut report = setup_report_fixture();
+        report.setup_complete = false;
+        report.final_reason_code = Some("setup_incomplete".to_string());
+        hydrate_setup_report_runtime_flags(&mut report);
+
+        assert!(!report.trusted_for_fast_start);
+        assert!(!report.requires_post_update_validation);
+        assert!(report.validated_build_version.is_none());
     }
 
     #[tokio::test]
