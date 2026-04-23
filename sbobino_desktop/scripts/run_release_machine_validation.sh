@@ -79,6 +79,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+unexpected_validation_error() {
+  local exit_code=$?
+  trap - ERR
+  if [[ "$FINAL_STATUS" == "failed" && -f "$REPORT_PATH" ]]; then
+    exit "$exit_code"
+  fi
+  REPORT_NOTES="Unexpected validation error while running ${MACHINE_CLASS} release validation."
+  FINAL_STATUS="failed"
+  write_report || true
+  exit "$exit_code"
+}
+trap unexpected_validation_error ERR
+
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "Missing required command: $1" >&2
@@ -208,6 +221,7 @@ PY
 }
 
 fail_validation() {
+  trap - ERR
   REPORT_NOTES=$1
   FINAL_STATUS="failed"
   write_report
@@ -494,6 +508,11 @@ prepare_legacy_upgrade_baseline_dmg() {
   local worktree_dir="$TMP_DIR/legacy-upgrade-baseline"
   local release_dir="$worktree_dir/sbobino_desktop"
   local candidate_feed_url="https://github.com/$REPO_SLUG/releases/download/$TAG/latest.json"
+  local baseline_app_dir="$release_dir/target/aarch64-apple-darwin/release/bundle/macos"
+  local baseline_app_path="$baseline_app_dir/Sbobino.app"
+  local baseline_dmg_dir="$release_dir/target/aarch64-apple-darwin/release/bundle/dmg"
+  local baseline_dmg_path="$baseline_dmg_dir/Sbobino_${LEGACY_UPGRADE_BASELINE_VERSION}_aarch64.dmg"
+  local staging_dir
 
   if ! baseline_ref=$(resolve_legacy_upgrade_baseline_git_ref); then
     fail_validation "Legacy baseline v${LEGACY_UPGRADE_BASELINE_VERSION} is unavailable: no public DMG, no local tag, and no fallback git revision were found."
@@ -514,19 +533,41 @@ PY
 
   if ! (
     cd "$release_dir"
-    ./scripts/prepare_local_release.sh "$LEGACY_UPGRADE_BASELINE_VERSION"
+    pushd apps/desktop >/dev/null
+    npm ci
+    SBOBINO_RELEASE_PROFILE=public npm run tauri:build -- --target aarch64-apple-darwin --bundles app
+    popd >/dev/null
+
+    if [[ ! -d "$baseline_app_path" ]]; then
+      echo "Expected baseline app at '$baseline_app_path', but it was not created." >&2
+      exit 1
+    fi
+
+    codesign --force --deep --sign - "$baseline_app_path"
+
+    staging_dir=$(mktemp -d "$TMP_DIR/legacy-dmg-stage.XXXXXX")
+    cp -R "$baseline_app_path" "$staging_dir/"
+    ln -s /Applications "$staging_dir/Applications"
+    mkdir -p "$baseline_dmg_dir"
+    rm -f "$baseline_dmg_path"
+    hdiutil create \
+      -volname "Sbobino" \
+      -srcfolder "$staging_dir" \
+      -ov \
+      -format UDZO \
+      "$baseline_dmg_path" >/dev/null
+    rm -rf "$staging_dir"
   ); then
     git -C "$REPO_ROOT" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
     fail_validation "Failed to build the validation baseline app from git ref '$baseline_ref'."
   fi
 
-  local built_dmg="$release_dir/dist/local-release/v${LEGACY_UPGRADE_BASELINE_VERSION}/Sbobino_${LEGACY_UPGRADE_BASELINE_VERSION}_aarch64.dmg"
-  if [[ ! -f "$built_dmg" ]]; then
+  if [[ ! -f "$baseline_dmg_path" ]]; then
     git -C "$REPO_ROOT" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
-    fail_validation "Legacy baseline build did not produce '$built_dmg'."
+    fail_validation "Legacy baseline build did not produce '$baseline_dmg_path'."
   fi
 
-  cp "$built_dmg" "$downloaded_dmg"
+  cp "$baseline_dmg_path" "$downloaded_dmg"
   git -C "$REPO_ROOT" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
   echo "$downloaded_dmg"
 }
