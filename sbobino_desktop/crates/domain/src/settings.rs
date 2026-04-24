@@ -467,7 +467,7 @@ impl Default for AutomaticImportActivityEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AutomaticImportQuarantineItem {
     pub id: String,
@@ -479,22 +479,6 @@ pub struct AutomaticImportQuarantineItem {
     pub first_detected_at: String,
     pub last_detected_at: String,
     pub retry_count: u32,
-}
-
-impl Default for AutomaticImportQuarantineItem {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            source_id: None,
-            source_label: None,
-            file_path: String::new(),
-            fingerprint_key: None,
-            reason: String::new(),
-            first_detected_at: String::new(),
-            last_detected_at: String::new(),
-            retry_count: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
