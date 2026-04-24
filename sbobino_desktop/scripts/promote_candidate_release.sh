@@ -55,9 +55,7 @@ version = sys.argv[2]
 expected_assets = {
     "release-readiness-proof.json",
     "distribution-readiness-proof.json",
-    "AS-PRIMARY.validation-report.json",
-    "AS-THIRD.validation-report.json",
-    "INTEL-PRIMARY.validation-report.json",
+    "portability-smoke-report.json",
 }
 present_assets = {
     asset.get("name", "").strip()
@@ -85,11 +83,9 @@ gh release download "$TAG" \
   --dir "$TMP_DIR" \
   --pattern "release-readiness-proof.json" \
   --pattern "distribution-readiness-proof.json" \
-  --pattern "AS-PRIMARY.validation-report.json" \
-  --pattern "AS-THIRD.validation-report.json" \
-  --pattern "INTEL-PRIMARY.validation-report.json"
+  --pattern "portability-smoke-report.json"
 
-python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG" "$RELEASE_JSON"
+python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG"
 import json
 import pathlib
 import sys
@@ -97,44 +93,6 @@ import sys
 report_dir = pathlib.Path(sys.argv[1])
 version = sys.argv[2]
 tag = sys.argv[3]
-release = json.loads(sys.argv[4])
-release_url = str(release.get("url", "")).strip()
-
-expected_reports = {
-    "AS-PRIMARY.validation-report.json": {
-        "machine_class": "AS-PRIMARY",
-        "allowed_statuses": {"passed"},
-        "runner_label": "self-hosted,macos,apple-silicon,as-primary",
-        "required_scenarios": [
-            "update_path_validation",
-            "warm_restart",
-            "functional_diarization_smoke",
-        ],
-    },
-    "AS-THIRD.validation-report.json": {
-        "machine_class": "AS-THIRD",
-        "allowed_statuses": {"passed"},
-        "runner_label": "self-hosted,macos,apple-silicon,as-third",
-        "required_scenarios": [
-            "clean_room_install",
-            "warm_restart",
-            "functional_diarization_smoke",
-        ],
-    },
-    "INTEL-PRIMARY.validation-report.json": {
-        "machine_class": "INTEL-PRIMARY",
-        "allowed_statuses": {"passed", "soft_pass"},
-        "runner_label": "self-hosted,macos,x64,intel-primary",
-        "required_scenarios": [
-            "release_metadata_validation",
-            "bootstrap_layer_validation",
-        ],
-    },
-}
-
-def require_non_empty(value: object, label: str, report_name: str) -> None:
-    if not str(value or "").strip():
-        raise SystemExit(f"Stable promotion blocked: {report_name} missing {label}.")
 
 def load_json(path: pathlib.Path, label: str) -> dict:
     if not path.is_file():
@@ -166,49 +124,20 @@ if str(distribution.get("status", "")).strip().lower() != "passed":
 if str(distribution.get("gate", "")).strip() != "distribution_readiness.sh":
     raise SystemExit("Stable promotion blocked: distribution-readiness-proof.json gate mismatch.")
 
-for report_name, expectation in expected_reports.items():
-    report = load_json(report_dir / report_name, report_name)
-    if int(report.get("schema_version", 0)) != 1:
-        raise SystemExit(f"Stable promotion blocked: {report_name} has unsupported schema_version.")
-    if report.get("version") != version:
-        raise SystemExit(f"Stable promotion blocked: {report_name} version mismatch.")
-    if report.get("release_tag") != tag:
-        raise SystemExit(f"Stable promotion blocked: {report_name} release_tag mismatch.")
-    if report.get("machine_class") != expectation["machine_class"]:
-        raise SystemExit(f"Stable promotion blocked: {report_name} machine_class mismatch.")
-    if str(report.get("status", "")).strip().lower() not in expectation["allowed_statuses"]:
-        raise SystemExit(f"Stable promotion blocked: {report_name} is not in an allowed passed state.")
-    require_non_empty(report.get("tester"), "tester", report_name)
-    require_non_empty(report.get("os_name"), "os_name", report_name)
-    require_non_empty(report.get("os_version"), "os_version", report_name)
-    require_non_empty(report.get("tested_at_utc"), "tested_at_utc", report_name)
-    require_non_empty(report.get("release_url"), "release_url", report_name)
-    require_non_empty(report.get("commit_sha"), "commit_sha", report_name)
-    if str(report.get("release_url", "")).strip() != release_url:
-        raise SystemExit(
-            f"Stable promotion blocked: {report_name} release_url does not match the public release URL."
-        )
-    if str(report.get("runner_label", "")).strip() != expectation["runner_label"]:
-        raise SystemExit(f"Stable promotion blocked: {report_name} runner_label mismatch.")
-    required_scenarios = report.get("required_scenarios")
-    if required_scenarios != expectation["required_scenarios"]:
-        raise SystemExit(
-            f"Stable promotion blocked: {report_name} required_scenarios do not match the expected matrix."
-        )
-    scenario_results = report.get("scenario_results")
-    if not isinstance(scenario_results, dict):
-        raise SystemExit(f"Stable promotion blocked: {report_name} is missing scenario_results.")
-    for scenario in expectation["required_scenarios"]:
-        if str(scenario_results.get(scenario, "")).strip().lower() != "passed":
-            raise SystemExit(
-                f"Stable promotion blocked: {report_name} scenario {scenario} is not passed."
-            )
-    if report_name == "INTEL-PRIMARY.validation-report.json":
-        arm64_execution = str(scenario_results.get("arm64_binary_execution", "")).strip().lower()
-        if arm64_execution not in {"passed", "not_applicable"}:
-            raise SystemExit(
-                "Stable promotion blocked: INTEL-PRIMARY arm64_binary_execution must be passed or not_applicable."
-            )
+portability = load_json(
+    report_dir / "portability-smoke-report.json",
+    "portability-smoke-report.json",
+)
+if int(portability.get("schema_version", 0)) != 1:
+    raise SystemExit(
+        "Stable promotion blocked: portability-smoke-report.json has unsupported schema_version."
+    )
+if portability.get("version") != version:
+    raise SystemExit("Stable promotion blocked: portability-smoke-report.json version mismatch.")
+if portability.get("release_tag") != tag:
+    raise SystemExit("Stable promotion blocked: portability-smoke-report.json release_tag mismatch.")
+if str(portability.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("Stable promotion blocked: portability-smoke-report.json is not marked passed.")
 PY
 
 gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease=false

@@ -1161,3 +1161,59 @@ async fn run_file_transcription_preserves_auto_import_metadata_and_fingerprint()
         Some("{\"path\":\"/tmp/memo.wav\",\"dedupe_key\":\"123\"}")
     );
 }
+
+#[tokio::test]
+async fn run_file_transcription_transcodes_wav_inputs_unconditionally() {
+    // Regression: previously, WAV inputs were fs::copy'd straight through to the
+    // pyannote helper, which uses Python's `wave` module and rejects non-PCM
+    // formats (IEEE float, mu-law, ...) with "unknown format: 3". Every job
+    // must now go through ffmpeg so downstream engines receive PCM-16 mono 16 kHz.
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("float32_source.wav");
+    tokio::fs::write(&input_path, b"fake float32 wav payload")
+        .await
+        .expect("failed to create wav file");
+
+    let transcoder = Arc::new(MockTranscoder::default());
+    let speech = Arc::new(MockSpeechEngine {
+        transcript: "already transcoded".to_string(),
+        segments: Vec::new(),
+    });
+    let enhancer = Arc::new(MockEnhancer::default());
+    let repo = Arc::new(InMemoryArtifactRepository::default());
+
+    let service =
+        TranscriptionService::new(transcoder.clone(), speech, enhancer, repo);
+
+    let _ = service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-wav-transcode".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Base,
+                engine: TranscriptionEngine::WhisperCpp,
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_text: String| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("wav transcription should succeed");
+
+    assert_eq!(
+        *transcoder
+            .calls
+            .lock()
+            .expect("transcoder calls lock poisoned"),
+        1,
+        "ffmpeg transcoder must be invoked even for .wav inputs"
+    );
+}

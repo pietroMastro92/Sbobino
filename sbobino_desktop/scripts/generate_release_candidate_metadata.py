@@ -10,85 +10,6 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def build_validation_templates(version: str, tag: str, commit_sha: str) -> dict[str, dict]:
-    return {
-        "AS-PRIMARY.validation-report.json": {
-            "schema_version": 1,
-            "version": version,
-            "release_tag": tag,
-            "release_url": "",
-            "commit_sha": commit_sha,
-            "machine_class": "AS-PRIMARY",
-            "status": "pending",
-            "tester": "",
-            "os_name": "",
-            "os_version": "",
-            "runner_label": "self-hosted,macos,apple-silicon,as-primary",
-            "tested_at_utc": "",
-            "notes": "",
-            "required_scenarios": [
-                "update_path_validation",
-                "warm_restart",
-                "functional_diarization_smoke",
-            ],
-            "scenario_results": {
-                "update_path_validation": "pending",
-                "warm_restart": "pending",
-                "functional_diarization_smoke": "pending",
-            },
-        },
-        "AS-THIRD.validation-report.json": {
-            "schema_version": 1,
-            "version": version,
-            "release_tag": tag,
-            "release_url": "",
-            "commit_sha": commit_sha,
-            "machine_class": "AS-THIRD",
-            "status": "pending",
-            "tester": "",
-            "os_name": "",
-            "os_version": "",
-            "runner_label": "self-hosted,macos,apple-silicon,as-third",
-            "tested_at_utc": "",
-            "notes": "",
-            "required_scenarios": [
-                "clean_room_install",
-                "warm_restart",
-                "functional_diarization_smoke",
-            ],
-            "scenario_results": {
-                "clean_room_install": "pending",
-                "warm_restart": "pending",
-                "functional_diarization_smoke": "pending",
-            },
-        },
-        "INTEL-PRIMARY.validation-report.json": {
-            "schema_version": 1,
-            "version": version,
-            "release_tag": tag,
-            "release_url": "",
-            "commit_sha": commit_sha,
-            "machine_class": "INTEL-PRIMARY",
-            "status": "pending",
-            "tester": "",
-            "os_name": "",
-            "os_version": "",
-            "runner_label": "self-hosted,macos,x64,intel-primary",
-            "tested_at_utc": "",
-            "notes": "",
-            "required_scenarios": [
-                "release_metadata_validation",
-                "bootstrap_layer_validation",
-            ],
-            "scenario_results": {
-                "release_metadata_validation": "pending",
-                "bootstrap_layer_validation": "pending",
-                "arm64_binary_execution": "pending",
-            },
-        },
-    }
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate release-readiness proof and machine validation templates."
@@ -144,16 +65,6 @@ def main() -> int:
         json.dumps(proof, indent=2) + "\n",
         encoding="utf-8",
     )
-
-    for filename, payload in build_validation_templates(
-        version,
-        tag,
-        args.commit_sha.strip(),
-    ).items():
-        (output_dir / filename).write_text(
-            json.dumps(payload, indent=2) + "\n",
-            encoding="utf-8",
-        )
 
     return 0
 

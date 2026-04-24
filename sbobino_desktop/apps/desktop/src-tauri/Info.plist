@@ -4,5 +4,7 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>Sbobino needs microphone access to capture live transcription audio.</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
 </dict>
 </plist>

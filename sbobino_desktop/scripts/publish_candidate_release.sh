@@ -50,9 +50,6 @@ required_assets=(
   "pyannote-model-community-1.zip"
   "release-notes.md"
   "release-readiness-proof.json"
-  "AS-PRIMARY.validation-report.json"
-  "AS-THIRD.validation-report.json"
-  "INTEL-PRIMARY.validation-report.json"
 )
 
 for asset in "${required_assets[@]}"; do
@@ -155,66 +152,6 @@ assert_descriptor_matches_asset("runtime_asset", runtime_release, "runtime asset
 assert_descriptor_matches_asset("pyannote_runtime_asset", pyannote_runtime, "pyannote runtime asset")
 assert_descriptor_matches_asset("pyannote_model_asset", pyannote_model, "pyannote model asset")
 
-expected_reports = {
-    "AS-PRIMARY.validation-report.json": {
-        "machine_class": "AS-PRIMARY",
-        "runner_label": "self-hosted,macos,apple-silicon,as-primary",
-        "required_scenarios": [
-            "update_path_validation",
-            "warm_restart",
-            "functional_diarization_smoke",
-        ],
-        "optional_scenarios": [],
-    },
-    "AS-THIRD.validation-report.json": {
-        "machine_class": "AS-THIRD",
-        "runner_label": "self-hosted,macos,apple-silicon,as-third",
-        "required_scenarios": [
-            "clean_room_install",
-            "warm_restart",
-            "functional_diarization_smoke",
-        ],
-        "optional_scenarios": [],
-    },
-    "INTEL-PRIMARY.validation-report.json": {
-        "machine_class": "INTEL-PRIMARY",
-        "runner_label": "self-hosted,macos,x64,intel-primary",
-        "required_scenarios": [
-            "release_metadata_validation",
-            "bootstrap_layer_validation",
-        ],
-        "optional_scenarios": [
-            "arm64_binary_execution",
-        ],
-    },
-}
-
-for name, expectation in expected_reports.items():
-    report = json.loads((asset_dir / name).read_text(encoding="utf-8"))
-    if int(report.get("schema_version", 0)) != 1:
-        raise SystemExit(f"{name} has an unsupported schema_version.")
-    if report.get("version") != version:
-        raise SystemExit(f"{name} version does not match requested release version.")
-    if report.get("release_tag") != expected_tag:
-        raise SystemExit(f"{name} release_tag does not match requested release tag.")
-    if report.get("machine_class") != expectation["machine_class"]:
-        raise SystemExit(f"{name} machine_class is incorrect.")
-    if str(report.get("runner_label", "")).strip() != expectation["runner_label"]:
-        raise SystemExit(f"{name} runner_label is incorrect.")
-    if str(report.get("status", "")).strip().lower() != "pending":
-        raise SystemExit(f"{name} must start as pending before candidate validation.")
-    scenario_results = report.get("scenario_results")
-    if not isinstance(scenario_results, dict):
-        raise SystemExit(f"{name} is missing scenario_results.")
-    required_scenarios = report.get("required_scenarios")
-    if required_scenarios != expectation["required_scenarios"]:
-        raise SystemExit(f"{name} required_scenarios do not match the expected matrix.")
-    for scenario in expectation["required_scenarios"]:
-        if str(scenario_results.get(scenario, "")).strip().lower() != "pending":
-            raise SystemExit(f"{name} scenario {scenario} must start as pending.")
-    for scenario in expectation["optional_scenarios"]:
-        if str(scenario_results.get(scenario, "")).strip().lower() != "pending":
-            raise SystemExit(f"{name} scenario {scenario} must start as pending.")
 PY
 
 if gh release view "$TAG" --repo "$REPO_SLUG" >/dev/null 2>&1; then
@@ -245,9 +182,6 @@ gh release upload "$TAG" \
   "$ASSET_DIR/pyannote-model-community-1.zip" \
   "$ASSET_DIR/pyannote-manifest.json" \
   "$ASSET_DIR/release-readiness-proof.json" \
-  "$ASSET_DIR/AS-PRIMARY.validation-report.json" \
-  "$ASSET_DIR/AS-THIRD.validation-report.json" \
-  "$ASSET_DIR/INTEL-PRIMARY.validation-report.json" \
   --repo "$REPO_SLUG"
 
 cat <<EOF
@@ -257,8 +191,6 @@ Prerelease candidate published successfully:
 
 Next required steps:
   1. ./scripts/distribution_readiness.sh "$VERSION" "$REPO_SLUG"
-  2. Generate distribution-readiness-proof.json after the remote integrity gate passes
-  3. Validate the exact GitHub prerelease on AS-PRIMARY, AS-THIRD, and INTEL-PRIMARY
-  4. Re-upload distribution-readiness-proof.json plus the three validation report JSON assets
-  5. ./scripts/promote_candidate_release.sh "$VERSION" "$REPO_SLUG"
+  2. Run portability smoke on a hosted macos-14 runner (automated in release.yml)
+  3. ./scripts/promote_candidate_release.sh "$VERSION" "$REPO_SLUG"
 EOF

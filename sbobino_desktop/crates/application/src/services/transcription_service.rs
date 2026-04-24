@@ -120,21 +120,15 @@ impl TranscriptionService {
 
         let wav_path = self.normalized_wav_path(&input_path, &request.job_id);
         let result = async {
-            if input_path.extension().and_then(|s| s.to_str()) != Some("wav") {
-                self.run_cancellable(
-                    &cancellation_token,
-                    self.transcoder.to_wav_mono_16k(&input_path, &wav_path),
-                )
-                .await?;
-            } else {
-                self.run_cancellable(&cancellation_token, async {
-                    fs::copy(&input_path, &wav_path).await.map_err(|e| {
-                        ApplicationError::AudioTranscoding(format!("failed to copy wav input: {e}"))
-                    })?;
-                    Ok(())
-                })
-                .await?;
-            }
+            // Always transcode through ffmpeg so downstream engines (whisper-cli and
+            // the pyannote helper, which uses Python's `wave` module) receive a
+            // deterministic PCM-16 mono 16 kHz stream. Skipping this for `.wav`
+            // inputs broke diarization for IEEE-float WAVs with `unknown format: 3`.
+            self.run_cancellable(
+                &cancellation_token,
+                self.transcoder.to_wav_mono_16k(&input_path, &wav_path),
+            )
+            .await?;
 
             let total_audio_seconds = self.wav_duration_seconds(&wav_path);
 

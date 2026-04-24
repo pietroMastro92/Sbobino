@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RunTranscriptionRequest};
 use sbobino_domain::{
-    ArtifactSourceOrigin, JobProgress, LanguageCode, SpeechModel, TranscriptionEngine,
+    ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, SpeechModel, TranscriptionEngine,
     WhisperOptions,
 };
 
@@ -111,6 +111,7 @@ pub(crate) async fn spawn_transcription_job(
     let cancellation_token = CancellationToken::new();
     let task_cancellation_token = cancellation_token.clone();
     let tasks = state.transcription_tasks.clone();
+    let transcription_gate = state.transcription_gate.clone();
     let automatic_import_metadata = request.metadata.clone();
     let automatic_import_state = state.clone();
 
@@ -137,6 +138,53 @@ pub(crate) async fn spawn_transcription_job(
                 },
             );
         });
+
+        // Serialize heavy work. If another job is already running, emit a
+        // Queued progress event so the UI can show "Waiting" and the user
+        // can still cancel. Dropping `_permit` at end of this block releases
+        // the gate for the next queued job.
+        let _permit = match transcription_gate.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                emit_progress(JobProgress {
+                    job_id: task_job_id.clone(),
+                    stage: JobStage::Queued,
+                    message: "Waiting for previous transcription to finish".to_string(),
+                    percentage: 0,
+                    current_seconds: None,
+                    total_seconds: None,
+                });
+                tokio::select! {
+                    biased;
+                    _ = task_cancellation_token.cancelled() => {
+                        let mut registry = tasks.lock().await;
+                        registry.remove(&cleanup_job_id);
+                        return;
+                    }
+                    permit = transcription_gate.clone().acquire_owned() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            let _ = app.emit(
+                                "transcription://failed",
+                                JobFailedEvent {
+                                    job_id: task_job_id.clone(),
+                                    message: "Transcription gate closed unexpectedly".to_string(),
+                                },
+                            );
+                            let mut registry = tasks.lock().await;
+                            registry.remove(&cleanup_job_id);
+                            return;
+                        }
+                    },
+                }
+            }
+        };
+
+        if task_cancellation_token.is_cancelled() {
+            let mut registry = tasks.lock().await;
+            registry.remove(&cleanup_job_id);
+            return;
+        }
 
         let transcription_service = match runtime_factory.build_service() {
             Ok(service) => service,

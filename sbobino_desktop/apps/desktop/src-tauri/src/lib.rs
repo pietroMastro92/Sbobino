@@ -15,7 +15,7 @@ use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
     Emitter,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::commands::artifacts::{
@@ -172,6 +172,7 @@ pub fn run() {
                 settings_service: bundle.settings_service,
                 runtime_factory: bundle.runtime_factory,
                 transcription_tasks: Arc::new(Mutex::new(HashMap::new())),
+                transcription_gate: Arc::new(Semaphore::new(1)),
                 realtime: RealtimeRuntime {
                     engine: Arc::new(Mutex::new(realtime_engine)),
                     preview: Arc::new(Mutex::new(None)),

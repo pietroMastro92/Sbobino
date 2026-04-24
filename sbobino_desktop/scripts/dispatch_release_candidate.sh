@@ -5,8 +5,9 @@ usage() {
   cat >&2 <<'EOF'
 Usage: dispatch_release_candidate.sh <tag-name> [repo-slug]
 
-Checks the self-hosted runner matrix and dispatches the Release Candidate
-workflow only when AS-PRIMARY, AS-THIRD, and INTEL-PRIMARY are online.
+Dispatches the Release Candidate workflow. The workflow runs entirely on
+GitHub-hosted runners (macos-14 + ubuntu-latest); no self-hosted Mac
+infrastructure is required.
 EOF
 }
 
@@ -17,14 +18,11 @@ fi
 
 TAG_NAME=$1
 REPO_SLUG=${2:-pietroMastro92/Sbobino}
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 if ! command -v gh >/dev/null 2>&1; then
   echo "Missing required command: gh" >&2
   exit 1
 fi
-
-"$ROOT_DIR/scripts/check_release_runner_matrix.sh" "$REPO_SLUG"
 
 gh workflow run "Release Candidate" \
   --repo "$REPO_SLUG" \

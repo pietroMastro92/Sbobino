@@ -402,27 +402,13 @@ Nothing in this folder has been published automatically.
    - \`pyannote-model-community-1.zip\`
    - \`pyannote-manifest.json\`
    - \`release-readiness-proof.json\`
-   - \`AS-PRIMARY.validation-report.json\`
-   - \`AS-THIRD.validation-report.json\`
-   - \`INTEL-PRIMARY.validation-report.json\`
    - \`release-notes.md\` (use this exact file as the GitHub release body)
 5. Run \`./scripts/distribution_readiness.sh "$VERSION"\` from \`sbobino_desktop/\`.
 6. Generate \`distribution-readiness-proof.json\` after the remote integrity gate passes.
-7. Validate that exact GitHub release against \`docs/distribution-validation-plan.md\` on:
-   - \`AS-PRIMARY\`
-   - \`AS-THIRD\`
-   - \`INTEL-PRIMARY\`
-8. Update all machine validation report JSON files with:
-   - the GitHub release URL
-   - tester name
-   - OS name/version
-   - \`tested_at_utc\`
-   - per-scenario results
-   - top-level \`status\` set to \`passed\` only when every mandatory scenario passed
-   - use \`soft_pass\` only for \`INTEL-PRIMARY\` when the arm64 binary is intentionally marked \`not_applicable\`
-9. Re-upload \`distribution-readiness-proof.json\` plus all three machine validation JSON files to the same GitHub prerelease with \`gh release upload --clobber\`.
-10. Promote to stable only with \`./scripts/promote_candidate_release.sh "$VERSION"\`.
-11. If validation fails, retire the prerelease and cut a new patch version. Do not overwrite a stable release in place.
+7. Run the portability smoke job on a hosted macos-14 runner (automated in release.yml).
+8. Re-upload \`distribution-readiness-proof.json\` and \`portability-smoke-report.json\` to the same GitHub prerelease with \`gh release upload --clobber\`.
+9. Promote to stable only with \`./scripts/promote_candidate_release.sh "$VERSION"\`.
+10. If validation fails, retire the prerelease and cut a new patch version. Do not overwrite a stable release in place.
 
 ## gh CLI example
 
@@ -437,9 +423,6 @@ python3 ./scripts/write_distribution_readiness_proof.py \
 
 gh release upload "v$VERSION" \
   "$OUTPUT_DIR/distribution-readiness-proof.json" \
-  "$OUTPUT_DIR/AS-PRIMARY.validation-report.json" \
-  "$OUTPUT_DIR/AS-THIRD.validation-report.json" \
-  "$OUTPUT_DIR/INTEL-PRIMARY.validation-report.json" \
   --clobber
 
 ./scripts/promote_candidate_release.sh "$VERSION"
@@ -506,21 +489,21 @@ Sbobino version installed with working runtime, whisper models, and pyannote.
 ## Before update
 
 1. Confirm the existing public version can open normally.
-2. Confirm `Settings > Local Models` reports pyannote \`Ready\`.
+2. Confirm \`Settings > Local Models\` reports pyannote \`Ready\`.
 3. Run one short diarized transcription to verify the pre-update baseline.
 
 ## Candidate validation
 
 1. Update to `v__VERSION__` using the real shipped flow.
 2. Launch the updated app.
-3. Open `Settings > Local Models`.
+3. Open \`Settings > Local Models\`.
 4. Run one diarized transcription.
 
 ## Decision rule
 
 - Pass only if the update completes without manual repair and pyannote stays usable the same way as before.
 - If any step fails, delete the prerelease and cut a new patch version.
-- Record the result in \`AS-PRIMARY.validation-report.json\` before promotion.
+- Record the result in the portability smoke report before promotion.
 EOF
 
 python3 - "$OUTPUT_DIR/UPGRADE_VALIDATION.md" "$VERSION" <<'PY'
@@ -549,9 +532,6 @@ Artifacts:
   - pyannote-model-community-1.zip
   - pyannote-manifest.json
   - release-readiness-proof.json
-  - AS-PRIMARY.validation-report.json
-  - AS-THIRD.validation-report.json
-  - INTEL-PRIMARY.validation-report.json
 EOF
 
 if [[ -f "$OUTPUT_DIR/Sbobino.app.tar.gz.sig" ]]; then
