@@ -34,13 +34,28 @@ RELEASE_API_URL="https://api.github.com/repos/$REPO_SLUG/releases/tags/$TAG"
 
 python3 - "$RELEASE_API_URL" <<'PY'
 import json
+import os
 import sys
+import urllib.error
 import urllib.request
 
 url = sys.argv[1]
-request = urllib.request.Request(url, headers={"User-Agent": "sbobino-distribution-readiness"})
-with urllib.request.urlopen(request) as response:
-    release = json.load(response)
+token = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+headers = {"User-Agent": "sbobino-distribution-readiness"}
+if token:
+    headers["Authorization"] = f"Bearer {token}"
+
+request = urllib.request.Request(url, headers=headers)
+try:
+    with urllib.request.urlopen(request) as response:
+        release = json.load(response)
+except urllib.error.HTTPError as exc:
+    if exc.code == 403 and not token:
+        raise SystemExit(
+            "GitHub API rate limit exceeded while checking release metadata. "
+            "Set GH_TOKEN or GITHUB_TOKEN to run distribution_readiness.sh reliably."
+        ) from exc
+    raise
 if release.get("draft", False):
     raise SystemExit("distribution_readiness.sh cannot validate draft releases.")
 PY
