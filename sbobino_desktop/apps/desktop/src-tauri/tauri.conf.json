@@ -38,9 +38,7 @@
       "entitlements": "entitlements.plist",
       "minimumSystemVersion": "13.0"
     },
-    "resources": [
-      "resources/pyannote"
-    ],
+    "resources": [],
     "externalBin": [
       "binaries/whisper-cli",
       "binaries/whisperkit-cli",
