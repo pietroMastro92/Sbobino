@@ -222,24 +222,17 @@ jobs:
         working-directory: sbobino_desktop
         run: |
           VERSION="${TAG_NAME#v}"
-          cat > "dist/github-release/v$VERSION/release-notes.md" <<EOF
-          ## Sbobino ${VERSION}
-
-          Candidate release built from the exact tagged sources for public distribution validation.
-
-          ### What is included
-
-          - Native desktop app for macOS Apple Silicon.
-          - Managed offline runtime setup for speech transcription and pyannote diarization.
-          - Release manifests and updater metadata tied to this exact candidate.
-          - Fail-closed promotion path: stable is blocked until hosted and self-hosted validation reports are uploaded as passed.
-
-          ### Validation contract
-
-          - This release is published first as a prerelease candidate.
-          - Stable promotion requires \`release_readiness.sh\`, \`distribution_readiness.sh\`, \`AS-PRIMARY\`, \`AS-THIRD\`, and \`INTEL-PRIMARY\` evidence on the exact public assets.
-          - If any mandatory validation fails, retire this candidate and cut a new patch version instead of overwriting the stable release.
-          EOF
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG_NAME}^" 2>/dev/null || true)
+          if [[ -z "$PREV_TAG" ]]; then
+            # First release ever: walk every reachable commit.
+            PREV_TAG=""
+          fi
+          mkdir -p "dist/github-release/v$VERSION"
+          python3 ./scripts/generate_codex_style_release_notes.py \
+            "$VERSION" \
+            "$PREV_TAG" \
+            "$TAG_NAME" \
+            --out "dist/github-release/v$VERSION/release-notes.md"
 
       - name: Generate updater feed
         working-directory: sbobino_desktop
