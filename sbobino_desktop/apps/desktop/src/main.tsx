@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
+import { ErrorBoundary } from "./lib/ErrorBoundary";
 import {
   fetchSettingsSnapshot,
   readSetupReport,
@@ -10,6 +11,18 @@ import "./styles.css";
 
 const standaloneSettingsWindow =
   new URLSearchParams(window.location.search).get("window") === "settings";
+
+// Surface async crashes that previously vanished into a white window. With
+// devtools enabled in tauri.conf.json the user can press cmd+option+i and
+// read these in the console.
+window.addEventListener("error", (event) => {
+  // eslint-disable-next-line no-console
+  console.error("[window.error]", event.error ?? event.message, event);
+});
+window.addEventListener("unhandledrejection", (event) => {
+  // eslint-disable-next-line no-console
+  console.error("[unhandledrejection]", event.reason);
+});
 
 const root = ReactDOM.createRoot(document.getElementById("root") as HTMLElement);
 
@@ -53,10 +66,12 @@ async function renderApp(): Promise<void> {
 
   root.render(
     <React.StrictMode>
-      <App
-        standaloneSettingsWindow={standaloneSettingsWindow}
-        initialBootstrap={initialBootstrap}
-      />
+      <ErrorBoundary>
+        <App
+          standaloneSettingsWindow={standaloneSettingsWindow}
+          initialBootstrap={initialBootstrap}
+        />
+      </ErrorBoundary>
     </React.StrictMode>,
   );
 }

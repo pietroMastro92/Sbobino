@@ -4318,47 +4318,70 @@ export function App({
       }
 
       const uCompleted = await subscribeJobCompleted((artifact) => {
-        failedJobMessagesRef.current.delete(artifact.job_id);
-        const pendingContext = pendingTranscriptionContextRef.current.get(
-          artifact.job_id,
-        );
-        pendingTranscriptionContextRef.current.delete(artifact.job_id);
-        const wasRunning = artifact.job_id === activeJobIdRef.current;
-        const wasFocused = artifact.job_id === focusedJobIdRef.current;
-        const hydratedArtifact = pendingContext
-          ? {
-              ...artifact,
-              title: pendingContext.title?.trim()
-                ? pendingContext.title
-                : artifact.title,
-              source_label: pendingContext.inputPath
-                ? fileLabel(pendingContext.inputPath)
-                : artifact.source_label,
-              parent_artifact_id:
-                pendingContext.parentId ?? artifact.parent_artifact_id,
+        // Wrap the whole handler in try/catch so a malformed artifact (or a
+        // bug in hydrateDetail / setSection) cannot tear down the React
+        // tree mid-event. Without this guard, a single throw here used to
+        // wipe every component when job 1 finished and job 2 was about to
+        // start, leaving the user with an empty white window.
+        try {
+          failedJobMessagesRef.current.delete(artifact.job_id);
+          const pendingContext = pendingTranscriptionContextRef.current.get(
+            artifact.job_id,
+          );
+          pendingTranscriptionContextRef.current.delete(artifact.job_id);
+          const wasRunning = artifact.job_id === activeJobIdRef.current;
+          const wasFocused = artifact.job_id === focusedJobIdRef.current;
+          const hydratedArtifact = pendingContext
+            ? {
+                ...artifact,
+                title: pendingContext.title?.trim()
+                  ? pendingContext.title
+                  : artifact.title,
+                source_label: pendingContext.inputPath
+                  ? fileLabel(pendingContext.inputPath)
+                  : artifact.source_label,
+                parent_artifact_id:
+                  pendingContext.parentId ?? artifact.parent_artifact_id,
+              }
+            : artifact;
+
+          prependArtifact(hydratedArtifact);
+          setQueueItems((previous) =>
+            previous.filter((entry) => entry.job_id !== artifact.job_id),
+          );
+
+          if (wasRunning) {
+            clearStartupWatchdog();
+            clearActiveJob();
+            activeJobIdRef.current = null;
+            setActiveJobTitle("");
+          }
+
+          if (wasFocused) {
+            setFocusedJobId(null);
+            setActiveJobPreviewText("");
+            activeJobDeltaSequenceRef.current = -1;
+            setActiveDetailContext(null);
+            try {
+              hydrateDetail(hydratedArtifact);
+            } catch (hydrationError) {
+              // eslint-disable-next-line no-console
+              console.error(
+                "[transcription://completed] hydrateDetail failed",
+                hydrationError,
+                hydratedArtifact,
+              );
             }
-          : artifact;
-
-        prependArtifact(hydratedArtifact);
-        setQueueItems((previous) =>
-          previous.filter((entry) => entry.job_id !== artifact.job_id),
-        );
-
-        if (wasRunning) {
-          clearStartupWatchdog();
-          clearActiveJob();
-          activeJobIdRef.current = null;
-          setActiveJobTitle("");
-        }
-
-        if (wasFocused) {
-          setFocusedJobId(null);
-          setActiveJobPreviewText("");
-          activeJobDeltaSequenceRef.current = -1;
-          setActiveDetailContext(null);
-          hydrateDetail(hydratedArtifact);
-          setSection("detail");
-          setError(null);
+            setSection("detail");
+            setError(null);
+          }
+        } catch (handlerError) {
+          // eslint-disable-next-line no-console
+          console.error(
+            "[transcription://completed] handler crashed",
+            handlerError,
+            artifact,
+          );
         }
       });
       if (unmounted) {

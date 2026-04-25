@@ -25,6 +25,10 @@ function walkSourceFiles(directory: string): string[] {
       || absolutePath.endsWith(".test.tsx")
       || absolutePath.endsWith(".d.ts")
       || absolutePath.endsWith(path.sep + "i18n.ts")
+      // ErrorBoundary is the safety net that must render even if the i18n
+      // catalog itself cannot load, so its copy is intentionally hardcoded
+      // English. Skip it from the raw-visible-JSX gate.
+      || absolutePath.endsWith(path.sep + "ErrorBoundary.tsx")
     ) {
       continue;
     }
