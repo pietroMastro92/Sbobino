@@ -8183,50 +8183,112 @@ export function App({
 
   async function onDeleteArtifactsWithConsent(ids: string[]): Promise<void> {
     const uniqueIds = Array.from(new Set(ids));
-    if (uniqueIds.length === 0) return;
+    const isBulk = ids.length > 1;
+    // eslint-disable-next-line no-console
+    console.error("[delete] enter", {
+      ids,
+      uniqueIds,
+      isBulk,
+      artifactsInStore: useAppStore.getState().artifacts.length,
+    });
+    if (uniqueIds.length === 0) {
+      // eslint-disable-next-line no-console
+      console.error("[delete] early-return uniqueIds=0", { ids });
+      return;
+    }
 
     const targets = artifacts.filter((artifact) =>
       uniqueIds.includes(artifact.id),
     );
-    if (targets.length === 0) return;
+    // eslint-disable-next-line no-console
+    console.error("[delete] resolved targets", {
+      targetsCount: targets.length,
+      targetIds: targets.map((target) => target.id),
+      uniqueIds,
+    });
+    if (targets.length === 0) {
+      // eslint-disable-next-line no-console
+      console.error("[delete] early-return targets=0 (stale ids?)", {
+        uniqueIds,
+        knownIdsSample: artifacts.slice(0, 5).map((artifact) => artifact.id),
+      });
+      return;
+    }
 
     const details = `${targets
       .slice(0, 5)
       .map((artifact) => `- ${artifact.title}`)
       .join("\n")}${targets.length > 5 ? "\n- ..." : ""}`;
 
-    const confirmed = await confirmDialog(
-      targets.length === 1
-        ? t(
-            "deleted.confirmMove",
-            'Move "{title}" to Recently Deleted?\n\nYou can restore this item later from Recently Deleted.',
-            {
-              title: targets[0].title,
-            },
-          )
-        : t(
-            "deleted.confirmMoveMany",
-            "Move {count} transcriptions to Recently Deleted?\n\n{items}\n\nYou can restore these items later from Recently Deleted.",
-            {
-              count: targets.length,
-              items: details,
-            },
-          ),
-      {
-        title: t("deleted.confirmMoveTitle", "Move to Recently Deleted"),
-        kind: "warning",
-      },
-    );
-    if (!confirmed) return;
+    let confirmed: boolean | undefined;
+    try {
+      confirmed = await confirmDialog(
+        targets.length === 1
+          ? t(
+              "deleted.confirmMove",
+              'Move "{title}" to Recently Deleted?\n\nYou can restore this item later from Recently Deleted.',
+              {
+                title: targets[0].title,
+              },
+            )
+          : t(
+              "deleted.confirmMoveMany",
+              "Move {count} transcriptions to Recently Deleted?\n\n{items}\n\nYou can restore these items later from Recently Deleted.",
+              {
+                count: targets.length,
+                items: details,
+              },
+            ),
+        {
+          title: t("deleted.confirmMoveTitle", "Move to Recently Deleted"),
+          kind: "warning",
+        },
+      );
+    } catch (confirmError) {
+      // eslint-disable-next-line no-console
+      console.error("[delete] confirmDialog threw", confirmError);
+      setError(
+        formatUiError("error.deleteFailed", "Delete failed", confirmError),
+      );
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.error("[delete] confirmDialog result", {
+      confirmed,
+      confirmedType: typeof confirmed,
+      isBulk,
+    });
+    if (!confirmed) {
+      // eslint-disable-next-line no-console
+      console.error("[delete] early-return user-cancelled-or-undefined", {
+        confirmed,
+      });
+      return;
+    }
 
     try {
       const result = await deleteArtifacts(uniqueIds);
+      // eslint-disable-next-line no-console
+      console.error("[delete] backend response", {
+        deletedFromBackend: result.deleted,
+        uniqueIds,
+      });
       if (result.deleted <= 0) {
+        // eslint-disable-next-line no-console
+        console.error("[delete] backend reported zero — likely already deleted or stale ids", {
+          uniqueIds,
+          knownIdsSample: artifacts.slice(0, 5).map((artifact) => artifact.id),
+        });
         setError(t("deleted.noneDeleted", "No transcriptions were deleted."));
         return;
       }
 
       removeArtifacts(uniqueIds);
+      // eslint-disable-next-line no-console
+      console.error("[delete] removeArtifacts done", {
+        storeArtifactsAfter: useAppStore.getState().artifacts.length,
+        removedIds: uniqueIds,
+      });
       await refreshDeletedArtifactsList();
 
       if (activeArtifact && uniqueIds.includes(activeArtifact.id)) {
@@ -8237,6 +8299,11 @@ export function App({
 
       setError(null);
     } catch (deleteError) {
+      // eslint-disable-next-line no-console
+      console.error("[delete] backend threw", {
+        deleteError,
+        uniqueIds,
+      });
       setError(
         formatUiError("error.deleteFailed", "Delete failed", deleteError),
       );
@@ -8272,11 +8339,20 @@ export function App({
   }
 
   async function onDeleteSelectedArtifacts(): Promise<void> {
+    // eslint-disable-next-line no-console
+    console.error("[delete] bulk-button enter", {
+      selectedArtifactIdsLength: selectedArtifactIds.length,
+      selectedArtifactIds,
+    });
     if (selectedArtifactIds.length === 0) {
+      // eslint-disable-next-line no-console
+      console.error("[delete] bulk-button early-return empty selection");
       return;
     }
     await onDeleteArtifactsWithConsent(selectedArtifactIds);
     setSelectedArtifactIds([]);
+    // eslint-disable-next-line no-console
+    console.error("[delete] bulk-button cleared selection");
   }
 
   async function onRestoreArtifactsWithConsent(ids: string[]): Promise<void> {

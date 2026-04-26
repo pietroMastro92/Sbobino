@@ -5654,9 +5654,14 @@ body.sidebar-resizing {
   display: grid;
   gap: 14px;
   width: 100%;
-  max-width: none;
+  max-width: 880px;
   align-content: start;
-  grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
+  /* Single column. The previous auto-fit rule turned panes with several
+     sections (Automatic Import: 5 panels) into a 5-column row on wide
+     windows, with each panel cropped to ~360px and unreadable. Settings
+     panes should always stack vertically; horizontal density is the
+     sidebar's job. */
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .settings-panel,
