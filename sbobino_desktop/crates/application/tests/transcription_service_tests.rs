@@ -1163,11 +1163,11 @@ async fn run_file_transcription_preserves_auto_import_metadata_and_fingerprint()
 }
 
 #[tokio::test]
-async fn run_file_transcription_transcodes_non_normalized_wav_inputs() {
+async fn run_file_transcription_transcodes_wav_inputs_unconditionally() {
     // Regression: previously, WAV inputs were fs::copy'd straight through to the
     // pyannote helper, which uses Python's `wave` module and rejects non-PCM
-    // formats (IEEE float, mu-law, ...) with "unknown format: 3". Inputs that
-    // do NOT match PCM-16 mono 16 kHz must still go through ffmpeg.
+    // formats (IEEE float, mu-law, ...) with "unknown format: 3". Every job
+    // must now go through ffmpeg so downstream engines receive PCM-16 mono 16 kHz.
     let temp = tempdir().expect("failed to create temp dir");
     let input_path = temp.path().join("float32_source.wav");
     tokio::fs::write(&input_path, b"fake float32 wav payload")
@@ -1213,71 +1213,6 @@ async fn run_file_transcription_transcodes_non_normalized_wav_inputs() {
             .lock()
             .expect("transcoder calls lock poisoned"),
         1,
-        "ffmpeg transcoder must run for WAVs whose header is not PCM-16 mono 16 kHz"
-    );
-}
-
-#[tokio::test]
-async fn run_file_transcription_skips_ffmpeg_when_wav_already_normalized() {
-    // Performance: skip the ffmpeg subprocess (saves ~2-10 s per job) when the
-    // input is already PCM-16 mono 16 kHz. Build a real WAV with hound so the
-    // header probe accepts it.
-    let temp = tempdir().expect("failed to create temp dir");
-    let input_path = temp.path().join("normalized.wav");
-    {
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(&input_path, spec)
-            .expect("failed to create normalized wav writer");
-        for _ in 0..1_600 {
-            writer.write_sample(0_i16).expect("write sample");
-        }
-        writer.finalize().expect("finalize wav");
-    }
-
-    let transcoder = Arc::new(MockTranscoder::default());
-    let speech = Arc::new(MockSpeechEngine {
-        transcript: "already normalized".to_string(),
-        segments: Vec::new(),
-    });
-    let enhancer = Arc::new(MockEnhancer::default());
-    let repo = Arc::new(InMemoryArtifactRepository::default());
-
-    let service = TranscriptionService::new(transcoder.clone(), speech, enhancer, repo);
-
-    let _ = service
-        .run_file_transcription(
-            RunTranscriptionRequest {
-                job_id: "job-skip-ffmpeg".to_string(),
-                input_path: input_path.to_string_lossy().to_string(),
-                language: LanguageCode::En,
-                model: SpeechModel::Base,
-                engine: TranscriptionEngine::WhisperCpp,
-                enable_ai: false,
-                source_origin: ArtifactSourceOrigin::Imported,
-                whisper_options: WhisperOptions::default(),
-                title: None,
-                parent_id: None,
-                metadata: BTreeMap::new(),
-                source_fingerprint_json: None,
-            },
-            Arc::new(|_| {}),
-            Arc::new(|_text: String| {}),
-            CancellationToken::new(),
-        )
-        .await
-        .expect("normalized wav transcription should succeed");
-
-    assert_eq!(
-        *transcoder
-            .calls
-            .lock()
-            .expect("transcoder calls lock poisoned"),
-        0,
-        "ffmpeg transcoder must not run for already-normalized PCM-16 mono 16 kHz wav inputs"
+        "ffmpeg transcoder must be invoked for every input"
     );
 }

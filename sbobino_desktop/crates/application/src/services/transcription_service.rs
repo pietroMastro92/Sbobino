@@ -117,31 +117,16 @@ impl TranscriptionService {
 
         let wav_path = self.normalized_wav_path(&input_path, &request.job_id);
         let result = async {
-            // Downstream engines (whisper-cli and the pyannote helper, which uses
-            // Python's `wave` module) require a PCM-16 mono 16 kHz stream. ffmpeg
-            // guarantees that, but spawning + transcoding adds ~2-10 s before the
-            // user sees any progress. Probe the WAV header first; if the file is
-            // already normalised, just copy it. Anything that does not match
-            // (IEEE float, stereo, non-16k, non-WAV containers like mp3/m4a) still
-            // falls through to the ffmpeg path, so the `unknown format: 3` fix
-            // from v0.1.31 cannot regress.
-            if Self::wav_already_normalized(&input_path) {
-                self.run_cancellable(&cancellation_token, async {
-                    fs::copy(&input_path, &wav_path).await.map_err(|e| {
-                        ApplicationError::AudioTranscoding(format!(
-                            "failed to copy normalized wav input: {e}"
-                        ))
-                    })?;
-                    Ok(())
-                })
-                .await?;
-            } else {
-                self.run_cancellable(
-                    &cancellation_token,
-                    self.transcoder.to_wav_mono_16k(&input_path, &wav_path),
-                )
-                .await?;
-            }
+            // Always transcode through ffmpeg so downstream engines (whisper-cli and
+            // the pyannote helper, which uses Python's `wave` module) receive a
+            // deterministic PCM-16 mono 16 kHz stream. The skip-ffmpeg fast path
+            // shipped in v0.1.36 caused field reports of "transcription does not
+            // start"; reverted until we can repro and root-cause.
+            self.run_cancellable(
+                &cancellation_token,
+                self.transcoder.to_wav_mono_16k(&input_path, &wav_path),
+            )
+            .await?;
 
             let total_audio_seconds = self.wav_duration_seconds(&wav_path);
 
@@ -796,22 +781,6 @@ impl TranscriptionService {
         }
 
         Some(frames / (spec.sample_rate as f32))
-    }
-
-    fn wav_already_normalized(path: &Path) -> bool {
-        // Whisper-cli and the pyannote helper both require PCM-16 mono 16 kHz.
-        // When the input already matches we can skip ffmpeg entirely and save
-        // 2-10 s of transcode time per job. Anything else (stereo, 44.1 kHz,
-        // float samples, mp3/m4a containers) returns false and goes through
-        // the ffmpeg path, preserving the IEEE-float fix from v0.1.31.
-        let Ok(reader) = hound::WavReader::open(path) else {
-            return false;
-        };
-        let spec = reader.spec();
-        spec.sample_format == hound::SampleFormat::Int
-            && spec.bits_per_sample == 16
-            && spec.channels == 1
-            && spec.sample_rate == 16_000
     }
 
     fn assign_speakers_to_segments(

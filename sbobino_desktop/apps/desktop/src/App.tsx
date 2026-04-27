@@ -7145,13 +7145,10 @@ export function App({
             fetchTranscriptionStartPreflight({
               model: settings.transcription.model,
             }),
-            // Was 8000ms; the preflight spawns ffmpeg/whisper-cli/whisper-stream
-            // to probe runnability and is the largest chunk of the "click ->
-            // first segment" delay. Cap to 3s so the user starts seeing actual
-            // queue progress sooner; if the preflight fails we still continue
-            // with the backend start, so worst case is a degraded but functional
-            // first job.
-            3_000,
+            // v0.1.36 lowered this to 3s; reverted to 8s after field reports
+            // that transcriptions did not start. Awaiting repro before
+            // re-attempting the optimisation.
+            8_000,
             t("error.preflightTimedOut", "Preflight timed out."),
           );
         } catch (preflightError) {
@@ -7294,11 +7291,10 @@ export function App({
               ),
             );
           }
-          // Was 120_000ms. Realistic preflight + ffmpeg + whisper warm time on
-          // Apple Silicon is ~5-15 s; 45 s is comfortable headroom while
-          // failing fast enough that the user does not stare at silence for
-          // two minutes when the runtime is genuinely broken.
-        }, 45_000);
+          // v0.1.36 lowered to 45s; reverted to 120s after field reports
+          // that transcriptions did not start. Long files / cold caches need
+          // more headroom than 45s before declaring a startup failure.
+        }, 120_000);
       } catch (startError) {
         clearStartupWatchdog();
         if (options?.queuedJobId) {

@@ -1,6 +1,6 @@
 [package]
 name = "sbobino-desktop"
-version = "0.1.36"
+version = "0.1.37"
 description = "Sbobino Desktop Rewrite"
 authors.workspace = true
 license.workspace = true
