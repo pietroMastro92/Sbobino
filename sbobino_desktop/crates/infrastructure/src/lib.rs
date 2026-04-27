@@ -51,6 +51,12 @@ pub struct RuntimeTranscriptionFactory {
     runtime_source_policy: RuntimeSourcePolicy,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeHealthMode {
+    Full,
+    Preflight,
+}
+
 const REQUIRED_MODEL_FILES: [&str; 5] = [
     "ggml-tiny.bin",
     "ggml-base.bin",
@@ -990,7 +996,8 @@ impl RuntimeTranscriptionFactory {
         }
 
         self.install_bundled_pyannote_override_if_available()?;
-        let pyannote_health = self.pyannote_health(settings);
+        self.ensure_managed_pyannote_runtime_layout();
+        let pyannote_health = self.pyannote_health(settings, RuntimeHealthMode::Full);
         if !pyannote_health.ready {
             return Err(pyannote_health.message);
         }
@@ -1117,8 +1124,23 @@ impl RuntimeTranscriptionFactory {
     }
 
     pub fn runtime_health(&self) -> Result<RuntimeHealth, String> {
+        self.runtime_health_with_mode(RuntimeHealthMode::Full)
+    }
+
+    pub fn runtime_health_preflight(&self) -> Result<RuntimeHealth, String> {
+        self.runtime_health_with_mode(RuntimeHealthMode::Preflight)
+    }
+
+    pub fn warmup_managed_pyannote_runtime(&self) {
+        self.ensure_managed_pyannote_runtime_layout();
+    }
+
+    fn runtime_health_with_mode(&self, mode: RuntimeHealthMode) -> Result<RuntimeHealth, String> {
         let settings = self.load_settings()?;
-        self.install_bundled_pyannote_override_if_available()?;
+        if mode == RuntimeHealthMode::Full {
+            self.install_bundled_pyannote_override_if_available()?;
+            self.ensure_managed_pyannote_runtime_layout();
+        }
         let configured_models_dir = if settings.transcription.models_dir.trim().is_empty() {
             settings.models_dir.clone()
         } else {
@@ -1165,7 +1187,7 @@ impl RuntimeTranscriptionFactory {
         } else {
             models_dir.join(coreml_encoder).is_dir()
         };
-        let pyannote = self.pyannote_health(&settings);
+        let pyannote = self.pyannote_health(&settings, mode);
         let required_models_ready = required_initial_setup_models()
             .iter()
             .all(|model_file| models_dir.join(model_file).exists());
@@ -1490,8 +1512,6 @@ impl RuntimeTranscriptionFactory {
     }
 
     fn managed_pyannote_python_path(&self) -> Option<String> {
-        let _ = ensure_embedded_libpython_is_present(&self.managed_pyannote_python_dir());
-        let _ = ensure_embedded_pyannote_stdlib_is_present(&self.managed_pyannote_python_dir());
         if pyannote_external_framework_reference(&self.managed_pyannote_python_dir()).is_some() {
             return None;
         }
@@ -1507,6 +1527,12 @@ impl RuntimeTranscriptionFactory {
         let python_root = self.managed_pyannote_python_dir();
         let python_path = self.managed_pyannote_python_path()?;
         validate_pyannote_python_runtime(&python_root, Path::new(&python_path)).err()
+    }
+
+    fn ensure_managed_pyannote_runtime_layout(&self) {
+        let runtime_root = self.managed_pyannote_python_dir();
+        let _ = ensure_embedded_libpython_is_present(&runtime_root);
+        let _ = ensure_embedded_pyannote_stdlib_is_present(&runtime_root);
     }
 
     fn ensure_managed_pyannote_model_dir(&self) -> Result<Option<String>, String> {
@@ -1665,7 +1691,11 @@ impl RuntimeTranscriptionFactory {
         Ok(())
     }
 
-    fn pyannote_health(&self, settings: &AppSettings) -> PyannoteRuntimeHealth {
+    fn pyannote_health(
+        &self,
+        settings: &AppSettings,
+        mode: RuntimeHealthMode,
+    ) -> PyannoteRuntimeHealth {
         let diarization = &settings.transcription.speaker_diarization;
         let managed_python_root = self.managed_pyannote_python_dir();
         let runtime_installed = self.managed_pyannote_python_path().is_some();
@@ -1711,7 +1741,10 @@ impl RuntimeTranscriptionFactory {
             && cached_runtime_layout_ready
             && manifest_matches_host
             && status_reason_code == "ok";
-        let runtime_validation_error = if runtime_installed && !should_trust_cached_ready_status {
+        let runtime_validation_error = if mode == RuntimeHealthMode::Full
+            && runtime_installed
+            && !should_trust_cached_ready_status
+        {
             self.pyannote_runtime_validation_error()
         } else {
             None
@@ -4385,7 +4418,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_health_repairs_missing_embedded_libpython_before_runnable_check() {
+    fn ensure_managed_pyannote_runtime_layout_repairs_missing_embedded_libpython() {
         let (_temp, factory) = build_factory();
         persist_enabled_diarization(&factory);
 
@@ -4419,7 +4452,7 @@ mod tests {
             .join("libpython3.11.dylib")
             .exists());
 
-        let _ = factory.managed_pyannote_python_path();
+        factory.ensure_managed_pyannote_runtime_layout();
 
         assert!(factory
             .managed_pyannote_python_dir()

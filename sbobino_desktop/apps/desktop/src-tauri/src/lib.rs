@@ -16,6 +16,7 @@ use tauri::{
     Emitter,
 };
 use tokio::sync::{Mutex, Semaphore};
+use tracing::warn;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::commands::artifacts::{
@@ -155,6 +156,19 @@ pub fn run() {
 
             let bundle = sbobino_infrastructure::bootstrap(&data_dir, resources_dir)
                 .map_err(|e| std::io::Error::other(format!("bootstrap failure: {e}")))?;
+
+            {
+                let runtime_factory = bundle.runtime_factory.clone();
+                tauri::async_runtime::spawn(async move {
+                    let warmup = tokio::task::spawn_blocking(move || {
+                        runtime_factory.warmup_managed_pyannote_runtime();
+                    })
+                    .await;
+                    if let Err(error) = warmup {
+                        warn!("pyannote runtime warmup task failed: {error}");
+                    }
+                });
+            }
 
             let realtime_engine = bundle
                 .runtime_factory

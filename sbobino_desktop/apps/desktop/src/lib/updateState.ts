@@ -20,11 +20,16 @@ export const DISMISSED_UPDATE_VERSION_STORAGE_KEY = "sbobino.update.dismissedVer
 export const SHARED_UPDATE_STATE_STORAGE_KEY = "sbobino.update.sharedState";
 export const LAST_PYANNOTE_AUTO_ACTION_STORAGE_KEY =
   "sbobino.update.lastPyannoteAutoAction";
+export const PYANNOTE_AUTO_ACTION_MARKER_TTL_MS = 12 * 60 * 60 * 1000;
+
+export type PyannoteAutoActionOutcome = "pending" | "succeeded" | "failed";
 
 export type PyannoteAutoActionMarker = {
   appVersion: string;
   trigger: PyannoteBackgroundActionTrigger;
   reasonCode: string;
+  expiresAt: number;
+  outcome: PyannoteAutoActionOutcome;
 };
 
 function readStorageValue(key: string): string | null {
@@ -64,7 +69,12 @@ export function readLastPyannoteAutoActionMarker(): PyannoteAutoActionMarker | n
     if (
       typeof parsed.appVersion !== "string" ||
       typeof parsed.trigger !== "string" ||
-      typeof parsed.reasonCode !== "string"
+      typeof parsed.reasonCode !== "string" ||
+      typeof parsed.expiresAt !== "number" ||
+      !Number.isFinite(parsed.expiresAt) ||
+      (parsed.outcome !== "pending" &&
+        parsed.outcome !== "succeeded" &&
+        parsed.outcome !== "failed")
     ) {
       return null;
     }
@@ -72,6 +82,8 @@ export function readLastPyannoteAutoActionMarker(): PyannoteAutoActionMarker | n
       appVersion: parsed.appVersion.trim(),
       trigger: parsed.trigger as PyannoteBackgroundActionTrigger,
       reasonCode: parsed.reasonCode.trim(),
+      expiresAt: parsed.expiresAt,
+      outcome: parsed.outcome,
     };
   } catch {
     return null;
@@ -92,6 +104,8 @@ export function writeLastPyannoteAutoActionMarker(
       appVersion: marker.appVersion.trim(),
       trigger: marker.trigger,
       reasonCode: marker.reasonCode.trim(),
+      expiresAt: marker.expiresAt,
+      outcome: marker.outcome,
     }),
   );
 }
@@ -101,6 +115,12 @@ export function matchesPyannoteAutoActionMarker(
   candidate: PyannoteAutoActionMarker,
 ): boolean {
   if (!marker) {
+    return false;
+  }
+  if (marker.outcome !== "pending") {
+    return false;
+  }
+  if (marker.expiresAt <= Date.now()) {
     return false;
   }
   return (

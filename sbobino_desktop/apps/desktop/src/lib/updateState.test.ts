@@ -43,6 +43,8 @@ describe("updateState", () => {
       appVersion: "0.1.16",
       trigger: "post_update",
       reasonCode: "pyannote_version_mismatch",
+      expiresAt: Date.now() + 60_000,
+      outcome: "pending",
     });
 
     expect(readLastSeenAppVersion()).toBe("0.1.16");
@@ -51,6 +53,8 @@ describe("updateState", () => {
       appVersion: "0.1.16",
       trigger: "post_update",
       reasonCode: "pyannote_version_mismatch",
+      expiresAt: expect.any(Number),
+      outcome: "pending",
     });
   });
 
@@ -59,6 +63,8 @@ describe("updateState", () => {
       appVersion: "0.1.16",
       trigger: "post_update" as const,
       reasonCode: "pyannote_version_mismatch",
+      expiresAt: Date.now() + 60_000,
+      outcome: "pending" as const,
     };
 
     expect(matchesPyannoteAutoActionMarker(current, current)).toBe(true);
@@ -79,6 +85,35 @@ describe("updateState", () => {
         ...current,
         appVersion: "0.1.17",
       }),
+    ).toBe(false);
+  });
+
+  it("does not match expired or failed pyannote auto-action markers", () => {
+    const candidate = {
+      appVersion: "0.1.38",
+      trigger: "startup" as const,
+      reasonCode: "pyannote_repair_required",
+      expiresAt: Date.now() + 60_000,
+      outcome: "pending" as const,
+    };
+
+    expect(
+      matchesPyannoteAutoActionMarker(
+        {
+          ...candidate,
+          expiresAt: Date.now() - 1,
+        },
+        candidate,
+      ),
+    ).toBe(false);
+    expect(
+      matchesPyannoteAutoActionMarker(
+        {
+          ...candidate,
+          outcome: "failed",
+        },
+        candidate,
+      ),
     ).toBe(false);
   });
 
