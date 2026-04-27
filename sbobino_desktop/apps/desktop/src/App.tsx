@@ -7219,11 +7219,11 @@ export function App({
                 ),
             });
           } else {
+            const failureMessage = formatTranscriptionPreflightMessage(preflight);
             setTranscriptionStartBadge({
               state: "error",
-              message: formatTranscriptionPreflightMessage(preflight),
+              message: failureMessage,
             });
-            const failureMessage = formatTranscriptionPreflightMessage(preflight);
             if (preserveCurrentArtifact) {
               setError(failureMessage);
             } else {
