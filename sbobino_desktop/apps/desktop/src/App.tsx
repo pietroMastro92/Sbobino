@@ -151,6 +151,7 @@ import {
 import { loadInitialAppBootstrapData } from "./lib/appBootstrap";
 import {
   matchesPyannoteAutoActionMarker,
+  PYANNOTE_AUTO_ACTION_MARKER_TTL_MS,
   readDismissedUpdateVersion,
   readLastPyannoteAutoActionMarker,
   readLastSeenAppVersion,
@@ -239,6 +240,7 @@ import { LiveMicrophoneWaveform } from "./components/LiveMicrophoneWaveform";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 import { LoadingAnimation } from "./components/LoadingAnimation";
 import { SetupMatrixIndicator } from "./components/SetupMatrixIndicator";
+import { StatusBadge } from "./components/StatusBadge";
 import {
   t,
   useTranslation,
@@ -562,6 +564,16 @@ const PYANNOTE_AUTO_ACTION_FAILURE_REASON_CODES = new Set([
   "pyannote_version_mismatch",
   "pyannote_arch_mismatch",
 ]);
+type TranscriptionStartBadgeState = "warning" | "ready" | "error";
+
+type TranscriptionStartBadge = {
+  state: TranscriptionStartBadgeState;
+  message: string;
+};
+
+function isPyannotePreflightReasonCode(reasonCode: string): boolean {
+  return reasonCode.startsWith("pyannote_");
+}
 
 function getPyannoteBackgroundActionStatusMessage(
   action: PyannoteBackgroundActionResponse,
@@ -3024,6 +3036,8 @@ export function App({
   const [startupRequirementsError, setStartupRequirementsError] = useState<
     string | null
   >(null);
+  const [transcriptionStartBadge, setTranscriptionStartBadge] =
+    useState<TranscriptionStartBadge | null>(null);
   const [initialSetupRunning, setInitialSetupRunning] = useState(false);
   const [initialSetupError, setInitialSetupError] = useState<string | null>(
     null,
@@ -4600,7 +4614,18 @@ export function App({
           pyannoteProvisioningActiveRef.current ||
           provisioningProgressKindRef.current === "pyannote_runtime" ||
           provisioningProgressKindRef.current === "pyannote_model";
-        if (pyannoteProvisioningFailed || (wasPyannoteProvisioning && event.state !== "running")) {
+        if (wasPyannoteProvisioning && event.state !== "running") {
+          const existingMarker = readLastPyannoteAutoActionMarker();
+          if (existingMarker) {
+            writeLastPyannoteAutoActionMarker({
+              ...existingMarker,
+              outcome:
+                event.state === "completed" && !pyannoteProvisioningFailed
+                  ? "succeeded"
+                  : "failed",
+            });
+          }
+        } else if (pyannoteProvisioningFailed) {
           writeLastPyannoteAutoActionMarker(null);
         }
         if (wasPyannoteProvisioning && event.state !== "running") {
@@ -6482,6 +6507,8 @@ export function App({
         appVersion,
         trigger,
         reasonCode: action.reason_code || "pyannote_repair_required",
+        expiresAt: Date.now() + PYANNOTE_AUTO_ACTION_MARKER_TTL_MS,
+        outcome: "pending" as const,
       };
       if (
         matchesPyannoteAutoActionMarker(
@@ -6507,7 +6534,10 @@ export function App({
       }
 
       pyannoteProvisioningActiveRef.current = false;
-      writeLastPyannoteAutoActionMarker(null);
+      writeLastPyannoteAutoActionMarker({
+        ...marker,
+        outcome: "failed",
+      });
       setProvisioning((previous) => ({
         ...previous,
         running: false,
@@ -6515,7 +6545,13 @@ export function App({
       }));
     } catch (error) {
       pyannoteProvisioningActiveRef.current = false;
-      writeLastPyannoteAutoActionMarker(null);
+      const previousMarker = readLastPyannoteAutoActionMarker();
+      if (previousMarker) {
+        writeLastPyannoteAutoActionMarker({
+          ...previousMarker,
+          outcome: "failed",
+        });
+      }
       console.warn(`Automatic pyannote action '${trigger}' failed:`, error);
     }
   }
@@ -7140,6 +7176,13 @@ export function App({
         }
 
         let preflight: TranscriptionStartPreflight | null = null;
+        setTranscriptionStartBadge({
+          state: "warning",
+          message: t(
+            "transcription.preflight.checking",
+            "Checking transcription readiness...",
+          ),
+        });
         try {
           preflight = await withTimeout(
             fetchTranscriptionStartPreflight({
@@ -7152,24 +7195,56 @@ export function App({
             t("error.preflightTimedOut", "Preflight timed out."),
           );
         } catch (preflightError) {
+          setTranscriptionStartBadge({
+            state: "warning",
+            message: t(
+              "transcription.preflight.degraded",
+              "Starting with degraded preflight checks.",
+            ),
+          });
           console.warn(
             "Transcription preflight failed, continuing with backend start:",
             preflightError,
           );
         }
         if (preflight && !preflight.allowed) {
-          const failureMessage = formatTranscriptionPreflightMessage(preflight);
-          if (preserveCurrentArtifact) {
-            setError(failureMessage);
+          if (isPyannotePreflightReasonCode(preflight.reason_code)) {
+            setTranscriptionStartBadge({
+              state: "warning",
+              message:
+                formatTranscriptionPreflightMessage(preflight) ||
+                t(
+                  "transcription.preflight.pyannoteWarning",
+                  "Pyannote needs attention, transcription will continue.",
+                ),
+            });
           } else {
-            presentTranscriptionFailure(failureMessage, nextDetailContext);
+            const failureMessage = formatTranscriptionPreflightMessage(preflight);
+            setTranscriptionStartBadge({
+              state: "error",
+              message: failureMessage,
+            });
+            if (preserveCurrentArtifact) {
+              setError(failureMessage);
+            } else {
+              presentTranscriptionFailure(failureMessage, nextDetailContext);
+            }
+            if (options?.queuedJobId) {
+              setQueueItems((previous) =>
+                previous.filter((entry) => entry.job_id !== options.queuedJobId),
+              );
+            }
+            return;
           }
-          if (options?.queuedJobId) {
-            setQueueItems((previous) =>
-              previous.filter((entry) => entry.job_id !== options.queuedJobId),
-            );
-          }
-          return;
+        }
+        if (preflight?.allowed) {
+          setTranscriptionStartBadge({
+            state: "ready",
+            message: t(
+              "transcription.preflight.ready",
+              "Transcription preflight ready.",
+            ),
+          });
         }
 
         const startResult = await withTimeout(
@@ -7297,6 +7372,10 @@ export function App({
         }, 120_000);
       } catch (startError) {
         clearStartupWatchdog();
+        setTranscriptionStartBadge({
+          state: "error",
+          message: formatAppError(startError),
+        });
         if (options?.queuedJobId) {
           setQueueItems((previous) =>
             previous.filter((entry) => entry.job_id !== options.queuedJobId),
@@ -9676,6 +9755,13 @@ export function App({
             {t("home.history", "History")}
           </button>
         </div>
+
+        {transcriptionStartBadge ? (
+          <StatusBadge
+            variant={transcriptionStartBadge.state}
+            message={transcriptionStartBadge.message}
+          />
+        ) : null}
 
         {homeAudioInputPath ? (
           <section className="panel-card home-audio-player-card">

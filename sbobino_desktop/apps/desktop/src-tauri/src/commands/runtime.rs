@@ -254,7 +254,7 @@ pub async fn ensure_transcription_runtime(
 ) -> Result<EnsureRuntimeResponse, CommandError> {
     let health = state
         .runtime_factory
-        .runtime_health()
+        .runtime_health_preflight()
         .map_err(|e| CommandError::new("runtime_health", e))?;
 
     if runtime_toolchain_ready(&health) {
