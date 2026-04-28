@@ -43,7 +43,7 @@ use crate::commands::realtime::{
 };
 use crate::commands::runtime::{
     ensure_transcription_runtime, get_realtime_start_readiness, get_transcription_runtime_health,
-    get_transcription_start_preflight,
+    get_transcription_runtime_status, get_transcription_start_preflight,
 };
 use crate::commands::settings::{
     delete_prompt, get_ai_capability_status, get_ai_providers, get_settings, get_settings_snapshot,
@@ -262,6 +262,7 @@ pub fn run() {
             ensure_transcription_runtime,
             get_realtime_start_readiness,
             get_transcription_runtime_health,
+            get_transcription_runtime_status,
             get_transcription_start_preflight,
             check_updates,
             open_settings_window,

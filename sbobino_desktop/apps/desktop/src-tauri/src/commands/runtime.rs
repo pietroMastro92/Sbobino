@@ -124,6 +124,38 @@ fn first_managed_runtime_failure(
     None
 }
 
+fn runtime_health_response(health: sbobino_infrastructure::RuntimeHealth) -> RuntimeHealthResponse {
+    RuntimeHealthResponse {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        host_os: health.host_os,
+        host_arch: health.host_arch,
+        is_apple_silicon: health.is_apple_silicon,
+        preferred_engine: engine_to_wire(&health.preferred_engine).to_string(),
+        configured_engine: engine_to_wire(&health.configured_engine).to_string(),
+        runtime_source: health.runtime_source,
+        managed_runtime_required: health.managed_runtime_required,
+        managed_runtime: health.managed_runtime,
+        ffmpeg_path: health.ffmpeg_path,
+        ffmpeg_resolved: health.ffmpeg_resolved,
+        ffmpeg_available: health.ffmpeg_available,
+        whisper_cli_path: health.whisper_cli_path,
+        whisper_cli_resolved: health.whisper_cli_resolved,
+        whisper_cli_available: health.whisper_cli_available,
+        whisper_stream_path: health.whisper_stream_path,
+        whisper_stream_resolved: health.whisper_stream_resolved,
+        whisper_stream_available: health.whisper_stream_available,
+        models_dir_configured: health.models_dir_configured,
+        models_dir_resolved: health.models_dir_resolved,
+        model_filename: health.model_filename,
+        model_present: health.model_present,
+        coreml_encoder_present: health.coreml_encoder_present,
+        missing_models: health.missing_models,
+        missing_encoders: health.missing_encoders,
+        pyannote: health.pyannote,
+        setup_complete: health.setup_complete,
+    }
+}
+
 fn is_legacy_whisperkit_path(path: &str) -> bool {
     path.to_ascii_lowercase().contains("whisperkit-cli")
 }
@@ -516,33 +548,17 @@ pub async fn get_transcription_runtime_health(
         .runtime_health()
         .map_err(|e| CommandError::new("runtime_health", e))?;
 
-    Ok(RuntimeHealthResponse {
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
-        host_os: health.host_os,
-        host_arch: health.host_arch,
-        is_apple_silicon: health.is_apple_silicon,
-        preferred_engine: engine_to_wire(&health.preferred_engine).to_string(),
-        configured_engine: engine_to_wire(&health.configured_engine).to_string(),
-        runtime_source: health.runtime_source,
-        managed_runtime_required: health.managed_runtime_required,
-        managed_runtime: health.managed_runtime,
-        ffmpeg_path: health.ffmpeg_path,
-        ffmpeg_resolved: health.ffmpeg_resolved,
-        ffmpeg_available: health.ffmpeg_available,
-        whisper_cli_path: health.whisper_cli_path,
-        whisper_cli_resolved: health.whisper_cli_resolved,
-        whisper_cli_available: health.whisper_cli_available,
-        whisper_stream_path: health.whisper_stream_path,
-        whisper_stream_resolved: health.whisper_stream_resolved,
-        whisper_stream_available: health.whisper_stream_available,
-        models_dir_configured: health.models_dir_configured,
-        models_dir_resolved: health.models_dir_resolved,
-        model_filename: health.model_filename,
-        model_present: health.model_present,
-        coreml_encoder_present: health.coreml_encoder_present,
-        missing_models: health.missing_models,
-        missing_encoders: health.missing_encoders,
-        pyannote: health.pyannote,
-        setup_complete: health.setup_complete,
-    })
+    Ok(runtime_health_response(health))
+}
+
+#[tauri::command]
+pub async fn get_transcription_runtime_status(
+    state: State<'_, AppState>,
+) -> Result<RuntimeHealthResponse, CommandError> {
+    let health = state
+        .runtime_factory
+        .runtime_health_preflight()
+        .map_err(|e| CommandError::new("runtime_status", e))?;
+
+    Ok(runtime_health_response(health))
 }

@@ -28,3 +28,13 @@ export function replaceQueuedTranscriptionJob(
 ): JobProgress[] {
   return items.map((item) => (item.job_id === queuedJobId ? startedJob : item));
 }
+
+export function shouldFocusStartedTranscription({
+  queuedPromotion,
+  preserveCurrentArtifact,
+}: {
+  queuedPromotion: boolean;
+  preserveCurrentArtifact: boolean;
+}): boolean {
+  return !queuedPromotion && !preserveCurrentArtifact;
+}

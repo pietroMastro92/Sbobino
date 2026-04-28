@@ -5,6 +5,7 @@ import {
   buildQueuedTranscriptionJobId,
   isQueuedTranscriptionJobId,
   replaceQueuedTranscriptionJob,
+  shouldFocusStartedTranscription,
 } from "./transcriptionQueue";
 
 describe("transcriptionQueue helpers", () => {
@@ -36,5 +37,26 @@ describe("transcriptionQueue helpers", () => {
       startedJob,
       buildQueuedTranscriptionJob("queued-start:2", "Queued transcription job."),
     ]);
+  });
+
+  it("focuses manual starts but keeps queued promotions in the background", () => {
+    expect(
+      shouldFocusStartedTranscription({
+        queuedPromotion: false,
+        preserveCurrentArtifact: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldFocusStartedTranscription({
+        queuedPromotion: true,
+        preserveCurrentArtifact: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldFocusStartedTranscription({
+        queuedPromotion: false,
+        preserveCurrentArtifact: true,
+      }),
+    ).toBe(false);
   });
 });

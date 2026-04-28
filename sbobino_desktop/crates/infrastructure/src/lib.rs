@@ -110,6 +110,7 @@ pub struct PyannoteRuntimeHealth {
     pub ready: bool,
     pub runtime_installed: bool,
     pub model_installed: bool,
+    pub runtime_dir: String,
     pub arch: String,
     pub device: String,
     pub source: String,
@@ -1698,6 +1699,10 @@ impl RuntimeTranscriptionFactory {
     ) -> PyannoteRuntimeHealth {
         let diarization = &settings.transcription.speaker_diarization;
         let managed_python_root = self.managed_pyannote_python_dir();
+        let runtime_dir = self
+            .managed_pyannote_runtime_dir()
+            .to_string_lossy()
+            .to_string();
         let runtime_installed = self.managed_pyannote_python_path().is_some();
         let model_installed = is_pyannote_model_dir(&self.managed_pyannote_model_dir());
         let manifest = self.read_managed_pyannote_manifest();
@@ -1765,6 +1770,7 @@ impl RuntimeTranscriptionFactory {
                 ready: true,
                 runtime_installed,
                 model_installed,
+                runtime_dir,
                 arch,
                 device,
                 source,
@@ -1796,6 +1802,7 @@ impl RuntimeTranscriptionFactory {
                 ready: true,
                 runtime_installed,
                 model_installed,
+                runtime_dir,
                 arch,
                 device,
                 source,
@@ -1885,6 +1892,7 @@ impl RuntimeTranscriptionFactory {
             ready,
             runtime_installed,
             model_installed,
+            runtime_dir,
             arch,
             device,
             source,
@@ -3999,6 +4007,13 @@ mod tests {
         assert!(health.pyannote.enabled);
         assert!(!health.pyannote.ready);
         assert_eq!(health.pyannote.reason_code, "pyannote_runtime_missing");
+        assert_eq!(
+            health.pyannote.runtime_dir,
+            factory
+                .managed_pyannote_runtime_dir()
+                .to_string_lossy()
+                .to_string()
+        );
     }
 
     #[test]
@@ -4092,6 +4107,13 @@ mod tests {
             .expect("runtime health should load");
         assert!(health.pyannote.ready);
         assert_eq!(health.pyannote.reason_code, "ok");
+        assert_eq!(
+            health.pyannote.runtime_dir,
+            factory
+                .managed_pyannote_runtime_dir()
+                .to_string_lossy()
+                .to_string()
+        );
     }
 
     #[test]

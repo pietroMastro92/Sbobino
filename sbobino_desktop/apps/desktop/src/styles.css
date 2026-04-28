@@ -2692,6 +2692,65 @@ code {
 
 .summary-editor {
   font-size: 1rem;
+  min-height: 220px;
+  height: min(42vh, 420px);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+}
+
+.summary-view {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 20px 24px;
+}
+
+.summary-view-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.summary-markdown {
+  display: grid;
+  gap: 12px;
+  max-width: 860px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.summary-markdown h2,
+.summary-markdown h3,
+.summary-markdown h4 {
+  margin: 0;
+  line-height: 1.2;
+}
+
+.summary-markdown h2 {
+  font-size: 1.32rem;
+}
+
+.summary-markdown h3 {
+  font-size: 1.12rem;
+}
+
+.summary-markdown h4 {
+  font-size: 1rem;
+}
+
+.summary-markdown p,
+.summary-markdown ul,
+.summary-markdown ol {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.55;
+}
+
+.summary-markdown ul,
+.summary-markdown ol {
+  padding-left: 1.25rem;
 }
 
 .emotion-view {

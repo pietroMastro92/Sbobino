@@ -604,7 +604,7 @@ pub async fn provisioning_status(
     let models_dir = PathBuf::from(state.runtime_factory.resolve_models_dir(&models_dir_value));
     let runtime_health = state
         .runtime_factory
-        .runtime_health()
+        .runtime_health_preflight()
         .map_err(|e| CommandError::new("runtime_health", e))?;
 
     let missing_models = collect_missing_models(&models_dir);

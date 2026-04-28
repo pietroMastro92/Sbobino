@@ -610,6 +610,7 @@ export type PyannoteRuntimeHealth = {
   ready: boolean;
   runtime_installed: boolean;
   model_installed: boolean;
+  runtime_dir: string;
   arch: string;
   device: string;
   source: string;

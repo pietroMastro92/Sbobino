@@ -378,6 +378,10 @@ export async function fetchRuntimeHealth(): Promise<RuntimeHealth> {
   return invoke<RuntimeHealth>("get_transcription_runtime_health");
 }
 
+export async function fetchRuntimeStatus(): Promise<RuntimeHealth> {
+  return invoke<RuntimeHealth>("get_transcription_runtime_status");
+}
+
 export async function readSetupReport(): Promise<InitialSetupReport | null> {
   return invoke<InitialSetupReport | null>("read_setup_report");
 }

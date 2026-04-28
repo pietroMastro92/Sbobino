@@ -78,6 +78,7 @@ import {
   fetchRealtimeStartReadiness,
   fetchTranscriptionStartPreflight,
   fetchRuntimeHealth,
+  fetchRuntimeStatus,
   fetchSettingsSnapshot,
   generateArtifactPack,
   getArtifact,
@@ -185,6 +186,7 @@ import {
   buildQueuedTranscriptionJobId,
   isQueuedTranscriptionJobId,
   replaceQueuedTranscriptionJob,
+  shouldFocusStartedTranscription,
 } from "./lib/transcriptionQueue";
 import { stripAnsi } from "./lib/ansiText";
 import { buildConfidenceTranscript } from "./lib/whisperConfidence";
@@ -240,7 +242,7 @@ import { LiveMicrophoneWaveform } from "./components/LiveMicrophoneWaveform";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 import { LoadingAnimation } from "./components/LoadingAnimation";
 import { SetupMatrixIndicator } from "./components/SetupMatrixIndicator";
-import { StatusBadge } from "./components/StatusBadge";
+import { SummaryMarkdown } from "./components/SummaryMarkdown";
 import {
   t,
   useTranslation,
@@ -525,6 +527,14 @@ type TranscriptionStartRequest = PendingTranscriptionContext & {
 
 type QueuedTranscriptionStart = TranscriptionStartRequest & {
   queueId: string;
+};
+
+type TranscriptionJobSnapshot = {
+  context: ActiveDetailContext | null;
+  previewText: string;
+  deltaSequence: number;
+  title: string;
+  progress: JobProgress | null;
 };
 
 const languageOptions: Array<{ value: LanguageCode; label: string }> = [
@@ -2959,6 +2969,7 @@ export function App({
   const [activeJobPreviewText, setActiveJobPreviewText] = useState("");
   const [activeJobTitle, setActiveJobTitle] = useState("");
   const [focusedJobId, setFocusedJobId] = useState<string | null>(null);
+  const [isEditingSummary, setIsEditingSummary] = useState(false);
   const [selectedSegmentSourceIndex, setSelectedSegmentSourceIndex] = useState<
     number | null
   >(null);
@@ -3036,8 +3047,13 @@ export function App({
   const [startupRequirementsError, setStartupRequirementsError] = useState<
     string | null
   >(null);
-  const [transcriptionStartBadge, setTranscriptionStartBadge] =
-    useState<TranscriptionStartBadge | null>(null);
+  const setTranscriptionStartBadge = (badge: TranscriptionStartBadge | null) => {
+    if (badge?.state === "error") {
+      console.error("[transcription preflight]", badge.message);
+    } else if (badge?.state === "warning") {
+      console.warn("[transcription preflight]", badge.message);
+    }
+  };
   const [initialSetupRunning, setInitialSetupRunning] = useState(false);
   const [initialSetupError, setInitialSetupError] = useState<string | null>(
     null,
@@ -3335,6 +3351,9 @@ export function App({
   const pendingTranscriptionContextRef = useRef<
     Map<string, PendingTranscriptionContext>
   >(new Map());
+  const transcriptionJobSnapshotsRef = useRef<
+    Map<string, TranscriptionJobSnapshot>
+  >(new Map());
   const queuedTranscriptionSequenceRef = useRef(0);
   const startupWatchdogRef = useRef<number | null>(null);
   const settingsSaveSequenceRef = useRef(0);
@@ -3592,7 +3611,7 @@ export function App({
     }
 
     if (settingsPane === "transcription") {
-      void refreshRuntimeHealth();
+      void refreshRuntimeStatus();
     }
   }, [settingsPane, standaloneSettingsWindow]);
 
@@ -3634,7 +3653,7 @@ export function App({
         const previousSeenVersion = readLastSeenAppVersion();
         const initialSettingsPromise = fetchSettingsSnapshot();
         const initialRuntimeHealthPromise = shouldPrimeSettingsDiagnostics
-          ? fetchRuntimeHealth()
+          ? fetchRuntimeStatus()
           : Promise.resolve(
               initialBootstrap?.setupReport?.runtime_health ?? null,
             );
@@ -3709,7 +3728,7 @@ export function App({
                 listDeletedArtifacts,
                 provisioningStatus,
                 provisioningModels,
-                fetchRuntimeHealth,
+                fetchRuntimeHealth: fetchRuntimeStatus,
               },
               { standaloneSettingsWindow },
             );
@@ -4285,6 +4304,7 @@ export function App({
           ...event,
           message: resolvedMessage,
         };
+        updateTranscriptionJobSnapshot(event.job_id, { progress: queueEvent });
         setQueueItems((previous) =>
           pushOrReplaceQueueItem(previous, queueEvent),
         );
@@ -4339,6 +4359,7 @@ export function App({
         // start, leaving the user with an empty white window.
         try {
           failedJobMessagesRef.current.delete(artifact.job_id);
+          transcriptionJobSnapshotsRef.current.delete(artifact.job_id);
           const pendingContext = pendingTranscriptionContextRef.current.get(
             artifact.job_id,
           );
@@ -4413,6 +4434,7 @@ export function App({
           payload.job_id,
           resolvedFailureMessage,
         );
+        transcriptionJobSnapshotsRef.current.delete(payload.job_id);
         const failedContext = pendingTranscriptionContextRef.current.get(
           payload.job_id,
         );
@@ -4460,25 +4482,31 @@ export function App({
       }
 
       const uTranscriptionDelta = await subscribeTranscriptionDelta((delta) => {
-        if (delta.job_id !== focusedJobIdRef.current) {
+        const snapshot = transcriptionJobSnapshotsRef.current.get(delta.job_id);
+        const previousSequence = snapshot?.deltaSequence ?? -1;
+        if (delta.sequence <= previousSequence) {
           return;
         }
-        if (delta.sequence <= activeJobDeltaSequenceRef.current) {
+        const next = delta.text ?? "";
+        if (!next.trim()) {
+          updateTranscriptionJobSnapshot(delta.job_id, {
+            deltaSequence: delta.sequence,
+          });
           return;
         }
-        activeJobDeltaSequenceRef.current = delta.sequence;
 
-        setActiveJobPreviewText((previous) => {
-          const next = delta.text ?? "";
-          if (!next.trim()) return previous;
-
-          // Some engines emit snapshot-style updates, others append finalized lines.
-          if (delta.mode === "replace") {
-            return next;
-          }
-
-          return mergeTranscriptionPreview(previous, next);
+        const previewText =
+          delta.mode === "replace"
+            ? next
+            : mergeTranscriptionPreview(snapshot?.previewText ?? "", next);
+        updateTranscriptionJobSnapshot(delta.job_id, {
+          previewText,
+          deltaSequence: delta.sequence,
         });
+        if (delta.job_id === focusedJobIdRef.current) {
+          activeJobDeltaSequenceRef.current = delta.sequence;
+          setActiveJobPreviewText(previewText);
+        }
       });
       if (unmounted) {
         uTranscriptionDelta();
@@ -5765,6 +5793,7 @@ export function App({
     setTranscriptViewMode(optimizedTranscriptExists ? "optimized" : "original");
     setDraftSummary(artifact.summary);
     setDraftFaqs(artifact.faqs);
+    setIsEditingSummary(false);
     setDraftEmotionAnalysis(parsePersistedEmotionAnalysis(artifact));
     setTrimRetranscriptionError(null);
     if (options?.resetChat) {
@@ -5790,6 +5819,20 @@ export function App({
     });
   }
 
+  function updateTranscriptionJobSnapshot(
+    jobId: string,
+    patch: Partial<TranscriptionJobSnapshot>,
+  ): void {
+    const previous = transcriptionJobSnapshotsRef.current.get(jobId);
+    transcriptionJobSnapshotsRef.current.set(jobId, {
+      context: patch.context ?? previous?.context ?? null,
+      previewText: patch.previewText ?? previous?.previewText ?? "",
+      deltaSequence: patch.deltaSequence ?? previous?.deltaSequence ?? -1,
+      title: patch.title ?? previous?.title ?? "",
+      progress: patch.progress ?? previous?.progress ?? null,
+    });
+  }
+
   function nextChatMessageId(prefix: "user" | "assistant"): string {
     chatMessageSerialRef.current += 1;
     return `${prefix}-${chatMessageSerialRef.current}`;
@@ -5801,8 +5844,10 @@ export function App({
   ): void {
     clearStartupWatchdog();
     const switchingJob = focusedJobIdRef.current !== jobId;
+    const snapshot = transcriptionJobSnapshotsRef.current.get(jobId);
+    const resolvedContext = detailContext ?? snapshot?.context ?? null;
     setFocusedJobId(jobId);
-    setActiveDetailContext(detailContext ?? null);
+    setActiveDetailContext(resolvedContext);
     setActiveArtifact(null);
     setDetailMode("transcript");
     setInspectorMode("details");
@@ -5810,9 +5855,16 @@ export function App({
     setTrimRetranscriptionError(null);
     setError(null);
     if (switchingJob) {
-      setActiveJobPreviewText("");
-      activeJobDeltaSequenceRef.current = -1;
+      setActiveJobPreviewText(snapshot?.previewText ?? "");
+      activeJobDeltaSequenceRef.current = snapshot?.deltaSequence ?? -1;
+      if (snapshot?.title) {
+        setActiveJobTitle(snapshot.title);
+      }
     }
+    updateTranscriptionJobSnapshot(jobId, {
+      context: resolvedContext,
+      title: snapshot?.title ?? activeJobTitle,
+    });
   }
 
   useEffect(() => {
@@ -6396,11 +6448,28 @@ export function App({
     }
   }
 
+  async function refreshRuntimeStatus(): Promise<void> {
+    try {
+      const health = await fetchRuntimeStatus();
+      setRuntimeHealth(health);
+      writeLastSeenAppVersion(health.app_version);
+      syncProvisioningFromRuntimeHealth(health);
+    } catch (healthError) {
+      setError(
+        formatUiError(
+          "error.readRuntimeHealth",
+          "Could not read transcription runtime health",
+          healthError,
+        ),
+      );
+    }
+  }
+
   async function refreshProvisioningModels(): Promise<void> {
     try {
       const [models, health] = await Promise.all([
         provisioningModels(),
-        fetchRuntimeHealth(),
+        fetchRuntimeStatus(),
       ]);
       setModelCatalog(models);
       setRuntimeHealth(health);
@@ -6420,7 +6489,7 @@ export function App({
   async function loadStartupRequirements(): Promise<StartupRequirementsSnapshot> {
     const [models, health] = await Promise.all([
       provisioningModels(),
-      fetchRuntimeHealth(),
+      fetchRuntimeStatus(),
     ]);
 
     syncProvisioningFromRuntimeHealth(health);
@@ -7101,6 +7170,24 @@ export function App({
       const preserveCurrentArtifact = Boolean(
         activeArtifact && section === "detail",
       );
+      const shouldFocusOnStart = shouldFocusStartedTranscription({
+        queuedPromotion: Boolean(options?.queuedJobId),
+        preserveCurrentArtifact,
+      });
+      let optimisticJobId: string | null = null;
+      let optimisticProgress: JobProgress | null = null;
+      const clearOptimisticFocus = () => {
+        if (!optimisticJobId) {
+          return;
+        }
+        transcriptionJobSnapshotsRef.current.delete(optimisticJobId);
+        if (focusedJobIdRef.current === optimisticJobId) {
+          setFocusedJobId(null);
+          setActiveJobPreviewText("");
+          activeJobDeltaSequenceRef.current = -1;
+          setActiveDetailContext(null);
+        }
+      };
 
       clearStartupWatchdog();
       setIsStarting(true);
@@ -7124,6 +7211,31 @@ export function App({
           return;
         }
 
+        if (shouldFocusOnStart) {
+          optimisticJobId = `starting:${Date.now()}:${Math.random()
+            .toString(36)
+            .slice(2)}`;
+          optimisticProgress = {
+            job_id: optimisticJobId,
+            stage: "preparing_audio",
+            message: t(
+              "transcription.preparingStart",
+              "Preparing transcription...",
+            ),
+            percentage: 0,
+            current_seconds: null,
+            total_seconds: null,
+          };
+          updateTranscriptionJobSnapshot(optimisticJobId, {
+            context: nextDetailContext,
+            title: requestedTitle ?? fileLabel(targetFile),
+            progress: optimisticProgress,
+          });
+          setProgress(optimisticProgress);
+          setActiveJobTitle(requestedTitle ?? fileLabel(targetFile));
+          focusRunningJob(optimisticJobId, nextDetailContext);
+        }
+
         const runtimeStatus = await withTimeout(
           ensureTranscriptionRuntime(),
           20_000,
@@ -7136,6 +7248,7 @@ export function App({
           if (preserveCurrentArtifact) {
             setError(failureMessage);
           } else {
+            clearOptimisticFocus();
             presentTranscriptionFailure(failureMessage, nextDetailContext);
           }
           if (options?.queuedJobId) {
@@ -7161,6 +7274,7 @@ export function App({
             if (preserveCurrentArtifact) {
               setError(failureMessage);
             } else {
+              clearOptimisticFocus();
               presentTranscriptionFailure(
                 failureMessage,
                 nextDetailContext,
@@ -7227,6 +7341,7 @@ export function App({
             if (preserveCurrentArtifact) {
               setError(failureMessage);
             } else {
+              clearOptimisticFocus();
               presentTranscriptionFailure(failureMessage, nextDetailContext);
             }
             if (options?.queuedJobId) {
@@ -7275,6 +7390,19 @@ export function App({
           title: requestedTitle,
           detailContext: nextDetailContext,
         });
+        updateTranscriptionJobSnapshot(job_id, {
+          context: nextDetailContext,
+          title: requestedTitle ?? fileLabel(targetFile),
+          progress: optimisticProgress
+            ? { ...optimisticProgress, job_id }
+            : null,
+        });
+        if (optimisticProgress) {
+          setProgress({ ...optimisticProgress, job_id });
+        }
+        if (optimisticJobId) {
+          transcriptionJobSnapshotsRef.current.delete(optimisticJobId);
+        }
 
         if (failedJobMessagesRef.current.has(job_id)) {
           const earlyFailure =
@@ -7331,7 +7459,7 @@ export function App({
         });
         setActiveJobTitle(requestedTitle ?? fileLabel(targetFile));
 
-        if (!preserveCurrentArtifact) {
+        if (shouldFocusOnStart) {
           setShowExportSheet(false);
           focusRunningJob(job_id, nextDetailContext);
         }
@@ -7384,6 +7512,7 @@ export function App({
         if (preserveCurrentArtifact) {
           setError(formatAppError(startError));
         } else {
+          clearOptimisticFocus();
           setActiveDetailContext(null);
           presentTranscriptionFailure(
             formatAppError(startError),
@@ -8268,35 +8397,14 @@ export function App({
 
   async function onDeleteArtifactsWithConsent(ids: string[]): Promise<void> {
     const uniqueIds = Array.from(new Set(ids));
-    const isBulk = ids.length > 1;
-    // eslint-disable-next-line no-console
-    console.error("[delete] enter", {
-      ids,
-      uniqueIds,
-      isBulk,
-      artifactsInStore: useAppStore.getState().artifacts.length,
-    });
     if (uniqueIds.length === 0) {
-      // eslint-disable-next-line no-console
-      console.error("[delete] early-return uniqueIds=0", { ids });
       return;
     }
 
     const targets = artifacts.filter((artifact) =>
       uniqueIds.includes(artifact.id),
     );
-    // eslint-disable-next-line no-console
-    console.error("[delete] resolved targets", {
-      targetsCount: targets.length,
-      targetIds: targets.map((target) => target.id),
-      uniqueIds,
-    });
     if (targets.length === 0) {
-      // eslint-disable-next-line no-console
-      console.error("[delete] early-return targets=0 (stale ids?)", {
-        uniqueIds,
-        knownIdsSample: artifacts.slice(0, 5).map((artifact) => artifact.id),
-      });
       return;
     }
 
@@ -8330,65 +8438,33 @@ export function App({
         },
       );
     } catch (confirmError) {
-      // eslint-disable-next-line no-console
-      console.error("[delete] confirmDialog threw", confirmError);
       setError(
         formatUiError("error.deleteFailed", "Delete failed", confirmError),
       );
       return;
     }
-    // eslint-disable-next-line no-console
-    console.error("[delete] confirmDialog result", {
-      confirmed,
-      confirmedType: typeof confirmed,
-      isBulk,
-    });
     if (!confirmed) {
-      // eslint-disable-next-line no-console
-      console.error("[delete] early-return user-cancelled-or-undefined", {
-        confirmed,
-      });
       return;
     }
 
     try {
       const result = await deleteArtifacts(uniqueIds);
-      // eslint-disable-next-line no-console
-      console.error("[delete] backend response", {
-        deletedFromBackend: result.deleted,
-        uniqueIds,
-      });
       if (result.deleted <= 0) {
-        // eslint-disable-next-line no-console
-        console.error("[delete] backend reported zero — likely already deleted or stale ids", {
-          uniqueIds,
-          knownIdsSample: artifacts.slice(0, 5).map((artifact) => artifact.id),
-        });
         setError(t("deleted.noneDeleted", "No transcriptions were deleted."));
         return;
       }
 
       removeArtifacts(uniqueIds);
-      // eslint-disable-next-line no-console
-      console.error("[delete] removeArtifacts done", {
-        storeArtifactsAfter: useAppStore.getState().artifacts.length,
-        removedIds: uniqueIds,
-      });
       await refreshDeletedArtifactsList();
 
       if (activeArtifact && uniqueIds.includes(activeArtifact.id)) {
         setActiveArtifact(null);
         setActiveDetailContext(null);
-        setSection("history");
+        setTrimRetranscriptionError(null);
       }
 
       setError(null);
     } catch (deleteError) {
-      // eslint-disable-next-line no-console
-      console.error("[delete] backend threw", {
-        deleteError,
-        uniqueIds,
-      });
       setError(
         formatUiError("error.deleteFailed", "Delete failed", deleteError),
       );
@@ -8805,8 +8881,19 @@ export function App({
         }),
       );
       setDraftSummary(answer);
+      const updated = await updateArtifact({
+        id: activeArtifact.id,
+        optimized_transcript: optimizedTranscriptForPersistence,
+        summary: answer,
+        faqs: draftFaqs,
+      });
+      if (updated) {
+        upsertArtifact(updated);
+        setActiveArtifact(updated);
+      }
       if (revealOnSuccess) {
         setDetailMode("summary");
+        setIsEditingSummary(false);
       }
       setError(null);
     } catch (summaryError) {
@@ -9756,13 +9843,6 @@ export function App({
           </button>
         </div>
 
-        {transcriptionStartBadge ? (
-          <StatusBadge
-            variant={transcriptionStartBadge.state}
-            message={transcriptionStartBadge.message}
-          />
-        ) : null}
-
         {homeAudioInputPath ? (
           <section className="panel-card home-audio-player-card">
             <div className="detail-audio-stack">
@@ -10260,7 +10340,35 @@ export function App({
     if (!activeArtifact) {
       if (focusedJobId) {
         if (!activeJobPreviewText) {
-          return <LoadingAnimation />;
+          const snapshot =
+            transcriptionJobSnapshotsRef.current.get(focusedJobId) ?? null;
+          const jobProgress =
+            focusedQueueJob ??
+            (progress?.job_id === focusedJobId ? progress : null) ??
+            snapshot?.progress ??
+            null;
+          const percentage = activeJobPercentage(
+            focusedJobId,
+            focusedQueueJob,
+            progress,
+          );
+          return (
+            <div className="detail-empty transcription-status-view">
+              <div className="center-empty-icon">
+                <ProgressRing percentage={percentage} size={32} />
+              </div>
+              <h2>
+                {formatJobStageLabel(jobProgress?.stage ?? "preparing_audio")}
+              </h2>
+              <p>
+                {jobProgress?.message ??
+                  t(
+                    "detail.transcriptionPreparing",
+                    "Preparing transcription...",
+                  )}
+              </p>
+            </div>
+          );
         }
         return (
           <TranscriptionPreview
@@ -10307,12 +10415,26 @@ export function App({
       }
 
       return (
-        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          <textarea
-            className="detail-editor summary-editor"
-            value={draftSummary}
-            onChange={(event) => setDraftSummary(event.target.value)}
-          />
+        <div className="summary-view">
+          <div className="summary-view-actions">
+            <button
+              className="secondary-button"
+              onClick={() => setIsEditingSummary((editing) => !editing)}
+            >
+              {isEditingSummary
+                ? t("summary.preview", "Preview")
+                : t("summary.edit", "Edit")}
+            </button>
+          </div>
+          {isEditingSummary ? (
+            <textarea
+              className="detail-editor summary-editor"
+              value={draftSummary}
+              onChange={(event) => setDraftSummary(event.target.value)}
+            />
+          ) : (
+            <SummaryMarkdown markdown={draftSummary} />
+          )}
           {generatedSections.map((section) => (
             <div key={section.key} className="inspector-block">
               <h4>{section.title}</h4>
@@ -14577,9 +14699,7 @@ export function App({
           <p className="muted">
             {t("settings.localModels.directory", "Directory:")}{" "}
             <code>
-              {provisioning.modelsDir
-                ? `${provisioning.modelsDir}/../runtime/pyannote`
-                : "runtime/pyannote"}
+              {pyannoteHealth?.runtime_dir || "runtime/pyannote"}
             </code>
           </p>
 
