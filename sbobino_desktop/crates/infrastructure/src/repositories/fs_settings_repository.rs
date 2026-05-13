@@ -109,6 +109,7 @@ impl FsSettingsRepository {
         } else {
             settings.sync_sections_from_legacy();
         }
+        backfill_automatic_import_source_transcription_defaults(&mut settings, &raw_json);
 
         self.populate_secrets(&mut settings)?;
 
@@ -235,6 +236,31 @@ fn should_treat_legacy_fields_as_source(settings: &AppSettings) -> bool {
     });
 
     legacy_differs && sections_match_defaults
+}
+
+fn backfill_automatic_import_source_transcription_defaults(
+    settings: &mut AppSettings,
+    raw_json: &serde_json::Value,
+) {
+    let Some(raw_sources) = raw_json
+        .get("automation")
+        .and_then(|automation| automation.get("watched_sources"))
+        .and_then(|sources| sources.as_array())
+    else {
+        return;
+    };
+
+    for (index, source) in settings.automation.watched_sources.iter_mut().enumerate() {
+        let Some(raw_source) = raw_sources.get(index).and_then(|value| value.as_object()) else {
+            continue;
+        };
+        if !raw_source.contains_key("model") {
+            source.model = settings.transcription.model.clone();
+        }
+        if !raw_source.contains_key("language") {
+            source.language = settings.transcription.language.clone();
+        }
+    }
 }
 
 #[async_trait]

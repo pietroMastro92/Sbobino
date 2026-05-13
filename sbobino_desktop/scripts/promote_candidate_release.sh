@@ -6,7 +6,7 @@ usage() {
 Usage: promote_candidate_release.sh <version> [repo-slug]
 
 Promotes a previously validated GitHub prerelease candidate to stable and
-removes older stable releases by default.
+keeps the latest two stable releases available for rollback by default.
 EOF
 }
 
@@ -142,23 +142,73 @@ PY
 
 gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease=false
 
-RELEASE_LIST_JSON=$(gh release list --repo "$REPO_SLUG" --exclude-pre-releases --json tagName,isLatest)
+STABLE_RELEASE_RETENTION=${SBOBINO_STABLE_RELEASE_RETENTION:-2}
+if ! [[ "$STABLE_RELEASE_RETENTION" =~ ^[0-9]+$ ]] || [[ "$STABLE_RELEASE_RETENTION" -lt 1 ]]; then
+  echo "SBOBINO_STABLE_RELEASE_RETENTION must be a positive integer." >&2
+  exit 1
+fi
 
-OLDER_STABLE_TAGS=$(python3 - <<'PY' "$RELEASE_LIST_JSON" "$TAG"
-import json, sys
+RELEASE_LIST_JSON=$(gh release list --repo "$REPO_SLUG" --exclude-pre-releases --limit 100 --json tagName,publishedAt,isLatest)
+
+STABLE_TAGS_TO_DELETE=$(python3 - <<'PY' "$RELEASE_LIST_JSON" "$TAG" "$STABLE_RELEASE_RETENTION"
+import json
+import re
+import sys
+
 releases = json.loads(sys.argv[1])
-for release in releases:
-    tag = release.get("tagName", "").strip()
-    if tag and tag != sys.argv[2]:
-        print(tag)
+current_tag = sys.argv[2]
+retention = int(sys.argv[3])
+
+def version_key(tag: str) -> tuple[int, ...]:
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)", tag.strip())
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+
+stable = []
+for index, release in enumerate(releases):
+    tag = str(release.get("tagName", "")).strip()
+    if not tag:
+        continue
+    stable.append(
+        {
+            "tag": tag,
+            "index": index,
+            "version": version_key(tag),
+            "published_at": str(release.get("publishedAt", "")),
+        }
+    )
+
+current = next((release for release in stable if release["tag"] == current_tag), None)
+if current is None:
+    raise SystemExit(f"Stable retention blocked: promoted tag {current_tag} is not listed as stable.")
+
+stable.sort(
+    key=lambda release: (
+        release["version"],
+        release["published_at"],
+        -release["index"],
+    ),
+    reverse=True,
+)
+
+keep = {current_tag}
+for release in stable:
+    if len(keep) >= retention:
+        break
+    keep.add(release["tag"])
+
+for release in stable:
+    if release["tag"] not in keep:
+        print(release["tag"])
 PY
 )
 
-if [[ -n "${OLDER_STABLE_TAGS// }" ]]; then
+if [[ -n "${STABLE_TAGS_TO_DELETE// }" ]]; then
   while IFS= read -r stable_tag; do
     [[ -z "$stable_tag" ]] && continue
     gh release delete "$stable_tag" --repo "$REPO_SLUG" --yes --cleanup-tag
-  done <<<"$OLDER_STABLE_TAGS"
+  done <<<"$STABLE_TAGS_TO_DELETE"
 fi
 
 cat <<EOF
@@ -166,5 +216,7 @@ Candidate promoted to stable:
   repo: $REPO_SLUG
   tag:  $TAG
 
-Older stable releases were removed to keep the latest validated version as the only stable public release.
+Stable release retention:
+  kept:    newest $STABLE_RELEASE_RETENTION stable release(s), including $TAG
+  deleted: ${STABLE_TAGS_TO_DELETE:-none}
 EOF
