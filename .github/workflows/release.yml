@@ -58,7 +58,8 @@ jobs:
       - name: Verify Rust toolchain
         run: |
           command -v cargo
-          cargo metadata --version
+          cargo --version
+          cargo metadata --no-deps --format-version 1 >/dev/null
           rustc --version
 
       - name: Install frontend dependencies

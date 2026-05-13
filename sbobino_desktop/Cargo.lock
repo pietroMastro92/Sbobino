@@ -4203,7 +4203,7 @@ dependencies = [
 
 [[package]]
 name = "sbobino-application"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "sbobino-desktop"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "sbobino-domain"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "chrono",
  "num_cpus",
@@ -4269,7 +4269,7 @@ dependencies = [
 
 [[package]]
 name = "sbobino-infrastructure"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5680,7 +5680,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tracing"
-version = "0.1.45"
+version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
