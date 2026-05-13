@@ -50,6 +50,17 @@ jobs:
           workspaces: |
             sbobino_desktop -> target
 
+      - name: Repair Rust toolchain after cache restore
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Verify Rust toolchain
+        run: |
+          command -v cargo
+          cargo metadata --version
+          rustc --version
+
       - name: Install frontend dependencies
         run: npm ci
 
