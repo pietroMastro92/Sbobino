@@ -138,6 +138,18 @@ impl TranscriptEnhancer for FoundationAppleEnhancer {
         9_000
     }
 
+    fn prefers_single_pass_optimize(&self) -> bool {
+        true
+    }
+
+    fn optimize_chunk_concurrency_limit(&self) -> usize {
+        1
+    }
+
+    fn optimize_direct_prompt_char_budget(&self) -> usize {
+        5_500
+    }
+
     fn emotion_direct_prompt_char_budget(&self) -> usize {
         6_500
     }

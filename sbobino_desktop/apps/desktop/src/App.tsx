@@ -273,6 +273,7 @@ import {
   PRIVACY_POLICY_VERSION,
 } from "./legal/privacyPolicy";
 import { shouldStartWindowDrag } from "./lib/windowDrag";
+import { formatImproveTextError } from "./lib/improveTextError";
 import {
   aiActionsAvailable,
   buildChatArtifactPayload,
@@ -9636,17 +9637,14 @@ export function App({
       setTranscriptViewMode("optimized");
       setError(null);
     } catch (optimizeError) {
-      const code = formatAppErrorCode(optimizeError);
-      if (code === "missing_ai_provider" || code === "missing_api_key") {
-        setError(
-          t(
-            "error.improveConfigureProvider",
-            "Improve text failed: configure an AI provider in Settings > AI Services.",
-          ),
-        );
-      } else {
-        setError(t("error.improveFailed", "Improve text failed"));
-      }
+      setError(
+        formatImproveTextError(
+          optimizeError,
+          t,
+          formatUiError,
+          formatAppErrorCode,
+        ),
+      );
     } finally {
       setIsImprovingText(false);
     }

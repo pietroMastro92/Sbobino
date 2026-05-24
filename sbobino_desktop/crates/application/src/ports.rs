@@ -60,6 +60,18 @@ pub trait TranscriptEnhancer: Send + Sync {
         14_000
     }
 
+    fn prefers_single_pass_optimize(&self) -> bool {
+        false
+    }
+
+    fn optimize_chunk_concurrency_limit(&self) -> usize {
+        3
+    }
+
+    fn optimize_direct_prompt_char_budget(&self) -> usize {
+        3_200
+    }
+
     fn emotion_direct_prompt_char_budget(&self) -> usize {
         9_000
     }

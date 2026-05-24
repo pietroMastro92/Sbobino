@@ -146,6 +146,14 @@ impl TranscriptEnhancer for GeminiEnhancer {
         18_000
     }
 
+    fn optimize_direct_prompt_char_budget(&self) -> usize {
+        12_000
+    }
+
+    fn optimize_chunk_concurrency_limit(&self) -> usize {
+        3
+    }
+
     fn emotion_direct_prompt_char_budget(&self) -> usize {
         12_000
     }

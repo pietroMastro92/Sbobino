@@ -163,7 +163,7 @@ pub struct GenerateArtifactPackPayload {
 const CHAT_CONTEXT_BUDGETS: &[(usize, usize)] = &[(8, 7600), (6, 5200), (4, 3400), (2, 2000)];
 const CHAT_CHUNK_TARGET_CHARS: usize = 900;
 const CHAT_CHUNK_OVERLAP_WORDS: usize = 24;
-const OPTIMIZE_CHUNK_TARGET_CHARS: usize = 2600;
+const OPTIMIZE_CHUNK_TARGET_CHAR_BUDGETS: &[usize] = &[2600, 1800, 1200, 800, 550];
 const OPTIMIZE_CHUNK_OVERLAP_WORDS: usize = 28;
 const OPTIMIZE_CHUNK_CONCURRENCY_LIMIT: usize = 3;
 #[cfg(test)]
@@ -180,6 +180,8 @@ const LOW_CONFIDENCE_CONTEXT_RADIUS_WORDS: usize = 3;
 const MAX_LOW_CONFIDENCE_PROMPT_SPANS: usize = 10;
 const SUMMARY_CONTEXT_OVERFLOW_MESSAGE: &str =
     "Exceeded model context window size. The app now uses chunked retrieval, but this request is still too large. Try a shorter custom prompt or fewer summary constraints.";
+const OPTIMIZE_CONTEXT_OVERFLOW_MESSAGE: &str =
+    "Exceeded model context window size while optimizing the transcript. The app retried with smaller chunks, but this transcript is still too large for the selected AI provider. Try a provider with a larger context window or optimize a shorter section.";
 const STUDY_PACK_METADATA_KEY: &str = "study_pack_v1";
 const MEETING_PACK_METADATA_KEY: &str = "meeting_intelligence_v1";
 
@@ -749,7 +751,12 @@ pub async fn optimize_artifact(
         .map_err(|e| CommandError::new("runtime_factory", e))?;
 
     if enhancers.is_empty() {
-        return Ok(text);
+        let reason = state
+            .runtime_factory
+            .ai_capability_status()
+            .ok()
+            .and_then(|status| status.unavailable_reason);
+        return Err(missing_ai_provider_command_error(reason.as_deref()));
     }
 
     run_with_enhancer_fallback(&enhancers, "optimize transcript", |enhancer| {
@@ -1491,57 +1498,70 @@ async fn optimize_with_rag(
         ));
     }
 
-    let chunks = chunk_text_by_words(
-        &cleaned,
-        OPTIMIZE_CHUNK_TARGET_CHARS,
-        OPTIMIZE_CHUNK_OVERLAP_WORDS,
-    );
+    let cleaned_char_count = cleaned.chars().count();
+    let direct_prompt_budget = enhancer.optimize_direct_prompt_char_budget();
+    let should_try_direct = cleaned_char_count <= direct_prompt_budget
+        && (enhancer.prefers_single_pass_optimize()
+            || direct_prompt_budget >= OPTIMIZE_CHUNK_TARGET_CHAR_BUDGETS[0]);
 
-    if chunks.is_empty() {
-        return Err(ApplicationError::Validation(
-            "cannot optimize an empty transcript".to_string(),
-        ));
-    }
-
-    if chunks.len() == 1 {
-        return enhancer
-            .optimize(&cleaned, language_code)
-            .await
-            .map(|optimized| constrain_transcript_edit(&cleaned, &optimized));
+    if should_try_direct {
+        match enhancer.optimize(&cleaned, language_code).await {
+            Ok(optimized) => return Ok(constrain_transcript_edit(&cleaned, &optimized)),
+            Err(error) if is_context_window_error(&error) => {}
+            Err(error) => return Err(error),
+        }
     }
 
     let concurrency_limit = enhancer
-        .summary_chunk_concurrency_limit()
+        .optimize_chunk_concurrency_limit()
         .clamp(1, OPTIMIZE_CHUNK_CONCURRENCY_LIMIT);
-    let chunk_concurrency = chunks.len().clamp(1, concurrency_limit);
 
-    let current_sections = stream::iter(chunks.into_iter())
-        .map(|chunk| async move {
-            enhancer
-                .optimize(&chunk, language_code)
-                .await
-                .map(|optimized| constrain_transcript_edit(&chunk, &optimized))
-        })
-        .buffered(chunk_concurrency)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    for target_chars in OPTIMIZE_CHUNK_TARGET_CHAR_BUDGETS {
+        let chunks = chunk_text_by_words(&cleaned, *target_chars, OPTIMIZE_CHUNK_OVERLAP_WORDS);
+        if chunks.is_empty() {
+            return Err(ApplicationError::Validation(
+                "cannot optimize an empty transcript".to_string(),
+            ));
+        }
 
-    let stitched = merge_optimized_transcript_sections(
-        &current_sections,
-        (OPTIMIZE_CHUNK_OVERLAP_WORDS / 2).max(4),
-    );
-    if stitched.trim().is_empty() {
-        return Ok(cleaned);
+        let chunk_concurrency = chunks.len().clamp(1, concurrency_limit);
+        let results = stream::iter(chunks.into_iter())
+            .map(|chunk| async move {
+                enhancer
+                    .optimize(&chunk, language_code)
+                    .await
+                    .map(|optimized| constrain_transcript_edit(&chunk, &optimized))
+            })
+            .buffered(chunk_concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        if results
+            .iter()
+            .any(|result| matches!(result, Err(error) if is_context_window_error(error)))
+        {
+            continue;
+        }
+
+        let current_sections = results.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let stitched = merge_optimized_transcript_sections(
+            &current_sections,
+            (OPTIMIZE_CHUNK_OVERLAP_WORDS / 2).max(4),
+        );
+        if stitched.trim().is_empty() {
+            return Ok(cleaned);
+        }
+
+        let reduced = constrain_transcript_edit(&cleaned, &stitched);
+        if reduced.trim().is_empty() {
+            return Ok(cleaned);
+        }
+        return Ok(reduced);
     }
 
-    let reduced = constrain_transcript_edit(&cleaned, &stitched);
-    if reduced.trim().is_empty() {
-        Ok(cleaned)
-    } else {
-        Ok(reduced)
-    }
+    Err(ApplicationError::PostProcessing(
+        OPTIMIZE_CONTEXT_OVERFLOW_MESSAGE.to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -3197,6 +3217,8 @@ mod tests {
         prompts: Mutex<Vec<String>>,
         prefer_single_pass: bool,
         chunk_concurrency_limit: usize,
+        optimize_context_limit_chars: Option<usize>,
+        optimize_direct_prompt_char_budget: usize,
         fail_direct_attempts: AtomicUsize,
         hallucinate_optimize: bool,
         hallucinate_merge: bool,
@@ -3216,9 +3238,24 @@ mod tests {
                 prompts: Mutex::new(Vec::new()),
                 prefer_single_pass,
                 chunk_concurrency_limit,
+                optimize_context_limit_chars: None,
+                optimize_direct_prompt_char_budget: 3_200,
                 fail_direct_attempts: AtomicUsize::new(fail_direct_attempts),
                 hallucinate_optimize: false,
                 hallucinate_merge: false,
+            }
+        }
+
+        fn with_optimize_context_limit(
+            prefer_single_pass: bool,
+            chunk_concurrency_limit: usize,
+            optimize_direct_prompt_char_budget: usize,
+            optimize_context_limit_chars: usize,
+        ) -> Self {
+            Self {
+                optimize_context_limit_chars: Some(optimize_context_limit_chars),
+                optimize_direct_prompt_char_budget,
+                ..Self::new(prefer_single_pass, chunk_concurrency_limit, 0)
             }
         }
 
@@ -3264,6 +3301,15 @@ mod tests {
             _language_code: &str,
         ) -> Result<String, ApplicationError> {
             self.optimize_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .optimize_context_limit_chars
+                .is_some_and(|limit| text.chars().count() > limit)
+            {
+                return Err(ApplicationError::PostProcessing(
+                    "Foundation bridge error: Exceeded model context window size".to_string(),
+                ));
+            }
+
             if self.hallucinate_optimize {
                 Ok(format!("{text} added commentary"))
             } else {
@@ -3335,6 +3381,18 @@ mod tests {
 
         fn summary_chunk_concurrency_limit(&self) -> usize {
             self.chunk_concurrency_limit
+        }
+
+        fn prefers_single_pass_optimize(&self) -> bool {
+            self.prefer_single_pass
+        }
+
+        fn optimize_chunk_concurrency_limit(&self) -> usize {
+            self.chunk_concurrency_limit
+        }
+
+        fn optimize_direct_prompt_char_budget(&self) -> usize {
+            self.optimize_direct_prompt_char_budget
         }
     }
 
@@ -3880,6 +3938,45 @@ mod tests {
         assert!(enhancer.optimize_calls.load(Ordering::SeqCst) > 1);
         assert_eq!(enhancer.ask_calls.load(Ordering::SeqCst), 0);
         assert!(!optimized.contains("[Section"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_retries_smaller_chunks_after_context_window() {
+        let enhancer = TrackingEnhancer::with_optimize_context_limit(true, 1, 5_500, 1_300);
+        let transcript =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(230);
+
+        let optimized = optimize_with_rag(&enhancer, &transcript, "en")
+            .await
+            .expect("optimization should retry with smaller chunks and succeed");
+
+        assert!(!optimized.trim().is_empty());
+        assert!(enhancer.optimize_calls.load(Ordering::SeqCst) > 2);
+        assert!(!optimized.contains("[Section"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_returns_specific_overflow_after_all_chunk_budgets_fail() {
+        let enhancer = TrackingEnhancer::with_optimize_context_limit(true, 1, 5_500, 20);
+        let transcript =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(20);
+
+        let error = optimize_with_rag(&enhancer, &transcript, "en")
+            .await
+            .expect_err("optimization should fail after exhausting smaller chunks");
+
+        assert!(matches!(error, ApplicationError::PostProcessing(_)));
+        assert!(error.to_string().contains("optimizing the transcript"));
+    }
+
+    #[test]
+    fn optimize_artifact_missing_provider_error_uses_actionable_code() {
+        let error = crate::ai_support::missing_ai_provider_command_error(Some(
+            "Foundation Models is not available on this Mac.",
+        ));
+
+        assert_eq!(error.code, "missing_ai_provider");
+        assert!(error.message.contains("Foundation Models"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
