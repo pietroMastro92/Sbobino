@@ -130,3 +130,15 @@ export function shouldFocusStartedTranscription({
 }): boolean {
   return !queuedPromotion && !preserveCurrentArtifact;
 }
+
+export function shouldPreserveCurrentArtifactOnStart({
+  hasActiveArtifact,
+  section,
+  isTrimmedAudioTranscription,
+}: {
+  hasActiveArtifact: boolean;
+  section: string;
+  isTrimmedAudioTranscription: boolean;
+}): boolean {
+  return hasActiveArtifact && section === "detail" && !isTrimmedAudioTranscription;
+}

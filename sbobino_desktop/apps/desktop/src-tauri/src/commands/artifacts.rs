@@ -7,7 +7,8 @@ use chrono::Utc;
 use docx_rs::{Docx, Paragraph, Run};
 use futures_util::stream::{self, StreamExt};
 use printpdf::{
-    ops::PdfPage, text::TextItem, units::Pt, BuiltinFont, Color, Mm, Op, PdfDocument, Rgb,
+    matrix::TextMatrix, ops::PdfPage, text::TextItem, units::Pt, BuiltinFont, Color, FontId, Mm,
+    Op, ParsedFont, PdfDocument, Rgb,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -36,6 +37,18 @@ use crate::{
 };
 
 const MIN_TRIMMED_AUDIO_DURATION_SECONDS: f64 = 1.5;
+const PDF_LEFT_X: f32 = 28.0;
+const PDF_TITLE_Y: f32 = 810.0;
+const PDF_BODY_START_Y: f32 = 780.0;
+const PDF_NEW_PAGE_BODY_START_Y: f32 = 810.0;
+const PDF_BOTTOM_Y: f32 = 42.0;
+const PDF_LINE_HEIGHT: f32 = 14.0;
+const PDF_BODY_MAX_CHARS: usize = 96;
+const PDF_SYSTEM_FONT_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/SFNS.ttf",
+];
 const SPEAKER_COLOR_PALETTE: &[&str] = &[
     "#4F7CFF", "#EC6A5E", "#27A376", "#B06BF2", "#D88B15", "#1293A5", "#E255A1", "#6C7A2D",
 ];
@@ -266,6 +279,7 @@ pub struct ExportArtifactPayload {
     pub options: Option<ExportOptions>,
     pub segments: Option<Vec<ExportSegment>>,
     pub content_override: Option<String>,
+    pub rendered_content_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -576,19 +590,27 @@ pub async fn export_artifact(
         options.include_timestamps,
         options.include_speaker_names,
     );
-    let export_document = build_export_document(
-        language,
-        &artifact.title,
-        &base_transcription,
-        &artifact.summary,
-        &artifact.faqs,
-        &artifact.metadata,
-        &segments,
-        style,
-        options.include_timestamps,
-        options.include_speaker_names,
-        &speaker_colors,
-    );
+    let export_document = payload
+        .rendered_content_override
+        .as_deref()
+        .and_then(|content| {
+            parse_rendered_export_document_override(content, language, &artifact.title, style)
+        })
+        .unwrap_or_else(|| {
+            build_export_document(
+                language,
+                &artifact.title,
+                &base_transcription,
+                &artifact.summary,
+                &artifact.faqs,
+                &artifact.metadata,
+                &segments,
+                style,
+                options.include_timestamps,
+                options.include_speaker_names,
+                &speaker_colors,
+            )
+        });
 
     match payload.format {
         ExportFormat::Txt => export_txt(
@@ -2311,25 +2333,40 @@ fn export_json(
 
 fn export_pdf(path: &Path, document: &ExportDocument) -> Result<(), CommandError> {
     let mut doc = PdfDocument::new(&document.title);
+    let font = load_pdf_font(&mut doc);
     let mut pages = Vec::new();
-    let mut ops = start_pdf_page_ops(Some(&document.title));
-    let mut y = 780.0_f32;
+    let mut ops = start_pdf_page_ops(Some(&document.title), font.as_ref());
+    let mut y = PDF_BODY_START_Y;
     let body_lines = render_document_body_lines(document);
     let colored_lines = render_document_body_styled_lines(document);
 
     if body_lines.is_empty() {
-        write_pdf_line(&mut ops, "No content available for export.", y, None);
+        write_pdf_line(
+            &mut ops,
+            "No content available for export.",
+            y,
+            None,
+            font.as_ref(),
+        );
     } else {
         for line in colored_lines {
-            if y < 42.0 {
-                ops.push(Op::EndTextSection);
-                pages.push(PdfPage::new(Mm(210.0), Mm(297.0), ops));
-                ops = start_pdf_page_ops(None);
-                y = 810.0;
-            }
+            for wrapped_line in wrap_pdf_text_line(&line.text, PDF_BODY_MAX_CHARS) {
+                if y < PDF_BOTTOM_Y {
+                    ops.push(Op::EndTextSection);
+                    pages.push(PdfPage::new(Mm(210.0), Mm(297.0), ops));
+                    ops = start_pdf_page_ops(None, font.as_ref());
+                    y = PDF_NEW_PAGE_BODY_START_Y;
+                }
 
-            write_pdf_line(&mut ops, &line.text, y, line.speaker_color.as_deref());
-            y -= 14.0;
+                write_pdf_line(
+                    &mut ops,
+                    &wrapped_line,
+                    y,
+                    line.speaker_color.as_deref(),
+                    font.as_ref(),
+                );
+                y -= PDF_LINE_HEIGHT;
+            }
         }
     }
 
@@ -2355,45 +2392,76 @@ fn export_pdf(path: &Path, document: &ExportDocument) -> Result<(), CommandError
         .map_err(|e| CommandError::new("export", format!("failed to write pdf: {e}")))
 }
 
-fn start_pdf_page_ops(title: Option<&str>) -> Vec<Op> {
+fn load_pdf_font(doc: &mut PdfDocument) -> Option<FontId> {
+    for candidate in PDF_SYSTEM_FONT_CANDIDATES {
+        let Ok(bytes) = std::fs::read(candidate) else {
+            continue;
+        };
+        let mut warnings = Vec::new();
+        if let Some(font) = ParsedFont::from_bytes(&bytes, 0, &mut warnings) {
+            return Some(doc.add_font(&font));
+        }
+    }
+
+    None
+}
+
+fn start_pdf_page_ops(title: Option<&str>, font: Option<&FontId>) -> Vec<Op> {
     let mut ops = vec![Op::StartTextSection];
 
     if let Some(title) = title {
-        ops.push(Op::SetFontSizeBuiltinFont {
-            size: Pt(20.0),
-            font: BuiltinFont::HelveticaBold,
+        set_pdf_font_size(&mut ops, Pt(20.0), font, BuiltinFont::HelveticaBold);
+        ops.push(Op::SetTextMatrix {
+            matrix: TextMatrix::Translate(Pt(PDF_LEFT_X), Pt(PDF_TITLE_Y)),
         });
-        ops.push(Op::SetTextCursor {
-            pos: printpdf::graphics::Point {
-                x: Pt(28.0),
-                y: Pt(810.0),
-            },
-        });
-        ops.push(Op::WriteTextBuiltinFont {
-            items: vec![TextItem::Text(title.to_string())],
-            font: BuiltinFont::HelveticaBold,
-        });
+        write_pdf_text(&mut ops, title, font, BuiltinFont::HelveticaBold);
 
-        ops.push(Op::SetFontSizeBuiltinFont {
-            size: Pt(11.0),
-            font: BuiltinFont::Helvetica,
-        });
+        set_pdf_font_size(&mut ops, Pt(11.0), font, BuiltinFont::Helvetica);
     } else {
-        ops.push(Op::SetFontSizeBuiltinFont {
-            size: Pt(11.0),
-            font: BuiltinFont::Helvetica,
-        });
+        set_pdf_font_size(&mut ops, Pt(11.0), font, BuiltinFont::Helvetica);
     }
 
     ops
 }
 
-fn write_pdf_line(ops: &mut Vec<Op>, line: &str, y: f32, speaker_color: Option<&str>) {
-    ops.push(Op::SetTextCursor {
-        pos: printpdf::graphics::Point {
-            x: Pt(28.0),
-            y: Pt(y),
-        },
+fn set_pdf_font_size(ops: &mut Vec<Op>, size: Pt, font: Option<&FontId>, fallback: BuiltinFont) {
+    if let Some(font) = font {
+        ops.push(Op::SetFontSize {
+            size,
+            font: font.clone(),
+        });
+    } else {
+        ops.push(Op::SetFontSizeBuiltinFont {
+            size,
+            font: fallback,
+        });
+    }
+}
+
+fn write_pdf_text(ops: &mut Vec<Op>, text: &str, font: Option<&FontId>, fallback: BuiltinFont) {
+    let items = vec![TextItem::Text(text.to_string())];
+    if let Some(font) = font {
+        ops.push(Op::WriteText {
+            items,
+            font: font.clone(),
+        });
+    } else {
+        ops.push(Op::WriteTextBuiltinFont {
+            items,
+            font: fallback,
+        });
+    }
+}
+
+fn write_pdf_line(
+    ops: &mut Vec<Op>,
+    line: &str,
+    y: f32,
+    speaker_color: Option<&str>,
+    font: Option<&FontId>,
+) {
+    ops.push(Op::SetTextMatrix {
+        matrix: TextMatrix::Translate(Pt(PDF_LEFT_X), Pt(y)),
     });
     if let Some((red, green, blue)) = speaker_color.and_then(parse_hex_rgb) {
         ops.push(Op::SetFillColor {
@@ -2409,10 +2477,52 @@ fn write_pdf_line(ops: &mut Vec<Op>, line: &str, y: f32, speaker_color: Option<&
             col: Color::Rgb(Rgb::new(0.12, 0.14, 0.19, None)),
         });
     }
-    ops.push(Op::WriteTextBuiltinFont {
-        items: vec![TextItem::Text(line.to_string())],
-        font: BuiltinFont::Helvetica,
-    });
+    write_pdf_text(ops, line, font, BuiltinFont::Helvetica);
+}
+
+fn wrap_pdf_text_line(line: &str, max_chars: usize) -> Vec<String> {
+    if line.trim().is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+
+    for word in line.split_whitespace() {
+        if word.chars().count() > max_chars {
+            if !current.is_empty() {
+                wrapped.push(current);
+                current = String::new();
+            }
+            let chars = word.chars().collect::<Vec<_>>();
+            for chunk in chars.chunks(max_chars) {
+                wrapped.push(chunk.iter().collect());
+            }
+            continue;
+        }
+
+        let next_len = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+
+        if next_len > max_chars && !current.is_empty() {
+            wrapped.push(current);
+            current = word.to_string();
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+
+    if !current.is_empty() {
+        wrapped.push(current);
+    }
+
+    wrapped
 }
 
 fn normalize_export_language(value: Option<&str>) -> &'static str {
@@ -2701,6 +2811,82 @@ fn render_markdown_document(document: &ExportDocument) -> String {
         }
     }));
     blocks.join("\n\n")
+}
+
+fn parse_rendered_export_document_override(
+    content: &str,
+    language: &str,
+    fallback_title: &str,
+    style: ExportStyle,
+) -> Option<ExportDocument> {
+    let normalized = content.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    let mut current = Vec::new();
+    for line in normalized.lines() {
+        if line.trim().is_empty() {
+            if !current.is_empty() {
+                blocks.push(current);
+                current = Vec::new();
+            }
+        } else {
+            current.push(line.trim_end().to_string());
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+
+    if blocks.is_empty() {
+        return None;
+    }
+
+    let fallback_document_title = localized_export_document_title(language, fallback_title);
+    let title = blocks
+        .first()
+        .map(|block| block.join("\n").trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_document_title);
+
+    let mut sections = blocks
+        .iter()
+        .skip(1)
+        .filter_map(|block| {
+            let section_title = block.first()?.trim();
+            if section_title.is_empty() {
+                return None;
+            }
+            let body = block
+                .iter()
+                .skip(1)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            if body.is_empty() {
+                return None;
+            }
+            Some(ExportDocumentSection {
+                title: section_title.to_string(),
+                body,
+                styled_lines: None,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if sections.is_empty() {
+        sections.push(ExportDocumentSection {
+            title: localized_export_primary_section_title(language, style).to_string(),
+            body: normalized.to_string(),
+            styled_lines: None,
+        });
+    }
+
+    Some(ExportDocument { title, sections })
 }
 
 fn render_document_body_lines(document: &ExportDocument) -> Vec<String> {
@@ -2995,9 +3181,10 @@ mod tests {
         build_artifact_context_transcript, build_chat_context_candidates, build_chunk_note_prompt,
         build_confidence_aware_optimize_prompt, build_direct_summary_prompt, build_export_content,
         build_export_document, build_export_segments, build_summary_instructions,
-        build_summary_synthesis_prompt, chunk_text_by_words, extract_low_confidence_spans,
-        is_context_window_error, optimize_with_rag, render_plain_text_document, summarize_with_rag,
-        trimmed_audio_output_metadata, validate_trimmed_audio_output, ApplicationError,
+        build_summary_synthesis_prompt, chunk_text_by_words, export_pdf,
+        extract_low_confidence_spans, is_context_window_error, optimize_with_rag,
+        render_plain_text_document, summarize_with_rag, trimmed_audio_output_metadata,
+        validate_trimmed_audio_output, wrap_pdf_text_line, ApplicationError,
         ArtifactAiContextOptions, ArtifactKind, ExportStyle, SummarizeArtifactPayload,
         TranscriptArtifact, TranscriptEnhancer, MIN_TRIMMED_AUDIO_DURATION_SECONDS,
     };
@@ -3355,6 +3542,148 @@ mod tests {
             .as_deref()
             .expect("speaker color fallback should exist")
             .starts_with('#'));
+    }
+
+    #[test]
+    fn transcript_document_without_timestamps_uses_full_transcript_not_timeline_lines() {
+        let artifact = sample_artifact_with_timeline(
+            "This is a clean transcript paragraph that should remain the primary body.",
+        );
+        let segments = build_export_segments(&artifact, &artifact.raw_transcript);
+
+        let document = build_export_document(
+            "en",
+            &artifact.title,
+            &artifact.raw_transcript,
+            &artifact.summary,
+            &artifact.faqs,
+            &artifact.metadata,
+            &segments,
+            ExportStyle::Transcript,
+            false,
+            false,
+            &BTreeMap::new(),
+        );
+
+        assert!(document.sections[0].styled_lines.is_none());
+        assert_eq!(
+            document.sections[0].body,
+            "This is a clean transcript paragraph that should remain the primary body."
+        );
+        assert!(!document.sections[0]
+            .body
+            .contains("Alice opens the meeting."));
+    }
+
+    #[test]
+    fn transcript_document_with_timestamps_still_uses_timeline_lines() {
+        let artifact = sample_artifact_with_timeline("fallback transcript");
+        let segments = build_export_segments(&artifact, &artifact.raw_transcript);
+
+        let document = build_export_document(
+            "en",
+            &artifact.title,
+            &artifact.raw_transcript,
+            &artifact.summary,
+            &artifact.faqs,
+            &artifact.metadata,
+            &segments,
+            ExportStyle::Transcript,
+            true,
+            true,
+            &BTreeMap::new(),
+        );
+
+        let styled_lines = document.sections[0]
+            .styled_lines
+            .as_ref()
+            .expect("timestamped transcript exports should expose timeline lines");
+        assert_eq!(
+            styled_lines[0].text,
+            "[00:12] Alice: Alice opens the meeting."
+        );
+        assert_eq!(
+            styled_lines[1].text,
+            "[00:24] Bob: Bob confirms the next step."
+        );
+    }
+
+    #[test]
+    fn subtitles_export_keeps_cue_style_output() {
+        let artifact = sample_artifact_with_timeline("fallback transcript");
+        let segments = build_export_segments(&artifact, &artifact.raw_transcript);
+
+        let content = build_export_content(
+            &artifact.raw_transcript,
+            &segments,
+            ExportStyle::Subtitles,
+            true,
+            true,
+        );
+
+        assert!(
+            content.contains("1\n00:00:12,000 --> 00:00:23,000\nAlice: Alice opens the meeting.")
+        );
+        assert!(
+            content.contains("2\n00:00:24,000 --> 00:00:35,000\nBob: Bob confirms the next step.")
+        );
+    }
+
+    #[test]
+    fn rendered_export_document_override_preserves_preview_sections() {
+        let document = super::parse_rendered_export_document_override(
+            "Transcript of Meeting\n\nTranscript\nClean edited transcript.\n\nSummary\nShort summary.",
+            "en",
+            "Meeting",
+            ExportStyle::Transcript,
+        )
+        .expect("rendered preview should parse as an export document");
+
+        assert_eq!(document.title, "Transcript of Meeting");
+        assert_eq!(document.sections[0].title, "Transcript");
+        assert_eq!(document.sections[0].body, "Clean edited transcript.");
+        assert_eq!(document.sections[1].title, "Summary");
+        assert_eq!(document.sections[1].body, "Short summary.");
+        assert_eq!(
+            render_plain_text_document(&document),
+            "Transcript of Meeting\n\nTranscript\nClean edited transcript.\n\nSummary\nShort summary."
+        );
+    }
+
+    #[test]
+    fn long_pdf_lines_wrap_without_losing_words() {
+        let line = "This transcript line is intentionally long so the PDF renderer wraps it into multiple visual lines without dropping any words from the exported content.";
+
+        let wrapped = wrap_pdf_text_line(line, 42);
+
+        assert!(wrapped.len() > 1);
+        assert!(wrapped.iter().all(|part| part.chars().count() <= 42));
+        assert_eq!(wrapped.join(" "), line);
+    }
+
+    #[test]
+    fn export_pdf_positions_body_text_with_absolute_text_matrices() {
+        let temp_dir = tempdir().expect("temp dir");
+        let path = temp_dir.path().join("transcript.pdf");
+        let document = super::ExportDocument {
+            title: "Transcript of Demo".to_string(),
+            sections: vec![super::ExportDocumentSection {
+                title: "Transcript".to_string(),
+                body: "First paragraph line.\nSecond paragraph line.".to_string(),
+                styled_lines: None,
+            }],
+        };
+
+        export_pdf(&path, &document).expect("pdf export should succeed");
+
+        let bytes = std::fs::read(path).expect("pdf should be written");
+        let pdf = String::from_utf8_lossy(&bytes);
+        assert!(pdf.contains("28 752 Tm"));
+        assert!(!pdf.contains("28 752 Td"));
+        assert!(
+            pdf.contains("/ToUnicode") || pdf.contains("(First paragraph line.) Tj"),
+            "PDF should either embed Unicode font mappings or emit fallback built-in-font text"
+        );
     }
 
     #[test]

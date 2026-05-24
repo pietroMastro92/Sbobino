@@ -9,6 +9,7 @@ import {
   markQueueItemTerminal,
   replaceQueuedTranscriptionJob,
   shouldFocusStartedTranscription,
+  shouldPreserveCurrentArtifactOnStart,
   shouldQueueTranscriptionStart,
   summarizeQueueItems,
   upsertQueueItem,
@@ -127,6 +128,23 @@ describe("transcriptionQueue helpers", () => {
       shouldFocusStartedTranscription({
         queuedPromotion: false,
         preserveCurrentArtifact: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not preserve the current artifact when starting a trimmed child transcription", () => {
+    expect(
+      shouldPreserveCurrentArtifactOnStart({
+        hasActiveArtifact: true,
+        section: "detail",
+        isTrimmedAudioTranscription: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldPreserveCurrentArtifactOnStart({
+        hasActiveArtifact: true,
+        section: "detail",
+        isTrimmedAudioTranscription: true,
       }),
     ).toBe(false);
   });

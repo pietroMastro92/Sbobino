@@ -195,6 +195,7 @@ import {
   markQueueItemTerminal,
   replaceQueuedTranscriptionJob,
   shouldFocusStartedTranscription,
+  shouldPreserveCurrentArtifactOnStart,
   shouldQueueTranscriptionStart,
   summarizeQueueItems,
   upsertQueueItem,
@@ -4578,6 +4579,13 @@ export function App({
             : artifact;
 
           prependArtifact(hydratedArtifact);
+          if (hydratedArtifact.parent_artifact_id) {
+            setExpandedArtifactIds((previous) => {
+              const next = new Set(previous);
+              next.add(hydratedArtifact.parent_artifact_id!);
+              return next;
+            });
+          }
           updateTranscriptionJobSnapshot(artifact.job_id, {
             title: hydratedArtifact.title,
             context: pendingContext?.detailContext ?? null,
@@ -7555,9 +7563,14 @@ export function App({
       const effectiveLanguage =
         request.language ?? settings.transcription.language;
       const nextDetailContext = request.detailContext ?? null;
-      const preserveCurrentArtifact = Boolean(
-        activeArtifact && section === "detail",
+      const isTrimmedAudioTranscription = Boolean(
+        request.trimValidationSnapshot && request.parentId,
       );
+      const preserveCurrentArtifact = shouldPreserveCurrentArtifactOnStart({
+        hasActiveArtifact: Boolean(activeArtifact),
+        section,
+        isTrimmedAudioTranscription,
+      });
       const shouldFocusOnStart = shouldFocusStartedTranscription({
         queuedPromotion: Boolean(options?.queuedJobId),
         preserveCurrentArtifact,
@@ -8008,6 +8021,8 @@ export function App({
       title: requestedTitle,
       detailContext: nextDetailContext,
       trimValidationSnapshot,
+      sourceOrigin:
+        isTrimRetranscription || preparedHomeTrim ? "trimmed" : undefined,
     };
 
     if (!isTrimRetranscription) {
@@ -9208,6 +9223,7 @@ export function App({
         },
         segments: payload.segments,
         content_override: payload.contentOverride,
+        rendered_content_override: payload.renderedContentOverride,
       });
       setError(null);
       return true;
@@ -12832,6 +12848,11 @@ export function App({
                 void onStartTranscription(effectiveTrimmedAudioDraft.path, {
                   parentId: effectiveTrimmedAudioDraft.parentArtifactId,
                   title: effectiveTrimmedAudioDraft.title,
+                });
+                setExpandedArtifactIds((previous) => {
+                  const next = new Set(previous);
+                  next.add(effectiveTrimmedAudioDraft.parentArtifactId);
+                  return next;
                 });
               }
             }}

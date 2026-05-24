@@ -26,6 +26,7 @@ export type ExportRequest = {
   options: ExportOptions;
   segments: ExportSegment[];
   contentOverride?: string;
+  renderedContentOverride?: string;
 };
 
 type ExportSheetProps = {
@@ -85,6 +86,10 @@ function getFormatsForStyle(
   if (style === "subtitles") return getSubtitlesFormats(t);
   if (style === "segments") return getSegmentsFormats(t);
   return getTranscriptFormats(t);
+}
+
+function isDocumentExportFormat(format: ExportFormat): boolean {
+  return format === "txt" || format === "docx" || format === "html" || format === "pdf" || format === "md";
 }
 
 type StyleItem = {
@@ -545,6 +550,7 @@ export function ExportSheet({
         },
         segments: exportSegments,
         contentOverride: transcriptText,
+        renderedContentOverride: isDocumentExportFormat(format) ? exportContent : undefined,
       });
       if (didExport) {
         onClose();

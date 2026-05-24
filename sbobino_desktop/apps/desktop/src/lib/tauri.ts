@@ -237,6 +237,7 @@ export async function exportArtifact(payload: {
     speakerLabel?: string | null;
   }>;
   content_override?: string;
+  rendered_content_override?: string;
 }): Promise<{ path: string }> {
   return invoke<{ path: string }>("export_artifact", { payload });
 }
