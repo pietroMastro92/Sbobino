@@ -11,8 +11,16 @@ ROOT_NAME="runtime"
 MACOS_DEPLOYMENT_TARGET=${SBOBINO_MACOS_RUNTIME_DEPLOYMENT_TARGET:-13.0}
 SDL2_VERSION=${SBOBINO_RUNTIME_SDL2_VERSION:-2.32.10}
 WHISPER_CPP_VERSION=${SBOBINO_RUNTIME_WHISPER_CPP_VERSION:-1.8.4}
+PARAKEET_CPP_REF=${SBOBINO_RUNTIME_PARAKEET_CPP_REF:-${SBOBINO_RUNTIME_PARAKEET_CPP_VERSION:-9edf17c3ada66e0f881dcff155492867db7ac4cf}}
 FFMPEG_VERSION=${SBOBINO_RUNTIME_FFMPEG_VERSION:-8.1}
 BUILD_JOBS=${SBOBINO_RUNTIME_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+PARAKEET_GGML_METAL=${SBOBINO_PARAKEET_METAL:-ON}
+
+case "$PARAKEET_GGML_METAL" in
+  1|ON|on|true|TRUE|yes|YES) PARAKEET_GGML_METAL=ON ;;
+  0|OFF|off|false|FALSE|no|NO) PARAKEET_GGML_METAL=OFF ;;
+  *) echo "Unsupported SBOBINO_PARAKEET_METAL value: $PARAKEET_GGML_METAL" >&2; exit 1 ;;
+esac
 
 STAGE_DIR=$(mktemp -d)
 SOURCE_DIR="$STAGE_DIR/src"
@@ -34,7 +42,7 @@ need_cmd() {
   fi
 }
 
-for command in clang cmake codesign curl make otool python3 tar xcrun; do
+for command in clang cmake codesign curl find git make otool python3 tar xcrun; do
   need_cmd "$command"
 done
 
@@ -76,6 +84,32 @@ extract_source_archive() {
       exit 1
       ;;
   esac
+}
+
+normalize_parakeet_ref() {
+  case "$1" in
+    v*|[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*|master|main|HEAD)
+      printf '%s\n' "$1"
+      ;;
+    [0-9]*)
+      printf 'v%s\n' "$1"
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
+checkout_parakeet_source() {
+  local source_root=$1
+  local ref
+  ref=$(normalize_parakeet_ref "$PARAKEET_CPP_REF")
+  git clone https://github.com/mudler/parakeet.cpp.git "$source_root"
+  (
+    cd "$source_root"
+    git checkout "$ref"
+    git submodule update --init --recursive --depth 1
+  )
 }
 
 read_binary_minos() {
@@ -183,6 +217,43 @@ build_whisper_binaries() {
   cp "$build_root/bin/whisper-stream" "$TARGET_BIN/whisper-stream"
 }
 
+build_parakeet_binary() {
+  local source_root="$BUILD_DIR/parakeet.cpp"
+  local build_root="$BUILD_DIR/parakeet-build"
+  local binary
+  local resolved_ref
+
+  checkout_parakeet_source "$source_root"
+  resolved_ref=$(git -C "$source_root" rev-parse HEAD)
+
+  cmake -S "$source_root" -B "$build_root" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
+    -DCMAKE_OSX_SYSROOT="$SDKROOT" \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DPARAKEET_BUILD_CLI=ON \
+    -DPARAKEET_BUILD_TESTS=OFF \
+    -DGGML_NATIVE=OFF \
+    -DPARAKEET_GGML_METAL="$PARAKEET_GGML_METAL"
+  cmake --build "$build_root" -j"$BUILD_JOBS"
+
+  binary=$(find "$build_root" -type f -name parakeet-cli -print -quit)
+  if [[ -z "$binary" ]]; then
+    echo "Unable to find parakeet-cli after building parakeet.cpp." >&2
+    exit 1
+  fi
+
+  cp "$binary" "$TARGET_BIN/parakeet-cli"
+  {
+    echo "parakeet_cpp_ref=$PARAKEET_CPP_REF"
+    echo "parakeet_cpp_resolved_ref=$resolved_ref"
+    echo "parakeet_ggml_metal=$PARAKEET_GGML_METAL"
+    echo "cmake_arch=arm64"
+  } > "$TARGET_BIN/parakeet-runtime-manifest.txt"
+}
+
 build_ffmpeg_binary() {
   local archive="$SOURCE_DIR/ffmpeg-${FFMPEG_VERSION}.tar.xz"
   local source_root="$BUILD_DIR/ffmpeg-${FFMPEG_VERSION}"
@@ -240,11 +311,30 @@ probe_runtime_binary() {
     "$binary" "$@" >/dev/null 2>&1
 }
 
+probe_parakeet_binary() {
+  local output
+  local status
+  set +e
+  output=$(env -i \
+    PATH="$TARGET_BIN:/usr/bin:/bin" \
+    DYLD_LIBRARY_PATH="$TARGET_LIB" \
+    DYLD_FALLBACK_LIBRARY_PATH="$TARGET_LIB" \
+    "$TARGET_BIN/parakeet-cli" --help 2>&1)
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 && "$output" != *"parakeet-cli transcribe"* ]]; then
+    echo "$output" >&2
+    echo "parakeet-cli --help probe failed with status $status." >&2
+    exit 1
+  fi
+}
+
 build_sdl2_static
 build_whisper_binaries
+build_parakeet_binary
 build_ffmpeg_binary
 
-for binary in ffmpeg whisper-cli whisper-stream; do
+for binary in ffmpeg whisper-cli whisper-stream parakeet-cli; do
   chmod 755 "$TARGET_BIN/$binary"
   codesign --force --sign - "$TARGET_BIN/$binary" >/dev/null 2>&1 || true
 done
@@ -252,10 +342,12 @@ done
 assert_binary_portable "$TARGET_BIN/ffmpeg" "ffmpeg"
 assert_binary_portable "$TARGET_BIN/whisper-cli" "whisper-cli"
 assert_binary_portable "$TARGET_BIN/whisper-stream" "whisper-stream"
+assert_binary_portable "$TARGET_BIN/parakeet-cli" "parakeet-cli"
 
 probe_runtime_binary "$TARGET_BIN/ffmpeg" -version
 probe_runtime_binary "$TARGET_BIN/whisper-cli" --help
 probe_runtime_binary "$TARGET_BIN/whisper-stream" --help
+probe_parakeet_binary
 
 ditto -c -k --sequesterRsrc --keepParent "$TARGET_ROOT" "$OUTPUT_ZIP"
 echo "Created $OUTPUT_ZIP"

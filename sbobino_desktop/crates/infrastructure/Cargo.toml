@@ -1,6 +1,6 @@
 [package]
 name = "sbobino-infrastructure"
-version = "0.1.41"
+version = "0.2.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -24,4 +24,5 @@ sbobino-domain = { path = "../domain" }
 sbobino-application = { path = "../application" }
 
 [dev-dependencies]
+regex = "1"
 tempfile = "3.13"

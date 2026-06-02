@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SELF_PATH="$SCRIPT_DIR/$(basename -- "$0")"
+APP_SUPPORT_DIR="${SBOBINO_APP_SUPPORT_DIR:-$HOME/Library/Application Support/com.sbobino.desktop}"
+for candidate in \
+  "$SCRIPT_DIR/parakeet-cli" \
+  "$APP_SUPPORT_DIR/bin/parakeet-cli" \
+  "/opt/homebrew/bin/parakeet-cli" \
+  "/usr/local/bin/parakeet-cli" \
+  "parakeet-cli"
+do
+  if [ "${candidate#*/}" != "$candidate" ]; then
+    if [ -x "$candidate" ]; then
+      CANDIDATE_PATH="$(CDPATH= cd -- "$(dirname -- "$candidate")" && pwd)/$(basename -- "$candidate")"
+      if [ "$CANDIDATE_PATH" = "$SELF_PATH" ]; then
+        continue
+      fi
+      exec "$candidate" "$@"
+    fi
+  else
+    if command -v "$candidate" >/dev/null 2>&1; then
+      exec "$candidate" "$@"
+    fi
+  fi
+done
+echo "parakeet-cli not found. Build parakeet.cpp or configure Parakeet CLI path in Settings > Local Models." >&2
+exit 127

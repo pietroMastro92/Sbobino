@@ -94,6 +94,35 @@ const MODEL_CATALOG: [(&str, &str, &str, &str, &str); 5] = [
 ];
 
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
+const PARAKEET_MODEL_BASE_URL: &str =
+    "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/";
+const PARAKEET_MODEL_CATALOG: [(&str, &str, &str); 5] = [
+    (
+        "tdt06b_v3_q4",
+        "Parakeet TDT 0.6B v3 Q4_K",
+        "tdt-0.6b-v3-q4_k.gguf",
+    ),
+    (
+        "realtime_eou120m_v1_f16",
+        "Parakeet Realtime EOU 120M F16",
+        "realtime_eou_120m-v1-f16.gguf",
+    ),
+    (
+        "realtime_eou120m_v1_q8",
+        "Parakeet Realtime EOU 120M Q8",
+        "realtime_eou_120m-v1-q8_0.gguf",
+    ),
+    (
+        "tdt06b_v3_f16",
+        "Parakeet TDT 0.6B v3 F16",
+        "tdt-0.6b-v3-f16.gguf",
+    ),
+    (
+        "tdt06b_v3_q8",
+        "Parakeet TDT 0.6B v3 Q8",
+        "tdt-0.6b-v3-q8_0.gguf",
+    ),
+];
 const LOCAL_RELEASE_ASSETS_DIR_ENV: &str = "SBOBINO_LOCAL_RELEASE_ASSETS_DIR";
 
 #[derive(Debug, Clone)]
@@ -527,6 +556,8 @@ pub struct ProvisioningModelCatalogEntry {
     pub model_file: String,
     pub installed: bool,
     pub coreml_installed: bool,
+    pub engine: String,
+    pub experimental: bool,
 }
 
 fn format_managed_runtime_install_error(health: &ManagedRuntimeHealth) -> String {
@@ -635,7 +666,13 @@ pub async fn provisioning_models(
     };
     let models_dir = PathBuf::from(state.runtime_factory.resolve_models_dir(&models_dir_value));
 
-    Ok(MODEL_CATALOG
+    let parakeet_models_dir = PathBuf::from(
+        state
+            .runtime_factory
+            .resolve_models_dir(&settings.transcription.parakeet_models_dir),
+    );
+
+    let mut entries = MODEL_CATALOG
         .iter()
         .map(|(key, label, model_file, encoder_dir, _encoder_archive)| {
             ProvisioningModelCatalogEntry {
@@ -644,9 +681,27 @@ pub async fn provisioning_models(
                 model_file: (*model_file).to_string(),
                 installed: models_dir.join(model_file).exists(),
                 coreml_installed: models_dir.join(encoder_dir).is_dir(),
+                engine: "whisper_cpp".to_string(),
+                experimental: false,
             }
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    entries.extend(
+        PARAKEET_MODEL_CATALOG
+            .iter()
+            .map(|(key, label, model_file)| ProvisioningModelCatalogEntry {
+                key: (*key).to_string(),
+                label: (*label).to_string(),
+                model_file: (*model_file).to_string(),
+                installed: parakeet_models_dir.join(model_file).exists(),
+                coreml_installed: false,
+                engine: "parakeet_cpp".to_string(),
+                experimental: true,
+            }),
+    );
+
+    Ok(entries)
 }
 
 fn pyannote_background_action_response(
@@ -945,6 +1000,8 @@ pub async fn provisioning_start(
         models_dir,
         missing_models,
         missing_encoders,
+        MODEL_BASE_URL,
+        "whisper_model",
         cancel_token,
     );
 
@@ -974,6 +1031,48 @@ pub async fn provisioning_download_model(
     tokio::fs::create_dir_all(&models_dir).await.map_err(|e| {
         CommandError::new("provisioning", format!("failed to create models dir: {e}"))
     })?;
+
+    if let Some((_, label, model_file)) = PARAKEET_MODEL_CATALOG
+        .iter()
+        .find(|(key, _, _)| *key == payload.model)
+    {
+        let parakeet_models_dir = PathBuf::from(
+            state
+                .runtime_factory
+                .resolve_models_dir(&settings.transcription.parakeet_models_dir),
+        );
+        tokio::fs::create_dir_all(&parakeet_models_dir)
+            .await
+            .map_err(|e| {
+                CommandError::new(
+                    "provisioning",
+                    format!("failed to create Parakeet models dir: {e}"),
+                )
+            })?;
+
+        if parakeet_models_dir.join(model_file).exists() {
+            emit_provisioning_status(
+                &app,
+                "completed",
+                &format!("{label} is already available."),
+                None,
+            );
+            return Ok(ProvisioningStartResponse { started: false });
+        }
+
+        let cancel_token = CancellationToken::new();
+        *state.provisioning.cancel_token.lock().await = Some(cancel_token.clone());
+        spawn_provisioning_download(
+            app,
+            parakeet_models_dir,
+            vec![(*model_file).to_string()],
+            Vec::new(),
+            PARAKEET_MODEL_BASE_URL,
+            "parakeet_model",
+            cancel_token,
+        );
+        return Ok(ProvisioningStartResponse { started: true });
+    }
 
     let Some((_, label, model_file, encoder_dir, encoder_archive)) = MODEL_CATALOG
         .iter()
@@ -1014,6 +1113,8 @@ pub async fn provisioning_download_model(
         models_dir,
         missing_models,
         missing_encoders,
+        MODEL_BASE_URL,
+        "whisper_model",
         cancel_token,
     );
 
@@ -1192,6 +1293,8 @@ fn spawn_provisioning_download(
     models_dir: PathBuf,
     missing_models: Vec<String>,
     missing_encoders: Vec<(String, String)>,
+    model_base_url: &'static str,
+    model_asset_kind: &'static str,
     cancel_token: CancellationToken,
 ) {
     let total = missing_models.len() + missing_encoders.len();
@@ -1227,10 +1330,10 @@ fn spawn_provisioning_download(
                 return;
             }
 
-            let url = format!("{MODEL_BASE_URL}{model}");
+            let url = format!("{model_base_url}{model}");
             let destination = models_dir.join(&model);
             match download_to_path(&client, &url, &destination, &cancel_token).await {
-                Ok(()) => emit_progress(model, "whisper_model", "downloaded".to_string()),
+                Ok(()) => emit_progress(model, model_asset_kind, "downloaded".to_string()),
                 Err(error) => {
                     if error == "cancelled" {
                         emit_provisioning_status(

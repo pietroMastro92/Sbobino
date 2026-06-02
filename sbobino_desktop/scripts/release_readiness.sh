@@ -149,7 +149,13 @@ env["DYLD_LIBRARY_PATH"] = lib_dir
 env["DYLD_FALLBACK_LIBRARY_PATH"] = lib_dir
 env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
 
-def run_probe(binary: str, args: list[str], timeout: int, allow_timeout: bool) -> None:
+def run_probe(
+    binary: str,
+    args: list[str],
+    timeout: int,
+    allow_timeout: bool,
+    allow_usage_exit: bool = False,
+) -> None:
     candidate = os.path.join(bin_dir, binary)
     try:
         result = subprocess.run(
@@ -167,6 +173,8 @@ def run_probe(binary: str, args: list[str], timeout: int, allow_timeout: bool) -
             f"{binary} did not respond within {timeout}s while validating extracted runtime asset."
         ) from exc
     if result.returncode != 0:
+        if allow_usage_exit and "parakeet-cli transcribe" in result.stdout:
+            return
         preview = "\n".join(result.stdout.splitlines()[:20])
         raise SystemExit(
             f"{binary} exited with code {result.returncode} while validating extracted runtime asset.\n{preview}"
@@ -196,17 +204,18 @@ def generate_test_wav(path: str) -> None:
             frames.extend(int(value).to_bytes(2, byteorder="little", signed=True))
         wav_file.writeframes(bytes(frames))
 
-for binary, args, timeout, cold_timeout in (
-    ("ffmpeg", ["-version"], 60, 45),
-    ("whisper-cli", ["--help"], 30, 15),
-    ("whisper-stream", ["--help"], 30, 15),
+for binary, args, timeout, cold_timeout, allow_usage_exit in (
+    ("ffmpeg", ["-version"], 60, 45, False),
+    ("whisper-cli", ["--help"], 30, 15, False),
+    ("whisper-stream", ["--help"], 30, 15, False),
+    ("parakeet-cli", ["--help"], 30, 15, True),
 ):
     candidate = os.path.join(bin_dir, binary)
     if not os.path.isfile(candidate):
         raise SystemExit(f"Runtime asset is missing expected binary: {candidate}")
 
-    run_probe(binary, args, cold_timeout, True)
-    run_probe(binary, args, timeout, False)
+    run_probe(binary, args, cold_timeout, True, allow_usage_exit)
+    run_probe(binary, args, timeout, False, allow_usage_exit)
 
 input_wav = os.path.join(root, "runtime", "smoke-input.wav")
 output_wav = os.path.join(root, "runtime", "smoke-output.wav")
@@ -465,7 +474,7 @@ assert_runtime_asset_portability() {
   unzip -q "$runtime_zip" -d "$runtime_stage"
 
   local binary
-  for binary in ffmpeg whisper-cli whisper-stream; do
+  for binary in ffmpeg whisper-cli whisper-stream parakeet-cli; do
     local candidate="$runtime_stage/runtime/bin/$binary"
     if [[ ! -x "$candidate" ]]; then
       echo "Runtime asset is missing expected executable: $candidate" >&2
@@ -558,7 +567,7 @@ if [[ -n "$APP_PATH" ]]; then
     exit 1
   fi
 
-  for binary in whisper-cli whisper-stream ffmpeg; do
+  for binary in whisper-cli whisper-stream ffmpeg parakeet-cli; do
     if [[ ! -x "$APP_PATH/Contents/MacOS/$binary" ]]; then
       echo "Bundled binary missing: $APP_PATH/Contents/MacOS/$binary" >&2
       exit 1

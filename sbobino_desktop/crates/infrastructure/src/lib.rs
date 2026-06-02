@@ -30,6 +30,7 @@ use adapters::{
     gemini::GeminiEnhancer,
     noop_enhancer::NoopEnhancer,
     openai_compatible::{AuthStyle, OpenAiCompatibleEnhancer},
+    parakeet_cpp::ParakeetCppEngine,
     pyannote::{
         embedded_helper_script, PyannoteSpeakerDiarizationEngine, EMBEDDED_HELPER_FILENAME,
     },
@@ -63,6 +64,14 @@ const REQUIRED_MODEL_FILES: [&str; 5] = [
     "ggml-small.bin",
     "ggml-medium.bin",
     "ggml-large-v3-turbo-q8_0.bin",
+];
+
+const PARAKEET_MODEL_CATALOG: [(&str, &str); 5] = [
+    ("tdt-0.6b-v3-q4_k.gguf", "TDT 0.6B v3 Q4_K"),
+    ("realtime_eou_120m-v1-f16.gguf", "Realtime EOU 120M F16"),
+    ("realtime_eou_120m-v1-q8_0.gguf", "Realtime EOU 120M Q8"),
+    ("tdt-0.6b-v3-f16.gguf", "TDT 0.6B v3 F16"),
+    ("tdt-0.6b-v3-q8_0.gguf", "TDT 0.6B v3 Q8"),
 ];
 
 const REQUIRED_COREML_ENCODERS: [(&str, &str); 5] = [
@@ -135,6 +144,7 @@ pub struct ManagedRuntimeHealth {
     pub ffmpeg: ManagedRuntimeBinaryHealth,
     pub whisper_cli: ManagedRuntimeBinaryHealth,
     pub whisper_stream: ManagedRuntimeBinaryHealth,
+    pub parakeet_cli: ManagedRuntimeBinaryHealth,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,10 +166,18 @@ pub struct RuntimeHealth {
     pub whisper_stream_path: String,
     pub whisper_stream_resolved: String,
     pub whisper_stream_available: bool,
+    pub parakeet_cli_path: String,
+    pub parakeet_cli_resolved: String,
+    pub parakeet_cli_available: bool,
     pub models_dir_configured: String,
     pub models_dir_resolved: String,
+    pub parakeet_models_dir_configured: String,
+    pub parakeet_models_dir_resolved: String,
     pub model_filename: String,
     pub model_present: bool,
+    pub parakeet_model_filename: String,
+    pub parakeet_model_present: bool,
+    pub missing_parakeet_models: Vec<String>,
     pub coreml_encoder_present: bool,
     pub missing_models: Vec<String>,
     pub missing_encoders: Vec<String>,
@@ -181,6 +199,7 @@ pub struct LiveStartHealth {
     pub ffmpeg_available: bool,
     pub whisper_stream_resolved: String,
     pub whisper_stream_available: bool,
+    pub parakeet_cli_resolved: String,
     pub models_dir_resolved: String,
     pub model_filename: String,
     pub model_present: bool,
@@ -371,12 +390,25 @@ impl RuntimeTranscriptionFactory {
         let whisper_cli_path = self
             .resolve_transcription_binary_details(&whisper_cli_reference, "whisper-cli")
             .resolved_path;
+        let parakeet_cli_path = self
+            .resolve_transcription_binary_details(
+                &settings.transcription.parakeet_cli_path,
+                "parakeet-cli",
+            )
+            .resolved_path;
         let models_dir = self.resolve_models_dir(&settings.transcription.models_dir);
+        let parakeet_models_dir =
+            self.resolve_models_dir(&settings.transcription.parakeet_models_dir);
         let runtime_check = self.managed_runtime_health();
         let whisper_cli_runnable = if self.managed_runtime_required() {
             runtime_check.whisper_cli.available
         } else {
             self.binary_path_is_runnable(&whisper_cli_path)
+        };
+        let parakeet_cli_runnable = if self.managed_runtime_required() {
+            runtime_check.parakeet_cli.available
+        } else {
+            self.binary_path_is_runnable(&parakeet_cli_path)
         };
         let ffmpeg_runnable = if self.managed_runtime_required() {
             runtime_check.ffmpeg.available
@@ -398,7 +430,8 @@ impl RuntimeTranscriptionFactory {
             ));
         }
 
-        if !whisper_cli_runnable {
+        if settings.transcription.engine == TranscriptionEngine::WhisperCpp && !whisper_cli_runnable
+        {
             if self.managed_runtime_required() {
                 return Err(format_managed_runtime_binary_error(
                     "Whisper CLI",
@@ -412,16 +445,29 @@ impl RuntimeTranscriptionFactory {
             ));
         }
 
-        let effective_engine = TranscriptionEngine::WhisperCpp;
-
-        if settings.transcription.engine != effective_engine {
-            warn!(
-                "Adjusting transcription engine for current runtime: configured={:?}, effective={:?}",
-                settings.transcription.engine, effective_engine
-            );
-            settings.transcription.engine = effective_engine.clone();
-            settings.transcription_engine = effective_engine.clone();
-            platform_settings_changed = true;
+        if settings.transcription.engine == TranscriptionEngine::ParakeetCpp {
+            if !parakeet_cli_runnable {
+                if self.managed_runtime_required() {
+                    return Err(format_managed_runtime_binary_error(
+                        "Parakeet CLI",
+                        &runtime_check.parakeet_cli,
+                        "Install or repair the experimental Parakeet runtime from Settings > Local Models.",
+                    ));
+                }
+                return Err(format!(
+                    "Parakeet.cpp CLI is not runnable at '{}'. Configure Parakeet CLI path in Settings > Local Models.",
+                    parakeet_cli_path
+                ));
+            }
+            let parakeet_model_path = PathBuf::from(&parakeet_models_dir)
+                .join(settings.transcription.parakeet_model.gguf_filename());
+            if !parakeet_model_path.exists() {
+                return Err(format!(
+                    "Parakeet model file '{}' was not found in '{}'. Download it from Settings > Local Models.",
+                    settings.transcription.parakeet_model.gguf_filename(),
+                    parakeet_models_dir
+                ));
+            }
         }
 
         if platform_settings_changed {
@@ -434,7 +480,15 @@ impl RuntimeTranscriptionFactory {
 
         let transcoder = Arc::new(FfmpegAdapter::new(ffmpeg_path));
         let speech_engine: Arc<dyn sbobino_application::SpeechToTextEngine> =
-            Arc::new(WhisperCppEngine::new(whisper_cli_path, models_dir));
+            match settings.transcription.engine {
+                TranscriptionEngine::WhisperCpp => {
+                    Arc::new(WhisperCppEngine::new(whisper_cli_path, models_dir))
+                }
+                TranscriptionEngine::ParakeetCpp => Arc::new(ParakeetCppEngine::new(
+                    parakeet_cli_path,
+                    parakeet_models_dir,
+                )),
+            };
         let speaker_diarizer = self.build_speaker_diarizer(&settings)?;
 
         let enhancer_candidates = self
@@ -1096,6 +1150,10 @@ impl RuntimeTranscriptionFactory {
             &self.managed_runtime_binary_path("whisper-stream"),
             &lib_dir,
         );
+        let parakeet_cli = verify_managed_runtime_binary(
+            &self.managed_runtime_binary_path("parakeet-cli"),
+            &lib_dir,
+        );
 
         ManagedRuntimeHealth {
             source: "managed_release_asset".to_string(),
@@ -1103,6 +1161,7 @@ impl RuntimeTranscriptionFactory {
             ffmpeg,
             whisper_cli,
             whisper_stream,
+            parakeet_cli,
         }
     }
 
@@ -1112,7 +1171,10 @@ impl RuntimeTranscriptionFactory {
         fallback: &str,
     ) -> BinaryResolution {
         if self.managed_runtime_required()
-            && matches!(fallback, "ffmpeg" | "whisper-cli" | "whisper-stream")
+            && matches!(
+                fallback,
+                "ffmpeg" | "whisper-cli" | "whisper-stream" | "parakeet-cli"
+            )
         {
             return BinaryResolution {
                 resolved_path: self
@@ -1151,6 +1213,9 @@ impl RuntimeTranscriptionFactory {
         };
         let resolved_models_dir = self.resolve_models_dir(&configured_models_dir);
         let models_dir = PathBuf::from(&resolved_models_dir);
+        let configured_parakeet_models_dir = settings.transcription.parakeet_models_dir.clone();
+        let resolved_parakeet_models_dir = self.resolve_models_dir(&configured_parakeet_models_dir);
+        let parakeet_models_dir = PathBuf::from(&resolved_parakeet_models_dir);
 
         let whisper_cli_configured =
             sanitize_whisper_cli_reference(&settings.transcription.whisper_cli_path);
@@ -1158,12 +1223,15 @@ impl RuntimeTranscriptionFactory {
             &settings.transcription.whisperkit_cli_path,
             &whisper_cli_configured,
         );
+        let parakeet_cli_configured = settings.transcription.parakeet_cli_path.clone();
 
         let managed_runtime = self.managed_runtime_health();
         let whisper_cli_resolution =
             self.resolve_transcription_binary_details(&whisper_cli_configured, "whisper-cli");
         let whisper_stream_resolution =
             self.resolve_transcription_binary_details(&whisper_stream_configured, "whisper-stream");
+        let parakeet_cli_resolution =
+            self.resolve_transcription_binary_details(&parakeet_cli_configured, "parakeet-cli");
         let ffmpeg_resolution = self
             .resolve_transcription_binary_details(&settings.transcription.ffmpeg_path, "ffmpeg");
         let ffmpeg_available = if self.managed_runtime_required() {
@@ -1181,9 +1249,20 @@ impl RuntimeTranscriptionFactory {
         } else {
             self.binary_path_is_runnable(&whisper_stream_resolution.resolved_path)
         };
+        let parakeet_cli_available = if self.managed_runtime_required() {
+            managed_runtime.parakeet_cli.available
+        } else {
+            self.binary_path_is_runnable(&parakeet_cli_resolution.resolved_path)
+        };
 
         let model_filename = settings.transcription.model.ggml_filename().to_string();
         let model_present = models_dir.join(&model_filename).exists();
+        let parakeet_model_filename = settings
+            .transcription
+            .parakeet_model
+            .gguf_filename()
+            .to_string();
+        let parakeet_model_present = parakeet_models_dir.join(&parakeet_model_filename).exists();
         let coreml_encoder = encoder_for_model(&model_filename).unwrap_or_default();
         let coreml_encoder_present = if coreml_encoder.is_empty() {
             false
@@ -1235,10 +1314,18 @@ impl RuntimeTranscriptionFactory {
             whisper_stream_path: whisper_stream_configured,
             whisper_stream_resolved: whisper_stream_resolution.resolved_path,
             whisper_stream_available,
+            parakeet_cli_path: parakeet_cli_configured,
+            parakeet_cli_resolved: parakeet_cli_resolution.resolved_path,
+            parakeet_cli_available,
             models_dir_configured: configured_models_dir,
             models_dir_resolved: resolved_models_dir,
+            parakeet_models_dir_configured: configured_parakeet_models_dir,
+            parakeet_models_dir_resolved: resolved_parakeet_models_dir,
             model_filename,
             model_present,
+            parakeet_model_filename,
+            parakeet_model_present,
+            missing_parakeet_models: missing_parakeet_models(&parakeet_models_dir),
             coreml_encoder_present,
             missing_models: missing_models(&models_dir),
             missing_encoders: missing_encoders(&models_dir),
@@ -1265,6 +1352,10 @@ impl RuntimeTranscriptionFactory {
         let managed_runtime = self.managed_runtime_health();
         let whisper_stream_resolution =
             self.resolve_transcription_binary_details(&whisper_stream_configured, "whisper-stream");
+        let parakeet_cli_resolution = self.resolve_transcription_binary_details(
+            &settings.transcription.parakeet_cli_path,
+            "parakeet-cli",
+        );
         let ffmpeg_resolution = self
             .resolve_transcription_binary_details(&settings.transcription.ffmpeg_path, "ffmpeg");
         let ffmpeg_available = if self.managed_runtime_required() {
@@ -1288,6 +1379,7 @@ impl RuntimeTranscriptionFactory {
             ffmpeg_available,
             whisper_stream_resolved: whisper_stream_resolution.resolved_path,
             whisper_stream_available,
+            parakeet_cli_resolved: parakeet_cli_resolution.resolved_path,
             models_dir_resolved: resolved_models_dir,
             model_filename,
             model_present,
@@ -2885,6 +2977,19 @@ fn missing_models(models_dir: &Path) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn missing_parakeet_models(models_dir: &Path) -> Vec<String> {
+    PARAKEET_MODEL_CATALOG
+        .iter()
+        .filter_map(|(filename, _label)| {
+            if models_dir.join(filename).exists() {
+                None
+            } else {
+                Some((*filename).to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
 fn missing_encoders(models_dir: &Path) -> Vec<String> {
     REQUIRED_COREML_ENCODERS
         .iter()
@@ -3888,7 +3993,9 @@ mod tests {
         ReconcileManagedPyannoteReleaseOutcome, RuntimeSourcePolicy, RuntimeTranscriptionFactory,
         PYANNOTE_COMPAT_LEVEL, PYANNOTE_STATUS_FILENAME,
     };
-    use sbobino_domain::{AiProvider, AppSettings, RemoteServiceConfig, RemoteServiceKind};
+    use sbobino_domain::{
+        AiProvider, AppSettings, RemoteServiceConfig, RemoteServiceKind, TranscriptionEngine,
+    };
     use tempfile::tempdir;
 
     fn build_factory() -> (tempfile::TempDir, RuntimeTranscriptionFactory) {
@@ -4875,6 +4982,136 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("Pyannote diarization runtime is not installed"));
+    }
+
+    #[test]
+    fn build_service_fails_closed_when_parakeet_cli_is_missing() {
+        let (_temp, factory) = build_factory();
+        let mut settings = AppSettings::default();
+        settings.transcription.engine = TranscriptionEngine::ParakeetCpp;
+        persist_settings(&factory, &settings);
+
+        prepare_managed_runtime(
+            &factory,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let parakeet_models_dir =
+            std::path::PathBuf::from(factory.resolve_models_dir("parakeet-models"));
+        std::fs::create_dir_all(&parakeet_models_dir).expect("parakeet models dir should exist");
+        std::fs::write(
+            parakeet_models_dir.join(settings.transcription.parakeet_model.gguf_filename()),
+            b"parakeet",
+        )
+        .expect("parakeet model should write");
+
+        let error = match factory.build_service() {
+            Ok(_) => panic!("service should fail when parakeet-cli is missing"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Parakeet CLI"));
+    }
+
+    #[test]
+    fn build_service_fails_closed_when_parakeet_model_is_missing() {
+        let (_temp, factory) = build_factory();
+        let mut settings = AppSettings::default();
+        settings.transcription.engine = TranscriptionEngine::ParakeetCpp;
+        persist_settings(&factory, &settings);
+
+        prepare_managed_runtime(
+            &factory,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_executable_file(
+            &factory.managed_runtime_binary_path("parakeet-cli"),
+            "#!/bin/sh\nexit 0\n",
+        );
+
+        let error = match factory.build_service() {
+            Ok(_) => panic!("service should fail when parakeet model is missing"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Parakeet model file"));
+    }
+
+    #[test]
+    fn build_service_accepts_parakeet_when_cli_and_model_are_present() {
+        let (_temp, factory) = build_factory();
+        let mut settings = AppSettings::default();
+        settings.transcription.engine = TranscriptionEngine::ParakeetCpp;
+        persist_settings(&factory, &settings);
+
+        prepare_managed_runtime(
+            &factory,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_executable_file(
+            &factory.managed_runtime_binary_path("parakeet-cli"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        let parakeet_models_dir =
+            std::path::PathBuf::from(factory.resolve_models_dir("parakeet-models"));
+        std::fs::create_dir_all(&parakeet_models_dir).expect("parakeet models dir should exist");
+        std::fs::write(
+            parakeet_models_dir.join(settings.transcription.parakeet_model.gguf_filename()),
+            b"parakeet",
+        )
+        .expect("parakeet model should write");
+
+        factory
+            .build_service()
+            .expect("service should build with parakeet cli and model");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dev_app_registers_parakeet_sidecar_like_whisper_sidecars() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let binaries_dir = manifest_dir.join("../../apps/desktop/src-tauri/binaries");
+        let parakeet_sidecar =
+            binaries_dir.join(format!("parakeet-cli-{}", target_triple_suffix()));
+
+        assert!(
+            parakeet_sidecar.is_file(),
+            "dev Parakeet sidecar wrapper should exist at {}",
+            parakeet_sidecar.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&parakeet_sidecar)
+                .expect("dev Parakeet sidecar metadata should load")
+                .permissions()
+                .mode();
+            assert_ne!(
+                mode & 0o111,
+                0,
+                "dev Parakeet sidecar wrapper should be executable"
+            );
+        }
+
+        let tauri_config_path = manifest_dir.join("../../apps/desktop/src-tauri/tauri.conf.json");
+        let tauri_config =
+            std::fs::read_to_string(&tauri_config_path).expect("tauri config should be readable");
+        let tauri_config: serde_json::Value =
+            serde_json::from_str(&tauri_config).expect("tauri config should be valid JSON");
+        let external_bins = tauri_config
+            .pointer("/bundle/externalBin")
+            .and_then(serde_json::Value::as_array)
+            .expect("tauri config should contain bundle.externalBin");
+
+        assert!(
+            external_bins
+                .iter()
+                .any(|entry| entry.as_str() == Some("binaries/parakeet-cli")),
+            "Tauri externalBin should register binaries/parakeet-cli"
+        );
     }
 
     #[test]

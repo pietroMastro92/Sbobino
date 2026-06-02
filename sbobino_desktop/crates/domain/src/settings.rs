@@ -68,16 +68,41 @@ impl SpeechModel {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum ParakeetModel {
+    RealtimeEou120mV1F16,
+    RealtimeEou120mV1Q8,
+    Tdt06bV3F16,
+    Tdt06bV3Q8,
+    #[default]
+    Tdt06bV3Q4,
+}
+
+impl ParakeetModel {
+    pub fn gguf_filename(&self) -> &'static str {
+        match self {
+            Self::RealtimeEou120mV1F16 => "realtime_eou_120m-v1-f16.gguf",
+            Self::RealtimeEou120mV1Q8 => "realtime_eou_120m-v1-q8_0.gguf",
+            Self::Tdt06bV3F16 => "tdt-0.6b-v3-f16.gguf",
+            Self::Tdt06bV3Q8 => "tdt-0.6b-v3-q8_0.gguf",
+            Self::Tdt06bV3Q4 => "tdt-0.6b-v3-q4_k.gguf",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum TranscriptionEngine {
     #[default]
     #[serde(alias = "whisper_kit")]
     WhisperCpp,
+    ParakeetCpp,
 }
 
 impl TranscriptionEngine {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::WhisperCpp => "whisper_cpp",
+            Self::ParakeetCpp => "parakeet_cpp",
         }
     }
 }
@@ -271,12 +296,15 @@ impl Default for SpeakerDiarizationSettings {
 pub struct TranscriptionSettings {
     pub engine: TranscriptionEngine,
     pub model: SpeechModel,
+    pub parakeet_model: ParakeetModel,
     pub language: LanguageCode,
     pub whisper_cli_path: String,
     #[serde(alias = "whisper_stream_path")]
     pub whisperkit_cli_path: String,
+    pub parakeet_cli_path: String,
     pub ffmpeg_path: String,
     pub models_dir: String,
+    pub parakeet_models_dir: String,
     pub enable_ai_post_processing: bool,
     pub speaker_diarization: SpeakerDiarizationSettings,
     pub whisper_options: WhisperOptions,
@@ -287,11 +315,14 @@ impl Default for TranscriptionSettings {
         Self {
             engine: TranscriptionEngine::default(),
             model: SpeechModel::Base,
+            parakeet_model: ParakeetModel::default(),
             language: LanguageCode::Auto,
             whisper_cli_path: "whisper-cli".to_string(),
             whisperkit_cli_path: "whisper-stream".to_string(),
+            parakeet_cli_path: "parakeet-cli".to_string(),
             ffmpeg_path: "ffmpeg".to_string(),
             models_dir: "models".to_string(),
+            parakeet_models_dir: "parakeet-models".to_string(),
             enable_ai_post_processing: false,
             speaker_diarization: SpeakerDiarizationSettings::default(),
             whisper_options: WhisperOptions::default(),

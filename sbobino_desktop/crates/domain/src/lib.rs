@@ -21,7 +21,7 @@ pub use settings::{
     AutomaticImportPostProcessingSettings, AutomaticImportPreset, AutomaticImportQuarantineItem,
     AutomaticImportSettings, AutomaticImportSource, AutomaticImportSourceHealth,
     AutomaticImportSourceStatus, GeneralSettings, LanguageCode, OrganizationSettings,
-    PromptBindings, PromptCategory, PromptSettings, PromptTask, PromptTemplate,
+    ParakeetModel, PromptBindings, PromptCategory, PromptSettings, PromptTask, PromptTemplate,
     RemoteServiceConfig, RemoteServiceKind, SpeakerDiarizationSettings, SpeechModel,
     TranscriptionEngine, TranscriptionSettings, WhisperOptions, WorkspaceConfig,
 };

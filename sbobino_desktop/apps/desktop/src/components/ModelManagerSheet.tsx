@@ -3,7 +3,6 @@ import { t } from "../i18n";
 import type {
   ProvisioningModelCatalogEntry,
   ProvisioningProgressEvent,
-  SpeechModel,
 } from "../types";
 
 type ModelManagerSheetProps = {
@@ -13,7 +12,7 @@ type ModelManagerSheetProps = {
   running: boolean;
   progress: ProvisioningProgressEvent | null;
   statusMessage: string;
-  onDownloadModel: (model: SpeechModel) => Promise<void>;
+  onDownloadModel: (model: string) => Promise<void>;
   onDownloadAll: () => Promise<void>;
   onRefresh: () => Promise<void>;
   onCancel: () => Promise<void>;
@@ -64,23 +63,41 @@ export function ModelManagerSheet({
           {models.map((model) => (
             <div key={model.key} className="model-row">
               <div className="model-row-main">
-                <strong>{t(`speechModel.${model.key}`, model.label)}</strong>
+                <strong>
+                  {model.engine === "whisper_cpp"
+                    ? t(`speechModel.${model.key}`, model.label)
+                    : model.label}
+                </strong>
                 <small>{model.model_file}</small>
               </div>
               <div className="model-row-actions">
+                {model.experimental ? (
+                  <span className="missing-chip">
+                    {t("status.experimental", "Experimental")}
+                  </span>
+                ) : null}
                 <span className={model.installed ? "kind-chip" : "missing-chip"}>
                   {model.installed ? t("modelManager.ready", "Ready") : t("modelManager.missing", "Missing")}
                 </span>
-                <span className={model.coreml_installed ? "kind-chip" : "missing-chip"}>
-                  {model.coreml_installed ? t("modelManager.coremlReady", "CoreML Ready") : t("modelManager.coremlMissing", "CoreML Missing")}
-                </span>
+                {model.engine === "whisper_cpp" ? (
+                  <span className={model.coreml_installed ? "kind-chip" : "missing-chip"}>
+                    {model.coreml_installed ? t("modelManager.coremlReady", "CoreML Ready") : t("modelManager.coremlMissing", "CoreML Missing")}
+                  </span>
+                ) : null}
                 <button
                   className="secondary-button"
-                  disabled={running || (model.installed && model.coreml_installed)}
+                  disabled={
+                    running ||
+                    (model.installed &&
+                      (model.engine !== "whisper_cpp" || model.coreml_installed))
+                  }
                   onClick={() => void onDownloadModel(model.key)}
                 >
                   <Download size={14} />
-                  {model.installed && model.coreml_installed ? t("modelManager.installed", "Installed") : t("modelManager.download", "Download")}
+                  {model.installed &&
+                  (model.engine !== "whisper_cpp" || model.coreml_installed)
+                    ? t("modelManager.installed", "Installed")
+                    : t("modelManager.download", "Download")}
                 </button>
               </div>
             </div>

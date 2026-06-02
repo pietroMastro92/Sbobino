@@ -213,6 +213,7 @@ import type {
   JobProgress,
   LanguageCode,
   OrganizationSettings,
+  ParakeetModel,
   PromptTask,
   PromptTemplate,
   ProvisioningProgressEvent,
@@ -570,6 +571,14 @@ const modelOptions: Array<{ value: SpeechModel; label: string }> = [
   { value: "large_turbo", label: "Large Turbo" },
 ];
 
+const parakeetModelOptions: Array<{ value: ParakeetModel; label: string }> = [
+  { value: "tdt06b_v3_q4", label: "TDT 0.6B v3 Q4_K" },
+  { value: "tdt06b_v3_f16", label: "TDT 0.6B v3 F16" },
+  { value: "tdt06b_v3_q8", label: "TDT 0.6B v3 Q8" },
+  { value: "realtime_eou120m_v1_f16", label: "Realtime EOU 120M F16" },
+  { value: "realtime_eou120m_v1_q8", label: "Realtime EOU 120M Q8" },
+];
+
 const MIN_RETRANSCRIBE_TRIM_DURATION_SECONDS = 1.5;
 const LEFT_SIDEBAR_WIDTH_STORAGE_KEY = "sbobino.layout.leftSidebarWidth";
 const RIGHT_SIDEBAR_WIDTH_STORAGE_KEY = "sbobino.layout.rightSidebarWidth";
@@ -653,7 +662,10 @@ function guessAppleSiliconFromUA(): boolean {
 const allTranscriptionEngineOptions: Array<{
   value: TranscriptionEngine;
   label: string;
-}> = [{ value: "whisper_cpp", label: "Whisper C++" }];
+}> = [
+  { value: "whisper_cpp", label: "Whisper.cpp" },
+  { value: "parakeet_cpp", label: "Parakeet.cpp Metal (Experimental)" },
+];
 
 const chunkingOptions: Array<{
   value: WhisperOptions["chunking_strategy"];
@@ -1790,7 +1802,7 @@ function formatRemoteServiceLabel(
   return label || formatProviderLabel(service.kind);
 }
 
-function formatSpeechModelLabel(model: SpeechModel, fallback?: string): string {
+function formatSpeechModelLabel(model: string, fallback?: string): string {
   return t(`speechModel.${model}`, fallback ?? model);
 }
 
@@ -2162,6 +2174,13 @@ function normalizeSettings(settings: AppSettings): AppSettings {
     },
     transcription: {
       ...settings.transcription,
+      parakeet_model:
+        settings.transcription.parakeet_model ?? "tdt06b_v3_q4",
+      parakeet_cli_path:
+        settings.transcription.parakeet_cli_path?.trim() || "parakeet-cli",
+      parakeet_models_dir:
+        settings.transcription.parakeet_models_dir?.trim() ||
+        "parakeet-models",
       speaker_diarization: normalizedSpeakerDiarization,
       whisper_options: normalizedWhisperOptions,
     },
@@ -7316,6 +7335,7 @@ export function App({
         ...current.transcription,
         engine,
       },
+      transcription_engine: engine,
     }));
   }
 
@@ -7590,7 +7610,9 @@ export function App({
         try {
           preflight = await withTimeout(
             fetchTranscriptionStartPreflight({
+              engine: settings.transcription.engine,
               model: settings.transcription.model,
+              parakeet_model: settings.transcription.parakeet_model,
             }),
             // v0.1.36 lowered this to 3s; reverted to 8s after field reports
             // that transcriptions did not start. Awaiting repro before
@@ -7649,6 +7671,7 @@ export function App({
             engine: settings.transcription.engine,
             language: settings.transcription.language,
             model: settings.transcription.model,
+            parakeet_model: settings.transcription.parakeet_model,
             enable_ai: settings.transcription.enable_ai_post_processing,
             whisper_options: sanitizeWhisperOptions(
               settings.transcription.whisper_options ??
@@ -9586,7 +9609,7 @@ export function App({
     }
   }
 
-  async function onDownloadModel(model: SpeechModel): Promise<void> {
+  async function onDownloadModel(model: string): Promise<void> {
     try {
       setProvisioning((previous) => ({
         ...previous,
@@ -14100,7 +14123,7 @@ export function App({
               <small>
                 {t(
                   "settings.transcription.engineDesc",
-                  "This app uses Whisper.cpp for local transcription.",
+                  "Whisper.cpp remains the default; Parakeet.cpp Metal is experimental.",
                 )}
               </small>
             </div>
@@ -14124,21 +14147,47 @@ export function App({
           <div className="settings-row settings-row-block">
             <div>
               <strong>
-                {t("settings.transcription.model", "Default model")}
+                {settings.transcription.engine === "parakeet_cpp"
+                  ? t(
+                      "settings.transcription.parakeetModel",
+                      "Default Parakeet model",
+                    )
+                  : t("settings.transcription.model", "Default model")}
               </strong>
             </div>
-            <select
-              value={settings.transcription.model}
-              onChange={(event) => {
-                void onChangeModel(event.target.value as SpeechModel);
-              }}
-            >
-              {modelOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {formatSpeechModelLabel(option.value, option.label)}
-                </option>
-              ))}
-            </select>
+            {settings.transcription.engine === "parakeet_cpp" ? (
+              <select
+                value={settings.transcription.parakeet_model}
+                onChange={(event) => {
+                  void patchSettings((current) => ({
+                    ...current,
+                    transcription: {
+                      ...current.transcription,
+                      parakeet_model: event.target.value as ParakeetModel,
+                    },
+                  }));
+                }}
+              >
+                {parakeetModelOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <select
+                value={settings.transcription.model}
+                onChange={(event) => {
+                  void onChangeModel(event.target.value as SpeechModel);
+                }}
+              >
+                {modelOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {formatSpeechModelLabel(option.value, option.label)}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
 
           <div className="settings-row settings-row-block">
@@ -14837,6 +14886,13 @@ export function App({
               {provisioning.modelsDir || settings.transcription.models_dir}
             </code>
           </p>
+          <p className="muted">
+            {t("settings.localModels.parakeetDirectory", "Parakeet directory:")}{" "}
+            <code>
+              {runtimeHealth?.parakeet_models_dir_resolved ||
+                settings.transcription.parakeet_models_dir}
+            </code>
+          </p>
 
           {runtimeHealth ? (
             <div className="settings-health-block">
@@ -14977,6 +15033,36 @@ export function App({
                 </div>
                 <div className="settings-health-row">
                   <span className="settings-health-label">
+                    {t("settings.localModels.parakeetCli", "Parakeet CLI")}
+                  </span>
+                  <span className="settings-health-value-inline settings-health-value-stack">
+                    <code className="settings-health-value">
+                      {runtimeHealth.parakeet_cli_resolved ||
+                        runtimeHealth.parakeet_cli_path}
+                    </code>
+                    {runtimeHealth.parakeet_cli_available ? (
+                      <span className="kind-chip">
+                        {t("settings.localModels.runnable")}
+                      </span>
+                    ) : (
+                      <span className="missing-chip">
+                        {t("settings.localModels.unavailable")}
+                      </span>
+                    )}
+                    {!runtimeHealth.parakeet_cli_available &&
+                    runtimeHealth.managed_runtime?.parakeet_cli
+                      .failure_message ? (
+                      <span className="settings-health-detail">
+                        {
+                          runtimeHealth.managed_runtime.parakeet_cli
+                            .failure_message
+                        }
+                      </span>
+                    ) : null}
+                  </span>
+                </div>
+                <div className="settings-health-row">
+                  <span className="settings-health-label">
                     {t("settings.localModels.activeModel")}
                   </span>
                   <span className="settings-health-value-inline">
@@ -14990,6 +15076,29 @@ export function App({
                         {t("settings.localModels.missing")}
                       </span>
                     )}
+                  </span>
+                </div>
+                <div className="settings-health-row">
+                  <span className="settings-health-label">
+                    {t(
+                      "settings.localModels.activeParakeetModel",
+                      "Active Parakeet model",
+                    )}
+                  </span>
+                  <span className="settings-health-value-inline">
+                    <code>{runtimeHealth.parakeet_model_filename}</code>
+                    {runtimeHealth.parakeet_model_present ? (
+                      <span className="kind-chip">
+                        {t("settings.localModels.installed")}
+                      </span>
+                    ) : (
+                      <span className="missing-chip">
+                        {t("settings.localModels.missing")}
+                      </span>
+                    )}
+                    <span className="missing-chip">
+                      {t("status.experimental", "Experimental")}
+                    </span>
                   </span>
                 </div>
                 {platformIsAppleSilicon && (
@@ -15017,11 +15126,18 @@ export function App({
               <div key={model.key} className="model-row">
                 <div className="model-row-main">
                   <strong>
-                    {formatSpeechModelLabel(model.key, model.label)}
+                    {model.engine === "whisper_cpp"
+                      ? formatSpeechModelLabel(model.key, model.label)
+                      : model.label}
                   </strong>
                   <small>{model.model_file}</small>
                 </div>
                 <div className="model-row-actions">
+                  {model.experimental ? (
+                    <span className="missing-chip">
+                      {t("status.experimental", "Experimental")}
+                    </span>
+                  ) : null}
                   <span
                     className={model.installed ? "kind-chip" : "missing-chip"}
                   >
@@ -15029,7 +15145,7 @@ export function App({
                       ? t("status.installed", "Installed")
                       : t("status.missing", "Missing")}
                   </span>
-                  {platformIsAppleSilicon && (
+                  {model.engine === "whisper_cpp" && platformIsAppleSilicon && (
                     <span
                       className={
                         model.coreml_installed ? "kind-chip" : "missing-chip"
@@ -15048,12 +15164,16 @@ export function App({
                     disabled={
                       provisioning.running ||
                       (model.installed &&
-                        (!platformIsAppleSilicon || model.coreml_installed))
+                        (model.engine !== "whisper_cpp" ||
+                          !platformIsAppleSilicon ||
+                          model.coreml_installed))
                     }
                     onClick={() => void onDownloadModel(model.key)}
                   >
                     {model.installed &&
-                    (!platformIsAppleSilicon || model.coreml_installed)
+                    (model.engine !== "whisper_cpp" ||
+                      !platformIsAppleSilicon ||
+                      model.coreml_installed)
                       ? t("status.installed", "Installed")
                       : t("settings.localModels.download", "Download")}
                   </button>
@@ -16240,6 +16360,41 @@ export function App({
                   transcription: {
                     ...current.transcription,
                     models_dir: event.target.value,
+                  },
+                }));
+              }}
+            />
+          </label>
+
+          <label>
+            {t("settings.advanced.parakeetCliPath", "Parakeet CLI path")}
+            <input
+              value={settings.transcription.parakeet_cli_path}
+              onChange={(event) => {
+                void patchSettings((current) => ({
+                  ...current,
+                  transcription: {
+                    ...current.transcription,
+                    parakeet_cli_path: event.target.value,
+                  },
+                }));
+              }}
+            />
+          </label>
+
+          <label>
+            {t(
+              "settings.advanced.parakeetModelsDir",
+              "Parakeet models directory",
+            )}
+            <input
+              value={settings.transcription.parakeet_models_dir}
+              onChange={(event) => {
+                void patchSettings((current) => ({
+                  ...current,
+                  transcription: {
+                    ...current.transcription,
+                    parakeet_models_dir: event.target.value,
                   },
                 }));
               }}

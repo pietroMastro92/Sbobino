@@ -472,10 +472,7 @@ impl WhisperStreamEngine {
         }
 
         for mut task in reader_tasks {
-            if timeout(Duration::from_secs(3), &mut task)
-                .await
-                .is_err()
-            {
+            if timeout(Duration::from_secs(3), &mut task).await.is_err() {
                 task.abort();
             }
         }
