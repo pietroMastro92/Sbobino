@@ -325,6 +325,7 @@ async fn scan_automatic_import_inner(
                 input_path: candidate.file_path.clone(),
                 engine: settings.transcription.engine.clone(),
                 model: candidate.model.clone(),
+                parakeet_model: settings.transcription.parakeet_model.clone(),
                 language: candidate.language.clone(),
                 enable_ai: candidate.enable_ai_post_processing,
                 whisper_options: settings.transcription.whisper_options.clone(),

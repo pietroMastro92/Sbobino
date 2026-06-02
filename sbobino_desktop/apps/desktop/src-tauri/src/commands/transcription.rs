@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RunTranscriptionRequest};
 use sbobino_domain::{
-    ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, SpeechModel, TranscriptionEngine,
-    WhisperOptions,
+    ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel, SpeechModel,
+    TranscriptionEngine, WhisperOptions,
 };
 
 use crate::{
@@ -31,6 +31,8 @@ pub struct StartTranscriptionPayload {
     pub engine: TranscriptionEngine,
     pub language: LanguageCode,
     pub model: SpeechModel,
+    #[serde(default)]
+    pub parakeet_model: ParakeetModel,
     pub enable_ai: bool,
     #[serde(default)]
     pub whisper_options: WhisperOptions,
@@ -107,6 +109,7 @@ pub(crate) async fn spawn_transcription_job(
         engine: payload.engine,
         language: payload.language,
         model: payload.model,
+        parakeet_model: payload.parakeet_model,
         enable_ai: payload.enable_ai,
         whisper_options: payload.whisper_options,
         title: payload.title,

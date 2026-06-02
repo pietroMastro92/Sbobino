@@ -14,7 +14,8 @@ use tracing::{instrument, warn};
 
 use sbobino_domain::{
     constrain_transcript_edit, minimize_transcript_repetitions, ArtifactKind, JobProgress,
-    JobStage, SpeakerTurn, TimedSegment, TranscriptArtifact, TranscriptionOutput,
+    JobStage, SpeakerTurn, TimedSegment, TranscriptArtifact, TranscriptionEngine,
+    TranscriptionOutput,
 };
 
 use crate::{
@@ -129,12 +130,14 @@ impl TranscriptionService {
             .await?;
 
             let total_audio_seconds = self.wav_duration_seconds(&wav_path);
+            let transcription_progress_message =
+                transcription_progress_message(&request.engine).to_string();
 
             self.emit(
                 &emit_progress,
                 &request.job_id,
                 JobStage::Transcribing,
-                "Running Whisper transcription",
+                &transcription_progress_message,
                 0,
                 Some(0.0),
                 total_audio_seconds,
@@ -143,6 +146,7 @@ impl TranscriptionService {
             let progress_callback = {
                 let emit_progress = emit_progress.clone();
                 let job_id = request.job_id.clone();
+                let transcription_progress_message = transcription_progress_message.clone();
                 let last_emitted_seconds = Arc::new(Mutex::new(0_f32));
                 let last_emitted_seconds_ref = last_emitted_seconds.clone();
 
@@ -165,7 +169,7 @@ impl TranscriptionService {
                     emit_progress(JobProgress {
                         job_id: job_id.clone(),
                         stage: JobStage::Transcribing,
-                        message: "Running Whisper transcription".to_string(),
+                        message: transcription_progress_message.clone(),
                         percentage,
                         current_seconds: Some(sanitized_seconds),
                         total_seconds: total_audio_seconds,
@@ -178,7 +182,7 @@ impl TranscriptionService {
                     &cancellation_token,
                     self.speech_engine.transcribe(
                         &wav_path,
-                        request.model.ggml_filename(),
+                        request.speech_model_filename(),
                         request.language.as_whisper_code(),
                         &request.whisper_options,
                         total_audio_seconds,
@@ -203,7 +207,7 @@ impl TranscriptionService {
                     &emit_progress,
                     &request.job_id,
                     JobStage::Transcribing,
-                    "Running Whisper transcription",
+                    &transcription_progress_message,
                     100,
                     Some(total),
                     Some(total),
@@ -317,7 +321,7 @@ impl TranscriptionService {
             let mut metadata = request.metadata.clone();
             metadata.insert(
                 "model".to_string(),
-                request.model.ggml_filename().to_string(),
+                request.speech_model_filename().to_string(),
             );
             metadata.insert(
                 "language".to_string(),
@@ -387,7 +391,7 @@ impl TranscriptionService {
             artifact.audio_duration_seconds = total_audio_seconds;
             artifact.parent_artifact_id = request.parent_id.clone();
             artifact.processing_engine = Some(request.engine.as_str().to_string());
-            artifact.processing_model = Some(request.model.ggml_filename().to_string());
+            artifact.processing_model = Some(request.speech_model_filename().to_string());
             artifact.processing_language = Some(request.language.as_whisper_code().to_string());
             artifact.whisper_options_json = serde_json::to_string(&request.whisper_options).ok();
             artifact.ai_provider_snapshot_json = Some(
@@ -903,4 +907,11 @@ fn metadata_bool(request: &RunTranscriptionRequest, key: &str, default: bool) ->
         .get(key)
         .map(|value| matches!(value.trim(), "true" | "1" | "yes"))
         .unwrap_or(default)
+}
+
+fn transcription_progress_message(engine: &TranscriptionEngine) -> &'static str {
+    match engine {
+        TranscriptionEngine::WhisperCpp => "Running Whisper transcription",
+        TranscriptionEngine::ParakeetCpp => "Running Parakeet transcription",
+    }
 }

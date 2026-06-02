@@ -12,6 +12,7 @@ Versions below match the **default** values in the packaging scripts at the time
 | Artifact | Default version / pin | Source in this repo |
 |----------|------------------------|---------------------|
 | **whisper.cpp** (`whisper-cli`, `whisper-stream`) | `1.8.4` (`SBOBINO_RUNTIME_WHISPER_CPP_VERSION`) | [`scripts/package_macos_runtime_asset.sh`](scripts/package_macos_runtime_asset.sh) — tarball `https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.8.4.tar.gz` |
+| **parakeet.cpp** (`parakeet-cli`, experimental) | `0.1.1` (`SBOBINO_RUNTIME_PARAKEET_CPP_VERSION`) | Same script — git tag `https://github.com/mudler/parakeet.cpp/tree/v0.1.1`, cloned with submodules |
 | **SDL2** (built static for whisper examples) | `2.32.10` (`SBOBINO_RUNTIME_SDL2_VERSION`) | Same script — `https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/...` |
 | **FFmpeg** (standalone `ffmpeg` in speech runtime zip) | `8.1` (`SBOBINO_RUNTIME_FFMPEG_VERSION`) | Same script — `https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz`, minimal `./configure` (no external GPL libraries enabled in that script) |
 | **FFmpeg** (shared libs bundled for TorchCodec inside pyannote runtime) | `8.0` (archive dated `2025-03-14`, SHA256 pinned in script) | [`scripts/setup_bundled_pyannote.sh`](scripts/setup_bundled_pyannote.sh) — `https://pytorch.s3.amazonaws.com/torchcodec/ffmpeg/2025-03-14/macos_arm64/8.0.tar.gz` |
@@ -27,12 +28,14 @@ When you cut a release, **update this file** if you change any of the above pins
 |------------------|----------|-------------------|---------------------|
 | Sbobino Desktop (this repository’s code) | This project | MIT | [`LICENSE`](LICENSE) |
 | whisper.cpp | [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) | MIT | [LICENSE](https://github.com/ggml-org/whisper.cpp/blob/master/LICENSE) |
+| parakeet.cpp | [mudler/parakeet.cpp](https://github.com/mudler/parakeet.cpp) | MIT | [LICENSE](https://github.com/mudler/parakeet.cpp/blob/master/LICENSE) |
 | SDL2 | [libsdl-org/SDL](https://github.com/libsdl-org/SDL) | zlib License | [LICENSE.txt](https://github.com/libsdl-org/SDL/blob/main/LICENSE.txt) |
 | FFmpeg | [FFmpeg](https://ffmpeg.org/) | **LGPL 2.1+** for most of the core library; **GPL 2+** when optional GPL components are enabled. Your obligations depend on **how** FFmpeg is built and linked. | [https://ffmpeg.org/legal.html](https://ffmpeg.org/legal.html) |
 | Python | [python.org](https://www.python.org/) | PSF License Agreement | [https://docs.python.org/3/license.html](https://docs.python.org/3/license.html) |
 | pyannote.audio | [pyannote/pyannote-audio](https://github.com/pyannote/pyannote-audio) | MIT (verify on the release you install) | Repository `LICENSE` |
 | PyTorch, torchcodec, and other pip dependencies | PyTorch / respective authors | Mostly BSD-style and similar permissive licenses; **verify** with `pip show` / upstream repos for the exact wheels you ship | [PyTorch](https://github.com/pytorch/pytorch), [torchcodec](https://github.com/pytorch/torchcodec) |
 | **Diarization model** `pyannote-community/speaker-diarization-community-1` | [Hugging Face model card](https://huggingface.co/pyannote-community/speaker-diarization-community-1) | **CC-BY-4.0** (stated in model card metadata) | Model card + [CC BY 4.0 legal text](https://creativecommons.org/licenses/by/4.0/legalcode) |
+| **Parakeet GGUF ASR models** `mudler/parakeet-cpp-gguf` | [Hugging Face model card](https://huggingface.co/mudler/parakeet-cpp-gguf) | **CC-BY-4.0** (stated in model card metadata; weights are derived from NVIDIA Parakeet models) | Model card + [CC BY 4.0 legal text](https://creativecommons.org/licenses/by/4.0/legalcode) |
 | Rust crates (e.g. Tauri, SQLite via `rusqlite`, `ring`, etc.) | crates.io / respective repos | Per-crate licenses in `Cargo.toml` and `Cargo.lock` | Regenerate or inspect with `cargo license` (third-party tool) if needed |
 
 ### CC-BY-4.0 model (pyannote community pipeline)
@@ -42,6 +45,12 @@ The Hugging Face repository **pyannote-community/speaker-diarization-community-1
 - Model card: [https://huggingface.co/pyannote-community/speaker-diarization-community-1](https://huggingface.co/pyannote-community/speaker-diarization-community-1)
 
 Hugging Face may also show **gated access** or **additional terms** in the UI; those apply when you download through their platform.
+
+### CC-BY-4.0 model (Parakeet GGUF ASR models)
+
+The Hugging Face repository **mudler/parakeet-cpp-gguf** declares **`license: cc-by-4.0`** in its model card. Sbobino treats these as experimental ASR weights separate from Whisper model files. Typical CC BY 4.0 obligations include **appropriate credit**, a **link to the license**, and **indication of changes** if you modify the material.
+
+- Model card: [https://huggingface.co/mudler/parakeet-cpp-gguf](https://huggingface.co/mudler/parakeet-cpp-gguf)
 
 ### FFmpeg source correspondence
 

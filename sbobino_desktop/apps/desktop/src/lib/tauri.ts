@@ -352,7 +352,7 @@ export async function planPyannoteBackgroundAction(
 }
 
 export async function provisioningDownloadModel(payload: {
-  model: AppSettings["model"];
+  model: string;
   include_coreml?: boolean;
 }): Promise<{ started: boolean }> {
   return invoke<{ started: boolean }>("provisioning_download_model", { payload });
@@ -401,7 +401,9 @@ export async function fetchRealtimeStartReadiness(payload: {
 }
 
 export async function fetchTranscriptionStartPreflight(payload: {
+  engine: StartTranscriptionPayload["engine"];
   model: StartTranscriptionPayload["model"];
+  parakeet_model: StartTranscriptionPayload["parakeet_model"];
 }): Promise<TranscriptionStartPreflight> {
   return invoke<TranscriptionStartPreflight>("get_transcription_start_preflight", { payload });
 }

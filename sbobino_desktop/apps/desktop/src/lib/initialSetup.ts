@@ -235,6 +235,14 @@ function getManagedRuntime(
         failure_reason: "",
         failure_message: "",
       },
+      parakeet_cli: {
+        resolved_path:
+          runtimeHealth.parakeet_cli_resolved ||
+          runtimeHealth.parakeet_cli_path,
+        available: runtimeHealth.parakeet_cli_available,
+        failure_reason: "",
+        failure_message: "",
+      },
     }
   );
 }

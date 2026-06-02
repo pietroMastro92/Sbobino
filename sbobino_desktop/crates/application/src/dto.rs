@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use sbobino_domain::{
-    ArtifactKind, ArtifactSourceOrigin, LanguageCode, SpeechModel, TranscriptionEngine,
-    WhisperOptions,
+    ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel,
+    TranscriptionEngine, WhisperOptions,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +14,7 @@ pub struct RunTranscriptionRequest {
     pub engine: TranscriptionEngine,
     pub language: LanguageCode,
     pub model: SpeechModel,
+    pub parakeet_model: ParakeetModel,
     pub enable_ai: bool,
     pub whisper_options: WhisperOptions,
     pub title: Option<String>,
@@ -21,6 +22,15 @@ pub struct RunTranscriptionRequest {
     pub source_origin: ArtifactSourceOrigin,
     pub metadata: BTreeMap<String, String>,
     pub source_fingerprint_json: Option<String>,
+}
+
+impl RunTranscriptionRequest {
+    pub fn speech_model_filename(&self) -> &'static str {
+        match self.engine {
+            TranscriptionEngine::WhisperCpp => self.model.ggml_filename(),
+            TranscriptionEngine::ParakeetCpp => self.parakeet_model.gguf_filename(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

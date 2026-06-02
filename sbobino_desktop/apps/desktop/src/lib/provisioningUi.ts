@@ -15,6 +15,9 @@ export function formatProvisioningAssetLabel(progress: ProvisioningProgressEvent
   if (progress.asset_kind === "whisper_encoder") {
     return t("provisioning.downloadingAsset", "Downloading {asset}", { asset });
   }
+  if (progress.asset_kind === "parakeet_model") {
+    return t("provisioning.downloadingAsset", "Downloading {asset}", { asset });
+  }
   return t("provisioning.downloadingAsset", "Downloading {asset}", { asset });
 }
 

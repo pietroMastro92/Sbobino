@@ -3,6 +3,7 @@ pub mod foundation_apple;
 pub mod gemini;
 pub mod noop_enhancer;
 pub mod openai_compatible;
+pub mod parakeet_cpp;
 pub mod pyannote;
 pub mod transcript_segmentation;
 pub mod whisper_cpp;

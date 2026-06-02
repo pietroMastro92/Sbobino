@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use tracing::warn;
 
-use sbobino_domain::{SpeechModel, TranscriptionEngine};
+use sbobino_domain::{ParakeetModel, SpeechModel, TranscriptionEngine};
 use sbobino_infrastructure::{ManagedRuntimeHealth, PyannoteRuntimeHealth};
 
 use crate::realtime_audio::probe_input_device_name;
@@ -30,10 +30,18 @@ pub struct RuntimeHealthResponse {
     pub whisper_stream_path: String,
     pub whisper_stream_resolved: String,
     pub whisper_stream_available: bool,
+    pub parakeet_cli_path: String,
+    pub parakeet_cli_resolved: String,
+    pub parakeet_cli_available: bool,
     pub models_dir_configured: String,
     pub models_dir_resolved: String,
+    pub parakeet_models_dir_configured: String,
+    pub parakeet_models_dir_resolved: String,
     pub model_filename: String,
     pub model_present: bool,
+    pub parakeet_model_filename: String,
+    pub parakeet_model_present: bool,
+    pub missing_parakeet_models: Vec<String>,
     pub coreml_encoder_present: bool,
     pub missing_models: Vec<String>,
     pub missing_encoders: Vec<String>,
@@ -43,7 +51,11 @@ pub struct RuntimeHealthResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct StartPreflightPayload {
+    #[serde(default)]
+    pub engine: Option<TranscriptionEngine>,
     pub model: SpeechModel,
+    #[serde(default)]
+    pub parakeet_model: Option<ParakeetModel>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +68,7 @@ pub struct StartPreflightResponse {
     pub model_path: String,
     pub whisper_cli_resolved: String,
     pub whisper_stream_resolved: String,
+    pub parakeet_cli_resolved: String,
     pub pyannote: PyannoteRuntimeHealth,
 }
 
@@ -69,6 +82,7 @@ pub struct RealtimeStartReadinessResponse {
     pub model_path: String,
     pub ffmpeg_resolved: String,
     pub whisper_stream_resolved: String,
+    pub parakeet_cli_resolved: String,
     pub input_device_name: Option<String>,
 }
 
@@ -86,6 +100,7 @@ pub struct EnsureRuntimeResponse {
 fn engine_to_wire(engine: &TranscriptionEngine) -> &'static str {
     match engine {
         TranscriptionEngine::WhisperCpp => "whisper_cpp",
+        TranscriptionEngine::ParakeetCpp => "parakeet_cpp",
     }
 }
 
@@ -144,10 +159,18 @@ fn runtime_health_response(health: sbobino_infrastructure::RuntimeHealth) -> Run
         whisper_stream_path: health.whisper_stream_path,
         whisper_stream_resolved: health.whisper_stream_resolved,
         whisper_stream_available: health.whisper_stream_available,
+        parakeet_cli_path: health.parakeet_cli_path,
+        parakeet_cli_resolved: health.parakeet_cli_resolved,
+        parakeet_cli_available: health.parakeet_cli_available,
         models_dir_configured: health.models_dir_configured,
         models_dir_resolved: health.models_dir_resolved,
+        parakeet_models_dir_configured: health.parakeet_models_dir_configured,
+        parakeet_models_dir_resolved: health.parakeet_models_dir_resolved,
         model_filename: health.model_filename,
         model_present: health.model_present,
+        parakeet_model_filename: health.parakeet_model_filename,
+        parakeet_model_present: health.parakeet_model_present,
+        missing_parakeet_models: health.missing_parakeet_models,
         coreml_encoder_present: health.coreml_encoder_present,
         missing_models: health.missing_models,
         missing_encoders: health.missing_encoders,
@@ -369,6 +392,7 @@ pub async fn get_realtime_start_readiness(
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
             whisper_stream_resolved: live_health.whisper_stream_resolved,
+            parakeet_cli_resolved: live_health.parakeet_cli_resolved,
             input_device_name: None,
         });
     }
@@ -386,6 +410,7 @@ pub async fn get_realtime_start_readiness(
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
             whisper_stream_resolved: live_health.whisper_stream_resolved,
+            parakeet_cli_resolved: live_health.parakeet_cli_resolved,
             input_device_name: None,
         });
     }
@@ -403,6 +428,7 @@ pub async fn get_realtime_start_readiness(
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
             whisper_stream_resolved: live_health.whisper_stream_resolved,
+            parakeet_cli_resolved: live_health.parakeet_cli_resolved,
             input_device_name: None,
         });
     }
@@ -417,6 +443,7 @@ pub async fn get_realtime_start_readiness(
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
             whisper_stream_resolved: live_health.whisper_stream_resolved,
+            parakeet_cli_resolved: live_health.parakeet_cli_resolved,
             input_device_name: Some(device_name),
         }),
         Err(error) => Ok(RealtimeStartReadinessResponse {
@@ -428,6 +455,7 @@ pub async fn get_realtime_start_readiness(
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
             whisper_stream_resolved: live_health.whisper_stream_resolved,
+            parakeet_cli_resolved: live_health.parakeet_cli_resolved,
             input_device_name: None,
         }),
     }
@@ -443,13 +471,30 @@ pub async fn get_transcription_start_preflight(
         .runtime_health()
         .map_err(|e| CommandError::new("runtime_health", e))?;
 
-    let model_filename = payload
-        .map(|value| value.model.ggml_filename().to_string())
-        .unwrap_or_else(|| health.model_filename.clone());
-    let model_path = PathBuf::from(&health.models_dir_resolved)
+    let requested_engine = payload
+        .as_ref()
+        .and_then(|value| value.engine.clone())
+        .unwrap_or_else(|| health.configured_engine.clone());
+    let model_filename = match requested_engine {
+        TranscriptionEngine::WhisperCpp => payload
+            .as_ref()
+            .map(|value| value.model.ggml_filename().to_string())
+            .unwrap_or_else(|| health.model_filename.clone()),
+        TranscriptionEngine::ParakeetCpp => payload
+            .as_ref()
+            .and_then(|value| value.parakeet_model.clone())
+            .map(|model| model.gguf_filename().to_string())
+            .unwrap_or_else(|| health.parakeet_model_filename.clone()),
+    };
+    let model_dir = match requested_engine {
+        TranscriptionEngine::WhisperCpp => &health.models_dir_resolved,
+        TranscriptionEngine::ParakeetCpp => &health.parakeet_models_dir_resolved,
+    };
+    let model_path = PathBuf::from(model_dir)
         .join(&model_filename)
         .to_string_lossy()
         .to_string();
+    let engine_wire = engine_to_wire(&requested_engine).to_string();
 
     if !health.ffmpeg_available {
         let message = if health.managed_runtime_required {
@@ -464,16 +509,17 @@ pub async fn get_transcription_start_preflight(
             allowed: false,
             reason_code: "ffmpeg_missing".to_string(),
             message,
-            engine: "whisper_cpp".to_string(),
+            engine: engine_wire,
             model_filename,
             model_path,
             whisper_cli_resolved: health.whisper_cli_resolved,
             whisper_stream_resolved: health.whisper_stream_resolved,
+            parakeet_cli_resolved: health.parakeet_cli_resolved,
             pyannote: health.pyannote,
         });
     }
 
-    if !health.whisper_cli_available {
+    if requested_engine == TranscriptionEngine::WhisperCpp && !health.whisper_cli_available {
         let message = if health.managed_runtime_required {
             runtime_toolchain_message(&health, None)
         } else {
@@ -486,11 +532,31 @@ pub async fn get_transcription_start_preflight(
             allowed: false,
             reason_code: "whispercpp_missing".to_string(),
             message,
-            engine: "whisper_cpp".to_string(),
+            engine: engine_wire,
             model_filename,
             model_path,
             whisper_cli_resolved: health.whisper_cli_resolved,
             whisper_stream_resolved: health.whisper_stream_resolved,
+            parakeet_cli_resolved: health.parakeet_cli_resolved,
+            pyannote: health.pyannote,
+        });
+    }
+
+    if requested_engine == TranscriptionEngine::ParakeetCpp && !health.parakeet_cli_available {
+        let message = format!(
+            "Parakeet CLI is not runnable at '{}'. Configure Parakeet CLI path in Settings > Local Models.",
+            health.parakeet_cli_resolved
+        );
+        return Ok(StartPreflightResponse {
+            allowed: false,
+            reason_code: "parakeetcpp_missing".to_string(),
+            message,
+            engine: engine_wire,
+            model_filename,
+            model_path,
+            whisper_cli_resolved: health.whisper_cli_resolved,
+            whisper_stream_resolved: health.whisper_stream_resolved,
+            parakeet_cli_resolved: health.parakeet_cli_resolved,
             pyannote: health.pyannote,
         });
     }
@@ -501,13 +567,14 @@ pub async fn get_transcription_start_preflight(
             reason_code: "model_missing".to_string(),
             message: format!(
                 "Model file '{}' was not found in '{}'. Download models from Settings > Local Models.",
-                model_filename, health.models_dir_resolved
+                model_filename, model_dir
             ),
-            engine: "whisper_cpp".to_string(),
+            engine: engine_wire,
             model_filename,
             model_path,
             whisper_cli_resolved: health.whisper_cli_resolved,
             whisper_stream_resolved: health.whisper_stream_resolved,
+            parakeet_cli_resolved: health.parakeet_cli_resolved,
             pyannote: health.pyannote,
         });
     }
@@ -517,11 +584,12 @@ pub async fn get_transcription_start_preflight(
             allowed: false,
             reason_code: health.pyannote.reason_code.clone(),
             message: health.pyannote.message.clone(),
-            engine: "whisper_cpp".to_string(),
+            engine: engine_wire,
             model_filename,
             model_path,
             whisper_cli_resolved: health.whisper_cli_resolved,
             whisper_stream_resolved: health.whisper_stream_resolved,
+            parakeet_cli_resolved: health.parakeet_cli_resolved,
             pyannote: health.pyannote,
         });
     }
@@ -529,12 +597,16 @@ pub async fn get_transcription_start_preflight(
     Ok(StartPreflightResponse {
         allowed: true,
         reason_code: "ok".to_string(),
-        message: "Whisper.cpp preflight passed.".to_string(),
-        engine: "whisper_cpp".to_string(),
+        message: match requested_engine {
+            TranscriptionEngine::WhisperCpp => "Whisper.cpp preflight passed.".to_string(),
+            TranscriptionEngine::ParakeetCpp => "Parakeet.cpp preflight passed.".to_string(),
+        },
+        engine: engine_wire,
         model_filename,
         model_path,
         whisper_cli_resolved: health.whisper_cli_resolved,
         whisper_stream_resolved: health.whisper_stream_resolved,
+        parakeet_cli_resolved: health.parakeet_cli_resolved,
         pyannote: health.pyannote,
     })
 }

@@ -14,9 +14,9 @@ use sbobino_application::{
     TranscriptionService,
 };
 use sbobino_domain::{
-    ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, SpeakerTurn,
-    SpeechModel, TimedSegment, TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
-    WhisperOptions,
+    ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel,
+    SpeakerTurn, SpeechModel, TimedSegment, TranscriptArtifact, TranscriptionEngine,
+    TranscriptionOutput, WhisperOptions,
 };
 
 const HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY: &str = "has_optimized_transcript";
@@ -55,6 +55,51 @@ impl SpeechToTextEngine for MockSpeechEngine {
         Ok(TranscriptionOutput {
             text: self.transcript.clone(),
             segments: self.segments.clone(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecordingSpeechEngine {
+    calls: Mutex<Vec<RecordingSpeechCall>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingSpeechCall {
+    model_filename: String,
+    language_code: String,
+}
+
+#[async_trait]
+impl SpeechToTextEngine for RecordingSpeechEngine {
+    async fn transcribe(
+        &self,
+        _input_wav: &Path,
+        model_filename: &str,
+        language_code: &str,
+        _options: &WhisperOptions,
+        _total_audio_seconds: Option<f32>,
+        _emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        _emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+    ) -> Result<TranscriptionOutput, ApplicationError> {
+        self.calls
+            .lock()
+            .expect("recording speech calls lock poisoned")
+            .push(RecordingSpeechCall {
+                model_filename: model_filename.to_string(),
+                language_code: language_code.to_string(),
+            });
+
+        Ok(TranscriptionOutput {
+            text: "parakeet transcript".to_string(),
+            segments: vec![TimedSegment {
+                text: "parakeet transcript".to_string(),
+                start_seconds: Some(0.0),
+                end_seconds: Some(1.0),
+                speaker_id: None,
+                speaker_label: None,
+                words: Vec::new(),
+            }],
         })
     }
 }
@@ -533,6 +578,7 @@ async fn run_file_transcription_without_ai_emits_expected_stages_and_persists() 
                 language: LanguageCode::En,
                 model: SpeechModel::Base,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: false,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),
@@ -605,6 +651,92 @@ async fn run_file_transcription_without_ai_emits_expected_stages_and_persists() 
 }
 
 #[tokio::test]
+async fn run_file_transcription_with_parakeet_uses_gguf_model_and_persists_engine_metadata() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("lezione.m4a");
+    tokio::fs::write(&input_path, b"fake m4a content")
+        .await
+        .expect("failed to create test input file");
+
+    let transcoder = Arc::new(MockTranscoder::default());
+    let speech = Arc::new(RecordingSpeechEngine::default());
+    let enhancer = Arc::new(MockEnhancer::default());
+    let repo = Arc::new(InMemoryArtifactRepository::default());
+    let service =
+        TranscriptionService::new(transcoder.clone(), speech.clone(), enhancer, repo.clone());
+
+    let emitted: Arc<Mutex<Vec<JobProgress>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_clone = emitted.clone();
+
+    let artifact = service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-parakeet-001".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::It,
+                model: SpeechModel::Base,
+                engine: TranscriptionEngine::ParakeetCpp,
+                parakeet_model: ParakeetModel::RealtimeEou120mV1F16,
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+            },
+            Arc::new(move |event| {
+                emitted_clone
+                    .lock()
+                    .expect("emitted lock poisoned")
+                    .push(event);
+            }),
+            Arc::new(|_text: String| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("parakeet transcription service should succeed");
+
+    let calls = speech
+        .calls
+        .lock()
+        .expect("recording speech calls lock poisoned")
+        .clone();
+    assert_eq!(
+        calls,
+        vec![RecordingSpeechCall {
+            model_filename: "realtime_eou_120m-v1-f16.gguf".to_string(),
+            language_code: "it".to_string(),
+        }]
+    );
+
+    assert_eq!(artifact.raw_transcript, "parakeet transcript");
+    assert_eq!(artifact.processing_engine.as_deref(), Some("parakeet_cpp"));
+    assert_eq!(
+        artifact.processing_model.as_deref(),
+        Some("realtime_eou_120m-v1-f16.gguf")
+    );
+    assert_eq!(
+        artifact.metadata.get("model").map(String::as_str),
+        Some("realtime_eou_120m-v1-f16.gguf")
+    );
+
+    assert!(emitted
+        .lock()
+        .expect("emitted lock poisoned")
+        .iter()
+        .any(|event| event.stage == JobStage::Transcribing
+            && event.message == "Running Parakeet transcription"));
+
+    let persisted = repo.list_recent(10, 0).await.expect("list should succeed");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(
+        persisted[0].processing_engine.as_deref(),
+        Some("parakeet_cpp")
+    );
+}
+
+#[tokio::test]
 async fn run_file_transcription_emits_final_transcript_snapshot_before_post_processing() {
     let temp = tempdir().expect("failed to create temp dir");
     let input_path = temp.path().join("lecture.mp3");
@@ -632,6 +764,7 @@ async fn run_file_transcription_emits_final_transcript_snapshot_before_post_proc
                 language: LanguageCode::En,
                 model: SpeechModel::Base,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: false,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),
@@ -690,6 +823,7 @@ async fn run_file_transcription_with_ai_runs_enhancer_steps() {
                 language: LanguageCode::En,
                 model: SpeechModel::Small,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: true,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),
@@ -767,6 +901,7 @@ async fn run_file_transcription_rejects_missing_input_path() {
                 language: LanguageCode::En,
                 model: SpeechModel::Base,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: false,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),
@@ -847,6 +982,7 @@ async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
                 language: LanguageCode::En,
                 model: SpeechModel::Base,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: false,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),
@@ -914,6 +1050,7 @@ async fn run_file_transcription_persists_diarization_failure_metadata() {
                 language: LanguageCode::En,
                 model: SpeechModel::Base,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: false,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),
@@ -974,6 +1111,7 @@ async fn run_file_transcription_keeps_raw_transcript_when_ai_fails() {
                 language: LanguageCode::En,
                 model: SpeechModel::Small,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: true,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),
@@ -1050,6 +1188,7 @@ async fn run_file_transcription_falls_back_to_secondary_ai_provider() {
                 language: LanguageCode::En,
                 model: SpeechModel::Small,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: true,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),
@@ -1128,6 +1267,7 @@ async fn run_file_transcription_preserves_auto_import_metadata_and_fingerprint()
                 language: LanguageCode::En,
                 model: SpeechModel::Base,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: false,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),
@@ -1192,6 +1332,7 @@ async fn run_file_transcription_transcodes_wav_inputs_unconditionally() {
                 language: LanguageCode::En,
                 model: SpeechModel::Base,
                 engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
                 enable_ai: false,
                 source_origin: ArtifactSourceOrigin::Imported,
                 whisper_options: WhisperOptions::default(),

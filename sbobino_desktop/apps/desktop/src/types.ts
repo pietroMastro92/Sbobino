@@ -12,7 +12,13 @@ export type LanguageCode =
 export type AppLanguage = "en" | "it" | "es" | "de";
 
 export type SpeechModel = "tiny" | "base" | "small" | "medium" | "large_turbo";
-export type TranscriptionEngine = "whisper_cpp" | "whisper_kit";
+export type ParakeetModel =
+  | "realtime_eou120m_v1_f16"
+  | "realtime_eou120m_v1_q8"
+  | "tdt06b_v3_f16"
+  | "tdt06b_v3_q8"
+  | "tdt06b_v3_q4";
+export type TranscriptionEngine = "whisper_cpp" | "parakeet_cpp";
 export type ArtifactKind = "file" | "realtime";
 export type ArtifactSourceOrigin = "imported" | "trimmed" | "realtime" | "legacy_external";
 export type ArtifactAudioBackfillStatus = "imported" | "pending_backfill" | "missing";
@@ -94,11 +100,14 @@ export type SpeakerDiarizationSettings = {
 export type TranscriptionSettings = {
   engine: TranscriptionEngine;
   model: SpeechModel;
+  parakeet_model: ParakeetModel;
   language: LanguageCode;
   whisper_cli_path: string;
   whisperkit_cli_path: string;
+  parakeet_cli_path: string;
   ffmpeg_path: string;
   models_dir: string;
+  parakeet_models_dir: string;
   enable_ai_post_processing: boolean;
   speaker_diarization: SpeakerDiarizationSettings;
   whisper_options: WhisperOptions;
@@ -484,6 +493,7 @@ export type StartTranscriptionPayload = {
   engine: TranscriptionEngine;
   language: LanguageCode;
   model: SpeechModel;
+  parakeet_model: ParakeetModel;
   enable_ai: boolean;
   whisper_options: WhisperOptions;
   title?: string;
@@ -533,6 +543,7 @@ export type ProvisioningProgressEvent = {
     | "speech_runtime"
     | "whisper_model"
     | "whisper_encoder"
+    | "parakeet_model"
     | "pyannote_runtime"
     | "pyannote_model";
   stage: string;
@@ -540,11 +551,13 @@ export type ProvisioningProgressEvent = {
 };
 
 export type ProvisioningModelCatalogEntry = {
-  key: SpeechModel;
+  key: string;
   label: string;
   model_file: string;
   installed: boolean;
   coreml_installed: boolean;
+  engine: TranscriptionEngine;
+  experimental: boolean;
 };
 
 export type RuntimeHealth = {
@@ -566,10 +579,18 @@ export type RuntimeHealth = {
   whisper_stream_path: string;
   whisper_stream_resolved: string;
   whisper_stream_available: boolean;
+  parakeet_cli_path: string;
+  parakeet_cli_resolved: string;
+  parakeet_cli_available: boolean;
   models_dir_configured: string;
   models_dir_resolved: string;
+  parakeet_models_dir_configured: string;
+  parakeet_models_dir_resolved: string;
   model_filename: string;
   model_present: boolean;
+  parakeet_model_filename: string;
+  parakeet_model_present: boolean;
+  missing_parakeet_models: string[];
   coreml_encoder_present: boolean;
   missing_models: string[];
   missing_encoders: string[];
@@ -590,6 +611,7 @@ export type ManagedRuntimeHealth = {
   ffmpeg: ManagedRuntimeBinaryHealth;
   whisper_cli: ManagedRuntimeBinaryHealth;
   whisper_stream: ManagedRuntimeBinaryHealth;
+  parakeet_cli: ManagedRuntimeBinaryHealth;
 };
 
 export type TranscriptionStartPreflight = {
@@ -601,6 +623,7 @@ export type TranscriptionStartPreflight = {
   model_path: string;
   whisper_cli_resolved: string;
   whisper_stream_resolved: string;
+  parakeet_cli_resolved: string;
   pyannote: PyannoteRuntimeHealth;
 };
 
@@ -613,6 +636,7 @@ export type RealtimeStartReadiness = {
   model_path: string;
   ffmpeg_resolved: string;
   whisper_stream_resolved: string;
+  parakeet_cli_resolved: string;
   input_device_name: string | null;
 };
 
