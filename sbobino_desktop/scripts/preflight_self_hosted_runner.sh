@@ -20,6 +20,21 @@ REPO_SLUG=${2:-pietroMastro92/Sbobino}
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FAILURES=()
 
+validation_fixture_audio() {
+  if [[ -n "${SBOBINO_VALIDATION_FIXTURE_AUDIO:-}" ]]; then
+    printf '%s\n' "$SBOBINO_VALIDATION_FIXTURE_AUDIO"
+    return 0
+  fi
+  case "$MACHINE_CLASS" in
+    AS-THIRD)
+      printf '%s\n' "$HOME/Fixtures/as-third-diarization.wav"
+      ;;
+    *)
+      printf '%s\n' ""
+      ;;
+  esac
+}
+
 labels_for_machine() {
   case "$1" in
     AS-PRIMARY)
@@ -102,10 +117,11 @@ then
 fi
 
 if [[ "$MACHINE_CLASS" != "INTEL-PRIMARY" ]]; then
-  if [[ -z "${SBOBINO_VALIDATION_FIXTURE_AUDIO:-}" ]]; then
+  FIXTURE_AUDIO=$(validation_fixture_audio)
+  if [[ -z "${FIXTURE_AUDIO:-}" ]]; then
     record_failure "SBOBINO_VALIDATION_FIXTURE_AUDIO is not set."
-  elif [[ ! -f "${SBOBINO_VALIDATION_FIXTURE_AUDIO}" ]]; then
-    record_failure "SBOBINO_VALIDATION_FIXTURE_AUDIO does not point to an existing file."
+  elif [[ ! -f "${FIXTURE_AUDIO}" ]]; then
+    record_failure "SBOBINO_VALIDATION_FIXTURE_AUDIO does not point to an existing file: $FIXTURE_AUDIO"
   fi
 fi
 
@@ -119,7 +135,11 @@ runners = json.loads(sys.argv[1]).get("runners", [])
 expected = set(sys.argv[2].split(","))
 
 for runner in runners:
-    labels = {label.get("name") for label in runner.get("labels", []) if label.get("name")}
+    labels = {
+        label.get("name", "").lower()
+        for label in runner.get("labels", [])
+        if label.get("name")
+    }
     if expected.issubset(labels) and runner.get("status") == "online":
         print(f"online:{runner.get('name','unknown')}")
         raise SystemExit(0)

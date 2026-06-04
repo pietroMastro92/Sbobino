@@ -42,12 +42,13 @@ required = {
 matched = {}
 for machine_class, labels_expected in required.items():
     for runner in runners:
-        labels = {label.get("name") for label in runner.get("labels", []) if label.get("name")}
+        labels_display = {label.get("name") for label in runner.get("labels", []) if label.get("name")}
+        labels = {label.lower() for label in labels_display}
         if labels_expected.issubset(labels) and runner.get("status") == "online":
             matched[machine_class] = {
                 "name": runner.get("name", "unknown"),
                 "busy": bool(runner.get("busy")),
-                "labels": sorted(labels),
+                "labels": sorted(labels_display),
             }
             break
 

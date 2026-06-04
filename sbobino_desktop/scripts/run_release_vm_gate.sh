@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: run_release_vm_gate.sh <version> [repo-slug]
+
+Runs the AS-THIRD UTM VM-backed release gate for a published prerelease.
+Set SBOBINO_RELEASE_RUN_ID to reuse an existing GitHub Actions run.
+EOF
+}
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  usage
+  exit 1
+fi
+
+VERSION=$1
+REPO_SLUG=${2:-pietroMastro92/Sbobino}
+TAG="v$VERSION"
+WORKFLOW_FILE="release-vm-validation.yml"
+MACHINE_CLASS="AS-THIRD"
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+need_cmd gh
+need_cmd python3
+
+"$ROOT_DIR/scripts/check_release_runner_class.sh" "$MACHINE_CLASS" "$REPO_SLUG"
+
+RELEASE_JSON=$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets,isPrerelease,tagName,url)
+python3 - <<'PY' "$RELEASE_JSON" "$VERSION"
+import json
+import sys
+
+release = json.loads(sys.argv[1])
+version = sys.argv[2]
+if release.get("tagName") != f"v{version}":
+    raise SystemExit("Release tag does not match requested version.")
+if release.get("isPrerelease") is not True:
+    raise SystemExit("AS-THIRD VM gate must run against a GitHub prerelease.")
+
+assets = {asset.get("name", "").strip() for asset in release.get("assets", [])}
+required = {f"Sbobino_{version}_aarch64.dmg", "setup-manifest.json", "speech-runtime-macos-aarch64.zip"}
+missing = sorted(required - assets)
+if missing:
+    raise SystemExit("AS-THIRD VM gate blocked: missing release assets: " + ", ".join(missing))
+PY
+
+RUN_ID=${SBOBINO_RELEASE_RUN_ID:-}
+if [[ -z "$RUN_ID" ]]; then
+  gh workflow run "$WORKFLOW_FILE" \
+    --repo "$REPO_SLUG" \
+    --ref "$TAG" \
+    -f version="$VERSION" \
+    -f machine_class="$MACHINE_CLASS"
+
+  sleep 10
+  RUNS_JSON=$(gh run list \
+    --repo "$REPO_SLUG" \
+    --workflow "$WORKFLOW_FILE" \
+    --json databaseId,displayTitle,status,createdAt \
+    --limit 20)
+  RUN_ID=$(python3 - <<'PY' "$RUNS_JSON" "$MACHINE_CLASS" "$VERSION"
+import json
+import sys
+
+runs = json.loads(sys.argv[1])
+needle = f"{sys.argv[2]} v{sys.argv[3]}"
+for run in runs:
+    if needle in str(run.get("displayTitle", "")):
+        print(run["databaseId"])
+        raise SystemExit(0)
+raise SystemExit(f"Could not resolve workflow run id for {needle}. Set SBOBINO_RELEASE_RUN_ID manually.")
+PY
+)
+fi
+
+echo "Watching AS-THIRD VM validation run: $RUN_ID"
+gh run watch "$RUN_ID" --repo "$REPO_SLUG" --exit-status
+
+TMP_DIR=$(mktemp -d)
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+gh release download "$TAG" \
+  --repo "$REPO_SLUG" \
+  --dir "$TMP_DIR" \
+  --pattern "$MACHINE_CLASS.validation-report.json"
+
+python3 - <<'PY' "$TMP_DIR/$MACHINE_CLASS.validation-report.json" "$VERSION" "$TAG" "$MACHINE_CLASS"
+import json
+import sys
+from pathlib import Path
+
+report_path = Path(sys.argv[1])
+version = sys.argv[2]
+tag = sys.argv[3]
+machine_class = sys.argv[4]
+
+if not report_path.is_file():
+    raise SystemExit(f"Missing {machine_class}.validation-report.json on prerelease.")
+
+report = json.loads(report_path.read_text(encoding="utf-8"))
+if int(report.get("schema_version", 0)) != 1:
+    raise SystemExit("AS-THIRD validation report has unsupported schema_version.")
+if report.get("machine_class") != machine_class:
+    raise SystemExit("AS-THIRD validation report machine_class mismatch.")
+if report.get("version") != version or report.get("release_tag") != tag:
+    raise SystemExit("AS-THIRD validation report version/tag mismatch.")
+if str(report.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("AS-THIRD validation report is not passed.")
+
+results = report.get("scenario_results") or {}
+required = {
+    "clean_room_install",
+    "warm_restart",
+    "functional_parakeet_smoke",
+    "functional_diarization_smoke",
+}
+failed = sorted(name for name in required if results.get(name) != "passed")
+if failed:
+    raise SystemExit("AS-THIRD validation report missing passed scenarios: " + ", ".join(failed))
+PY
+
+echo "AS-THIRD VM release gate passed for $TAG."

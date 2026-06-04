@@ -135,6 +135,11 @@ function collectUnexpectedEnglishCatalogClones(): string[] {
     "settings.localModels.whisperStream",
     "settings.whisper.title",
     "settings.ai.foundationModel",
+    "parakeetModel.tdt06b_v3_q4",
+    "parakeetModel.tdt06b_v3_f16",
+    "parakeetModel.tdt06b_v3_q8",
+    "parakeetModel.realtime_eou120m_v1_f16",
+    "parakeetModel.realtime_eou120m_v1_q8",
   ]);
   const findings: string[] = [];
 

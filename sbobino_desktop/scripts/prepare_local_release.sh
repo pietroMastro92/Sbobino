@@ -406,9 +406,10 @@ Nothing in this folder has been published automatically.
 5. Run \`./scripts/distribution_readiness.sh "$VERSION"\` from \`sbobino_desktop/\`.
 6. Generate \`distribution-readiness-proof.json\` after the remote integrity gate passes.
 7. Run the portability smoke job on a hosted macos-14 runner (automated in release.yml).
-8. Re-upload \`distribution-readiness-proof.json\` and \`portability-smoke-report.json\` to the same GitHub prerelease with \`gh release upload --clobber\`.
-9. Promote to stable only with \`./scripts/promote_candidate_release.sh "$VERSION"\`.
-10. If validation fails, retire the prerelease and cut a new patch version. Do not overwrite a stable release in place.
+8. Run \`./scripts/run_release_vm_gate.sh "$VERSION"\` so AS-THIRD installs the public DMG and validates Parakeet + diarization in the VM.
+9. Re-upload \`distribution-readiness-proof.json\`, \`portability-smoke-report.json\`, and \`AS-THIRD.validation-report.json\` to the same GitHub prerelease with \`gh release upload --clobber\`.
+10. Promote to stable only with \`./scripts/promote_candidate_release.sh "$VERSION"\`.
+11. If validation fails, retire the prerelease and cut a new patch version. Do not overwrite a stable release in place.
 
 ## gh CLI example
 
@@ -424,6 +425,8 @@ python3 ./scripts/write_distribution_readiness_proof.py \
 gh release upload "v$VERSION" \
   "$OUTPUT_DIR/distribution-readiness-proof.json" \
   --clobber
+
+./scripts/run_release_vm_gate.sh "$VERSION"
 
 ./scripts/promote_candidate_release.sh "$VERSION"
 \`\`\`
@@ -452,6 +455,8 @@ Homebrew, host Python, or previously installed Sbobino runtime assets.
 4. Confirm first launch:
    - runtime downloads and validates successfully
    - required whisper models download successfully
+   - required Parakeet model downloads successfully
+   - `Parakeet.cpp Metal (Experimental)` can transcribe the fixture audio
    - pyannote runtime and model install successfully
    - app enters the main UI without manual fixes
 5. Quit the app and launch it again.

@@ -15,6 +15,7 @@ Environment variables:
   SBOBINO_VALIDATION_DATA_DIR        Override app data dir
   SBOBINO_VALIDATION_APP_PATH        Override installed app path
   SBOBINO_VALIDATION_FIXTURE_AUDIO   Audio fixture used for diarization smoke on Apple Silicon
+  SBOBINO_VALIDATION_PARAKEET_MODEL  Parakeet GGUF used for AS-THIRD app smoke
   SBOBINO_VALIDATION_TIMEOUT_SECONDS Timeout for setup/runtime readiness waits (default: 2400)
   SBOBINO_VALIDATION_PRIVACY_VERSION Privacy policy version to seed into settings.json
 EOF
@@ -33,7 +34,19 @@ REPORT_PATH=${4:-"$(pwd)/${MACHINE_CLASS}.validation-report.json"}
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DATA_DIR=${SBOBINO_VALIDATION_DATA_DIR:-"$HOME/Library/Application Support/com.sbobino.desktop"}
 APP_PATH=${SBOBINO_VALIDATION_APP_PATH:-"/Applications/Sbobino.app"}
-FIXTURE_AUDIO=${SBOBINO_VALIDATION_FIXTURE_AUDIO:-}
+default_fixture_audio() {
+  case "${MACHINE_CLASS:-}" in
+    AS-THIRD)
+      printf '%s\n' "$HOME/Fixtures/as-third-diarization.wav"
+      ;;
+    *)
+      printf '%s\n' ""
+      ;;
+  esac
+}
+
+FIXTURE_AUDIO=${SBOBINO_VALIDATION_FIXTURE_AUDIO:-$(default_fixture_audio)}
+PARAKEET_MODEL=${SBOBINO_VALIDATION_PARAKEET_MODEL:-tdt-0.6b-v3-q4_k.gguf}
 TIMEOUT_SECONDS=${SBOBINO_VALIDATION_TIMEOUT_SECONDS:-2400}
 PRIVACY_POLICY_VERSION=${SBOBINO_VALIDATION_PRIVACY_VERSION:-2026-04-03}
 TAG="v$VERSION"
@@ -54,6 +67,7 @@ SCENARIO_UPDATE_PATH_VALIDATION="pending"
 SCENARIO_CLEAN_ROOM_INSTALL="pending"
 SCENARIO_WARM_RESTART="pending"
 SCENARIO_FUNCTIONAL_DIARIZATION_SMOKE="pending"
+SCENARIO_FUNCTIONAL_PARAKEET_SMOKE="pending"
 SCENARIO_RELEASE_METADATA_VALIDATION="pending"
 SCENARIO_BOOTSTRAP_LAYER_VALIDATION="pending"
 SCENARIO_ARM64_BINARY_EXECUTION="pending"
@@ -96,6 +110,7 @@ write_report() {
     "$SCENARIO_CLEAN_ROOM_INSTALL" \
     "$SCENARIO_WARM_RESTART" \
     "$SCENARIO_FUNCTIONAL_DIARIZATION_SMOKE" \
+    "$SCENARIO_FUNCTIONAL_PARAKEET_SMOKE" \
     "$SCENARIO_RELEASE_METADATA_VALIDATION" \
     "$SCENARIO_BOOTSTRAP_LAYER_VALIDATION" \
     "$SCENARIO_ARM64_BINARY_EXECUTION"
@@ -120,10 +135,11 @@ from pathlib import Path
     clean_room_install,
     warm_restart,
     functional_diarization_smoke,
+    functional_parakeet_smoke,
     release_metadata_validation,
     bootstrap_layer_validation,
     arm64_binary_execution,
-) = sys.argv[1:19]
+) = sys.argv[1:20]
 
 definitions = {
     "AS-PRIMARY": {
@@ -137,20 +153,22 @@ definitions = {
             "warm_restart": warm_restart,
             "functional_diarization_smoke": functional_diarization_smoke,
         },
-        "runner_label": "self-hosted,macos,apple-silicon,as-primary",
+        "runner_label": "self-hosted,macOS,ARM64,apple-silicon,as-primary",
     },
     "AS-THIRD": {
         "required": [
             "clean_room_install",
             "warm_restart",
+            "functional_parakeet_smoke",
             "functional_diarization_smoke",
         ],
         "results": {
             "clean_room_install": clean_room_install,
             "warm_restart": warm_restart,
+            "functional_parakeet_smoke": functional_parakeet_smoke,
             "functional_diarization_smoke": functional_diarization_smoke,
         },
-        "runner_label": "self-hosted,macos,apple-silicon,as-third",
+        "runner_label": "self-hosted,macOS,ARM64,apple-silicon,as-third",
     },
     "INTEL-PRIMARY": {
         "required": [
@@ -162,7 +180,7 @@ definitions = {
             "bootstrap_layer_validation": bootstrap_layer_validation,
             "arm64_binary_execution": arm64_binary_execution,
         },
-        "runner_label": "self-hosted,macos,x64,intel-primary",
+        "runner_label": "self-hosted,macOS,X64,intel-primary",
     },
 }
 
@@ -450,6 +468,53 @@ PY
   fi
 }
 
+run_parakeet_transcription_smoke() {
+  if [[ -z "${FIXTURE_AUDIO// }" ]]; then
+    fail_validation "SBOBINO_VALIDATION_FIXTURE_AUDIO is required for AS-THIRD Parakeet smoke."
+  fi
+  if [[ ! -f "$FIXTURE_AUDIO" ]]; then
+    fail_validation "Parakeet smoke audio fixture not found at '$FIXTURE_AUDIO'."
+  fi
+
+  local parakeet_cli="$DATA_DIR/bin/parakeet-cli"
+  local parakeet_models_dir="$DATA_DIR/parakeet-models"
+  local parakeet_model_path="$parakeet_models_dir/$PARAKEET_MODEL"
+  local smoke_log="$TMP_DIR/parakeet-real-smoke.log"
+  local compare_log="$TMP_DIR/parakeet-metal-compare.log"
+
+  if [[ ! -x "$parakeet_cli" ]]; then
+    fail_validation "Managed Parakeet CLI was not installed at '$parakeet_cli'."
+  fi
+  if [[ ! -f "$parakeet_model_path" ]]; then
+    fail_validation "Managed Parakeet model was not installed at '$parakeet_model_path'."
+  fi
+
+  if ! PATH="$DATA_DIR/bin:$PATH" \
+    SBOBINO_PARAKEET_CLI="$parakeet_cli" \
+    SBOBINO_PARAKEET_MODELS_DIR="$parakeet_models_dir" \
+    SBOBINO_PARAKEET_MODEL="$PARAKEET_MODEL" \
+    SBOBINO_PARAKEET_AUDIO="$FIXTURE_AUDIO" \
+    SBOBINO_ASR_SAMPLE=artemis \
+    "$ROOT_DIR/scripts/smoke_parakeet_real.sh" >"$smoke_log" 2>&1; then
+    fail_validation "Parakeet real smoke failed. Last log lines: $(tail -80 "$smoke_log")"
+  fi
+
+  if ! PATH="$DATA_DIR/bin:$PATH" \
+    SBOBINO_APP_SUPPORT_DIR="$DATA_DIR" \
+    SBOBINO_PARAKEET_CLI="$parakeet_cli" \
+    SBOBINO_PARAKEET_MODELS_DIR="$parakeet_models_dir" \
+    SBOBINO_PARAKEET_MODEL="$PARAKEET_MODEL" \
+    SBOBINO_ARTEMIS_AUDIO="$FIXTURE_AUDIO" \
+    SBOBINO_ASR_SAMPLE=artemis \
+    SBOBINO_ASR_COMPARE_MODE=transcribe \
+    SBOBINO_REQUIRE_PARAKEET_GPU=1 \
+    SBOBINO_COMPARE_SKIP_PARAKEET_CPU=1 \
+    SBOBINO_COMPARE_SKIP_WHISPER_GPU=1 \
+    "$ROOT_DIR/scripts/compare_asr_engines_real.sh" >"$compare_log" 2>&1; then
+    fail_validation "Parakeet Metal transcription smoke failed. Last log lines: $(tail -120 "$compare_log")"
+  fi
+}
+
 find_previous_stable_version() {
   python3 - <<'PY' "$REPO_SLUG" "$TAG"
 import json
@@ -526,6 +591,9 @@ validate_as_third() {
   wait_for_setup_report_success "$TIMEOUT_SECONDS"
   wait_for_runtime_health_ready "$TIMEOUT_SECONDS" 0
   SCENARIO_CLEAN_ROOM_INSTALL="passed"
+
+  run_parakeet_transcription_smoke
+  SCENARIO_FUNCTIONAL_PARAKEET_SMOKE="passed"
 
   quit_app
   set_speaker_diarization_enabled 1

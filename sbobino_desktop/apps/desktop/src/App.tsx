@@ -235,6 +235,7 @@ import type {
   SpeechModel,
   TimelineV2,
   TranscriptionEngine,
+  TranscriptionSettings,
   TranscriptionStartPreflight,
   TranscriptArtifact,
   UpdateCheckResponse,
@@ -592,12 +593,57 @@ const modelOptions: Array<{ value: SpeechModel; label: string }> = [
 ];
 
 const parakeetModelOptions: Array<{ value: ParakeetModel; label: string }> = [
-  { value: "tdt06b_v3_q4", label: "TDT 0.6B v3 Q4_K" },
-  { value: "tdt06b_v3_f16", label: "TDT 0.6B v3 F16" },
-  { value: "tdt06b_v3_q8", label: "TDT 0.6B v3 Q8" },
-  { value: "realtime_eou120m_v1_f16", label: "Realtime EOU 120M F16" },
-  { value: "realtime_eou120m_v1_q8", label: "Realtime EOU 120M Q8" },
+  { value: "tdt06b_v3_q4", label: "Parakeet TDT 0.6B v3 Q4_K" },
+  { value: "tdt06b_v3_f16", label: "Parakeet TDT 0.6B v3 F16" },
+  { value: "tdt06b_v3_q8", label: "Parakeet TDT 0.6B v3 Q8" },
+  {
+    value: "realtime_eou120m_v1_f16",
+    label: "Parakeet Realtime EOU 120M F16",
+  },
+  {
+    value: "realtime_eou120m_v1_q8",
+    label: "Parakeet Realtime EOU 120M Q8",
+  },
 ];
+
+type PrimaryTranscriptionModelOption =
+  | { engine: "whisper_cpp"; value: SpeechModel; label: string }
+  | { engine: "parakeet_cpp"; value: ParakeetModel; label: string };
+
+function primaryTranscriptionModelOptions(
+  engine: TranscriptionEngine,
+): PrimaryTranscriptionModelOption[] {
+  if (engine === "parakeet_cpp") {
+    return parakeetModelOptions.map((option) => ({
+      ...option,
+      engine: "parakeet_cpp",
+    }));
+  }
+
+  return modelOptions.map((option) => ({
+    ...option,
+    engine: "whisper_cpp",
+  }));
+}
+
+function selectedPrimaryTranscriptionModel(
+  transcription: TranscriptionSettings,
+): SpeechModel | ParakeetModel {
+  return transcription.engine === "parakeet_cpp"
+    ? transcription.parakeet_model
+    : transcription.model;
+}
+
+function findSelectedTranscriptionModelEntry(
+  modelCatalog: ProvisioningModelCatalogEntry[],
+  transcription: TranscriptionSettings,
+): ProvisioningModelCatalogEntry | undefined {
+  const selectedModel = selectedPrimaryTranscriptionModel(transcription);
+  return modelCatalog.find(
+    (entry) =>
+      entry.engine === transcription.engine && entry.key === selectedModel,
+  );
+}
 
 const MIN_RETRANSCRIBE_TRIM_DURATION_SECONDS = 1.5;
 const LEFT_SIDEBAR_WIDTH_STORAGE_KEY = "sbobino.layout.leftSidebarWidth";
@@ -1831,6 +1877,10 @@ function formatLanguageLabel(language: LanguageCode): string {
   return t(`lang.${language}`, option?.label ?? language);
 }
 
+function formatParakeetModelLabel(model: string, fallback?: string): string {
+  return t(`parakeetModel.${model}`, fallback ?? model);
+}
+
 function formatArtifactKindLabel(kind: ArtifactKind): string {
   return kind === "realtime"
     ? t("history.live", "Live")
@@ -1961,6 +2011,14 @@ function formatTranscriptionPreflightMessage(
       "error.whisperCliNotRunnable",
       "Whisper CLI is not runnable at '{path}'. Configure Whisper CLI path in Settings > Local Models.",
       { path: preflight.whisper_cli_resolved },
+    );
+  }
+
+  if (preflight.reason_code === "parakeetcpp_missing") {
+    return t(
+      "error.parakeetCliNotRunnable",
+      "Parakeet CLI is not runnable at '{path}'. Repair the local runtime from Settings > Local Models.",
+      { path: preflight.parakeet_cli_resolved },
     );
   }
 
@@ -5127,9 +5185,9 @@ export function App({
       return false;
     }
 
-    const selectedModel = settings.transcription.model;
-    const modelEntry = modelCatalog.find(
-      (entry) => entry.key === selectedModel,
+    const modelEntry = findSelectedTranscriptionModelEntry(
+      modelCatalog,
+      settings.transcription,
     );
     if (!modelEntry) {
       return true;
@@ -5143,9 +5201,9 @@ export function App({
       return false;
     }
 
-    const selectedModel = settings.transcription.model;
-    const modelEntry = modelCatalog.find(
-      (entry) => entry.key === selectedModel,
+    const modelEntry = findSelectedTranscriptionModelEntry(
+      modelCatalog,
+      settings.transcription,
     );
     if (!modelEntry) {
       return true;
@@ -7429,6 +7487,16 @@ export function App({
       transcription: {
         ...current.transcription,
         model,
+      },
+    }));
+  }
+
+  async function onChangeParakeetModel(model: ParakeetModel): Promise<void> {
+    await patchSettings((current) => ({
+      ...current,
+      transcription: {
+        ...current.transcription,
+        parakeet_model: model,
       },
     }));
   }
@@ -12524,6 +12592,14 @@ export function App({
   }
 
   function renderMetadataInspector(): JSX.Element {
+    const transcriptionSettings = settings?.transcription ?? null;
+    const primaryModelOptions = primaryTranscriptionModelOptions(
+      transcriptionSettings?.engine ?? "whisper_cpp",
+    );
+    const primaryModelValue = transcriptionSettings
+      ? selectedPrimaryTranscriptionModel(transcriptionSettings)
+      : "base";
+
     return (
       <div className="inspector-body">
         <h4>{t("metadata.modelLanguage", "Model & Language")}</h4>
@@ -12531,14 +12607,23 @@ export function App({
         <div className="property-grid">
           <label>{t("metadata.model")}</label>
           <select
-            value={settings?.transcription.model ?? "base"}
-            onChange={(event) =>
-              void onChangeModel(event.target.value as SpeechModel)
-            }
+            value={primaryModelValue}
+            onChange={(event) => {
+              if (!transcriptionSettings) {
+                return;
+              }
+              if (transcriptionSettings.engine === "parakeet_cpp") {
+                void onChangeParakeetModel(event.target.value as ParakeetModel);
+                return;
+              }
+              void onChangeModel(event.target.value as SpeechModel);
+            }}
           >
-            {modelOptions.map((option) => (
+            {primaryModelOptions.map((option) => (
               <option key={option.value} value={option.value}>
-                {formatSpeechModelLabel(option.value, option.label)}
+                {option.engine === "parakeet_cpp"
+                  ? formatParakeetModelLabel(option.value, option.label)
+                  : formatSpeechModelLabel(option.value, option.label)}
               </option>
             ))}
           </select>
@@ -17331,14 +17416,39 @@ export function App({
                       <Mic size={12} />
                     </span>
                     <select
-                      value={settings?.transcription.model ?? "base"}
-                      onChange={(event) =>
-                        void onChangeModel(event.target.value as SpeechModel)
+                      value={
+                        settings
+                          ? selectedPrimaryTranscriptionModel(
+                              settings.transcription,
+                            )
+                          : "base"
                       }
+                      onChange={(event) => {
+                        if (!settings) {
+                          return;
+                        }
+                        if (settings.transcription.engine === "parakeet_cpp") {
+                          void onChangeParakeetModel(
+                            event.target.value as ParakeetModel,
+                          );
+                          return;
+                        }
+                        void onChangeModel(event.target.value as SpeechModel);
+                      }}
                     >
-                      {modelOptions.map((option) => (
+                      {primaryTranscriptionModelOptions(
+                        settings?.transcription.engine ?? "whisper_cpp",
+                      ).map((option) => (
                         <option key={option.value} value={option.value}>
-                          {formatSpeechModelLabel(option.value, option.label)}
+                          {option.engine === "parakeet_cpp"
+                            ? formatParakeetModelLabel(
+                                option.value,
+                                option.label,
+                              )
+                            : formatSpeechModelLabel(
+                                option.value,
+                                option.label,
+                              )}
                         </option>
                       ))}
                     </select>

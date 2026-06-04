@@ -192,5 +192,6 @@ Prerelease candidate published successfully:
 Next required steps:
   1. ./scripts/distribution_readiness.sh "$VERSION" "$REPO_SLUG"
   2. Run portability smoke on a hosted macos-14 runner (automated in release.yml)
-  3. ./scripts/promote_candidate_release.sh "$VERSION" "$REPO_SLUG"
+  3. ./scripts/run_release_vm_gate.sh "$VERSION" "$REPO_SLUG"
+  4. ./scripts/promote_candidate_release.sh "$VERSION" "$REPO_SLUG"
 EOF

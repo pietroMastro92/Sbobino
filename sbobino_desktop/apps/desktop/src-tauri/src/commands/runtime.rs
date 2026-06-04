@@ -95,6 +95,7 @@ pub struct EnsureRuntimeResponse {
     pub ffmpeg_resolved: String,
     pub whisper_cli_resolved: String,
     pub whisper_stream_resolved: String,
+    pub parakeet_cli_resolved: String,
 }
 
 fn engine_to_wire(engine: &TranscriptionEngine) -> &'static str {
@@ -106,10 +107,29 @@ fn engine_to_wire(engine: &TranscriptionEngine) -> &'static str {
 
 fn runtime_toolchain_ready(health: &sbobino_infrastructure::RuntimeHealth) -> bool {
     if health.managed_runtime_required {
-        return health.managed_runtime.ready;
+        return match health.configured_engine {
+            TranscriptionEngine::WhisperCpp => {
+                health.managed_runtime.ffmpeg.available
+                    && health.managed_runtime.whisper_cli.available
+                    && health.managed_runtime.whisper_stream.available
+            }
+            TranscriptionEngine::ParakeetCpp => {
+                health.managed_runtime.ffmpeg.available
+                    && health.managed_runtime.parakeet_cli.available
+            }
+        };
     }
 
-    health.ffmpeg_available && health.whisper_cli_available && health.whisper_stream_available
+    match health.configured_engine {
+        TranscriptionEngine::WhisperCpp => {
+            health.ffmpeg_available
+                && health.whisper_cli_available
+                && health.whisper_stream_available
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            health.ffmpeg_available && health.parakeet_cli_available
+        }
+    }
 }
 
 fn first_managed_runtime_failure(
@@ -134,6 +154,13 @@ fn first_managed_runtime_failure(
             "Whisper Stream",
             managed_runtime.whisper_stream.resolved_path.as_str(),
             managed_runtime.whisper_stream.failure_message.as_str(),
+        ));
+    }
+    if !managed_runtime.parakeet_cli.available {
+        return Some((
+            "Parakeet CLI",
+            managed_runtime.parakeet_cli.resolved_path.as_str(),
+            managed_runtime.parakeet_cli.failure_message.as_str(),
         ));
     }
     None
@@ -223,9 +250,15 @@ fn runtime_toolchain_message(
             health.whisper_stream_resolved
         ));
     }
+    if !health.parakeet_cli_available {
+        missing.push(format!(
+            "Parakeet CLI is not runnable at '{}'.",
+            health.parakeet_cli_resolved
+        ));
+    }
 
     let mut message = if missing.is_empty() {
-        "Whisper.cpp runtime unavailable.".to_string()
+        "Transcription runtime unavailable.".to_string()
     } else {
         missing.join(" ")
     };
@@ -233,7 +266,7 @@ fn runtime_toolchain_message(
         message.push(' ');
         message.push_str(note);
     }
-    message.push_str(" Configure Whisper CLI path in Settings > Local Models.");
+    message.push_str(" Repair the local runtime from Settings > Local Models.");
     message
 }
 
@@ -315,16 +348,24 @@ pub async fn ensure_transcription_runtime(
     if runtime_toolchain_ready(&health) {
         return Ok(EnsureRuntimeResponse {
             ready: true,
-            engine: "whisper_cpp".to_string(),
+            engine: engine_to_wire(&health.configured_engine).to_string(),
             did_setup: false,
-            message: "Whisper.cpp runtime available.".to_string(),
+            message: match health.configured_engine {
+                TranscriptionEngine::WhisperCpp => "Whisper.cpp runtime available.".to_string(),
+                TranscriptionEngine::ParakeetCpp => "Parakeet.cpp runtime available.".to_string(),
+            },
             ffmpeg_resolved: health.ffmpeg_resolved,
             whisper_cli_resolved: health.whisper_cli_resolved,
             whisper_stream_resolved: health.whisper_stream_resolved,
+            parakeet_cli_resolved: health.parakeet_cli_resolved,
         });
     }
 
-    let (did_setup, setup_note) = normalize_runtime_settings_for_whisper_cpp(&state).await;
+    let (did_setup, setup_note) = if health.configured_engine == TranscriptionEngine::WhisperCpp {
+        normalize_runtime_settings_for_whisper_cpp(&state).await
+    } else {
+        (false, None)
+    };
 
     let refreshed = state
         .runtime_factory
@@ -335,6 +376,8 @@ pub async fn ensure_transcription_runtime(
     let message = if ready {
         if did_setup {
             "Whisper.cpp runtime is ready.".to_string()
+        } else if refreshed.configured_engine == TranscriptionEngine::ParakeetCpp {
+            "Parakeet.cpp runtime available.".to_string()
         } else {
             "Whisper.cpp runtime available.".to_string()
         }
@@ -344,12 +387,13 @@ pub async fn ensure_transcription_runtime(
 
     Ok(EnsureRuntimeResponse {
         ready,
-        engine: "whisper_cpp".to_string(),
+        engine: engine_to_wire(&refreshed.configured_engine).to_string(),
         did_setup,
         message,
         ffmpeg_resolved: refreshed.ffmpeg_resolved,
         whisper_cli_resolved: refreshed.whisper_cli_resolved,
         whisper_stream_resolved: refreshed.whisper_stream_resolved,
+        parakeet_cli_resolved: refreshed.parakeet_cli_resolved,
     })
 }
 
@@ -544,7 +588,7 @@ pub async fn get_transcription_start_preflight(
 
     if requested_engine == TranscriptionEngine::ParakeetCpp && !health.parakeet_cli_available {
         let message = format!(
-            "Parakeet CLI is not runnable at '{}'. Configure Parakeet CLI path in Settings > Local Models.",
+            "Parakeet CLI is not runnable at '{}'. Repair the local runtime from Settings > Local Models.",
             health.parakeet_cli_resolved
         );
         return Ok(StartPreflightResponse {
