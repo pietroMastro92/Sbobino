@@ -18,6 +18,9 @@ Environment variables:
   SBOBINO_RUNNER_NAME           Override the generated runner name.
   SBOBINO_RUNNER_WORKDIR        Override the runner work directory.
   SBOBINO_RUNNER_EPHEMERAL      Set to 1 to configure the runner as ephemeral.
+  SBOBINO_VALIDATION_FIXTURE_AUDIO
+                                 Optional validation fixture path. AS-THIRD
+                                 defaults to ~/Fixtures/as-third-diarization.wav.
 EOF
 }
 
@@ -184,4 +187,7 @@ Self-hosted runner configured successfully.
 
 Next recommended step:
   ./scripts/preflight_self_hosted_runner.sh "$MACHINE_CLASS" "$REPO_SLUG"
+
+For AS-THIRD, make sure this fixture exists before running the VM gate:
+  ~/Fixtures/as-third-diarization.wav
 EOF

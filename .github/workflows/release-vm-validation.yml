@@ -1,0 +1,65 @@
+name: Release VM Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without leading v
+        required: true
+        type: string
+      machine_class:
+        description: Self-hosted validation machine class
+        required: true
+        default: AS-THIRD
+        type: choice
+        options:
+          - AS-THIRD
+
+run-name: ${{ inputs.machine_class }} v${{ inputs.version }} release VM validation
+
+permissions:
+  contents: write
+
+jobs:
+  as-third:
+    if: ${{ inputs.machine_class == 'AS-THIRD' }}
+    runs-on: [self-hosted, macOS, ARM64, apple-silicon, as-third]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG_NAME: v${{ inputs.version }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ inputs.version }}
+          fetch-depth: 0
+
+      - name: Validate runner preflight
+        working-directory: sbobino_desktop
+        run: ./scripts/preflight_self_hosted_runner.sh AS-THIRD "$GITHUB_REPOSITORY"
+
+      - name: Run AS-THIRD clean-room validation
+        working-directory: sbobino_desktop
+        run: |
+          ./scripts/run_release_machine_validation.sh \
+            AS-THIRD \
+            "${{ inputs.version }}" \
+            "$GITHUB_REPOSITORY" \
+            "$PWD/AS-THIRD.validation-report.json"
+
+      - name: Upload validation report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AS-THIRD.validation-report
+          path: sbobino_desktop/AS-THIRD.validation-report.json
+          if-no-files-found: error
+
+      - name: Upload validation report to prerelease
+        if: always()
+        working-directory: sbobino_desktop
+        run: |
+          gh release upload "$TAG_NAME" \
+            AS-THIRD.validation-report.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber

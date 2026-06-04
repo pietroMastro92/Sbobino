@@ -652,6 +652,7 @@ export type EnsureRuntimeResponse = {
   ffmpeg_resolved: string;
   whisper_cli_resolved: string;
   whisper_stream_resolved: string;
+  parakeet_cli_resolved: string;
 };
 
 export type UpdateCheckResponse = {

@@ -1157,7 +1157,10 @@ impl RuntimeTranscriptionFactory {
 
         ManagedRuntimeHealth {
             source: "managed_release_asset".to_string(),
-            ready: ffmpeg.available && whisper_cli.available && whisper_stream.available,
+            ready: ffmpeg.available
+                && whisper_cli.available
+                && whisper_stream.available
+                && parakeet_cli.available,
             ffmpeg,
             whisper_cli,
             whisper_stream,
@@ -4140,6 +4143,22 @@ mod tests {
         whisper_cli_script: &str,
         whisper_stream_script: &str,
     ) {
+        prepare_managed_runtime_with_parakeet(
+            factory,
+            ffmpeg_script,
+            whisper_cli_script,
+            whisper_stream_script,
+            Some("#!/bin/sh\nexit 0\n"),
+        );
+    }
+
+    fn prepare_managed_runtime_with_parakeet(
+        factory: &RuntimeTranscriptionFactory,
+        ffmpeg_script: &str,
+        whisper_cli_script: &str,
+        whisper_stream_script: &str,
+        parakeet_cli_script: Option<&str>,
+    ) {
         std::fs::create_dir_all(factory.managed_runtime_lib_dir())
             .expect("managed runtime lib dir should exist");
         write_executable_file(
@@ -4154,6 +4173,9 @@ mod tests {
             &factory.managed_runtime_binary_path("whisper-stream"),
             whisper_stream_script,
         );
+        if let Some(script) = parakeet_cli_script {
+            write_executable_file(&factory.managed_runtime_binary_path("parakeet-cli"), script);
+        }
     }
 
     #[test]
@@ -4991,11 +5013,12 @@ mod tests {
         settings.transcription.engine = TranscriptionEngine::ParakeetCpp;
         persist_settings(&factory, &settings);
 
-        prepare_managed_runtime(
+        prepare_managed_runtime_with_parakeet(
             &factory,
             "#!/bin/sh\nexit 0\n",
             "#!/bin/sh\nexit 0\n",
             "#!/bin/sh\nexit 0\n",
+            None,
         );
         let parakeet_models_dir =
             std::path::PathBuf::from(factory.resolve_models_dir("parakeet-models"));

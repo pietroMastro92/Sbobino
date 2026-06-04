@@ -567,6 +567,8 @@ fn format_managed_runtime_install_error(health: &ManagedRuntimeHealth) -> String
         Some(("Whisper CLI", &health.whisper_cli))
     } else if !health.whisper_stream.available {
         Some(("Whisper Stream", &health.whisper_stream))
+    } else if !health.parakeet_cli.available {
+        Some(("Parakeet CLI", &health.parakeet_cli))
     } else {
         None
     };
@@ -584,6 +586,17 @@ fn format_managed_runtime_install_error(health: &ManagedRuntimeHealth) -> String
     }
 
     "Local runtime was installed but is still not runnable.".to_string()
+}
+
+fn transcription_runtime_install_complete(health: &sbobino_infrastructure::RuntimeHealth) -> bool {
+    if health.managed_runtime_required {
+        return health.managed_runtime.ready;
+    }
+
+    health.ffmpeg_available
+        && health.whisper_cli_available
+        && health.whisper_stream_available
+        && health.parakeet_cli_available
 }
 
 fn collect_missing_models(models_dir: &Path) -> Vec<String> {
@@ -1178,8 +1191,7 @@ pub async fn provisioning_install_runtime(
         .runtime_factory
         .runtime_health()
         .map_err(|e| CommandError::new("runtime_health", e))?;
-    let runtime_ready =
-        health.ffmpeg_available && health.whisper_cli_available && health.whisper_stream_available;
+    let runtime_ready = transcription_runtime_install_complete(&health);
 
     if runtime_ready && !force {
         emit_provisioning_status(
@@ -2728,17 +2740,20 @@ mod tests {
         estimate_pyannote_required_free_bytes, install_pyannote_archive, install_runtime_archive,
         plan_pyannote_background_action_inner, prepare_pyannote_runtime_stage,
         prepare_pyannote_runtime_swap, promote_staged_pyannote_runtime,
-        rollback_pyannote_runtime_swap, sha256_file_hex, validate_manifest_asset_descriptor,
-        validate_setup_manifest, verify_file_sha256, PyannoteAssetSelection,
-        PyannoteBackgroundActionTrigger,
+        rollback_pyannote_runtime_swap, sha256_file_hex, transcription_runtime_install_complete,
+        validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
+        PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
     };
     use crate::release_assets::{
         PyannoteReleaseAsset, PyannoteReleaseManifest, ReleaseAssetDescriptor, RuntimeReleaseAsset,
         RuntimeReleaseManifest, SetupReleaseManifest, PYANNOTE_COMPAT_LEVEL,
         PYANNOTE_MANIFEST_ASSET, RUNTIME_MANIFEST_ASSET, SETUP_MANIFEST_ASSET,
     };
-    use sbobino_domain::AppSettings;
-    use sbobino_infrastructure::{ManagedPyannoteManifest, RuntimeTranscriptionFactory};
+    use sbobino_domain::{AppSettings, TranscriptionEngine};
+    use sbobino_infrastructure::{
+        ManagedPyannoteManifest, ManagedRuntimeBinaryHealth, ManagedRuntimeHealth,
+        PyannoteRuntimeHealth, RuntimeHealth, RuntimeTranscriptionFactory,
+    };
     use std::io::Write;
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::tempdir;
@@ -2915,6 +2930,79 @@ mod tests {
             size_bytes: None,
             expanded_size_bytes: None,
         }
+    }
+
+    fn managed_binary_health(available: bool) -> ManagedRuntimeBinaryHealth {
+        ManagedRuntimeBinaryHealth {
+            resolved_path: "/tmp/runtime/bin/tool".to_string(),
+            available,
+            failure_reason: if available {
+                String::new()
+            } else {
+                "missing".to_string()
+            },
+            failure_message: if available {
+                String::new()
+            } else {
+                "tool is missing".to_string()
+            },
+        }
+    }
+
+    fn runtime_health_with_managed_runtime(managed_runtime: ManagedRuntimeHealth) -> RuntimeHealth {
+        RuntimeHealth {
+            host_os: "macos".to_string(),
+            host_arch: "aarch64".to_string(),
+            is_apple_silicon: true,
+            preferred_engine: TranscriptionEngine::WhisperCpp,
+            configured_engine: TranscriptionEngine::WhisperCpp,
+            runtime_source: "managed_release_asset".to_string(),
+            managed_runtime_required: true,
+            managed_runtime,
+            ffmpeg_path: "ffmpeg".to_string(),
+            ffmpeg_resolved: "/tmp/runtime/bin/ffmpeg".to_string(),
+            ffmpeg_available: true,
+            whisper_cli_path: "whisper-cli".to_string(),
+            whisper_cli_resolved: "/tmp/runtime/bin/whisper-cli".to_string(),
+            whisper_cli_available: true,
+            whisper_stream_path: "whisper-stream".to_string(),
+            whisper_stream_resolved: "/tmp/runtime/bin/whisper-stream".to_string(),
+            whisper_stream_available: true,
+            parakeet_cli_path: "parakeet-cli".to_string(),
+            parakeet_cli_resolved: "/tmp/runtime/bin/parakeet-cli".to_string(),
+            parakeet_cli_available: false,
+            models_dir_configured: "models".to_string(),
+            models_dir_resolved: "/tmp/models".to_string(),
+            parakeet_models_dir_configured: "parakeet-models".to_string(),
+            parakeet_models_dir_resolved: "/tmp/parakeet-models".to_string(),
+            model_filename: "ggml-base.bin".to_string(),
+            model_present: true,
+            parakeet_model_filename: "tdt-0.6b-v3-q4_k.gguf".to_string(),
+            parakeet_model_present: false,
+            missing_parakeet_models: vec![],
+            coreml_encoder_present: false,
+            missing_models: vec![],
+            missing_encoders: vec![],
+            pyannote: PyannoteRuntimeHealth::default(),
+            setup_complete: false,
+        }
+    }
+
+    #[test]
+    fn transcription_runtime_install_complete_requires_parakeet_cli() {
+        let health = runtime_health_with_managed_runtime(ManagedRuntimeHealth {
+            source: "managed_release_asset".to_string(),
+            ready: false,
+            ffmpeg: managed_binary_health(true),
+            whisper_cli: managed_binary_health(true),
+            whisper_stream: managed_binary_health(true),
+            parakeet_cli: managed_binary_health(false),
+        });
+
+        assert!(
+            !transcription_runtime_install_complete(&health),
+            "runtime repair must not skip install when Parakeet CLI is missing"
+        );
     }
 
     #[tokio::test]
