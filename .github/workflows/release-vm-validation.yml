@@ -59,6 +59,10 @@ jobs:
           cargo --version
           rustc --version
 
+      - name: Clean previous validation state
+        working-directory: sbobino_desktop
+        run: ./scripts/clean_release_validation_state.sh AS-THIRD
+
       - name: Validate runner preflight
         working-directory: sbobino_desktop
         run: ./scripts/preflight_self_hosted_runner.sh AS-THIRD "$GITHUB_REPOSITORY"
