@@ -13,6 +13,7 @@ use sbobino_domain::{
     TranscriptArtifact, TranscriptionEngine,
 };
 
+use crate::parakeet_realtime::{ParakeetRealtimeEngine, ParakeetRealtimeStopResult};
 use crate::realtime_audio::start_input_preview;
 use crate::{error::CommandError, state::AppState};
 
@@ -47,6 +48,60 @@ fn resolve_realtime_engine(
     }
 }
 
+fn resolve_parakeet_live_engine(state: &AppState) -> Result<ParakeetRealtimeEngine, CommandError> {
+    let settings = state
+        .runtime_factory
+        .load_settings()
+        .map_err(|load_error| CommandError::new("settings", load_error))?;
+    let parakeet_cli_path = state
+        .runtime_factory
+        .resolve_binary_path(&settings.transcription.parakeet_cli_path, "parakeet-cli");
+    let bin_dir = std::path::PathBuf::from(&parakeet_cli_path)
+        .parent()
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            CommandError::from(ApplicationError::SpeechToText(format!(
+                "Unable to resolve Parakeet runtime directory from {parakeet_cli_path}"
+            )))
+        })?;
+    let lib_path = if bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
+        bin_dir
+            .parent()
+            .unwrap_or(&bin_dir)
+            .join("lib")
+            .join("libparakeet.dylib")
+    } else {
+        bin_dir.join("libparakeet.dylib")
+    };
+    let models_dir = state
+        .runtime_factory
+        .resolve_models_dir(&settings.transcription.parakeet_models_dir);
+    Ok(ParakeetRealtimeEngine::new(lib_path, models_dir.into()))
+}
+
+fn select_parakeet_live_model(
+    models_dir: &std::path::Path,
+    requested: ParakeetModel,
+) -> ParakeetModel {
+    if matches!(
+        requested,
+        ParakeetModel::RealtimeEou120mV1F16 | ParakeetModel::RealtimeEou120mV1Q8
+    ) {
+        return requested;
+    }
+
+    for candidate in [
+        ParakeetModel::RealtimeEou120mV1F16,
+        ParakeetModel::RealtimeEou120mV1Q8,
+    ] {
+        if models_dir.join(candidate.gguf_filename()).exists() {
+            return candidate;
+        }
+    }
+
+    requested
+}
+
 #[derive(Debug, Deserialize)]
 pub struct StartRealtimePayload {
     #[serde(default)]
@@ -74,6 +129,11 @@ pub struct StopRealtimePayload {
 pub struct StopRealtimeResponse {
     pub saved: bool,
     pub artifact: Option<TranscriptArtifact>,
+}
+
+struct RealtimeStopResult {
+    transcript: String,
+    saved_audio_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,24 +191,6 @@ pub async fn start_realtime(
     let model = payload.model.unwrap_or(default_model);
     let language = payload.language.unwrap_or(default_language);
 
-    if engine_kind == TranscriptionEngine::ParakeetCpp {
-        let parakeet_model = payload
-            .parakeet_model
-            .unwrap_or(settings.transcription.parakeet_model);
-        return Err(CommandError::from(ApplicationError::SpeechToText(format!(
-            "Parakeet.cpp live transcription is not enabled yet for '{}'. File transcription works with Parakeet; live requires the parakeet.cpp C API streaming path and must not fall back to Whisper.",
-            parakeet_model.gguf_filename()
-        ))));
-    }
-
-    let engine = resolve_realtime_engine(&state)?;
-    {
-        let mut current_engine = state.realtime.engine.lock().await;
-        *current_engine = engine.clone();
-    }
-
-    start_realtime_preview(&app, &state).await?;
-
     if let Some(id) = &payload.resume_artifact_id {
         let artifact = state
             .artifact_service
@@ -157,37 +199,124 @@ pub async fn start_realtime(
             .map_err(CommandError::from)?
             .ok_or_else(|| CommandError::new("not_found", "realtime session not found"))?;
 
-        engine.seed_buffer(&artifact.raw_transcript).await;
         *state.realtime.session_name.lock().await = Some(artifact.title.clone());
     } else {
-        engine.reset().await;
         *state.realtime.session_name.lock().await = None;
     }
 
-    *state.realtime.model_filename.lock().await = Some(model.ggml_filename().to_string());
     *state.realtime.language_code.lock().await = language.as_whisper_code().to_string();
+    *state.realtime.active_engine.lock().await = engine_kind.clone();
 
     let app_handle = app.clone();
     let emit_delta = Arc::new(move |delta: RealtimeDelta| {
         let _ = app_handle.emit("realtime://delta", delta);
     });
 
-    if let Err(error) = engine
-        .start(
-            model.ggml_filename(),
-            language.as_whisper_code(),
-            emit_delta,
-        )
-        .await
-    {
-        stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
-        return Err(CommandError::from(error));
+    match engine_kind {
+        TranscriptionEngine::WhisperCpp => {
+            let engine = resolve_realtime_engine(&state)?;
+            {
+                let mut current_engine = state.realtime.engine.lock().await;
+                *current_engine = engine.clone();
+            }
+            if let Some(id) = &payload.resume_artifact_id {
+                if let Some(artifact) = state
+                    .artifact_service
+                    .get(id)
+                    .await
+                    .map_err(CommandError::from)?
+                {
+                    engine.seed_buffer(&artifact.raw_transcript).await;
+                }
+            } else {
+                engine.reset().await;
+            }
+            *state.realtime.model_filename.lock().await = Some(model.ggml_filename().to_string());
+
+            start_realtime_preview(&app, &state).await?;
+
+            if let Err(error) = engine
+                .start(
+                    model.ggml_filename(),
+                    language.as_whisper_code(),
+                    emit_delta,
+                )
+                .await
+            {
+                stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+                return Err(CommandError::from(error));
+            }
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+            let parakeet_engine = resolve_parakeet_live_engine(&state)?;
+            let models_dir = state
+                .runtime_factory
+                .resolve_models_dir(&settings.transcription.parakeet_models_dir);
+            let requested_model = payload
+                .parakeet_model
+                .unwrap_or(settings.transcription.parakeet_model);
+            let live_model =
+                select_parakeet_live_model(std::path::Path::new(&models_dir), requested_model);
+            if let Some(id) = &payload.resume_artifact_id {
+                if let Some(artifact) = state
+                    .artifact_service
+                    .get(id)
+                    .await
+                    .map_err(CommandError::from)?
+                {
+                    parakeet_engine.seed_buffer(&artifact.raw_transcript).await;
+                }
+            } else {
+                parakeet_engine.reset().await;
+            }
+            *state.realtime.model_filename.lock().await =
+                Some(live_model.gguf_filename().to_string());
+            {
+                let mut current_engine = state.realtime.parakeet_engine.lock().await;
+                *current_engine = Some(parakeet_engine.clone());
+            }
+
+            if let Err(error) = parakeet_engine
+                .start(live_model.gguf_filename(), emit_delta)
+                .await
+            {
+                return Err(CommandError::from(error));
+            }
+        }
     }
 
     sleep(Duration::from_millis(350)).await;
-    if !engine.is_running().await {
-        stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
-        let diagnostics = engine.snapshot_diagnostics().await;
+    let running = match engine_kind {
+        TranscriptionEngine::WhisperCpp => {
+            let engine = state.realtime.engine.lock().await.clone();
+            engine.is_running().await
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            let engine = state.realtime.parakeet_engine.lock().await.clone();
+            match engine {
+                Some(engine) => engine.is_running().await,
+                None => false,
+            }
+        }
+    };
+    if !running {
+        if engine_kind == TranscriptionEngine::WhisperCpp {
+            stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+        }
+        let diagnostics = match engine_kind {
+            TranscriptionEngine::WhisperCpp => {
+                let engine = state.realtime.engine.lock().await.clone();
+                engine.snapshot_diagnostics().await
+            }
+            TranscriptionEngine::ParakeetCpp => {
+                let engine = state.realtime.parakeet_engine.lock().await.clone();
+                match engine {
+                    Some(engine) => engine.snapshot_diagnostics().await,
+                    None => Vec::new(),
+                }
+            }
+        };
         let detail = if diagnostics.is_empty() {
             "Realtime transcription stopped immediately. Verify microphone access and that at least one audio input device is available.".to_string()
         } else {
@@ -212,9 +341,18 @@ pub async fn pause_realtime(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    let engine = state.realtime.engine.lock().await.clone();
-    engine.pause().await.map_err(CommandError::from)?;
-    stop_realtime_preview(&app, &state, "paused", "Microphone preview paused.").await;
+    match state.realtime.active_engine.lock().await.clone() {
+        TranscriptionEngine::WhisperCpp => {
+            let engine = state.realtime.engine.lock().await.clone();
+            engine.pause().await.map_err(CommandError::from)?;
+            stop_realtime_preview(&app, &state, "paused", "Microphone preview paused.").await;
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            if let Some(engine) = state.realtime.parakeet_engine.lock().await.clone() {
+                engine.pause().await.map_err(CommandError::from)?;
+            }
+        }
+    }
 
     let _ = app.emit(
         "realtime://status",
@@ -232,9 +370,18 @@ pub async fn resume_realtime(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), CommandError> {
-    let engine = state.realtime.engine.lock().await.clone();
-    start_realtime_preview(&app, &state).await?;
-    engine.resume().await.map_err(CommandError::from)?;
+    match state.realtime.active_engine.lock().await.clone() {
+        TranscriptionEngine::WhisperCpp => {
+            let engine = state.realtime.engine.lock().await.clone();
+            start_realtime_preview(&app, &state).await?;
+            engine.resume().await.map_err(CommandError::from)?;
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            if let Some(engine) = state.realtime.parakeet_engine.lock().await.clone() {
+                engine.resume().await.map_err(CommandError::from)?;
+            }
+        }
+    }
 
     let _ = app.emit(
         "realtime://status",
@@ -260,9 +407,33 @@ pub async fn stop_realtime(
     });
     let save = payload.save.unwrap_or(true);
 
-    let engine = state.realtime.engine.lock().await.clone();
-    let stop_result = engine.stop().await.map_err(CommandError::from)?;
-    stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+    let active_engine = state.realtime.active_engine.lock().await.clone();
+    let stop_result = match active_engine {
+        TranscriptionEngine::WhisperCpp => {
+            let engine = state.realtime.engine.lock().await.clone();
+            let result = engine.stop().await.map_err(CommandError::from)?;
+            stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+            RealtimeStopResult {
+                transcript: result.transcript,
+                saved_audio_path: result.saved_audio_path,
+            }
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            let engine = state
+                .realtime
+                .parakeet_engine
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| CommandError::new("realtime", "Parakeet live is not running"))?;
+            let result: ParakeetRealtimeStopResult =
+                engine.stop().await.map_err(CommandError::from)?;
+            RealtimeStopResult {
+                transcript: result.transcript,
+                saved_audio_path: result.saved_audio_path,
+            }
+        }
+    };
 
     let _ = app.emit(
         "realtime://status",
@@ -352,7 +523,10 @@ pub async fn stop_realtime(
     .map_err(|e| CommandError::new("validation", e.to_string()))?;
     artifact.audio_available = stop_result.saved_audio_path.is_some();
     artifact.audio_duration_seconds = payload.elapsed_seconds.map(|value| value as f32);
-    artifact.processing_engine = Some("whisper_stream".to_string());
+    artifact.processing_engine = Some(match active_engine {
+        TranscriptionEngine::WhisperCpp => "whisper_stream".to_string(),
+        TranscriptionEngine::ParakeetCpp => "parakeet_cpp".to_string(),
+    });
     artifact.processing_language = Some(state.realtime.language_code.lock().await.clone());
     if let Some(path) = stop_result.saved_audio_path.as_ref() {
         artifact.set_source_external_path(path.to_string_lossy().to_string());

@@ -41,6 +41,7 @@ sbobino-infrastructure = { path = "../../../crates/infrastructure" }
 window-vibrancy = "0.7.1"
 base64 = "0.22"
 hound.workspace = true
+libloading.workspace = true
 libc = "0.2"
 
 [dev-dependencies]

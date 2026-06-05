@@ -413,33 +413,133 @@ pub async fn get_realtime_start_readiness(
         .and_then(|value| value.engine.clone())
         .unwrap_or_else(|| settings.transcription.engine.clone());
     if selected_engine == TranscriptionEngine::ParakeetCpp {
-        let selected_parakeet_model = payload
+        let requested_parakeet_model = payload
             .as_ref()
             .and_then(|value| value.parakeet_model.clone())
             .unwrap_or_else(|| settings.transcription.parakeet_model.clone());
-        let model_filename = selected_parakeet_model.gguf_filename().to_string();
         let health = state
             .runtime_factory
             .runtime_health()
             .map_err(|e| CommandError::new("runtime_health", e))?;
-        let model_path = PathBuf::from(&health.parakeet_models_dir_resolved)
-            .join(&model_filename)
-            .to_string_lossy()
-            .to_string();
+        let models_dir = PathBuf::from(&health.parakeet_models_dir_resolved);
+        let selected_parakeet_model = if matches!(
+            requested_parakeet_model,
+            ParakeetModel::RealtimeEou120mV1F16 | ParakeetModel::RealtimeEou120mV1Q8
+        ) {
+            requested_parakeet_model
+        } else if models_dir
+            .join(ParakeetModel::RealtimeEou120mV1F16.gguf_filename())
+            .exists()
+        {
+            ParakeetModel::RealtimeEou120mV1F16
+        } else if models_dir
+            .join(ParakeetModel::RealtimeEou120mV1Q8.gguf_filename())
+            .exists()
+        {
+            ParakeetModel::RealtimeEou120mV1Q8
+        } else {
+            requested_parakeet_model
+        };
+        let model_filename = selected_parakeet_model.gguf_filename().to_string();
+        let model_path_buf = models_dir.join(&model_filename);
+        let model_path = model_path_buf.to_string_lossy().to_string();
+        let parakeet_cli = PathBuf::from(&health.parakeet_cli_resolved);
+        let parakeet_lib = parakeet_cli
+            .parent()
+            .and_then(|bin_dir| {
+                if bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
+                    bin_dir
+                        .parent()
+                        .map(|parent| parent.join("lib").join("libparakeet.dylib"))
+                } else {
+                    Some(bin_dir.join("libparakeet.dylib"))
+                }
+            })
+            .unwrap_or_else(|| PathBuf::from("libparakeet.dylib"));
+
+        if !health.parakeet_cli_available {
+            return Ok(RealtimeStartReadinessResponse {
+                allowed: false,
+                reason_code: "parakeet_cli_missing".to_string(),
+                message: format!(
+                    "Parakeet.cpp runtime is not available at {}.",
+                    health.parakeet_cli_resolved
+                ),
+                engine: "parakeet_cpp".to_string(),
+                model_filename,
+                model_path,
+                ffmpeg_resolved: health.ffmpeg_resolved,
+                whisper_stream_resolved: health.whisper_stream_resolved,
+                parakeet_cli_resolved: health.parakeet_cli_resolved,
+                input_device_name: None,
+            });
+        }
+
+        if !parakeet_lib.exists() {
+            return Ok(RealtimeStartReadinessResponse {
+                allowed: false,
+                reason_code: "parakeet_live_library_missing".to_string(),
+                message: format!(
+                    "Parakeet.cpp live library is missing at {}. Reinstall the local runtime.",
+                    parakeet_lib.display()
+                ),
+                engine: "parakeet_cpp".to_string(),
+                model_filename,
+                model_path,
+                ffmpeg_resolved: health.ffmpeg_resolved,
+                whisper_stream_resolved: health.whisper_stream_resolved,
+                parakeet_cli_resolved: health.parakeet_cli_resolved,
+                input_device_name: None,
+            });
+        }
+
+        if !model_path_buf.exists() {
+            return Ok(RealtimeStartReadinessResponse {
+                allowed: false,
+                reason_code: "parakeet_realtime_model_missing".to_string(),
+                message: format!(
+                    "Parakeet.cpp live requires a realtime EOU model. Download '{}' in Local Models.",
+                    model_filename
+                ),
+                engine: "parakeet_cpp".to_string(),
+                model_filename,
+                model_path,
+                ffmpeg_resolved: health.ffmpeg_resolved,
+                whisper_stream_resolved: health.whisper_stream_resolved,
+                parakeet_cli_resolved: health.parakeet_cli_resolved,
+                input_device_name: None,
+            });
+        }
+
+        let input_device_name = match crate::realtime_audio::probe_input_device_name() {
+            Ok(name) => Some(name),
+            Err(error) => {
+                return Ok(RealtimeStartReadinessResponse {
+                    allowed: false,
+                    reason_code: error.reason_code,
+                    message: error.message,
+                    engine: "parakeet_cpp".to_string(),
+                    model_filename,
+                    model_path,
+                    ffmpeg_resolved: health.ffmpeg_resolved,
+                    whisper_stream_resolved: health.whisper_stream_resolved,
+                    parakeet_cli_resolved: health.parakeet_cli_resolved,
+                    input_device_name: None,
+                });
+            }
+        };
+
         return Ok(RealtimeStartReadinessResponse {
-            allowed: false,
-            reason_code: "parakeet_live_not_ready".to_string(),
-            message: format!(
-                "Parakeet.cpp live transcription is experimental and is not enabled in this build. File transcription can use '{}'; live will be enabled only through parakeet.cpp C API streaming, without Whisper fallback.",
-                model_filename
-            ),
+            allowed: true,
+            reason_code: "ok".to_string(),
+            message: format!("Parakeet.cpp live is ready with '{}'.", model_filename),
             engine: "parakeet_cpp".to_string(),
             model_filename,
             model_path,
             ffmpeg_resolved: health.ffmpeg_resolved,
             whisper_stream_resolved: health.whisper_stream_resolved,
             parakeet_cli_resolved: health.parakeet_cli_resolved,
-            input_device_name: None,
+            input_device_name,
         });
     }
     let selected_model = payload

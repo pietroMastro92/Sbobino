@@ -4234,6 +4234,7 @@ dependencies = [
  "futures-util",
  "hound",
  "libc",
+ "libloading 0.8.9",
  "printpdf",
  "reqwest 0.12.28",
  "sbobino-application",

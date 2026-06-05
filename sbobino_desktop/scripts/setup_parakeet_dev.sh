@@ -14,10 +14,11 @@ fi
 APP_ID=${SBOBINO_APP_ID:-com.sbobino.desktop}
 APP_SUPPORT_DIR=${SBOBINO_APP_SUPPORT_DIR:-"$HOME/Library/Application Support/$APP_ID"}
 INSTALL_BIN_DIR=${SBOBINO_PARAKEET_INSTALL_BIN_DIR:-"$APP_SUPPORT_DIR/bin"}
+INSTALL_LIB_DIR=${SBOBINO_PARAKEET_INSTALL_LIB_DIR:-"$APP_SUPPORT_DIR/lib"}
 MODELS_DIR=${SBOBINO_PARAKEET_MODELS_DIR:-"$APP_SUPPORT_DIR/parakeet-models"}
-PARAKEET_CPP_REF=${SBOBINO_RUNTIME_PARAKEET_CPP_REF:-${SBOBINO_RUNTIME_PARAKEET_CPP_VERSION:-9edf17c3ada66e0f881dcff155492867db7ac4cf}}
+PARAKEET_CPP_REF=${SBOBINO_RUNTIME_PARAKEET_CPP_REF:-${SBOBINO_RUNTIME_PARAKEET_CPP_VERSION:-b11fe5bca78ad8b342dd559a43d76df3984bb447}}
 MODEL_FILENAME=${SBOBINO_PARAKEET_MODEL:-tdt-0.6b-v3-q4_k.gguf}
-EXTRA_MODELS=${SBOBINO_PARAKEET_EXTRA_MODELS:-tdt-0.6b-v3-f16.gguf}
+EXTRA_MODELS=${SBOBINO_PARAKEET_EXTRA_MODELS:-tdt-0.6b-v3-f16.gguf realtime_eou_120m-v1-f16.gguf realtime_eou_120m-v1-q8_0.gguf}
 MODEL_BASE_URL="https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main"
 BUILD_JOBS=${SBOBINO_RUNTIME_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 MACOS_DEPLOYMENT_TARGET=${SBOBINO_MACOS_RUNTIME_DEPLOYMENT_TARGET:-13.0}
@@ -92,7 +93,7 @@ probe_parakeet_cli() {
   local output
   local status
   set +e
-  output=$("$INSTALL_CLI" --help 2>&1)
+  output=$(env DYLD_LIBRARY_PATH="$INSTALL_LIB_DIR:${DYLD_LIBRARY_PATH:-}" "$INSTALL_CLI" --help 2>&1)
   status=$?
   set -e
   printf '%s\n' "$output"
@@ -114,6 +115,7 @@ write_runtime_manifest() {
     echo "parakeet_cpp_resolved_ref=$resolved_ref"
     echo "parakeet_ggml_metal=$PARAKEET_GGML_METAL"
     echo "cmake_arch=$CMAKE_ARCH"
+    echo "parakeet_live_library=$INSTALL_LIB"
     echo "model=$MODEL_FILENAME"
     if [[ -n "$EXTRA_MODELS" ]]; then
       echo "extra_models=$EXTRA_MODELS"
@@ -137,6 +139,7 @@ trap cleanup EXIT
 SOURCE_ROOT="$WORK_DIR/parakeet.cpp"
 BUILD_ROOT="$WORK_DIR/parakeet-build"
 INSTALL_CLI="$INSTALL_BIN_DIR/parakeet-cli"
+INSTALL_LIB="$INSTALL_LIB_DIR/libparakeet.dylib"
 MODEL_PATH="$MODELS_DIR/$MODEL_FILENAME"
 MANIFEST_PATH="$INSTALL_BIN_DIR/parakeet-runtime-manifest.txt"
 
@@ -147,7 +150,7 @@ echo "models_dir=$MODELS_DIR"
 echo "model=$MODEL_FILENAME"
 echo "extra_models=$EXTRA_MODELS"
 
-run mkdir -p "$INSTALL_BIN_DIR" "$MODELS_DIR"
+run mkdir -p "$INSTALL_BIN_DIR" "$INSTALL_LIB_DIR" "$MODELS_DIR"
 
 if [[ "${SBOBINO_PARAKEET_SKIP_BUILD:-0}" != "1" ]]; then
   checkout_parakeet_source
@@ -157,7 +160,9 @@ if [[ "${SBOBINO_PARAKEET_SKIP_BUILD:-0}" != "1" ]]; then
     -DCMAKE_OSX_ARCHITECTURES="$CMAKE_ARCH" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
     -DCMAKE_OSX_SYSROOT="$SDKROOT" \
-    -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH="@loader_path;@loader_path/../lib" \
+    -DPARAKEET_SHARED=ON \
     -DPARAKEET_BUILD_CLI=ON \
     -DPARAKEET_BUILD_TESTS=OFF \
     -DGGML_NATIVE=OFF \
@@ -170,14 +175,35 @@ if [[ "${SBOBINO_PARAKEET_SKIP_BUILD:-0}" != "1" ]]; then
     if [[ -z "$BUILT_CLI" ]]; then
       fail "Unable to find parakeet-cli after building parakeet.cpp"
     fi
+    BUILT_LIB=$(find "$BUILD_ROOT" -type f -name libparakeet.dylib -print -quit)
+    if [[ -z "$BUILT_LIB" ]]; then
+      fail "Unable to find libparakeet.dylib after building parakeet.cpp"
+    fi
     run cp "$BUILT_CLI" "$INSTALL_CLI"
+    while IFS= read -r dylib; do
+      run cp "$dylib" "$INSTALL_LIB_DIR/$(basename "$dylib")"
+    done < <(find "$BUILD_ROOT" -type f -name 'lib*.dylib' -print)
+    (
+      cd "$INSTALL_LIB_DIR"
+      for dylib in lib*.0.13.0.dylib; do
+        [[ -e "$dylib" ]] || continue
+        run ln -sf "$dylib" "${dylib/.0.13.0.dylib/.0.dylib}"
+        run ln -sf "$dylib" "${dylib/.0.13.0.dylib/.dylib}"
+      done
+    )
     run chmod 755 "$INSTALL_CLI"
+    for dylib in "$INSTALL_LIB_DIR"/lib*.dylib; do
+      run chmod 755 "$dylib"
+    done
     write_runtime_manifest "$RESOLVED_REF"
     probe_parakeet_cli
   else
     echo "+ find '$BUILD_ROOT' -type f -name parakeet-cli -print -quit"
     echo "+ cp <built-parakeet-cli> '$INSTALL_CLI'"
+    echo "+ cp <built-lib*.dylib> '$INSTALL_LIB_DIR/'"
+    echo "+ ln -sf versioned ggml dylib names in '$INSTALL_LIB_DIR'"
     echo "+ chmod 755 '$INSTALL_CLI'"
+    echo "+ chmod 755 '$INSTALL_LIB_DIR'/lib*.dylib"
     echo "+ write '$MANIFEST_PATH'"
     echo "+ probe '$INSTALL_CLI' --help"
   fi

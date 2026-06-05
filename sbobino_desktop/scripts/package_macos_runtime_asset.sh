@@ -11,7 +11,7 @@ ROOT_NAME="runtime"
 MACOS_DEPLOYMENT_TARGET=${SBOBINO_MACOS_RUNTIME_DEPLOYMENT_TARGET:-13.0}
 SDL2_VERSION=${SBOBINO_RUNTIME_SDL2_VERSION:-2.32.10}
 WHISPER_CPP_VERSION=${SBOBINO_RUNTIME_WHISPER_CPP_VERSION:-1.8.4}
-PARAKEET_CPP_REF=${SBOBINO_RUNTIME_PARAKEET_CPP_REF:-${SBOBINO_RUNTIME_PARAKEET_CPP_VERSION:-9edf17c3ada66e0f881dcff155492867db7ac4cf}}
+PARAKEET_CPP_REF=${SBOBINO_RUNTIME_PARAKEET_CPP_REF:-${SBOBINO_RUNTIME_PARAKEET_CPP_VERSION:-b11fe5bca78ad8b342dd559a43d76df3984bb447}}
 FFMPEG_VERSION=${SBOBINO_RUNTIME_FFMPEG_VERSION:-8.1}
 BUILD_JOBS=${SBOBINO_RUNTIME_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 PARAKEET_GGML_METAL=${SBOBINO_PARAKEET_METAL:-ON}
@@ -221,6 +221,7 @@ build_parakeet_binary() {
   local source_root="$BUILD_DIR/parakeet.cpp"
   local build_root="$BUILD_DIR/parakeet-build"
   local binary
+  local library
   local resolved_ref
 
   checkout_parakeet_source "$source_root"
@@ -232,7 +233,9 @@ build_parakeet_binary() {
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
     -DCMAKE_OSX_SYSROOT="$SDKROOT" \
-    -DBUILD_SHARED_LIBS=OFF \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+    -DCMAKE_INSTALL_RPATH="@loader_path;@loader_path/../lib" \
+    -DPARAKEET_SHARED=ON \
     -DPARAKEET_BUILD_CLI=ON \
     -DPARAKEET_BUILD_TESTS=OFF \
     -DGGML_NATIVE=OFF \
@@ -246,11 +249,29 @@ build_parakeet_binary() {
   fi
 
   cp "$binary" "$TARGET_BIN/parakeet-cli"
+  library=$(find "$build_root" -type f -name libparakeet.dylib -print -quit)
+  if [[ -z "$library" ]]; then
+    echo "Unable to find libparakeet.dylib after building parakeet.cpp." >&2
+    exit 1
+  fi
+  while IFS= read -r dylib; do
+    cp "$dylib" "$TARGET_LIB/$(basename "$dylib")"
+  done < <(find "$build_root" -type f -name 'lib*.dylib' -print)
+  (
+    cd "$TARGET_LIB"
+    for dylib in lib*.0.13.0.dylib; do
+      [[ -e "$dylib" ]] || continue
+      ln -sf "$dylib" "${dylib/.0.13.0.dylib/.0.dylib}"
+      ln -sf "$dylib" "${dylib/.0.13.0.dylib/.dylib}"
+    done
+  )
   {
     echo "parakeet_cpp_ref=$PARAKEET_CPP_REF"
     echo "parakeet_cpp_resolved_ref=$resolved_ref"
     echo "parakeet_ggml_metal=$PARAKEET_GGML_METAL"
     echo "cmake_arch=arm64"
+    echo "parakeet_live_library=lib/libparakeet.dylib"
+    echo "parakeet_shared_libraries=$(find "$TARGET_LIB" -type f -name 'lib*.dylib' | wc -l | tr -d ' ')"
   } > "$TARGET_BIN/parakeet-runtime-manifest.txt"
 }
 
@@ -338,11 +359,19 @@ for binary in ffmpeg whisper-cli whisper-stream parakeet-cli; do
   chmod 755 "$TARGET_BIN/$binary"
   codesign --force --sign - "$TARGET_BIN/$binary" >/dev/null 2>&1 || true
 done
+chmod 755 "$TARGET_LIB/libparakeet.dylib"
+for dylib in "$TARGET_LIB"/lib*.dylib; do
+  chmod 755 "$dylib"
+  codesign --force --sign - "$dylib" >/dev/null 2>&1 || true
+done
 
 assert_binary_portable "$TARGET_BIN/ffmpeg" "ffmpeg"
 assert_binary_portable "$TARGET_BIN/whisper-cli" "whisper-cli"
 assert_binary_portable "$TARGET_BIN/whisper-stream" "whisper-stream"
 assert_binary_portable "$TARGET_BIN/parakeet-cli" "parakeet-cli"
+for dylib in "$TARGET_LIB"/lib*.dylib; do
+  assert_binary_portable "$dylib" "$(basename "$dylib")"
+done
 
 probe_runtime_binary "$TARGET_BIN/ffmpeg" -version
 probe_runtime_binary "$TARGET_BIN/whisper-cli" --help

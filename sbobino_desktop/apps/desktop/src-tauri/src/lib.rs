@@ -1,6 +1,7 @@
 mod ai_support;
 mod commands;
 mod error;
+mod parakeet_realtime;
 mod realtime_audio;
 mod release_assets;
 mod state;
@@ -177,6 +178,10 @@ pub fn run() {
                 transcription_gate: Arc::new(Semaphore::new(1)),
                 realtime: RealtimeRuntime {
                     engine: Arc::new(Mutex::new(realtime_engine)),
+                    parakeet_engine: Arc::new(Mutex::new(None)),
+                    active_engine: Arc::new(Mutex::new(
+                        sbobino_domain::TranscriptionEngine::WhisperCpp,
+                    )),
                     preview: Arc::new(Mutex::new(None)),
                     session_name: Arc::new(Mutex::new(None)),
                     model_filename: Arc::new(Mutex::new(None)),
