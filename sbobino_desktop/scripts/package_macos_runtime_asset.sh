@@ -65,7 +65,30 @@ rm -f "$OUTPUT_ZIP"
 download_source_archive() {
   local url=$1
   local output=$2
-  curl --fail --location --silent --show-error "$url" --output "$output"
+  curl --fail --location --silent --show-error \
+    --connect-timeout 20 \
+    --retry 8 \
+    --retry-delay 5 \
+    --retry-max-time 240 \
+    --retry-all-errors \
+    "$url" \
+    --output "$output"
+}
+
+retry_command() {
+  local attempt=1
+  local max_attempts=${SBOBINO_RUNTIME_NETWORK_RETRIES:-5}
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if (( attempt >= max_attempts )); then
+      return 1
+    fi
+    echo "Command failed, retrying ($attempt/$max_attempts): $*" >&2
+    sleep $(( attempt * 5 ))
+    attempt=$((attempt + 1))
+  done
 }
 
 extract_source_archive() {
@@ -104,11 +127,11 @@ checkout_parakeet_source() {
   local source_root=$1
   local ref
   ref=$(normalize_parakeet_ref "$PARAKEET_CPP_REF")
-  git clone https://github.com/mudler/parakeet.cpp.git "$source_root"
+  retry_command git clone https://github.com/mudler/parakeet.cpp.git "$source_root"
   (
     cd "$source_root"
     git checkout "$ref"
-    git submodule update --init --recursive --depth 1
+    retry_command git submodule update --init --recursive --depth 1
   )
 }
 
