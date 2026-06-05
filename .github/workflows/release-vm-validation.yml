@@ -42,6 +42,9 @@ jobs:
           echo "/opt/homebrew/sbin" >> "$GITHUB_PATH"
           echo "/usr/local/bin" >> "$GITHUB_PATH"
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Validate runner preflight
         working-directory: sbobino_desktop
         run: ./scripts/preflight_self_hosted_runner.sh AS-THIRD "$GITHUB_REPOSITORY"
