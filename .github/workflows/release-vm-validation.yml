@@ -27,7 +27,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG_NAME: v${{ inputs.version }}
-      SBOBINO_RUNNER_MIN_FREE_GB: "12.0"
+      SBOBINO_RUNNER_MIN_FREE_GB: "8.0"
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v4
