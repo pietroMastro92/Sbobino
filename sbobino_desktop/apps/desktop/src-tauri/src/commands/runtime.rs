@@ -408,6 +408,40 @@ pub async fn get_realtime_start_readiness(
         .runtime_factory
         .load_settings()
         .map_err(|e| CommandError::new("settings", e))?;
+    let selected_engine = payload
+        .as_ref()
+        .and_then(|value| value.engine.clone())
+        .unwrap_or_else(|| settings.transcription.engine.clone());
+    if selected_engine == TranscriptionEngine::ParakeetCpp {
+        let selected_parakeet_model = payload
+            .as_ref()
+            .and_then(|value| value.parakeet_model.clone())
+            .unwrap_or_else(|| settings.transcription.parakeet_model.clone());
+        let model_filename = selected_parakeet_model.gguf_filename().to_string();
+        let health = state
+            .runtime_factory
+            .runtime_health()
+            .map_err(|e| CommandError::new("runtime_health", e))?;
+        let model_path = PathBuf::from(&health.parakeet_models_dir_resolved)
+            .join(&model_filename)
+            .to_string_lossy()
+            .to_string();
+        return Ok(RealtimeStartReadinessResponse {
+            allowed: false,
+            reason_code: "parakeet_live_not_ready".to_string(),
+            message: format!(
+                "Parakeet.cpp live transcription is experimental and is not enabled in this build. File transcription can use '{}'; live will be enabled only through parakeet.cpp C API streaming, without Whisper fallback.",
+                model_filename
+            ),
+            engine: "parakeet_cpp".to_string(),
+            model_filename,
+            model_path,
+            ffmpeg_resolved: health.ffmpeg_resolved,
+            whisper_stream_resolved: health.whisper_stream_resolved,
+            parakeet_cli_resolved: health.parakeet_cli_resolved,
+            input_device_name: None,
+        });
+    }
     let selected_model = payload
         .as_ref()
         .map(|value| value.model.clone())

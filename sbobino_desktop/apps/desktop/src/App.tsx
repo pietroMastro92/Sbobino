@@ -9319,7 +9319,9 @@ export function App({
 
       const readiness = await withTimeout(
         fetchRealtimeStartReadiness({
+          engine: settings.transcription.engine,
           model: settings.transcription.model,
+          parakeet_model: settings.transcription.parakeet_model,
         }),
         8_000,
         t("error.preflightTimedOut", "Preflight timed out."),
@@ -9336,7 +9338,9 @@ export function App({
       setRealtimePreview("");
       setRealtimeSessionOpen(false);
       await startRealtime({
+        engine: settings.transcription.engine,
         model: settings.transcription.model,
+        parakeet_model: settings.transcription.parakeet_model,
         language: settings.transcription.language,
       });
       setDraftTitle(sessionTitle);

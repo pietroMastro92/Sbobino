@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RealtimeDelta};
 use sbobino_domain::{
-    ArtifactKind, ArtifactSourceOrigin, LanguageCode, SpeechModel, TranscriptArtifact,
+    ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel,
+    TranscriptArtifact, TranscriptionEngine,
 };
 
 use crate::realtime_audio::start_input_preview;
@@ -48,7 +49,11 @@ fn resolve_realtime_engine(
 
 #[derive(Debug, Deserialize)]
 pub struct StartRealtimePayload {
+    #[serde(default)]
+    pub engine: Option<TranscriptionEngine>,
     pub model: Option<SpeechModel>,
+    #[serde(default)]
+    pub parakeet_model: Option<ParakeetModel>,
     pub language: Option<LanguageCode>,
     pub resume_artifact_id: Option<String>,
 }
@@ -106,7 +111,9 @@ pub async fn start_realtime(
     payload: Option<StartRealtimePayload>,
 ) -> Result<StartRealtimeResponse, CommandError> {
     let payload = payload.unwrap_or(StartRealtimePayload {
+        engine: None,
         model: None,
+        parakeet_model: None,
         language: None,
         resume_artifact_id: None,
     });
@@ -118,8 +125,21 @@ pub async fn start_realtime(
 
     let default_model = settings.transcription.model;
     let default_language = settings.transcription.language;
+    let engine_kind = payload
+        .engine
+        .unwrap_or_else(|| settings.transcription.engine.clone());
     let model = payload.model.unwrap_or(default_model);
     let language = payload.language.unwrap_or(default_language);
+
+    if engine_kind == TranscriptionEngine::ParakeetCpp {
+        let parakeet_model = payload
+            .parakeet_model
+            .unwrap_or(settings.transcription.parakeet_model);
+        return Err(CommandError::from(ApplicationError::SpeechToText(format!(
+            "Parakeet.cpp live transcription is not enabled yet for '{}'. File transcription works with Parakeet; live requires the parakeet.cpp C API streaming path and must not fall back to Whisper.",
+            parakeet_model.gguf_filename()
+        ))));
+    }
 
     let engine = resolve_realtime_engine(&state)?;
     {
