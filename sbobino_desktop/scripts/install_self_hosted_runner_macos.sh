@@ -18,6 +18,7 @@ Environment variables:
   SBOBINO_RUNNER_NAME           Override the generated runner name.
   SBOBINO_RUNNER_WORKDIR        Override the runner work directory.
   SBOBINO_RUNNER_EPHEMERAL      Set to 1 to configure the runner as ephemeral.
+  SBOBINO_RUNNER_PATH           Override PATH exported by the LaunchAgent.
   SBOBINO_VALIDATION_FIXTURE_AUDIO
                                  Optional validation fixture path. AS-THIRD
                                  defaults to ~/Fixtures/as-third-diarization.wav.
@@ -102,6 +103,7 @@ HOSTNAME_SAFE=$(scutil --get LocalHostName 2>/dev/null || hostname -s)
 HOSTNAME_SAFE=${HOSTNAME_SAFE// /-}
 RUNNER_NAME=${SBOBINO_RUNNER_NAME:-"sbobino-${MACHINE_CLASS_LOWER}-${HOSTNAME_SAFE}"}
 RUNNER_WORKDIR=${SBOBINO_RUNNER_WORKDIR:-"$RUNNER_ROOT/_work"}
+RUNNER_PATH=${SBOBINO_RUNNER_PATH:-"$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"}
 RUNNER_URL="https://github.com/$REPO_SLUG"
 RUNNER_TARBALL="actions-runner-osx-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
 RUNNER_DOWNLOAD_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${RUNNER_TARBALL}"
@@ -157,6 +159,15 @@ cat >"$PLIST_PATH" <<EOF
   </array>
   <key>WorkingDirectory</key>
   <string>$RUNNER_CONFIG_DIR</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>$HOME</string>
+    <key>PATH</key>
+    <string>$RUNNER_PATH</string>
+    <key>SBOBINO_VALIDATION_FIXTURE_AUDIO</key>
+    <string>${SBOBINO_VALIDATION_FIXTURE_AUDIO:-$HOME/Fixtures/as-third-diarization.wav}</string>
+  </dict>
   <key>KeepAlive</key>
   <true/>
   <key>RunAtLoad</key>

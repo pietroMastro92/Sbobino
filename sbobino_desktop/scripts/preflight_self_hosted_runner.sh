@@ -19,6 +19,7 @@ MACHINE_CLASS=$1
 REPO_SLUG=${2:-pietroMastro92/Sbobino}
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FAILURES=()
+MIN_FREE_GB=${SBOBINO_RUNNER_MIN_FREE_GB:-12.0}
 
 validation_fixture_audio() {
   if [[ -n "${SBOBINO_VALIDATION_FIXTURE_AUDIO:-}" ]]; then
@@ -106,14 +107,15 @@ free = shutil.disk_usage("/").free / (1024 ** 3)
 print(f"{free:.1f}")
 PY
 )
-if ! python3 - <<'PY' "$AVAILABLE_GB"
+if ! python3 - <<'PY' "$AVAILABLE_GB" "$MIN_FREE_GB"
 import sys
 available = float(sys.argv[1])
-if available < 30.0:
+minimum = float(sys.argv[2])
+if available < minimum:
     raise SystemExit(1)
 PY
 then
-  record_failure "Less than 30 GB free on the system volume."
+  record_failure "Less than ${MIN_FREE_GB} GB free on the system volume."
 fi
 
 if [[ "$MACHINE_CLASS" != "INTEL-PRIMARY" ]]; then
@@ -165,4 +167,5 @@ Runner preflight passed.
   arch:     $CURRENT_ARCH
   labels:   $(labels_for_machine "$MACHINE_CLASS")
   free GB:  $AVAILABLE_GB
+  min GB:   $MIN_FREE_GB
 EOF
