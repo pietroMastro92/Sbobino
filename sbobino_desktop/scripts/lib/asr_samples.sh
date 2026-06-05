@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+export LC_ALL=C
+
 asr_fail() {
   echo "error: $*" >&2
   exit 1
