@@ -139,6 +139,8 @@ import {
   type InitialSetupReport,
   type InitialSetupStepId,
   INITIAL_SETUP_REQUIRES_PYANNOTE,
+  INITIAL_SETUP_REQUIRED_MODELS,
+  INITIAL_SETUP_REQUIRED_PARAKEET_MODELS,
   findProvisioningModelEntry,
   getRuntimeToolchainFailureMessage,
   getInitialSetupMissingModels,
@@ -407,6 +409,14 @@ function createInitialSetupReport(): InitialSetupReport {
       {
         id: "whisper-models",
         label: "Whisper models",
+        status: "pending",
+        detail: null,
+        started_at: null,
+        finished_at: null,
+      },
+      {
+        id: "parakeet-models",
+        label: "Parakeet models",
         status: "pending",
         detail: null,
         started_at: null,
@@ -7186,7 +7196,7 @@ export function App({
           "This can take a few minutes the first time.",
         ),
       );
-      for (const model of ["base", "large_turbo"] as SpeechModel[]) {
+      for (const model of INITIAL_SETUP_REQUIRED_MODELS) {
         const entry = findProvisioningModelEntry(snapshot.modelCatalog, model);
         if (
           isProvisionedModelReady(
@@ -7220,6 +7230,48 @@ export function App({
       }
       await updateInitialSetupStepState(
         "whisper-models",
+        "completed",
+        t("setup.firstLaunch.downloading", "Downloading local models..."),
+        t("settings.localModels.readyMessage", "Local models are ready"),
+      );
+
+      await updateInitialSetupStepState(
+        "parakeet-models",
+        "running",
+        t("setup.firstLaunch.downloading", "Downloading local models..."),
+        t(
+          "setup.firstLaunch.downloadingDesc",
+          "This can take a few minutes the first time.",
+        ),
+      );
+      for (const model of INITIAL_SETUP_REQUIRED_PARAKEET_MODELS) {
+        const entry = findProvisioningModelEntry(snapshot.modelCatalog, model);
+        if (isProvisionedModelReady(entry, false)) {
+          continue;
+        }
+
+        initialSetupStepIdRef.current = "parakeet-models";
+        setInitialSetupStepLabel(
+          t("setup.firstLaunch.downloadingModel", "Downloading {model}...", {
+            model: entry?.label ?? model,
+          }),
+        );
+        setInitialSetupStepDetail(
+          t(
+            "setup.firstLaunch.downloadingDesc",
+            "This can take a few minutes the first time.",
+          ),
+        );
+        await waitForProvisioningRun(() =>
+          provisioningDownloadModel({
+            model,
+            include_coreml: false,
+          }),
+        );
+        snapshot = await loadStartupRequirements();
+      }
+      await updateInitialSetupStepState(
+        "parakeet-models",
         "completed",
         t("setup.firstLaunch.downloading", "Downloading local models..."),
         t("settings.localModels.readyMessage", "Local models are ready"),
