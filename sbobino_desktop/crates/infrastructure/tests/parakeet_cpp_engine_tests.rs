@@ -95,11 +95,23 @@ async fn transcribe_parses_json_words_and_emits_text() {
     std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
     std::fs::write(models_dir.join("tdt-0.6b-v3-f16.gguf"), b"fake model")
         .expect("failed to create model");
+    std::fs::write(
+        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
+        b"fake realtime model",
+    )
+    .expect("failed to create preview model");
     std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
 
     write_executable_script(
         &script_path,
         r#"#!/bin/sh
+case "$*" in
+  *--stream*)
+    echo '[00:00:00.000 --> 00:00:00.500] hello'
+    echo '[00:00:00.500 --> 00:00:01.000] world'
+    exit 0
+    ;;
+esac
 echo 'loading model'
 echo '{"text":"hello world","words":[{"w":"hello","start":0.12,"end":0.44,"conf":0.91},{"w":"world","start":0.44,"end":0.8,"conf":0.88}],"tokens":[]}'
 exit 0
@@ -133,10 +145,14 @@ exit 0
     assert_eq!(transcript.segments[0].words[0].text, "hello");
     assert_eq!(transcript.segments[0].words[0].start_seconds, Some(0.12));
     assert_eq!(transcript.segments[0].words[0].confidence, Some(0.91));
-    assert_eq!(
-        emitted.lock().expect("emit lock poisoned").as_slice(),
-        ["hello world"]
+    let emitted = emitted.lock().expect("emit lock poisoned");
+    assert!(
+        emitted.len() >= 3,
+        "expected progressive preview deltas plus final transcript, got {emitted:?}"
     );
+    assert!(emitted[0].contains("REPLACE:hello"));
+    assert!(emitted[1].contains("REPLACE:hello\nworld"));
+    assert_eq!(emitted.last().map(String::as_str), Some("hello world"));
 }
 
 #[tokio::test]
@@ -149,11 +165,23 @@ async fn transcribe_parses_segment_json_with_words() {
     std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
     std::fs::write(models_dir.join("tdt-0.6b-v3-f16.gguf"), b"fake model")
         .expect("failed to create model");
+    std::fs::write(
+        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
+        b"fake realtime model",
+    )
+    .expect("failed to create preview model");
     std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
 
     write_executable_script(
         &script_path,
         r#"#!/bin/sh
+case "$*" in
+  *--stream*)
+    echo '[00:00:00.000 --> 00:00:00.500] ciao.'
+    echo '[00:00:00.500 --> 00:00:01.200] mondo'
+    exit 0
+    ;;
+esac
 echo '{"text":"ciao. mondo","segments":[{"text":"ciao.","start":0.0,"end":0.5,"words":[{"text":"ciao","start":0.0,"end":0.5,"confidence":0.92}]},{"text":"mondo","start":0.5,"end":1.2,"words":[{"text":"mondo","start":0.5,"end":1.2,"confidence":0.89}]}]}'
 exit 0
 "#,
@@ -223,7 +251,7 @@ async fn transcribe_rejects_missing_model_before_starting_cli() {
 }
 
 #[tokio::test]
-async fn transcribe_rejects_successful_cli_without_json() {
+async fn transcribe_rejects_missing_realtime_preview_model_before_starting_cli() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");
     let models_dir = temp.path().join("parakeet-models");
@@ -235,7 +263,52 @@ async fn transcribe_rejects_successful_cli_without_json() {
     std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
     write_executable_script(
         &script_path,
-        "#!/bin/sh\necho 'loaded model but no json'\nexit 0\n",
+        "#!/bin/sh\necho cli should not run >&2\nexit 99\n",
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let error = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-f16.gguf",
+            "it",
+            &WhisperOptions::default(),
+            None,
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect_err("missing realtime preview model should fail");
+
+    assert!(error
+        .to_string()
+        .contains("Parakeet progressive preview requires"));
+    assert!(!error.to_string().contains("cli should not run"));
+}
+
+#[tokio::test]
+async fn transcribe_rejects_successful_cli_without_json() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-f16.gguf"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(
+        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
+        b"fake realtime model",
+    )
+    .expect("failed to create preview model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\ncase \"$*\" in *--stream*) echo '[00:00:00.000 --> 00:00:01.000] preview'; exit 0;; esac\necho 'loaded model but no json'\nexit 0\n",
     );
 
     let engine = ParakeetCppEngine::new(
@@ -269,6 +342,11 @@ async fn transcribe_returns_stderr_on_failure() {
     std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
     std::fs::write(models_dir.join("tdt-0.6b-v3-f16.gguf"), b"fake model")
         .expect("failed to create model");
+    std::fs::write(
+        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
+        b"fake realtime model",
+    )
+    .expect("failed to create preview model");
     std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
 
     write_executable_script(

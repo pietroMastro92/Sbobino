@@ -514,6 +514,8 @@ export type RealtimeDeltaKind = "append_final" | "replace_final" | "update_previ
 export type RealtimeDelta = {
   kind: RealtimeDeltaKind;
   text: string;
+  start_seconds?: number | null;
+  end_seconds?: number | null;
 };
 
 export type RealtimeStatusEvent = {

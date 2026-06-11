@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RealtimeDelta};
 use sbobino_domain::{
-    ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel,
-    TranscriptArtifact, TranscriptionEngine,
+    ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel, TimedSegment,
+    TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
 };
 
 use crate::parakeet_realtime::{ParakeetRealtimeEngine, ParakeetRealtimeStopResult};
@@ -133,6 +133,7 @@ pub struct StopRealtimeResponse {
 
 struct RealtimeStopResult {
     transcript: String,
+    segments: Vec<TimedSegment>,
     saved_audio_path: Option<std::path::PathBuf>,
 }
 
@@ -415,6 +416,7 @@ pub async fn stop_realtime(
             stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
             RealtimeStopResult {
                 transcript: result.transcript,
+                segments: Vec::new(),
                 saved_audio_path: result.saved_audio_path,
             }
         }
@@ -430,6 +432,7 @@ pub async fn stop_realtime(
                 engine.stop().await.map_err(CommandError::from)?;
             RealtimeStopResult {
                 transcript: result.transcript,
+                segments: result.segments,
                 saved_audio_path: result.saved_audio_path,
             }
         }
@@ -497,6 +500,16 @@ pub async fn stop_realtime(
             "false".to_string()
         },
     );
+    if !stop_result.segments.is_empty() {
+        metadata.insert(
+            "timeline_v2".to_string(),
+            TranscriptionOutput {
+                text: stop_result.transcript.clone(),
+                segments: stop_result.segments.clone(),
+            }
+            .timeline_v2_metadata_json(),
+        );
+    }
 
     let source_label = stop_result
         .saved_audio_path
@@ -527,6 +540,7 @@ pub async fn stop_realtime(
         TranscriptionEngine::WhisperCpp => "whisper_stream".to_string(),
         TranscriptionEngine::ParakeetCpp => "parakeet_cpp".to_string(),
     });
+    artifact.processing_model = Some(model_filename.clone());
     artifact.processing_language = Some(state.realtime.language_code.lock().await.clone());
     if let Some(path) = stop_result.saved_audio_path.as_ref() {
         artifact.set_source_external_path(path.to_string_lossy().to_string());

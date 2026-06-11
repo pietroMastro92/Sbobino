@@ -236,6 +236,7 @@ import type {
   SpeakerDiarizationSettings,
   SpeechModel,
   TimelineV2,
+  TimelineV2Segment,
   TranscriptionEngine,
   TranscriptionSettings,
   TranscriptionStartPreflight,
@@ -1774,6 +1775,30 @@ function mergeTranscriptionPreview(previous: string, incoming: string): string {
   return `${current}\n${next}`;
 }
 
+function realtimeSegmentFromDelta(delta: RealtimeDelta): TimelineV2Segment | null {
+  const text = delta.text?.trim();
+  if (!text) {
+    return null;
+  }
+  const startSeconds =
+    typeof delta.start_seconds === "number" && Number.isFinite(delta.start_seconds)
+      ? delta.start_seconds
+      : undefined;
+  const endSeconds =
+    typeof delta.end_seconds === "number" && Number.isFinite(delta.end_seconds)
+      ? delta.end_seconds
+      : undefined;
+  if (startSeconds === undefined && endSeconds === undefined) {
+    return null;
+  }
+  return {
+    text,
+    start_seconds: startSeconds,
+    end_seconds: endSeconds,
+    words: [],
+  };
+}
+
 function setCancelPillDangerProximity(
   button: HTMLButtonElement,
   clientX: number,
@@ -3144,6 +3169,9 @@ export function App({
   );
   const [realtimeFinalLines, setRealtimeFinalLines] = useState<string[]>([]);
   const [realtimePreview, setRealtimePreview] = useState("");
+  const [realtimeSegments, setRealtimeSegments] = useState<TimelineV2Segment[]>([]);
+  const [realtimePreviewSegment, setRealtimePreviewSegment] =
+    useState<TimelineV2Segment | null>(null);
   const [realtimeInputLevels, setRealtimeInputLevels] = useState<number[]>([]);
   const [realtimePreviewState, setRealtimePreviewState] = useState<
     "idle" | "connecting" | "running" | "paused" | "blocked" | "unavailable"
@@ -4831,6 +4859,11 @@ export function App({
           if (delta.kind === "append_final") {
             setRealtimeFinalLines((previous) => [...previous, delta.text]);
             setRealtimePreview("");
+            const segment = realtimeSegmentFromDelta(delta);
+            if (segment) {
+              setRealtimeSegments((previous) => [...previous, segment]);
+              setRealtimePreviewSegment(null);
+            }
           }
 
           if (delta.kind === "replace_final") {
@@ -4843,10 +4876,21 @@ export function App({
               return next;
             });
             setRealtimePreview("");
+            const segment = realtimeSegmentFromDelta(delta);
+            if (segment) {
+              setRealtimeSegments((previous) => {
+                if (previous.length === 0) {
+                  return [segment];
+                }
+                return [...previous.slice(0, -1), segment];
+              });
+              setRealtimePreviewSegment(null);
+            }
           }
 
           if (delta.kind === "update_preview") {
             setRealtimePreview(delta.text);
+            setRealtimePreviewSegment(realtimeSegmentFromDelta(delta));
           }
         },
       );
@@ -5309,9 +5353,30 @@ export function App({
     shouldDelayAutomaticImportScan,
   ]);
 
+  const realtimeTimelineV2Json = useMemo(() => {
+    if (!realtimeSessionOpen || activeArtifact || focusedJobId) {
+      return null;
+    }
+    const segments = realtimePreviewSegment
+      ? [...realtimeSegments, realtimePreviewSegment]
+      : realtimeSegments;
+    if (segments.length === 0) {
+      return null;
+    }
+    return JSON.stringify({ version: 2, segments });
+  }, [
+    activeArtifact,
+    focusedJobId,
+    realtimePreviewSegment,
+    realtimeSegments,
+    realtimeSessionOpen,
+  ]);
   const detailSegments = useMemo(
-    () => parseTimelineV2Segments(activeArtifact?.metadata?.timeline_v2),
-    [activeArtifact?.metadata?.timeline_v2],
+    () =>
+      parseTimelineV2Segments(
+        activeArtifact?.metadata?.timeline_v2 ?? realtimeTimelineV2Json,
+      ),
+    [activeArtifact?.metadata?.timeline_v2, realtimeTimelineV2Json],
   );
   const speakerColorMap = useMemo(
     () =>
@@ -9388,6 +9453,8 @@ export function App({
       const sessionTitle = buildLiveSessionTitle();
       setRealtimeFinalLines([]);
       setRealtimePreview("");
+      setRealtimeSegments([]);
+      setRealtimePreviewSegment(null);
       setRealtimeSessionOpen(false);
       await startRealtime({
         engine: settings.transcription.engine,
@@ -9421,6 +9488,8 @@ export function App({
       setRealtimeStartedAtMs(null);
       setRealtimePreviewState("idle");
       setRealtimeInputLevels([]);
+      setRealtimeSegments([]);
+      setRealtimePreviewSegment(null);
       setError(
         formatUiError(
           "error.realtimeStartFailed",
@@ -9490,6 +9559,8 @@ export function App({
       }
       setRealtimePreview("");
       setRealtimeFinalLines([]);
+      setRealtimeSegments([]);
+      setRealtimePreviewSegment(null);
       setRealtimeSessionOpen(false);
       setRealtimeStartedAtMs(null);
       setError(null);

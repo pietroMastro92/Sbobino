@@ -59,4 +59,8 @@ pub enum RealtimeDeltaKind {
 pub struct RealtimeDelta {
     pub kind: RealtimeDeltaKind,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_seconds: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_seconds: Option<f32>,
 }
