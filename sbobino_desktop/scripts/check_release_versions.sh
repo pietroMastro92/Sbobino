@@ -43,4 +43,6 @@ if [[ -n "$EXPECTED_VERSION" && "$PACKAGE_VERSION" != "$EXPECTED_VERSION" ]]; th
   exit 1
 fi
 
+"$ROOT_DIR/scripts/check_updater_public_key.sh" "$TAURI_CONF"
+
 echo "Version coherence verified: $PACKAGE_VERSION"

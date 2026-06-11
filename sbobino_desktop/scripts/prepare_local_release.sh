@@ -11,15 +11,15 @@ commits, or publish anything to GitHub.
 
 Optional environment variables:
   SBOBINO_RELEASE_PROFILE               Build profile: public (default) or standalone-dev.
-  SBOBINO_UPDATER_KEY_DIR               Directory used for stable local updater keys.
+  SBOBINO_UPDATER_KEY_DIR               Directory used for standalone-dev local updater keys.
   SBOBINO_RELEASE_SUMMARY               Override the GitHub release summary paragraph.
   SBOBINO_RELEASE_NOTES_SHORT           Override the concise updater note stored in latest.json.
   SBOBINO_RELEASE_IMPROVEMENTS_MD       Override the Markdown bullet list for the Improvements section.
   SBOBINO_RELEASE_FIXES_MD              Override the Markdown bullet list for the Fixes section.
   SBOBINO_RELEASE_SETUP_MD              Override the Markdown bullet list for the Setup and compatibility section.
-  TAURI_UPDATER_PUBLIC_KEY              Injected into tauri.conf.json only for this local build.
-  TAURI_SIGNING_PRIVATE_KEY             If present, signs Sbobino.app.tar.gz for updater use.
-  TAURI_SIGNING_PRIVATE_KEY_PATH        If present, signs Sbobino.app.tar.gz from a private key file.
+  TAURI_UPDATER_PUBLIC_KEY              Public release key. Must match scripts/updater-public-key.txt.
+  TAURI_SIGNING_PRIVATE_KEY             Signs Sbobino.app.tar.gz for updater use.
+  TAURI_SIGNING_PRIVATE_KEY_PATH        Signs Sbobino.app.tar.gz from a private key file.
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD    Password for the Tauri updater private key.
 EOF
 }
@@ -207,7 +207,22 @@ if [[ "$RELEASE_PROFILE" != "public" && "$RELEASE_PROFILE" != "standalone-dev" ]
   exit 1
 fi
 
-ensure_local_updater_keys
+if [[ "$RELEASE_PROFILE" == "public" ]]; then
+  if [[ -z "${TAURI_UPDATER_PUBLIC_KEY:-}" ]]; then
+    echo "Public releases require TAURI_UPDATER_PUBLIC_KEY." >&2
+    echo "Use the historical public key from scripts/updater-public-key.txt." >&2
+    echo "Do not generate a new updater key for a public release." >&2
+    exit 1
+  fi
+  if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" && -z "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]]; then
+    echo "Public releases require TAURI_SIGNING_PRIVATE_KEY or TAURI_SIGNING_PRIVATE_KEY_PATH." >&2
+    echo "It must be the private key paired with scripts/updater-public-key.txt." >&2
+    exit 1
+  fi
+  "$ROOT_DIR/scripts/check_updater_public_key.sh" "$TAURI_CONF" "$TAURI_UPDATER_PUBLIC_KEY"
+else
+  ensure_local_updater_keys
+fi
 
 cp "$TAURI_CONF" "$TAURI_CONF_BACKUP"
 HAS_UPDATER_KEYS=0
