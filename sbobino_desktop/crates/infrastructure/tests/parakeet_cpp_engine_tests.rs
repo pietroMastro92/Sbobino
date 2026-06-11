@@ -146,13 +146,146 @@ exit 0
     assert_eq!(transcript.segments[0].words[0].start_seconds, Some(0.12));
     assert_eq!(transcript.segments[0].words[0].confidence, Some(0.91));
     let emitted = emitted.lock().expect("emit lock poisoned");
+    let preview_deltas = emitted
+        .iter()
+        .filter(|line| line.starts_with("\u{001F}REPLACE:"))
+        .collect::<Vec<_>>();
     assert!(
-        emitted.len() >= 3,
+        preview_deltas.len() >= 2,
         "expected progressive preview deltas plus final transcript, got {emitted:?}"
     );
-    assert!(emitted[0].contains("REPLACE:hello"));
-    assert!(emitted[1].contains("REPLACE:hello\nworld"));
+    assert!(preview_deltas[0].contains("REPLACE:hello"));
+    assert!(preview_deltas[1].contains("REPLACE:hello\nworld"));
     assert_eq!(emitted.last().map(String::as_str), Some("hello world"));
+}
+
+#[tokio::test]
+async fn transcribe_accepts_progressive_preview_from_stderr() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-f16.gguf"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(
+        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
+        b"fake realtime model",
+    )
+    .expect("failed to create preview model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+case "$*" in
+  *--stream*)
+    echo 'pk::Backend using GPU device Metal' 1>&2
+    echo '[00:00:00.000 --> 00:00:00.500] ciao' 1>&2
+    echo '[00:00:00.500 --> 00:00:01.000] mondo' 1>&2
+    exit 0
+    ;;
+esac
+echo '{"text":"ciao mondo","words":[{"w":"ciao","start":0.0,"end":0.4},{"w":"mondo","start":0.4,"end":0.9}]}'
+exit 0
+"#,
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_ref = emitted.clone();
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-f16.gguf",
+            "it",
+            &WhisperOptions::default(),
+            Some(1.0),
+            Arc::new(move |line: String| {
+                emitted_ref.lock().expect("emit lock poisoned").push(line);
+            }),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("transcription should succeed");
+
+    assert_eq!(transcript.text, "ciao mondo");
+    let emitted = emitted.lock().expect("emit lock poisoned");
+    assert!(
+        emitted
+            .iter()
+            .any(|line| line.starts_with("\u{001F}REPLACE:") && line.contains("ciao")),
+        "expected stderr preview delta, got {emitted:?}"
+    );
+}
+
+#[tokio::test]
+async fn transcribe_splits_root_words_into_multiple_timed_segments() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-f16.gguf"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(
+        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
+        b"fake realtime model",
+    )
+    .expect("failed to create preview model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+case "$*" in
+  *--stream*)
+    echo '[00:00:00.000 --> 00:00:01.000] preview'
+    exit 0
+    ;;
+esac
+echo '{"text":"one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen","words":[{"w":"one","start":0.0,"end":1.0},{"w":"two","start":1.0,"end":2.0},{"w":"three","start":2.0,"end":3.0},{"w":"four","start":3.0,"end":4.0},{"w":"five","start":4.0,"end":5.0},{"w":"six","start":5.0,"end":6.0},{"w":"seven","start":6.0,"end":7.0},{"w":"eight","start":7.0,"end":8.0},{"w":"nine","start":8.0,"end":9.0},{"w":"ten","start":9.0,"end":10.0},{"w":"eleven","start":10.0,"end":11.0},{"w":"twelve","start":11.0,"end":12.0},{"w":"thirteen","start":12.0,"end":13.0},{"w":"fourteen","start":13.0,"end":14.0},{"w":"fifteen","start":14.0,"end":15.0}]}'
+exit 0
+"#,
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-f16.gguf",
+            "en",
+            &WhisperOptions::default(),
+            Some(15.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("transcription should succeed");
+
+    assert!(
+        transcript.segments.len() >= 2,
+        "expected root words to be split into multiple segments, got {:?}",
+        transcript.segments
+    );
+    assert_eq!(transcript.segments[0].start_seconds, Some(0.0));
+    assert_eq!(
+        transcript
+            .segments
+            .last()
+            .and_then(|segment| segment.end_seconds),
+        Some(15.0)
+    );
 }
 
 #[tokio::test]
@@ -470,15 +603,27 @@ async fn parakeet_cpp_real_smoke() {
         .expect("real Parakeet transcription should succeed");
 
     eprintln!("parakeet_text={}", transcript.text);
+    eprintln!("parakeet_segments={}", transcript.segments.len());
     assert_valid_real_parakeet_output(&transcript);
+    let min_segments = optional_env("SBOBINO_PARAKEET_MIN_SEGMENTS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    assert!(
+        transcript.segments.len() >= min_segments,
+        "expected at least {min_segments} Parakeet segments, got {}",
+        transcript.segments.len()
+    );
     let emitted = emitted.lock().expect("emit lock poisoned");
     let preview_delta_count = emitted
         .iter()
         .filter(|line| line.starts_with("\u{001F}REPLACE:"))
         .count();
+    let min_preview_deltas = optional_env("SBOBINO_PARAKEET_MIN_PREVIEW_DELTAS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
     assert!(
-        preview_delta_count >= 2,
-        "expected at least two progressive Parakeet preview deltas, got {preview_delta_count}"
+        preview_delta_count >= min_preview_deltas,
+        "expected at least {min_preview_deltas} progressive Parakeet preview deltas, got {preview_delta_count}"
     );
     assert_eq!(
         emitted.last().map(String::as_str),

@@ -12,6 +12,7 @@ export const INITIAL_SETUP_REQUIRED_MODELS: SpeechModel[] = [
 ];
 export const INITIAL_SETUP_REQUIRED_PARAKEET_MODELS: ParakeetModel[] = [
   "tdt06b_v3_q4",
+  "realtime_eou120m_v1_f16",
 ];
 export const INITIAL_SETUP_REQUIRES_PYANNOTE = false;
 

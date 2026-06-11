@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -14,6 +15,11 @@ use crate::adapters::transcript_segmentation::normalize_transcript_segments;
 const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
 const REALTIME_EOU_F16_MODEL: &str = "realtime_eou_120m-v1-f16.gguf";
 const REALTIME_EOU_Q8_MODEL: &str = "realtime_eou_120m-v1-q8_0.gguf";
+const WORD_SEGMENT_GAP_BREAK_SECONDS: f32 = 1.25;
+const WORD_SEGMENT_MAX_CHARS: usize = 140;
+const WORD_SEGMENT_MAX_DURATION_SECONDS: f32 = 12.0;
+const WORD_SEGMENT_MIN_TERMINAL_WORDS: usize = 3;
+const PREVIEW_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct ParakeetCppEngine {
@@ -53,6 +59,12 @@ struct ParakeetJsonWord {
     end: Option<f32>,
     #[serde(default, alias = "confidence")]
     conf: Option<f32>,
+}
+
+#[derive(Default)]
+struct PreviewStreamState {
+    preview: String,
+    delta_count: usize,
 }
 
 impl ParakeetCppEngine {
@@ -173,6 +185,7 @@ impl ParakeetCppEngine {
                 .segments
                 .into_iter()
                 .filter_map(Self::segment_from_json)
+                .flat_map(|segment| Self::split_segment_if_needed(segment, total_audio_seconds))
                 .collect::<Vec<_>>()
         };
 
@@ -216,14 +229,139 @@ impl ParakeetCppEngine {
             }];
         }
 
-        vec![TimedSegment {
-            text,
-            start_seconds: words.iter().find_map(|word| word.start_seconds),
-            end_seconds: words.iter().rev().find_map(|word| word.end_seconds),
-            speaker_id: None,
-            speaker_label: None,
-            words,
-        }]
+        Self::segments_from_timed_words(text, words, total_audio_seconds)
+    }
+
+    fn split_segment_if_needed(
+        segment: TimedSegment,
+        total_audio_seconds: Option<f32>,
+    ) -> Vec<TimedSegment> {
+        if segment.words.is_empty() {
+            return vec![segment];
+        }
+
+        let chars = segment.text.chars().count();
+        let duration = segment
+            .start_seconds
+            .zip(segment.end_seconds)
+            .map(|(start, end)| (end - start).max(0.0))
+            .unwrap_or_default();
+
+        if chars <= WORD_SEGMENT_MAX_CHARS && duration <= WORD_SEGMENT_MAX_DURATION_SECONDS {
+            return vec![segment];
+        }
+
+        Self::segments_from_timed_words(segment.text, segment.words, total_audio_seconds)
+    }
+
+    fn segments_from_timed_words(
+        text: String,
+        words: Vec<TimedWord>,
+        total_audio_seconds: Option<f32>,
+    ) -> Vec<TimedSegment> {
+        let mut segments = Vec::<TimedSegment>::new();
+        let mut current_words = Vec::<TimedWord>::new();
+        let mut current_text = String::new();
+
+        for word in words {
+            let next_text = word.text.trim();
+            if next_text.is_empty() {
+                continue;
+            }
+
+            if !current_words.is_empty()
+                && Self::should_break_word_segment(&current_text, &current_words, &word)
+            {
+                Self::flush_word_segment(&mut segments, &mut current_text, &mut current_words);
+            }
+
+            current_text = Self::join_text_parts(&current_text, next_text);
+            current_words.push(word);
+        }
+
+        Self::flush_word_segment(&mut segments, &mut current_text, &mut current_words);
+
+        if segments.is_empty() {
+            return vec![TimedSegment {
+                text,
+                start_seconds: None,
+                end_seconds: total_audio_seconds,
+                speaker_id: None,
+                speaker_label: None,
+                words: Vec::new(),
+            }];
+        }
+
+        segments
+    }
+
+    fn should_break_word_segment(
+        current_text: &str,
+        current_words: &[TimedWord],
+        next_word: &TimedWord,
+    ) -> bool {
+        let current_text = current_text.trim();
+        let next_text = next_word.text.trim();
+        let combined_chars = current_text.chars().count() + 1 + next_text.chars().count();
+        if combined_chars > WORD_SEGMENT_MAX_CHARS {
+            return true;
+        }
+
+        let current_start = current_words.iter().find_map(|word| word.start_seconds);
+        let current_end = current_words.iter().rev().find_map(|word| word.end_seconds);
+        if let (Some(start), Some(end)) = (current_start, current_end) {
+            if end >= start && end - start >= WORD_SEGMENT_MAX_DURATION_SECONDS {
+                return true;
+            }
+        }
+
+        if let (Some(end), Some(next_start)) = (current_end, next_word.start_seconds) {
+            if next_start > end && next_start - end > WORD_SEGMENT_GAP_BREAK_SECONDS {
+                return true;
+            }
+        }
+
+        current_words.len() >= WORD_SEGMENT_MIN_TERMINAL_WORDS
+            && Self::ends_with_strong_boundary(current_text)
+    }
+
+    fn flush_word_segment(
+        segments: &mut Vec<TimedSegment>,
+        current_text: &mut String,
+        current_words: &mut Vec<TimedWord>,
+    ) {
+        let text = current_text.trim().to_string();
+        if !text.is_empty() {
+            let words = std::mem::take(current_words);
+            segments.push(TimedSegment {
+                text,
+                start_seconds: words.iter().find_map(|word| word.start_seconds),
+                end_seconds: words.iter().rev().find_map(|word| word.end_seconds),
+                speaker_id: None,
+                speaker_label: None,
+                words,
+            });
+        }
+        current_text.clear();
+    }
+
+    fn join_text_parts(left: &str, right: &str) -> String {
+        let left = left.trim();
+        let right = right.trim();
+        if left.is_empty() {
+            return right.to_string();
+        }
+        if right.is_empty() {
+            return left.to_string();
+        }
+        if left.ends_with('-') {
+            return format!("{left}{right}");
+        }
+        format!("{left} {right}")
+    }
+
+    fn ends_with_strong_boundary(value: &str) -> bool {
+        value.ends_with('.') || value.ends_with('!') || value.ends_with('?') || value.ends_with('…')
     }
 
     fn segment_from_json(segment: ParakeetJsonSegment) -> Option<TimedSegment> {
@@ -266,6 +404,8 @@ impl ParakeetCppEngine {
             .replace("\u{001b}[0m", "")
             .replace("[2K]", "")
             .replace("[BLANK_AUDIO]", "")
+            .trim_start_matches("[stream:final]")
+            .trim_start_matches("[stream]")
             .split('\r')
             .next_back()
             .unwrap_or("")
@@ -274,7 +414,7 @@ impl ParakeetCppEngine {
     }
 
     fn stream_line_is_noise(text: &str) -> bool {
-        const PREFIXES: [&str; 12] = [
+        const PREFIXES: [&str; 14] = [
             "init:",
             "main:",
             "ggml_",
@@ -283,6 +423,8 @@ impl ParakeetCppEngine {
             "system_info:",
             "load_model:",
             "backend:",
+            "ggml_backend",
+            "ggml_metal",
             "pk::",
             "n_threads",
             "transcribe:",
@@ -293,7 +435,18 @@ impl ParakeetCppEngine {
         trimmed.is_empty()
             || trimmed.starts_with('{')
             || trimmed.ends_with('}')
+            || Self::looks_like_word_timestamp_line(trimmed)
             || PREFIXES.iter().any(|prefix| trimmed.starts_with(prefix))
+    }
+
+    fn looks_like_word_timestamp_line(text: &str) -> bool {
+        let Some(first_token) = text.split_whitespace().next() else {
+            return false;
+        };
+        let Some((start, end)) = first_token.split_once('-') else {
+            return false;
+        };
+        start.parse::<f32>().is_ok() && end.parse::<f32>().is_ok()
     }
 
     fn parse_timecode_seconds(value: &str) -> Option<f32> {
@@ -335,6 +488,16 @@ impl ParakeetCppEngine {
             }
         }
 
+        let text = if let Some(eou_index) = text.find("[EOU @") {
+            let marker = &text[eou_index + "[EOU @".len()..];
+            if let Some(end_marker) = marker.find('s') {
+                progress_seconds = Self::parse_timecode_seconds(&marker[..end_marker]);
+            }
+            text[..eou_index].trim()
+        } else {
+            text
+        };
+
         let text = text.trim();
         if text.is_empty() || Self::stream_line_is_noise(text) {
             return None;
@@ -374,6 +537,7 @@ impl ParakeetCppEngine {
 
     async fn consume_preview_stream<R>(
         reader: R,
+        state: Arc<Mutex<PreviewStreamState>>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<String, ApplicationError>
@@ -383,7 +547,7 @@ impl ParakeetCppEngine {
         let mut reader = tokio::io::BufReader::new(reader);
         let mut buffer = [0_u8; 2048];
         let mut pending = Vec::<u8>::new();
-        let mut preview = String::new();
+        let mut raw_output = String::new();
 
         loop {
             let read = reader.read(&mut buffer).await.map_err(|error| {
@@ -395,6 +559,7 @@ impl ParakeetCppEngine {
                 break;
             }
             pending.extend_from_slice(&buffer[..read]);
+            raw_output.push_str(&String::from_utf8_lossy(&buffer[..read]));
 
             let mut record_start = 0usize;
             let mut consumed = 0usize;
@@ -404,15 +569,12 @@ impl ParakeetCppEngine {
                 }
                 if index > record_start {
                     let raw = String::from_utf8_lossy(&pending[record_start..index]).to_string();
-                    if let Some((text, progress_seconds)) =
-                        Self::stream_line_text_and_progress(&raw)
-                    {
-                        preview = Self::merge_preview(&preview, &text);
-                        emit_partial(format!("{DELTA_REPLACE_PREFIX}{preview}"));
-                        if let Some(seconds) = progress_seconds {
-                            emit_progress_seconds(seconds);
-                        }
-                    }
+                    Self::process_preview_record(
+                        &raw,
+                        &state,
+                        emit_partial.as_ref(),
+                        emit_progress_seconds.as_ref(),
+                    );
                 }
                 record_start = index + 1;
                 consumed = record_start;
@@ -425,16 +587,41 @@ impl ParakeetCppEngine {
 
         if !pending.is_empty() {
             let raw = String::from_utf8_lossy(&pending).to_string();
-            if let Some((text, progress_seconds)) = Self::stream_line_text_and_progress(&raw) {
-                preview = Self::merge_preview(&preview, &text);
-                emit_partial(format!("{DELTA_REPLACE_PREFIX}{preview}"));
-                if let Some(seconds) = progress_seconds {
-                    emit_progress_seconds(seconds);
-                }
-            }
+            Self::process_preview_record(
+                &raw,
+                &state,
+                emit_partial.as_ref(),
+                emit_progress_seconds.as_ref(),
+            );
         }
 
-        Ok(preview)
+        Ok(raw_output)
+    }
+
+    fn process_preview_record(
+        raw: &str,
+        state: &Arc<Mutex<PreviewStreamState>>,
+        emit_partial: &(dyn Fn(String) + Send + Sync),
+        emit_progress_seconds: &(dyn Fn(f32) + Send + Sync),
+    ) {
+        let Some((text, progress_seconds)) = Self::stream_line_text_and_progress(raw) else {
+            return;
+        };
+
+        let preview = {
+            let mut state = state.lock().expect("parakeet preview state lock poisoned");
+            let next_preview = Self::merge_preview(&state.preview, &text);
+            if next_preview == state.preview {
+                return;
+            }
+            state.preview = next_preview;
+            state.delta_count += 1;
+            state.preview.clone()
+        };
+        emit_partial(format!("{DELTA_REPLACE_PREFIX}{preview}"));
+        if let Some(seconds) = progress_seconds {
+            emit_progress_seconds(seconds);
+        }
     }
 
     async fn run_progressive_preview(
@@ -456,6 +643,7 @@ impl ParakeetCppEngine {
             .arg("--timestamps")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.kill_on_drop(true);
 
         let mut child = command.spawn().map_err(|error| {
             ApplicationError::SpeechToText(format!(
@@ -471,29 +659,38 @@ impl ParakeetCppEngine {
             ApplicationError::SpeechToText("missing parakeet-cli preview stderr pipe".to_string())
         })?;
 
+        let state = Arc::new(Mutex::new(PreviewStreamState::default()));
         let stdout_task = tokio::spawn(Self::consume_preview_stream(
             stdout,
+            state.clone(),
+            emit_partial.clone(),
+            emit_progress_seconds.clone(),
+        ));
+        let stderr_task = tokio::spawn(Self::consume_preview_stream(
+            stderr,
+            state.clone(),
             emit_partial.clone(),
             emit_progress_seconds,
         ));
-        let stderr_task = tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stderr);
-            let mut output = String::new();
-            let _ = reader.read_to_string(&mut output).await;
-            output
-        });
 
         let status = child.wait().await.map_err(|error| {
             ApplicationError::SpeechToText(format!(
                 "failed to wait for parakeet-cli stream preview: {error}"
             ))
         })?;
-        let preview = stdout_task.await.map_err(|error| {
+        stdout_task.await.map_err(|error| {
             ApplicationError::SpeechToText(format!(
                 "parakeet-cli preview reader task failed: {error}"
             ))
         })??;
-        let stderr_output = stderr_task.await.unwrap_or_default();
+        let stderr_output = stderr_task
+            .await
+            .map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "parakeet-cli preview stderr reader task failed: {error}"
+                ))
+            })?
+            .unwrap_or_default();
 
         if !status.success() {
             return Err(ApplicationError::SpeechToText(format!(
@@ -506,8 +703,14 @@ impl ParakeetCppEngine {
             )));
         }
 
-        if !preview.trim().is_empty() {
-            emit_partial(format!("{DELTA_REPLACE_PREFIX}{}", preview.trim()));
+        let preview = state
+            .lock()
+            .expect("parakeet preview state lock poisoned")
+            .preview
+            .trim()
+            .to_string();
+        if !preview.is_empty() {
+            emit_partial(format!("{DELTA_REPLACE_PREFIX}{preview}"));
         }
 
         Ok(())
@@ -534,13 +737,25 @@ impl SpeechToTextEngine for ParakeetCppEngine {
 
         let model_path = self.validate_model_exists(model_filename)?;
         let preview_model_path = self.validate_preview_model_exists(model_filename)?;
-        self.run_progressive_preview(
-            input_wav,
-            &preview_model_path,
-            emit_partial.clone(),
-            emit_progress_seconds.clone(),
+        match tokio::time::timeout(
+            PREVIEW_TIMEOUT,
+            self.run_progressive_preview(
+                input_wav,
+                &preview_model_path,
+                emit_partial.clone(),
+                emit_progress_seconds.clone(),
+            ),
         )
-        .await?;
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("Parakeet progressive preview unavailable: {error}");
+            }
+            Err(_) => {
+                eprintln!("Parakeet progressive preview timed out after {PREVIEW_TIMEOUT:?}");
+            }
+        }
 
         let mut command = Command::new(&self.binary_path);
         Self::configure_command_environment(&mut command, &self.binary_path);

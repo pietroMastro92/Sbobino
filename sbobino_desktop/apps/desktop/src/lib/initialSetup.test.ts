@@ -116,6 +116,15 @@ function createModelCatalogFixture(): ProvisioningModelCatalogEntry[] {
       engine: "parakeet_cpp",
       experimental: true,
     },
+    {
+      key: "realtime_eou120m_v1_f16",
+      label: "Parakeet Realtime EOU 120M F16",
+      model_file: "realtime_eou_120m-v1-f16.gguf",
+      installed: true,
+      coreml_installed: true,
+      engine: "parakeet_cpp",
+      experimental: true,
+    },
   ];
 }
 
@@ -177,10 +186,15 @@ describe("initialSetup helpers", () => {
       ...catalog[2],
       installed: false,
     };
+    catalog[3] = {
+      ...catalog[3],
+      installed: false,
+    };
 
     expect(getInitialSetupMissingModels(catalog, true)).toEqual([
       "large_turbo",
       "tdt06b_v3_q4",
+      "realtime_eou120m_v1_f16",
     ]);
   });
 

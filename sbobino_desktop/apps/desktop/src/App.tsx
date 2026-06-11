@@ -8188,7 +8188,9 @@ export function App({
         ? fileToProcess
         : (preparedHomeTrim?.path ?? selectedFile);
     if (!settings || !targetFile) return;
-    const parentId = options?.parentId;
+    const matchingTrimDraft =
+      trimmedAudioDraft?.path === targetFile ? trimmedAudioDraft : null;
+    const parentId = options?.parentId ?? matchingTrimDraft?.parentArtifactId;
     const requestedTitle = options?.title?.trim()
       ? options.title.trim()
       : preparedHomeTrim?.title;
@@ -8198,17 +8200,16 @@ export function App({
         ? activeArtifact
         : null;
     const isTrimRetranscription =
-      trimmedAudioDraft?.path === targetFile &&
-      trimmedAudioDraft.parentArtifactId === parentId;
+      matchingTrimDraft?.parentArtifactId === parentId;
     const nextDetailContext = buildActiveDetailContext({
       inputPath: targetFile,
       requestedTitle,
       sourceArtifact: sourceArtifactForContext,
-      trimmedAudioDraft: isTrimRetranscription ? trimmedAudioDraft : null,
+      trimmedAudioDraft: isTrimRetranscription ? matchingTrimDraft : null,
       restoreArtifactOnFailure: isTrimRetranscription,
     });
     const trimValidationSnapshot = isTrimRetranscription
-      ? trimmedAudioDraft
+      ? matchingTrimDraft
       : preparedHomeTrim;
     const request: TranscriptionStartRequest = {
       inputPath: targetFile,
