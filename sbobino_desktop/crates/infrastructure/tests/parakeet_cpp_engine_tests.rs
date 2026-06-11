@@ -446,6 +446,8 @@ async fn parakeet_cpp_real_smoke() {
     );
 
     let engine = ParakeetCppEngine::new(cli_path, models_dir);
+    let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_ref = emitted.clone();
     let transcript = engine
         .transcribe(
             Path::new(&audio_path),
@@ -453,8 +455,12 @@ async fn parakeet_cpp_real_smoke() {
             "auto",
             &WhisperOptions::default(),
             None,
-            Arc::new(|line: String| {
-                eprintln!("parakeet_partial={line}");
+            Arc::new(move |line: String| {
+                let mut emitted = emitted_ref.lock().expect("emit lock poisoned");
+                if emitted.len() < 5 {
+                    eprintln!("parakeet_partial={line}");
+                }
+                emitted.push(line);
             }),
             Arc::new(|seconds: f32| {
                 eprintln!("parakeet_progress_seconds={seconds:.3}");
@@ -465,6 +471,20 @@ async fn parakeet_cpp_real_smoke() {
 
     eprintln!("parakeet_text={}", transcript.text);
     assert_valid_real_parakeet_output(&transcript);
+    let emitted = emitted.lock().expect("emit lock poisoned");
+    let preview_delta_count = emitted
+        .iter()
+        .filter(|line| line.starts_with("\u{001F}REPLACE:"))
+        .count();
+    assert!(
+        preview_delta_count >= 2,
+        "expected at least two progressive Parakeet preview deltas, got {preview_delta_count}"
+    );
+    assert_eq!(
+        emitted.last().map(String::as_str),
+        Some(transcript.text.as_str()),
+        "final Parakeet delta should match the final transcript"
+    );
 
     if let Some(pattern) = optional_env("SBOBINO_PARAKEET_EXPECTED_REGEX") {
         let regex = Regex::new(&pattern).expect("SBOBINO_PARAKEET_EXPECTED_REGEX is invalid");

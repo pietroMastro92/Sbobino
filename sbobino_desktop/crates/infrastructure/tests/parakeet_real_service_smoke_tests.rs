@@ -228,12 +228,14 @@ async fn parakeet_service_real_smoke_persists_metadata() {
     );
 
     let repo = Arc::new(SmokeArtifactRepository::default());
+    let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let service = TranscriptionService::new(
         Arc::new(FfmpegAdapter::new("ffmpeg".to_string())),
         Arc::new(ParakeetCppEngine::new(cli_path, models_dir)),
         Arc::new(NoopEnhancer),
         repo.clone(),
     );
+    let emitted_ref = emitted.clone();
 
     let artifact = service
         .run_file_transcription(
@@ -258,8 +260,12 @@ async fn parakeet_service_real_smoke_persists_metadata() {
                     progress.stage, progress.percentage, progress.message
                 );
             }),
-            Arc::new(|delta| {
-                eprintln!("service_delta={delta}");
+            Arc::new(move |delta| {
+                let mut emitted = emitted_ref.lock().expect("emit lock poisoned");
+                if emitted.len() < 5 {
+                    eprintln!("service_delta={delta}");
+                }
+                emitted.push(delta);
             }),
             CancellationToken::new(),
         )
@@ -269,6 +275,20 @@ async fn parakeet_service_real_smoke_persists_metadata() {
     assert!(
         !artifact.raw_transcript.trim().is_empty(),
         "service smoke produced an empty raw transcript"
+    );
+    let emitted = emitted.lock().expect("emit lock poisoned");
+    let preview_delta_count = emitted
+        .iter()
+        .filter(|delta| delta.starts_with("\u{001F}REPLACE:"))
+        .count();
+    assert!(
+        preview_delta_count >= 2,
+        "expected at least two progressive service deltas before final Parakeet transcript, got {preview_delta_count}"
+    );
+    assert_eq!(
+        emitted.last().map(String::as_str),
+        Some(artifact.raw_transcript.as_str()),
+        "final service delta should match persisted raw transcript"
     );
     assert_eq!(artifact.processing_engine.as_deref(), Some("parakeet_cpp"));
     assert_eq!(
