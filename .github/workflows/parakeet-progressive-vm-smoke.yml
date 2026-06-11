@@ -1,0 +1,75 @@
+name: Parakeet Progressive VM Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to test
+        required: true
+        default: codex/parakeet-progressive-segments
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  as-third:
+    name: AS-THIRD progressive Parakeet smoke
+    runs-on: [self-hosted, macOS, ARM64, apple-silicon, as-third]
+    timeout-minutes: 90
+    env:
+      SBOBINO_RUNNER_MIN_FREE_GB: "8.0"
+      SBOBINO_ASR_SAMPLE: parakeet_fixture
+      SBOBINO_PARAKEET_FIXTURE: speech.wav
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Add VM toolchain paths
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Validate AS-THIRD preflight
+        working-directory: sbobino_desktop
+        run: |
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
+          ./scripts/preflight_self_hosted_runner.sh AS-THIRD "$GITHUB_REPOSITORY"
+
+      - name: Install frontend dependencies
+        working-directory: sbobino_desktop/apps/desktop
+        run: |
+          export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+          npm ci
+
+      - name: Run targeted Rust tests
+        working-directory: sbobino_desktop
+        run: |
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
+          cargo fmt --check
+          cargo test -p sbobino-infrastructure --test parakeet_cpp_engine_tests
+          cargo test -p sbobino-infrastructure --test whisper_stream_engine_tests
+          cargo test -p sbobino-desktop parakeet_realtime
+          cargo test -p sbobino-application --test transcription_service_tests
+
+      - name: Run frontend tests and build
+        working-directory: sbobino_desktop/apps/desktop
+        run: |
+          export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+          npm test
+          npm run build
+
+      - name: Run real Parakeet progressive file smoke
+        working-directory: sbobino_desktop
+        run: |
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
+          export SBOBINO_PARAKEET_CLI="$HOME/Library/Application Support/com.sbobino.desktop/bin/parakeet-cli"
+          export SBOBINO_PARAKEET_MODELS_DIR="$HOME/Library/Application Support/com.sbobino.desktop/parakeet-models"
+          export SBOBINO_PARAKEET_MODEL="tdt-0.6b-v3-q4_k.gguf"
+          ./scripts/setup_parakeet_fixtures.sh
+          ./scripts/smoke_parakeet_real.sh
