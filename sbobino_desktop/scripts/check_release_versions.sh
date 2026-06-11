@@ -7,6 +7,7 @@ if [[ $# -gt 1 ]]; then
 fi
 
 EXPECTED_VERSION=${1:-}
+RELEASE_PROFILE=${SBOBINO_RELEASE_PROFILE:-public}
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PACKAGE_JSON="$ROOT_DIR/apps/desktop/package.json"
 TAURI_CONF="$ROOT_DIR/apps/desktop/src-tauri/tauri.conf.json"
@@ -43,6 +44,8 @@ if [[ -n "$EXPECTED_VERSION" && "$PACKAGE_VERSION" != "$EXPECTED_VERSION" ]]; th
   exit 1
 fi
 
-"$ROOT_DIR/scripts/check_updater_public_key.sh" "$TAURI_CONF"
+if [[ "$RELEASE_PROFILE" != "standalone-dev" ]]; then
+  "$ROOT_DIR/scripts/check_updater_public_key.sh" "$TAURI_CONF"
+fi
 
 echo "Version coherence verified: $PACKAGE_VERSION"
