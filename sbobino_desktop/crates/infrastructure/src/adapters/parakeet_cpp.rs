@@ -178,16 +178,22 @@ impl ParakeetCppEngine {
             ));
         }
 
-        let raw_segments = if parsed.segments.is_empty() {
-            Self::segments_from_words(text.clone(), parsed.words, total_audio_seconds)
-        } else {
-            parsed
-                .segments
-                .into_iter()
-                .filter_map(Self::segment_from_json)
-                .flat_map(|segment| Self::split_segment_if_needed(segment, total_audio_seconds))
-                .collect::<Vec<_>>()
-        };
+        let has_flat_words = !parsed.words.is_empty();
+        let segment_words_available = parsed
+            .segments
+            .iter()
+            .any(|segment| !segment.words.is_empty());
+        let raw_segments =
+            if parsed.segments.is_empty() || (has_flat_words && !segment_words_available) {
+                Self::segments_from_words(text.clone(), parsed.words, total_audio_seconds)
+            } else {
+                parsed
+                    .segments
+                    .into_iter()
+                    .filter_map(Self::segment_from_json)
+                    .flat_map(|segment| Self::split_segment_if_needed(segment, total_audio_seconds))
+                    .collect::<Vec<_>>()
+            };
 
         let raw_segments = if raw_segments.is_empty() {
             vec![TimedSegment {
@@ -432,6 +438,10 @@ impl ParakeetCppEngine {
         ];
 
         let trimmed = text.trim();
+        let trimmed = trimmed
+            .strip_prefix("[parakeet]")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
         trimmed.is_empty()
             || trimmed.starts_with('{')
             || trimmed.ends_with('}')
@@ -535,6 +545,90 @@ impl ParakeetCppEngine {
         format!("{current}\n{next}")
     }
 
+    fn emit_final_preview_snapshots(
+        result: &TranscriptionOutput,
+        existing_preview_delta_count: usize,
+        existing_preview_text: &str,
+        emit_partial: &(dyn Fn(String) + Send + Sync),
+    ) {
+        if existing_preview_delta_count >= 2 && existing_preview_text.trim() == result.text.trim() {
+            return;
+        }
+
+        let snapshots = Self::final_preview_snapshots(result);
+        for snapshot in snapshots {
+            if snapshot.trim().is_empty() || snapshot.trim() == existing_preview_text.trim() {
+                continue;
+            }
+            emit_partial(format!("{DELTA_REPLACE_PREFIX}{snapshot}"));
+        }
+    }
+
+    fn final_preview_snapshots(result: &TranscriptionOutput) -> Vec<String> {
+        let mut snapshots = Vec::new();
+        let mut cumulative = String::new();
+
+        for segment in &result.segments {
+            let text = segment.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            cumulative = Self::join_text_parts(&cumulative, text);
+            snapshots.push(cumulative.clone());
+            if snapshots.len() >= 3 {
+                break;
+            }
+        }
+
+        if snapshots.len() >= 2 {
+            if snapshots.last().map(String::as_str) != Some(result.text.trim()) {
+                snapshots.push(result.text.trim().to_string());
+            }
+            return Self::dedupe_snapshots(snapshots);
+        }
+
+        let words = result
+            .segments
+            .iter()
+            .flat_map(|segment| segment.words.iter())
+            .map(|word| word.text.trim())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        if words.len() >= 2 {
+            let midpoint = (words.len() / 2).max(1);
+            snapshots.push(words[..midpoint].join(" "));
+            snapshots.push(words.join(" "));
+            if snapshots.last().map(String::as_str) != Some(result.text.trim()) {
+                snapshots.push(result.text.trim().to_string());
+            }
+            return Self::dedupe_snapshots(snapshots);
+        }
+
+        let text = result.text.trim();
+        let text_words = text.split_whitespace().collect::<Vec<_>>();
+        if text_words.len() >= 2 {
+            let midpoint = (text_words.len() / 2).max(1);
+            snapshots.push(text_words[..midpoint].join(" "));
+            snapshots.push(text.to_string());
+        } else if !text.is_empty() {
+            snapshots.push(text.to_string());
+        }
+
+        Self::dedupe_snapshots(snapshots)
+    }
+
+    fn dedupe_snapshots(snapshots: Vec<String>) -> Vec<String> {
+        let mut unique = Vec::new();
+        for snapshot in snapshots {
+            let snapshot = snapshot.trim().to_string();
+            if snapshot.is_empty() || unique.last() == Some(&snapshot) {
+                continue;
+            }
+            unique.push(snapshot);
+        }
+        unique
+    }
+
     async fn consume_preview_stream<R>(
         reader: R,
         state: Arc<Mutex<PreviewStreamState>>,
@@ -628,6 +722,7 @@ impl ParakeetCppEngine {
         &self,
         input_wav: &Path,
         preview_model_path: &Path,
+        state: Arc<Mutex<PreviewStreamState>>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<(), ApplicationError> {
@@ -659,7 +754,6 @@ impl ParakeetCppEngine {
             ApplicationError::SpeechToText("missing parakeet-cli preview stderr pipe".to_string())
         })?;
 
-        let state = Arc::new(Mutex::new(PreviewStreamState::default()));
         let stdout_task = tokio::spawn(Self::consume_preview_stream(
             stdout,
             state.clone(),
@@ -737,25 +831,26 @@ impl SpeechToTextEngine for ParakeetCppEngine {
 
         let model_path = self.validate_model_exists(model_filename)?;
         let preview_model_path = self.validate_preview_model_exists(model_filename)?;
-        match tokio::time::timeout(
-            PREVIEW_TIMEOUT,
-            self.run_progressive_preview(
-                input_wav,
-                &preview_model_path,
-                emit_partial.clone(),
-                emit_progress_seconds.clone(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("Parakeet progressive preview unavailable: {error}");
-            }
-            Err(_) => {
-                eprintln!("Parakeet progressive preview timed out after {PREVIEW_TIMEOUT:?}");
-            }
-        }
+        let preview_state = Arc::new(Mutex::new(PreviewStreamState::default()));
+        let preview_engine = self.clone();
+        let preview_input = input_wav.to_path_buf();
+        let preview_model = preview_model_path.clone();
+        let preview_emit_partial = emit_partial.clone();
+        let preview_emit_progress = emit_progress_seconds.clone();
+        let preview_state_for_task = preview_state.clone();
+        let preview_task = tokio::spawn(async move {
+            tokio::time::timeout(
+                PREVIEW_TIMEOUT,
+                preview_engine.run_progressive_preview(
+                    &preview_input,
+                    &preview_model,
+                    preview_state_for_task,
+                    preview_emit_partial,
+                    preview_emit_progress,
+                ),
+            )
+            .await
+        });
 
         let mut command = Command::new(&self.binary_path);
         Self::configure_command_environment(&mut command, &self.binary_path);
@@ -790,6 +885,35 @@ impl SpeechToTextEngine for ParakeetCppEngine {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let result = Self::parse_json_output(&stdout, total_audio_seconds)?;
+        let (preview_text, preview_delta_count) = {
+            let preview_snapshot = preview_state
+                .lock()
+                .expect("parakeet preview state lock poisoned");
+            (
+                preview_snapshot.preview.trim().to_string(),
+                preview_snapshot.delta_count,
+            )
+        };
+        Self::emit_final_preview_snapshots(
+            &result,
+            preview_delta_count,
+            &preview_text,
+            emit_partial.as_ref(),
+        );
+        preview_task.abort();
+        match preview_task.await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                eprintln!("Parakeet progressive preview unavailable: {error}");
+            }
+            Ok(Err(_)) => {
+                eprintln!("Parakeet progressive preview timed out after {PREVIEW_TIMEOUT:?}");
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                eprintln!("Parakeet progressive preview task failed: {error}");
+            }
+        }
         emit_partial(result.text.clone());
         if let Some(total) = total_audio_seconds {
             emit_progress_seconds(total);

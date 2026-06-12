@@ -289,6 +289,62 @@ exit 0
 }
 
 #[tokio::test]
+async fn transcribe_prefers_flat_words_when_segments_have_no_words() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-f16.gguf"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(
+        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
+        b"fake realtime model",
+    )
+    .expect("failed to create preview model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+case "$*" in
+  *--stream*)
+    echo '[00:00:00.000 --> 00:00:01.000] preview'
+    exit 0
+    ;;
+esac
+echo '{"text":"first sentence. second sentence.","segments":[{"text":"first sentence. second sentence.","start":0.0,"end":4.0}],"words":[{"w":"first","start":0.0,"end":0.4},{"w":"sentence.","start":0.4,"end":1.0},{"w":"second","start":3.0,"end":3.5},{"w":"sentence.","start":3.5,"end":4.0}]}'
+exit 0
+"#,
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-f16.gguf",
+            "en",
+            &WhisperOptions::default(),
+            Some(4.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("transcription should succeed");
+
+    assert_eq!(transcript.segments.len(), 2);
+    assert_eq!(transcript.segments[0].text, "first sentence.");
+    assert_eq!(transcript.segments[0].words.len(), 2);
+    assert_eq!(transcript.segments[1].text, "second sentence.");
+    assert_eq!(transcript.segments[1].start_seconds, Some(3.0));
+}
+
+#[tokio::test]
 async fn transcribe_parses_segment_json_with_words() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");
