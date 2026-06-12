@@ -2451,20 +2451,7 @@ fn verify_managed_runtime_binary(candidate: &Path, lib_dir: &Path) -> ManagedRun
                     }
                 };
 
-                if status.success() {
-                    return ManagedRuntimeBinaryHealth {
-                        resolved_path,
-                        available: true,
-                        failure_reason: String::new(),
-                        failure_message: String::new(),
-                    };
-                }
-
-                if managed_runtime_probe_accepts_nonzero_exit(
-                    candidate,
-                    &output.stdout,
-                    &output.stderr,
-                ) {
+                if status.success() || binary_probe_accepts_nonzero_exit(candidate, &output) {
                     return ManagedRuntimeBinaryHealth {
                         resolved_path,
                         available: true,
@@ -2521,11 +2508,7 @@ fn verify_managed_runtime_binary(candidate: &Path, lib_dir: &Path) -> ManagedRun
     }
 }
 
-fn managed_runtime_probe_accepts_nonzero_exit(
-    candidate: &Path,
-    stdout: &[u8],
-    stderr: &[u8],
-) -> bool {
+fn binary_probe_accepts_nonzero_exit(candidate: &Path, output: &std::process::Output) -> bool {
     let file_name = candidate
         .file_name()
         .and_then(|value| value.to_str())
@@ -2534,11 +2517,11 @@ fn managed_runtime_probe_accepts_nonzero_exit(
         return false;
     }
 
-    let mut output = String::from_utf8_lossy(stdout).to_string();
-    output.push_str(&String::from_utf8_lossy(stderr));
-    output.contains("parakeet-cli transcribe")
-        || output.contains("Usage:")
-        || output.contains("Available commands")
+    let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    combined.contains("parakeet-cli transcribe")
+        || combined.contains("Usage:")
+        || combined.contains("Available commands")
 }
 
 fn is_runnable_binary_file(candidate: &Path) -> bool {
@@ -2564,8 +2547,8 @@ fn is_runnable_binary_file(candidate: &Path) -> bool {
 
     let mut child = match command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(process) => process,
@@ -2575,7 +2558,13 @@ fn is_runnable_binary_file(candidate: &Path) -> bool {
     let deadline = Instant::now() + probe.timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => {
+                let output = match child.wait_with_output() {
+                    Ok(output) => output,
+                    Err(_) => return false,
+                };
+                return status.success() || binary_probe_accepts_nonzero_exit(candidate, &output);
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -4244,6 +4233,22 @@ mod tests {
             "parakeet usage/help output should verify the managed runtime binary"
         );
         assert!(health.ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runnable_probe_accepts_parakeet_usage_exit() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let parakeet_cli = temp.path().join("parakeet-cli");
+        write_executable_file(
+            &parakeet_cli,
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n  echo 'parakeet-cli transcribe' >&2\n  exit 2\nfi\nexit 1\n",
+        );
+
+        assert!(
+            super::is_runnable_binary_file(&parakeet_cli),
+            "parakeet-cli usage/help output should be treated as runnable"
+        );
     }
 
     #[test]
