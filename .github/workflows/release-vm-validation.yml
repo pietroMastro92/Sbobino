@@ -36,6 +36,14 @@ jobs:
           ref: v${{ inputs.version }}
           fetch-depth: 0
 
+      - name: Overlay hosted validation scripts
+        run: |
+          git fetch --no-tags origin "$GITHUB_SHA"
+          git checkout "$GITHUB_SHA" -- \
+            sbobino_desktop/scripts/lib/asr_samples.sh \
+            sbobino_desktop/scripts/setup_parakeet_fixtures.sh \
+            sbobino_desktop/scripts/run_release_machine_validation.sh
+
       - name: Add VM toolchain paths
         run: |
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
