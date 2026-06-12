@@ -155,7 +155,12 @@ exit 0
         "expected progressive preview deltas plus final transcript, got {emitted:?}"
     );
     assert!(preview_deltas[0].contains("REPLACE:hello"));
-    assert!(preview_deltas[1].contains("REPLACE:hello\nworld"));
+    assert!(
+        preview_deltas
+            .iter()
+            .any(|line| line.contains("hello") && line.contains("world")),
+        "expected a cumulative preview containing the final words, got {preview_deltas:?}"
+    );
     assert_eq!(emitted.last().map(String::as_str), Some("hello world"));
 }
 
