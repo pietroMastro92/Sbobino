@@ -415,10 +415,15 @@ pub async fn get_realtime_start_readiness(
             .runtime_health()
             .map_err(|e| CommandError::new("runtime_health", e))?;
         let models_dir = PathBuf::from(&health.parakeet_models_dir_resolved);
-        let selected_parakeet_model = if matches!(
+        let requested_realtime = matches!(
             requested_parakeet_model,
             ParakeetModel::RealtimeEou120mV1F16 | ParakeetModel::RealtimeEou120mV1Q8
-        ) {
+        );
+        let selected_parakeet_model = if requested_realtime
+            && models_dir
+                .join(requested_parakeet_model.gguf_filename())
+                .exists()
+        {
             requested_parakeet_model
         } else if models_dir
             .join(ParakeetModel::RealtimeEou120mV1F16.gguf_filename())
@@ -431,7 +436,7 @@ pub async fn get_realtime_start_readiness(
         {
             ParakeetModel::RealtimeEou120mV1Q8
         } else {
-            requested_parakeet_model
+            ParakeetModel::RealtimeEou120mV1F16
         };
         let model_filename = selected_parakeet_model.gguf_filename().to_string();
         let model_path_buf = models_dir.join(&model_filename);

@@ -35,6 +35,21 @@ fn write_executable_script(path: &Path, content: &str) {
     std::fs::set_permissions(path, permissions).expect("failed to chmod script");
 }
 
+fn write_test_wav(path: &Path, seconds: u32) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).expect("failed to create wav");
+    for index in 0..(seconds * 16_000) {
+        let value = ((index as f32 * 0.02).sin() * i16::MAX as f32 * 0.2) as i16;
+        writer.write_sample(value).expect("failed to write sample");
+    }
+    writer.finalize().expect("failed to finalize wav");
+}
+
 fn assert_valid_real_parakeet_output(transcript: &sbobino_domain::TranscriptionOutput) {
     assert!(
         !transcript.text.trim().is_empty(),
@@ -226,6 +241,90 @@ exit 0
             .iter()
             .any(|line| line.starts_with("\u{001F}REPLACE:") && line.contains("ciao")),
         "expected stderr preview delta, got {emitted:?}"
+    );
+}
+
+#[tokio::test]
+async fn transcribe_uses_realtime_json_chunks_for_progressive_preview() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
+        .expect("failed to create final model");
+    std::fs::write(
+        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
+        b"fake realtime model",
+    )
+    .expect("failed to create preview model");
+    write_test_wav(&input_wav, 18);
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+case "$*" in
+  *realtime_eou_120m-v1-f16.gguf*chunk-0000.wav*)
+    echo '{"text":"first chunk<EOU>","words":[{"w":"first","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
+    exit 0
+    ;;
+  *realtime_eou_120m-v1-f16.gguf*chunk-0001.wav*)
+    echo '{"text":"second chunk<EOU>","words":[{"w":"second","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
+    exit 0
+    ;;
+  *realtime_eou_120m-v1-f16.gguf*chunk-0002.wav*)
+    echo '{"text":"third chunk<EOU>","words":[{"w":"third","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
+    exit 0
+    ;;
+esac
+echo '{"text":"first chunk second chunk third chunk","words":[{"w":"first","start":0.0,"end":0.2},{"w":"chunk","start":0.2,"end":0.4},{"w":"second","start":8.0,"end":8.2},{"w":"chunk","start":8.2,"end":8.4},{"w":"third","start":16.0,"end":16.2},{"w":"chunk","start":16.2,"end":16.4}]}'
+exit 0
+"#,
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_ref = emitted.clone();
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-q4_k.gguf",
+            "en",
+            &WhisperOptions::default(),
+            Some(18.0),
+            Arc::new(move |line: String| {
+                emitted_ref.lock().expect("emit lock poisoned").push(line);
+            }),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("transcription should succeed");
+
+    assert_eq!(transcript.text, "first chunk second chunk third chunk");
+    let emitted = emitted.lock().expect("emit lock poisoned");
+    let preview_deltas = emitted
+        .iter()
+        .filter(|line| line.starts_with("\u{001F}REPLACE:"))
+        .collect::<Vec<_>>();
+    assert!(
+        preview_deltas.len() >= 2,
+        "expected progressive preview deltas before final output, got {emitted:?}"
+    );
+    assert!(
+        preview_deltas[0].contains("first chunk") && !preview_deltas[0].contains("second chunk"),
+        "first preview should contain only the first chunk, got {:?}",
+        preview_deltas[0]
+    );
+    assert!(
+        preview_deltas
+            .iter()
+            .any(|line| line.contains("first chunk") && line.contains("second chunk")),
+        "expected cumulative chunk preview, got {preview_deltas:?}"
     );
 }
 

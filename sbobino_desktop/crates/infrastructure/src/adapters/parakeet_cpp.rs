@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -19,7 +20,10 @@ const WORD_SEGMENT_GAP_BREAK_SECONDS: f32 = 1.25;
 const WORD_SEGMENT_MAX_CHARS: usize = 140;
 const WORD_SEGMENT_MAX_DURATION_SECONDS: f32 = 12.0;
 const WORD_SEGMENT_MIN_TERMINAL_WORDS: usize = 3;
-const PREVIEW_TIMEOUT: Duration = Duration::from_secs(30);
+const PREVIEW_TIMEOUT: Duration = Duration::from_secs(12);
+const PREVIEW_CHUNK_SECONDS: f32 = 8.0;
+const PREVIEW_MAX_CHUNKS: usize = 2;
+const PREVIEW_CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct ParakeetCppEngine {
@@ -65,6 +69,12 @@ struct ParakeetJsonWord {
 struct PreviewStreamState {
     preview: String,
     delta_count: usize,
+}
+
+struct PreviewChunk {
+    path: PathBuf,
+    start_seconds: f32,
+    end_seconds: f32,
 }
 
 impl ParakeetCppEngine {
@@ -154,6 +164,17 @@ impl ParakeetCppEngine {
         Ok(&stdout[start..=end])
     }
 
+    fn clean_transcript_text(value: &str) -> String {
+        value
+            .replace("<EOU>", "")
+            .replace("[EOU]", "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string()
+    }
+
     fn parse_json_output(
         raw_stdout: &str,
         total_audio_seconds: Option<f32>,
@@ -163,13 +184,13 @@ impl ParakeetCppEngine {
             ApplicationError::SpeechToText(format!("failed to parse parakeet-cli JSON: {error}"))
         })?;
 
-        let text = parsed.text.trim().to_string();
+        let text = Self::clean_transcript_text(&parsed.text);
         let segment_text = parsed
             .segments
             .iter()
-            .map(|segment| segment.text.trim())
+            .map(|segment| Self::clean_transcript_text(&segment.text))
             .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
+            .collect::<Vec<String>>()
             .join(" ");
         let text = if text.is_empty() { segment_text } else { text };
         if text.is_empty() {
@@ -371,7 +392,7 @@ impl ParakeetCppEngine {
     }
 
     fn segment_from_json(segment: ParakeetJsonSegment) -> Option<TimedSegment> {
-        let text = segment.text.trim().to_string();
+        let text = Self::clean_transcript_text(&segment.text);
         if text.is_empty() {
             return None;
         }
@@ -392,7 +413,7 @@ impl ParakeetCppEngine {
     }
 
     fn word_from_json(word: ParakeetJsonWord) -> Option<TimedWord> {
-        let text = word.w.trim().to_string();
+        let text = Self::clean_transcript_text(&word.w);
         if text.is_empty() {
             return None;
         }
@@ -405,18 +426,20 @@ impl ParakeetCppEngine {
     }
 
     fn clean_stream_line(raw_line: &str) -> String {
-        raw_line
+        let cleaned = raw_line
             .replace("\u{001b}[2K", "")
             .replace("\u{001b}[0m", "")
             .replace("[2K]", "")
             .replace("[BLANK_AUDIO]", "")
+            .replace("<EOU>", "")
             .trim_start_matches("[stream:final]")
             .trim_start_matches("[stream]")
             .split('\r')
             .next_back()
             .unwrap_or("")
             .trim()
-            .to_string()
+            .to_string();
+        Self::clean_transcript_text(&cleaned)
     }
 
     fn stream_line_is_noise(text: &str) -> bool {
@@ -809,6 +832,260 @@ impl ParakeetCppEngine {
 
         Ok(())
     }
+
+    fn prepare_preview_chunks(
+        input_wav: &Path,
+    ) -> Result<(TempDir, Vec<PreviewChunk>), ApplicationError> {
+        let reader = hound::WavReader::open(input_wav).map_err(|error| {
+            ApplicationError::SpeechToText(format!(
+                "Parakeet progressive preview could not read WAV chunks from {}: {error}",
+                input_wav.display()
+            ))
+        })?;
+        let spec = reader.spec();
+        let channels = u64::from(spec.channels.max(1));
+        let samples_per_chunk = ((spec.sample_rate as f32 * PREVIEW_CHUNK_SECONDS).round() as u64
+            * channels)
+            .max(channels);
+        let temp_dir = tempfile::Builder::new()
+            .prefix("sbobino-parakeet-preview-")
+            .tempdir()
+            .map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "failed to create Parakeet preview chunk directory: {error}"
+                ))
+            })?;
+
+        let chunks = match spec.sample_format {
+            hound::SampleFormat::Float => Self::write_typed_preview_chunks::<f32>(
+                reader,
+                spec,
+                temp_dir.path(),
+                samples_per_chunk,
+            )?,
+            hound::SampleFormat::Int if spec.bits_per_sample <= 16 => {
+                Self::write_typed_preview_chunks::<i16>(
+                    reader,
+                    spec,
+                    temp_dir.path(),
+                    samples_per_chunk,
+                )?
+            }
+            hound::SampleFormat::Int => Self::write_typed_preview_chunks::<i32>(
+                reader,
+                spec,
+                temp_dir.path(),
+                samples_per_chunk,
+            )?,
+        };
+
+        Ok((temp_dir, chunks))
+    }
+
+    fn write_typed_preview_chunks<T>(
+        mut reader: hound::WavReader<std::io::BufReader<std::fs::File>>,
+        spec: hound::WavSpec,
+        temp_dir: &Path,
+        samples_per_chunk: u64,
+    ) -> Result<Vec<PreviewChunk>, ApplicationError>
+    where
+        T: hound::Sample + Copy,
+    {
+        let channels = u64::from(spec.channels.max(1));
+        let sample_rate = spec.sample_rate.max(1) as f32;
+        let mut chunks = Vec::new();
+        let mut writer: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
+        let mut chunk_path = PathBuf::new();
+        let mut chunk_start_sample = 0_u64;
+        let mut chunk_sample_count = 0_u64;
+        let mut total_samples = 0_u64;
+
+        for sample in reader.samples::<T>() {
+            if writer.is_none() {
+                chunk_start_sample = total_samples;
+                chunk_sample_count = 0;
+                chunk_path = temp_dir.join(format!("chunk-{:04}.wav", chunks.len()));
+                writer = Some(
+                    hound::WavWriter::create(&chunk_path, spec).map_err(|error| {
+                        ApplicationError::SpeechToText(format!(
+                            "failed to create Parakeet preview chunk {}: {error}",
+                            chunk_path.display()
+                        ))
+                    })?,
+                );
+            }
+
+            let sample = sample.map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "failed to decode WAV sample for Parakeet preview: {error}"
+                ))
+            })?;
+            if let Some(writer) = writer.as_mut() {
+                writer.write_sample(sample).map_err(|error| {
+                    ApplicationError::SpeechToText(format!(
+                        "failed to write Parakeet preview chunk {}: {error}",
+                        chunk_path.display()
+                    ))
+                })?;
+            }
+            total_samples = total_samples.saturating_add(1);
+            chunk_sample_count = chunk_sample_count.saturating_add(1);
+
+            if chunk_sample_count >= samples_per_chunk {
+                Self::finish_preview_chunk(
+                    &mut chunks,
+                    writer.take(),
+                    &chunk_path,
+                    chunk_start_sample,
+                    chunk_sample_count,
+                    channels,
+                    sample_rate,
+                )?;
+            }
+        }
+
+        if writer.is_some() {
+            Self::finish_preview_chunk(
+                &mut chunks,
+                writer.take(),
+                &chunk_path,
+                chunk_start_sample,
+                chunk_sample_count,
+                channels,
+                sample_rate,
+            )?;
+        }
+
+        Ok(chunks)
+    }
+
+    fn finish_preview_chunk(
+        chunks: &mut Vec<PreviewChunk>,
+        writer: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
+        chunk_path: &Path,
+        chunk_start_sample: u64,
+        chunk_sample_count: u64,
+        channels: u64,
+        sample_rate: f32,
+    ) -> Result<(), ApplicationError> {
+        if chunk_sample_count == 0 {
+            return Ok(());
+        }
+        if let Some(writer) = writer {
+            writer.finalize().map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "failed to finalize Parakeet preview chunk {}: {error}",
+                    chunk_path.display()
+                ))
+            })?;
+        }
+        let start_seconds = (chunk_start_sample / channels) as f32 / sample_rate;
+        let end_seconds =
+            ((chunk_start_sample + chunk_sample_count) / channels) as f32 / sample_rate;
+        chunks.push(PreviewChunk {
+            path: chunk_path.to_path_buf(),
+            start_seconds,
+            end_seconds,
+        });
+        Ok(())
+    }
+
+    async fn run_preview_json_for_chunk(
+        &self,
+        chunk_path: &Path,
+        preview_model_path: &Path,
+    ) -> Result<String, ApplicationError> {
+        let mut command = Command::new(&self.binary_path);
+        Self::configure_command_environment(&mut command, &self.binary_path);
+        command
+            .arg("transcribe")
+            .arg("--model")
+            .arg(preview_model_path)
+            .arg("--input")
+            .arg(chunk_path)
+            .arg("--json")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let output = tokio::time::timeout(PREVIEW_CHUNK_TIMEOUT, command.output())
+            .await
+            .map_err(|_| {
+                ApplicationError::SpeechToText(format!(
+                    "parakeet-cli chunk preview timed out after {PREVIEW_CHUNK_TIMEOUT:?}"
+                ))
+            })?
+            .map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "parakeet-cli chunk preview failed to start at '{}': {error}",
+                    self.binary_path
+                ))
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(ApplicationError::SpeechToText(format!(
+                "parakeet-cli chunk preview failed: {}",
+                if stderr.is_empty() {
+                    output.status.to_string()
+                } else {
+                    stderr
+                }
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed = Self::parse_json_output(&stdout, None)?;
+        Ok(parsed.text)
+    }
+
+    async fn run_chunked_progressive_preview(
+        &self,
+        input_wav: &Path,
+        preview_model_path: &Path,
+        state: Arc<Mutex<PreviewStreamState>>,
+        emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+    ) -> Result<(), ApplicationError> {
+        let (_temp_dir, chunks) = match Self::prepare_preview_chunks(input_wav) {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                eprintln!(
+                    "Parakeet chunked preview unavailable, falling back to stream preview: {error}"
+                );
+                return self
+                    .run_progressive_preview(
+                        input_wav,
+                        preview_model_path,
+                        state,
+                        emit_partial,
+                        emit_progress_seconds,
+                    )
+                    .await;
+            }
+        };
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in chunks.into_iter().take(PREVIEW_MAX_CHUNKS) {
+            let text = self
+                .run_preview_json_for_chunk(&chunk.path, preview_model_path)
+                .await?;
+            let preview = {
+                let mut state = state.lock().expect("parakeet preview state lock poisoned");
+                let next_preview = Self::merge_preview(&state.preview, &text);
+                if next_preview == state.preview {
+                    continue;
+                }
+                state.preview = next_preview;
+                state.delta_count += 1;
+                state.preview.clone()
+            };
+            emit_partial(format!("{DELTA_REPLACE_PREFIX}{preview}"));
+            emit_progress_seconds(chunk.end_seconds.max(chunk.start_seconds));
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -832,25 +1109,26 @@ impl SpeechToTextEngine for ParakeetCppEngine {
         let model_path = self.validate_model_exists(model_filename)?;
         let preview_model_path = self.validate_preview_model_exists(model_filename)?;
         let preview_state = Arc::new(Mutex::new(PreviewStreamState::default()));
-        let preview_engine = self.clone();
-        let preview_input = input_wav.to_path_buf();
-        let preview_model = preview_model_path.clone();
-        let preview_emit_partial = emit_partial.clone();
-        let preview_emit_progress = emit_progress_seconds.clone();
-        let preview_state_for_task = preview_state.clone();
-        let preview_task = tokio::spawn(async move {
-            tokio::time::timeout(
-                PREVIEW_TIMEOUT,
-                preview_engine.run_progressive_preview(
-                    &preview_input,
-                    &preview_model,
-                    preview_state_for_task,
-                    preview_emit_partial,
-                    preview_emit_progress,
-                ),
-            )
-            .await
-        });
+        match tokio::time::timeout(
+            PREVIEW_TIMEOUT,
+            self.run_chunked_progressive_preview(
+                input_wav,
+                &preview_model_path,
+                preview_state.clone(),
+                emit_partial.clone(),
+                emit_progress_seconds.clone(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("Parakeet progressive preview unavailable: {error}");
+            }
+            Err(_) => {
+                eprintln!("Parakeet progressive preview timed out after {PREVIEW_TIMEOUT:?}");
+            }
+        }
 
         let mut command = Command::new(&self.binary_path);
         Self::configure_command_environment(&mut command, &self.binary_path);
@@ -900,20 +1178,6 @@ impl SpeechToTextEngine for ParakeetCppEngine {
             &preview_text,
             emit_partial.as_ref(),
         );
-        preview_task.abort();
-        match preview_task.await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => {
-                eprintln!("Parakeet progressive preview unavailable: {error}");
-            }
-            Ok(Err(_)) => {
-                eprintln!("Parakeet progressive preview timed out after {PREVIEW_TIMEOUT:?}");
-            }
-            Err(error) if error.is_cancelled() => {}
-            Err(error) => {
-                eprintln!("Parakeet progressive preview task failed: {error}");
-            }
-        }
         emit_partial(result.text.clone());
         if let Some(total) = total_audio_seconds {
             emit_progress_seconds(total);

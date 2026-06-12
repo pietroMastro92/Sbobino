@@ -16,6 +16,37 @@ function dedupeArtifactsById(artifacts: TranscriptArtifact[]): TranscriptArtifac
   return uniqueArtifacts;
 }
 
+function artifactParentId(artifact: TranscriptArtifact): string | null {
+  return artifact.parent_artifact_id ?? artifact.metadata?.parent_id ?? null;
+}
+
+function insertArtifactInDisplayOrder(
+  artifact: TranscriptArtifact,
+  artifacts: TranscriptArtifact[],
+): TranscriptArtifact[] {
+  const dedupedArtifacts = artifacts.filter((item) => item.id !== artifact.id);
+  const parentId = artifactParentId(artifact);
+  if (!parentId) {
+    return [artifact, ...dedupedArtifacts];
+  }
+
+  const parentIndex = dedupedArtifacts.findIndex((item) => item.id === parentId);
+  if (parentIndex === -1) {
+    return [artifact, ...dedupedArtifacts];
+  }
+
+  const nextArtifacts = [...dedupedArtifacts];
+  let insertIndex = parentIndex + 1;
+  while (
+    insertIndex < nextArtifacts.length &&
+    artifactParentId(nextArtifacts[insertIndex]) === parentId
+  ) {
+    insertIndex += 1;
+  }
+  nextArtifacts.splice(insertIndex, 0, artifact);
+  return nextArtifacts;
+}
+
 type AppState = {
   settings: AppSettings | null;
   selectedFile: string | null;
@@ -52,7 +83,7 @@ export const useAppStore = create<AppState>((set) => ({
   setArtifacts: (artifacts) => set({ artifacts: dedupeArtifactsById(artifacts) }),
   prependArtifact: (artifact) =>
     set((state) => ({
-      artifacts: [artifact, ...state.artifacts.filter((item) => item.id !== artifact.id)],
+      artifacts: insertArtifactInDisplayOrder(artifact, state.artifacts),
     })),
   upsertArtifact: (artifact) =>
     set((state) => {
