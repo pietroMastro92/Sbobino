@@ -107,17 +107,10 @@ fn engine_to_wire(engine: &TranscriptionEngine) -> &'static str {
 
 fn runtime_toolchain_ready(health: &sbobino_infrastructure::RuntimeHealth) -> bool {
     if health.managed_runtime_required {
-        return match health.configured_engine {
-            TranscriptionEngine::WhisperCpp => {
-                health.managed_runtime.ffmpeg.available
-                    && health.managed_runtime.whisper_cli.available
-                    && health.managed_runtime.whisper_stream.available
-            }
-            TranscriptionEngine::ParakeetCpp => {
-                health.managed_runtime.ffmpeg.available
-                    && health.managed_runtime.parakeet_cli.available
-            }
-        };
+        return health.managed_runtime.ffmpeg.available
+            && health.managed_runtime.whisper_cli.available
+            && health.managed_runtime.whisper_stream.available
+            && health.managed_runtime.parakeet_cli.available;
     }
 
     match health.configured_engine {
@@ -811,4 +804,107 @@ pub async fn get_transcription_runtime_status(
         .map_err(|e| CommandError::new("runtime_status", e))?;
 
     Ok(runtime_health_response(health))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sbobino_infrastructure::{ManagedRuntimeBinaryHealth, RuntimeHealth};
+
+    fn available_binary(name: &str) -> ManagedRuntimeBinaryHealth {
+        ManagedRuntimeBinaryHealth {
+            resolved_path: format!("/tmp/{name}"),
+            available: true,
+            failure_reason: String::new(),
+            failure_message: String::new(),
+        }
+    }
+
+    fn missing_binary(name: &str) -> ManagedRuntimeBinaryHealth {
+        ManagedRuntimeBinaryHealth {
+            resolved_path: format!("/tmp/{name}"),
+            available: false,
+            failure_reason: "missing_file".to_string(),
+            failure_message: "Managed runtime binary is missing.".to_string(),
+        }
+    }
+
+    fn runtime_health_for_managed_runtime(
+        configured_engine: TranscriptionEngine,
+        parakeet_available: bool,
+    ) -> RuntimeHealth {
+        let parakeet_cli = if parakeet_available {
+            available_binary("parakeet-cli")
+        } else {
+            missing_binary("parakeet-cli")
+        };
+        RuntimeHealth {
+            host_os: "macos".to_string(),
+            host_arch: "aarch64".to_string(),
+            is_apple_silicon: true,
+            preferred_engine: TranscriptionEngine::WhisperCpp,
+            configured_engine,
+            runtime_source: "managed_release_asset".to_string(),
+            managed_runtime_required: true,
+            managed_runtime: ManagedRuntimeHealth {
+                source: "managed_release_asset".to_string(),
+                ready: parakeet_available,
+                ffmpeg: available_binary("ffmpeg"),
+                whisper_cli: available_binary("whisper-cli"),
+                whisper_stream: available_binary("whisper-stream"),
+                parakeet_cli,
+            },
+            ffmpeg_path: "ffmpeg".to_string(),
+            ffmpeg_resolved: "/tmp/ffmpeg".to_string(),
+            ffmpeg_available: true,
+            whisper_cli_path: "whisper-cli".to_string(),
+            whisper_cli_resolved: "/tmp/whisper-cli".to_string(),
+            whisper_cli_available: true,
+            whisper_stream_path: "whisper-stream".to_string(),
+            whisper_stream_resolved: "/tmp/whisper-stream".to_string(),
+            whisper_stream_available: true,
+            parakeet_cli_path: "parakeet-cli".to_string(),
+            parakeet_cli_resolved: "/tmp/parakeet-cli".to_string(),
+            parakeet_cli_available: parakeet_available,
+            models_dir_configured: "/tmp/models".to_string(),
+            models_dir_resolved: "/tmp/models".to_string(),
+            parakeet_models_dir_configured: "/tmp/parakeet-models".to_string(),
+            parakeet_models_dir_resolved: "/tmp/parakeet-models".to_string(),
+            model_filename: "ggml-base.bin".to_string(),
+            model_present: true,
+            parakeet_model_filename: "tdt-0.6b-v3-q4_k.gguf".to_string(),
+            parakeet_model_present: true,
+            missing_parakeet_models: Vec::new(),
+            coreml_encoder_present: true,
+            missing_models: Vec::new(),
+            missing_encoders: Vec::new(),
+            pyannote: PyannoteRuntimeHealth {
+                enabled: false,
+                ready: true,
+                runtime_installed: false,
+                model_installed: false,
+                runtime_dir: "/tmp/runtime/pyannote".to_string(),
+                arch: "aarch64-apple-darwin".to_string(),
+                device: "cpu".to_string(),
+                source: "disabled".to_string(),
+                reason_code: "disabled".to_string(),
+                message: "disabled".to_string(),
+            },
+            setup_complete: parakeet_available,
+        }
+    }
+
+    #[test]
+    fn managed_runtime_requires_parakeet_even_when_whisper_is_selected() {
+        let health = runtime_health_for_managed_runtime(TranscriptionEngine::WhisperCpp, false);
+
+        assert!(!runtime_toolchain_ready(&health));
+    }
+
+    #[test]
+    fn managed_runtime_is_ready_when_all_release_binaries_are_available() {
+        let health = runtime_health_for_managed_runtime(TranscriptionEngine::WhisperCpp, true);
+
+        assert!(runtime_toolchain_ready(&health));
+    }
 }

@@ -184,7 +184,13 @@ export function isRuntimeToolchainReady(
 
   const managedRuntime = getManagedRuntime(runtimeHealth);
   if (runtimeHealth.managed_runtime_required) {
-    return managedRuntime.ready;
+    return (
+      managedRuntime.ready &&
+      managedRuntime.ffmpeg.available &&
+      managedRuntime.whisper_cli.available &&
+      managedRuntime.whisper_stream.available &&
+      managedRuntime.parakeet_cli.available
+    );
   }
 
   return (
@@ -210,6 +216,9 @@ export function getRuntimeToolchainFailureMessage(
   }
   if (!managedRuntime.whisper_stream.available) {
     return managedRuntime.whisper_stream.failure_message || null;
+  }
+  if (!managedRuntime.parakeet_cli.available) {
+    return managedRuntime.parakeet_cli.failure_message || null;
   }
 
   return null;

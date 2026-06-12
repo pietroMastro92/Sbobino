@@ -68,6 +68,15 @@ jobs:
           cargo --version
           rustc --version
 
+      - name: Setup hosted media tools
+        run: |
+          set -euo pipefail
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
       - name: Clean previous validation state
         working-directory: sbobino_desktop
         run: ./scripts/clean_release_validation_state.sh AS-THIRD

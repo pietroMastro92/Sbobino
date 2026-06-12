@@ -6,6 +6,8 @@ import {
   getInitialSetupMissingModels,
   isInitialSetupComplete,
   shouldBlockMainUiDuringStartup,
+  getRuntimeToolchainFailureMessage,
+  isRuntimeToolchainReady,
   shouldRepairPyannoteRuntime,
 } from "./initialSetup";
 
@@ -42,7 +44,7 @@ function createRuntimeHealthFixture(): RuntimeHealth {
       },
       parakeet_cli: {
         resolved_path: "/tmp/parakeet-cli",
-        available: false,
+        available: true,
         failure_reason: "",
         failure_message: "",
       },
@@ -58,7 +60,7 @@ function createRuntimeHealthFixture(): RuntimeHealth {
     whisper_stream_available: true,
     parakeet_cli_path: "parakeet-cli",
     parakeet_cli_resolved: "/tmp/parakeet-cli",
-    parakeet_cli_available: false,
+    parakeet_cli_available: true,
     models_dir_configured: "/tmp/models",
     models_dir_resolved: "/tmp/models",
     parakeet_models_dir_configured: "parakeet-models",
@@ -207,6 +209,26 @@ describe("initialSetup helpers", () => {
 
     runtimeHealth.pyannote.ready = false;
     expect(isInitialSetupComplete(true, runtimeHealth, catalog)).toBe(true);
+  });
+
+  it("does not trust managed runtime readiness when Parakeet CLI is missing", () => {
+    const runtimeHealth = createRuntimeHealthFixture();
+    runtimeHealth.managed_runtime.ready = true;
+    runtimeHealth.managed_runtime.parakeet_cli = {
+      resolved_path: "/tmp/parakeet-cli",
+      available: false,
+      failure_reason: "missing_file",
+      failure_message: "Managed runtime binary is missing.",
+    };
+    runtimeHealth.parakeet_cli_available = false;
+
+    expect(isRuntimeToolchainReady(runtimeHealth)).toBe(false);
+    expect(getRuntimeToolchainFailureMessage(runtimeHealth)).toBe(
+      "Managed runtime binary is missing.",
+    );
+    expect(
+      isInitialSetupComplete(true, runtimeHealth, createModelCatalogFixture()),
+    ).toBe(false);
   });
 
   it("allows warm start only for trusted completed setup reports", () => {
