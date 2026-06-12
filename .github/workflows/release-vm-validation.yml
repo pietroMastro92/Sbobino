@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       machine_class:
-        description: Self-hosted validation machine class
+        description: Validation machine class
         required: true
         default: AS-THIRD
         type: choice
@@ -23,10 +23,11 @@ permissions:
 jobs:
   as-third:
     if: ${{ inputs.machine_class == 'AS-THIRD' }}
-    runs-on: [self-hosted, macOS, ARM64, apple-silicon, as-third]
+    runs-on: macos-14
     env:
       GH_TOKEN: ${{ github.token }}
       TAG_NAME: v${{ inputs.version }}
+      SBOBINO_VALIDATION_RUNNER_LABEL: github-hosted,macos-14,as-third
       SBOBINO_RUNNER_MIN_FREE_GB: "8.0"
     steps:
       - name: Checkout release tag
@@ -63,9 +64,11 @@ jobs:
         working-directory: sbobino_desktop
         run: ./scripts/clean_release_validation_state.sh AS-THIRD
 
-      - name: Validate runner preflight
+      - name: Prepare hosted AS-THIRD fixture audio
         working-directory: sbobino_desktop
-        run: ./scripts/preflight_self_hosted_runner.sh AS-THIRD "$GITHUB_REPOSITORY"
+        run: |
+          ./scripts/setup_parakeet_fixtures.sh
+          echo "SBOBINO_VALIDATION_FIXTURE_AUDIO=$HOME/Library/Application Support/com.sbobino.desktop/parakeet-fixtures/tests/fixtures/speech.wav" >> "$GITHUB_ENV"
 
       - name: Run AS-THIRD clean-room validation
         working-directory: sbobino_desktop
