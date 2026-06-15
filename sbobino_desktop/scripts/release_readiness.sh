@@ -546,7 +546,7 @@ npm test
 popd >/dev/null
 
 pushd "$ROOT_DIR" >/dev/null
-cargo test --workspace
+RUST_TEST_THREADS=1 cargo test --workspace
 popd >/dev/null
 
 if [[ -n "$APP_PATH" ]]; then

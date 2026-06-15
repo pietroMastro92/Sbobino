@@ -15,6 +15,7 @@ use cpal::{
 use libloading::Library;
 
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
+use sbobino_domain::TimedSegment;
 
 type ParakeetCtx = std::ffi::c_void;
 type ParakeetStream = std::ffi::c_void;
@@ -49,6 +50,7 @@ struct ParakeetRealtimeState {
     shutdown_tx: Option<mpsc::Sender<()>>,
     worker: Option<JoinHandle<()>>,
     transcript: Arc<Mutex<String>>,
+    segments: Arc<Mutex<Vec<TimedSegment>>>,
     diagnostics: Arc<Mutex<Vec<String>>>,
     saved_audio_path: Option<PathBuf>,
 }
@@ -56,6 +58,7 @@ struct ParakeetRealtimeState {
 #[derive(Debug, Clone)]
 pub struct ParakeetRealtimeStopResult {
     pub transcript: String,
+    pub segments: Vec<TimedSegment>,
     pub saved_audio_path: Option<PathBuf>,
 }
 
@@ -102,6 +105,7 @@ impl ParakeetRealtimeEngine {
         let session_dir = create_session_dir()?;
         let saved_audio_path = session_dir.join("parakeet-live.wav");
         let transcript = Arc::new(Mutex::new(String::new()));
+        let segments = Arc::new(Mutex::new(Vec::new()));
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
         let paused = Arc::new(AtomicBool::new(false));
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -109,6 +113,7 @@ impl ParakeetRealtimeEngine {
         let model_for_thread = model_path.clone();
         let audio_for_thread = saved_audio_path.clone();
         let transcript_for_thread = transcript.clone();
+        let segments_for_thread = segments.clone();
         let diagnostics_for_thread = diagnostics.clone();
         let paused_for_thread = paused.clone();
 
@@ -121,6 +126,7 @@ impl ParakeetRealtimeEngine {
                 startup_tx.clone(),
                 paused_for_thread,
                 transcript_for_thread,
+                segments_for_thread,
                 diagnostics_for_thread,
                 emit_delta,
             );
@@ -136,6 +142,7 @@ impl ParakeetRealtimeEngine {
                 state.shutdown_tx = Some(shutdown_tx);
                 state.worker = Some(worker);
                 state.transcript = transcript;
+                state.segments = segments;
                 state.diagnostics = diagnostics;
                 state.saved_audio_path = Some(saved_audio_path);
                 Ok(())
@@ -202,8 +209,16 @@ impl ParakeetRealtimeEngine {
             })?
             .trim()
             .to_string();
+        let segments = state
+            .segments
+            .lock()
+            .map_err(|_| {
+                ApplicationError::SpeechToText("Parakeet segment lock poisoned".to_string())
+            })?
+            .clone();
         Ok(ParakeetRealtimeStopResult {
             transcript,
+            segments,
             saved_audio_path: state.saved_audio_path.clone(),
         })
     }
@@ -228,6 +243,9 @@ impl ParakeetRealtimeEngine {
             if let Ok(mut transcript) = state.transcript.lock() {
                 *transcript = text.trim().to_string();
             }
+            if let Ok(mut segments) = state.segments.lock() {
+                segments.clear();
+            }
         }
     }
 
@@ -235,6 +253,9 @@ impl ParakeetRealtimeEngine {
         if let Ok(state) = self.state.lock() {
             if let Ok(mut transcript) = state.transcript.lock() {
                 transcript.clear();
+            }
+            if let Ok(mut segments) = state.segments.lock() {
+                segments.clear();
             }
             if let Ok(mut diagnostics) = state.diagnostics.lock() {
                 diagnostics.clear();
@@ -350,6 +371,7 @@ fn run_parakeet_capture(
     startup_tx: mpsc::Sender<Result<(), ApplicationError>>,
     paused: Arc<AtomicBool>,
     transcript: Arc<Mutex<String>>,
+    segments: Arc<Mutex<Vec<TimedSegment>>>,
     diagnostics: Arc<Mutex<Vec<String>>>,
     emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
 ) -> Result<(), ApplicationError> {
@@ -388,6 +410,7 @@ fn run_parakeet_capture(
         startup_tx,
         paused,
         transcript,
+        segments,
         diagnostics,
         emit_delta,
     );
@@ -409,6 +432,7 @@ fn run_capture_loop(
     startup_tx: mpsc::Sender<Result<(), ApplicationError>>,
     paused: Arc<AtomicBool>,
     transcript: Arc<Mutex<String>>,
+    segments: Arc<Mutex<Vec<TimedSegment>>>,
     diagnostics: Arc<Mutex<Vec<String>>>,
     emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
 ) -> Result<(), ApplicationError> {
@@ -456,6 +480,8 @@ fn run_capture_loop(
     })?;
 
     let mut resampler = LinearResampler::new(sample_rate, 16_000);
+    let mut processed_samples: u64 = 0;
+    let mut assembler = ParakeetLiveAssembler::new(transcript, segments, emit_delta);
     let _stream_guard = input_stream;
     let _ = startup_tx.send(Ok(()));
 
@@ -485,6 +511,8 @@ fn run_capture_loop(
         if pcm_16k.is_empty() {
             continue;
         }
+        processed_samples = processed_samples.saturating_add(pcm_16k.len() as u64);
+        let current_seconds = processed_samples as f32 / 16_000.0;
         write_pcm_i16(&mut writer, &pcm_16k)?;
 
         let mut eou = 0;
@@ -502,14 +530,16 @@ fn run_capture_loop(
                 last_error(api, ctx)
             ))
         })?;
-        emit_parakeet_delta(&transcript, &emit_delta, &delta);
+        assembler.push_delta(&delta, current_seconds);
         if eou != 0 {
-            emit_parakeet_delta(&transcript, &emit_delta, "\n");
+            assembler.finish_segment(current_seconds);
         }
     }
 
     let tail = resampler.finish();
     if !tail.is_empty() {
+        processed_samples = processed_samples.saturating_add(tail.len() as u64);
+        let current_seconds = processed_samples as f32 / 16_000.0;
         write_pcm_i16(&mut writer, &tail)?;
         let mut eou = 0;
         let ptr = unsafe {
@@ -526,7 +556,7 @@ fn run_capture_loop(
                 last_error(api, ctx)
             ))
         })?;
-        emit_parakeet_delta(&transcript, &emit_delta, &delta);
+        assembler.push_delta(&delta, current_seconds);
     }
 
     let ptr = unsafe { (api.stream_finalize)(stream) };
@@ -536,7 +566,9 @@ fn run_capture_loop(
             last_error(api, ctx)
         ))
     })?;
-    emit_parakeet_delta(&transcript, &emit_delta, &delta);
+    let final_seconds = processed_samples as f32 / 16_000.0;
+    assembler.push_delta(&delta, final_seconds);
+    assembler.finish_segment(final_seconds);
     writer.finalize().map_err(|error| {
         ApplicationError::SpeechToText(format!(
             "failed to finalize Parakeet live WAV at {}: {error}",
@@ -544,6 +576,132 @@ fn run_capture_loop(
         ))
     })?;
     Ok(())
+}
+
+struct ParakeetLiveAssembler {
+    transcript: Arc<Mutex<String>>,
+    segments: Arc<Mutex<Vec<TimedSegment>>>,
+    emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
+    current_text: String,
+    current_start_seconds: Option<f32>,
+    current_end_seconds: Option<f32>,
+    last_segment_end_seconds: f32,
+}
+
+impl ParakeetLiveAssembler {
+    fn new(
+        transcript: Arc<Mutex<String>>,
+        segments: Arc<Mutex<Vec<TimedSegment>>>,
+        emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
+    ) -> Self {
+        Self {
+            transcript,
+            segments,
+            emit_delta,
+            current_text: String::new(),
+            current_start_seconds: None,
+            current_end_seconds: None,
+            last_segment_end_seconds: 0.0,
+        }
+    }
+
+    fn push_delta(&mut self, delta: &str, current_seconds: f32) {
+        let display = normalize_parakeet_live_delta(delta);
+        let display_text = display.trim();
+        if display_text.is_empty() {
+            return;
+        }
+
+        if self.current_start_seconds.is_none() {
+            self.current_start_seconds = Some(self.last_segment_end_seconds.min(current_seconds));
+        }
+        self.current_end_seconds = Some(current_seconds.max(self.last_segment_end_seconds));
+        let starts_new_word = display.chars().next().is_some_and(char::is_whitespace);
+        if starts_new_word
+            && !self.current_text.is_empty()
+            && !self
+                .current_text
+                .chars()
+                .last()
+                .is_some_and(char::is_whitespace)
+        {
+            self.current_text.push(' ');
+        }
+        self.current_text.push_str(display_text);
+
+        (self.emit_delta)(RealtimeDelta {
+            kind: RealtimeDeltaKind::UpdatePreview,
+            text: self.current_text.clone(),
+            start_seconds: self.current_start_seconds,
+            end_seconds: self.current_end_seconds,
+        });
+    }
+
+    fn finish_segment(&mut self, current_seconds: f32) {
+        let text = self.current_text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+
+        let start_seconds = self
+            .current_start_seconds
+            .filter(|value| value.is_finite())
+            .unwrap_or(self.last_segment_end_seconds.min(current_seconds));
+        let end_seconds = self
+            .current_end_seconds
+            .filter(|value| value.is_finite())
+            .unwrap_or(current_seconds)
+            .max(start_seconds);
+
+        let segment = TimedSegment {
+            text: text.clone(),
+            start_seconds: Some(start_seconds),
+            end_seconds: Some(end_seconds),
+            speaker_id: None,
+            speaker_label: None,
+            words: Vec::new(),
+        };
+
+        if let Ok(mut transcript) = self.transcript.lock() {
+            if !transcript.trim().is_empty() && !transcript.ends_with('\n') {
+                transcript.push('\n');
+            }
+            transcript.push_str(&text);
+        }
+        if let Ok(mut segments) = self.segments.lock() {
+            segments.push(segment);
+        }
+
+        (self.emit_delta)(RealtimeDelta {
+            kind: RealtimeDeltaKind::AppendFinal,
+            text,
+            start_seconds: Some(start_seconds),
+            end_seconds: Some(end_seconds),
+        });
+
+        self.current_text.clear();
+        self.current_start_seconds = None;
+        self.current_end_seconds = None;
+        self.last_segment_end_seconds = end_seconds;
+    }
+}
+
+fn normalize_parakeet_live_delta(delta: &str) -> String {
+    let starts_new_word = delta.chars().next().is_some_and(char::is_whitespace);
+    let text = delta
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return String::new();
+    }
+    if starts_new_word {
+        format!(" {text}")
+    } else {
+        text
+    }
 }
 
 fn build_input_stream(
@@ -621,35 +779,6 @@ fn write_pcm_i16(
     Ok(())
 }
 
-fn emit_parakeet_delta(
-    transcript: &Arc<Mutex<String>>,
-    emit_delta: &Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
-    delta: &str,
-) {
-    if delta.is_empty() {
-        return;
-    }
-    let display = delta.trim();
-    if let Ok(mut text) = transcript.lock() {
-        if delta == "\n" {
-            if !text.ends_with('\n') {
-                text.push('\n');
-            }
-        } else {
-            if !text.is_empty() && !text.ends_with([' ', '\n']) {
-                text.push(' ');
-            }
-            text.push_str(display);
-        }
-    }
-    if !display.is_empty() {
-        emit_delta(RealtimeDelta {
-            kind: RealtimeDeltaKind::AppendFinal,
-            text: display.to_string(),
-        });
-    }
-}
-
 struct LinearResampler {
     input_rate: u32,
     output_rate: u32,
@@ -689,7 +818,7 @@ impl LinearResampler {
             self.position += step;
         }
 
-        let drop_count = self.position.floor() as usize;
+        let drop_count = (self.position.floor() as usize).min(self.carry.len().saturating_sub(1));
         if drop_count > 0 {
             self.carry.drain(0..drop_count);
             self.position -= drop_count as f64;
@@ -702,6 +831,240 @@ impl LinearResampler {
             self.push(&[last])
         } else {
             Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_assembler_emits_preview_then_final_segment() {
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let segments = Arc::new(Mutex::new(Vec::new()));
+        let emitted: Arc<Mutex<Vec<RealtimeDelta>>> = Arc::new(Mutex::new(Vec::new()));
+        let emitted_ref = emitted.clone();
+        let mut assembler = ParakeetLiveAssembler::new(
+            transcript.clone(),
+            segments.clone(),
+            Arc::new(move |delta| {
+                emitted_ref
+                    .lock()
+                    .expect("emitted lock poisoned")
+                    .push(delta);
+            }),
+        );
+
+        assembler.push_delta("ciao", 0.4);
+        assembler.push_delta(" mondo", 1.2);
+        assembler.finish_segment(1.4);
+
+        assert_eq!(
+            transcript
+                .lock()
+                .expect("transcript lock poisoned")
+                .as_str(),
+            "ciao mondo"
+        );
+        let segments = segments.lock().expect("segments lock poisoned");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].text, "ciao mondo");
+        assert_eq!(segments[0].start_seconds, Some(0.0));
+        assert_eq!(segments[0].end_seconds, Some(1.2));
+
+        let emitted = emitted.lock().expect("emitted lock poisoned");
+        assert_eq!(emitted.len(), 3);
+        assert!(matches!(emitted[0].kind, RealtimeDeltaKind::UpdatePreview));
+        assert_eq!(emitted[0].text, "ciao");
+        assert!(matches!(emitted[1].kind, RealtimeDeltaKind::UpdatePreview));
+        assert_eq!(emitted[1].text, "ciao mondo");
+        assert!(matches!(emitted[2].kind, RealtimeDeltaKind::AppendFinal));
+        assert_eq!(emitted[2].text, "ciao mondo");
+    }
+
+    #[test]
+    fn live_assembler_joins_parakeet_subword_deltas_without_spaces() {
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let segments = Arc::new(Mutex::new(Vec::new()));
+        let emitted: Arc<Mutex<Vec<RealtimeDelta>>> = Arc::new(Mutex::new(Vec::new()));
+        let emitted_ref = emitted.clone();
+        let mut assembler = ParakeetLiveAssembler::new(
+            transcript.clone(),
+            segments,
+            Arc::new(move |delta| {
+                emitted_ref
+                    .lock()
+                    .expect("emitted lock poisoned")
+                    .push(delta);
+            }),
+        );
+
+        assembler.push_delta("the cl", 0.4);
+        assembler.push_delta("osest point", 0.8);
+        assembler.push_delta(" of", 1.2);
+        assembler.finish_segment(1.4);
+
+        assert_eq!(
+            transcript
+                .lock()
+                .expect("transcript lock poisoned")
+                .as_str(),
+            "the closest point of"
+        );
+        assert_eq!(
+            emitted
+                .lock()
+                .expect("emitted lock poisoned")
+                .last()
+                .map(|delta| delta.text.as_str()),
+            Some("the closest point of")
+        );
+    }
+
+    #[test]
+    fn live_assembler_ignores_empty_finalize() {
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let segments = Arc::new(Mutex::new(Vec::new()));
+        let emitted: Arc<Mutex<Vec<RealtimeDelta>>> = Arc::new(Mutex::new(Vec::new()));
+        let emitted_ref = emitted.clone();
+        let mut assembler = ParakeetLiveAssembler::new(
+            transcript,
+            segments.clone(),
+            Arc::new(move |delta| {
+                emitted_ref
+                    .lock()
+                    .expect("emitted lock poisoned")
+                    .push(delta);
+            }),
+        );
+
+        assembler.finish_segment(2.0);
+
+        assert!(segments.lock().expect("segments lock poisoned").is_empty());
+        assert!(emitted.lock().expect("emitted lock poisoned").is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires real libparakeet.dylib, realtime GGUF model, and spoken WAV env vars"]
+    fn parakeet_realtime_c_api_streams_real_wav() {
+        let lib_path = std::env::var("SBOBINO_PARAKEET_LIB")
+            .expect("SBOBINO_PARAKEET_LIB must point to libparakeet.dylib");
+        let models_dir = std::env::var("SBOBINO_PARAKEET_MODELS_DIR")
+            .expect("SBOBINO_PARAKEET_MODELS_DIR must point to Parakeet models");
+        let model = std::env::var("SBOBINO_PARAKEET_REALTIME_MODEL")
+            .unwrap_or_else(|_| "realtime_eou_120m-v1-f16.gguf".to_string());
+        let audio_path = std::env::var("SBOBINO_PARAKEET_AUDIO")
+            .expect("SBOBINO_PARAKEET_AUDIO must point to a spoken WAV");
+
+        let engine =
+            ParakeetRealtimeEngine::new(PathBuf::from(lib_path), PathBuf::from(models_dir));
+        let api = engine.load_api().expect("libparakeet should load");
+        let model_path = engine.models_dir.join(model);
+        let model_c = CString::new(model_path.to_string_lossy().as_bytes())
+            .expect("model path should not contain NUL");
+        let ctx = unsafe { (api.load)(model_c.as_ptr()) };
+        assert!(!ctx.is_null(), "Parakeet realtime model should load");
+        let stream = unsafe { (api.stream_begin)(ctx) };
+        assert!(
+            !stream.is_null(),
+            "Parakeet realtime stream should begin: {}",
+            last_error(&api, ctx)
+        );
+
+        let samples = read_test_wav_as_16k_mono(Path::new(&audio_path), 24.0);
+        assert!(!samples.is_empty(), "test WAV should produce samples");
+        let mut combined = String::new();
+        let mut saw_eou = false;
+        for chunk in samples.chunks(16_000) {
+            let mut eou = 0;
+            let ptr = unsafe {
+                (api.stream_feed)(stream, chunk.as_ptr(), chunk.len() as c_int, &mut eou)
+            };
+            if let Some(delta) = take_c_string(&api, ptr) {
+                let display = normalize_parakeet_live_delta(&delta);
+                if !display.trim().is_empty() {
+                    println!("parakeet_realtime_delta={}", display.trim());
+                    combined = ParakeetLiveAssembler::join_for_test(&combined, &display);
+                }
+            }
+            saw_eou |= eou != 0;
+        }
+        let ptr = unsafe { (api.stream_finalize)(stream) };
+        if let Some(delta) = take_c_string(&api, ptr) {
+            let display = normalize_parakeet_live_delta(&delta);
+            if !display.trim().is_empty() {
+                println!("parakeet_realtime_final={}", display.trim());
+                combined = ParakeetLiveAssembler::join_for_test(&combined, &display);
+            }
+        }
+        unsafe {
+            (api.stream_free)(stream);
+            (api.free)(ctx);
+        }
+
+        assert!(
+            !combined.trim().is_empty(),
+            "Parakeet realtime C API produced no transcript"
+        );
+        println!("parakeet_realtime_text={combined}");
+        println!("parakeet_realtime_saw_eou={saw_eou}");
+    }
+
+    fn read_test_wav_as_16k_mono(path: &Path, max_seconds: f32) -> Vec<f32> {
+        let mut reader = hound::WavReader::open(path).expect("failed to open test WAV");
+        let spec = reader.spec();
+        let channels = usize::from(spec.channels.max(1));
+        let max_samples = (spec.sample_rate as f32 * max_seconds) as usize * channels;
+        let mono = match spec.sample_format {
+            hound::SampleFormat::Float => {
+                let samples = reader
+                    .samples::<f32>()
+                    .take(max_samples)
+                    .map(|sample| sample.expect("failed to read float sample"))
+                    .collect::<Vec<_>>();
+                mix_to_mono(&samples, channels)
+            }
+            hound::SampleFormat::Int if spec.bits_per_sample <= 16 => {
+                let samples = reader
+                    .samples::<i16>()
+                    .take(max_samples)
+                    .map(|sample| {
+                        sample.expect("failed to read i16 sample") as f32 / i16::MAX as f32
+                    })
+                    .collect::<Vec<_>>();
+                mix_to_mono(&samples, channels)
+            }
+            hound::SampleFormat::Int => {
+                let scale = ((1_i64 << (spec.bits_per_sample.saturating_sub(1))) - 1) as f32;
+                let samples = reader
+                    .samples::<i32>()
+                    .take(max_samples)
+                    .map(|sample| sample.expect("failed to read i32 sample") as f32 / scale)
+                    .collect::<Vec<_>>();
+                mix_to_mono(&samples, channels)
+            }
+        };
+        let mut resampler = LinearResampler::new(spec.sample_rate, 16_000);
+        let mut output = resampler.push(&mono);
+        output.extend(resampler.finish());
+        output
+    }
+
+    impl ParakeetLiveAssembler {
+        fn join_for_test(left: &str, right: &str) -> String {
+            let left = left.trim();
+            let starts_new_word = right.chars().next().is_some_and(char::is_whitespace);
+            let right = right.trim();
+            if left.is_empty() {
+                right.to_string()
+            } else if right.is_empty() || left.contains(right) {
+                left.to_string()
+            } else if starts_new_word {
+                format!("{left} {right}")
+            } else {
+                format!("{left}{right}")
+            }
         }
     }
 }

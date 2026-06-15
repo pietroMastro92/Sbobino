@@ -66,19 +66,24 @@ describe("useAppStore", () => {
     expect(useAppStore.getState().artifacts.map((item) => item.id)).toEqual(["a1"]);
   });
 
-  it("deduplicates a trim artifact when the same id is prepended twice", () => {
+  it("keeps a prepended trim artifact next to its parent and deduplicates it", () => {
     const store = useAppStore.getState();
     const parent = artifact("parent-1", "parent");
+    const unrelated = artifact("other-1", "other");
     const trim = {
       ...artifact("trim-1", "parent - Trim 03:14-06:38"),
       metadata: { parent_id: parent.id },
     };
 
-    store.setArtifacts([parent]);
+    store.setArtifacts([unrelated, parent]);
     store.prependArtifact(trim);
     store.prependArtifact({ ...trim, updated_at: "2026-01-01T00:01:00Z" });
 
-    expect(useAppStore.getState().artifacts.map((item) => item.id)).toEqual(["trim-1", "parent-1"]);
+    expect(useAppStore.getState().artifacts.map((item) => item.id)).toEqual([
+      "other-1",
+      "parent-1",
+      "trim-1",
+    ]);
     expect(useAppStore.getState().artifacts.filter((item) => item.id === "trim-1")).toHaveLength(1);
   });
 

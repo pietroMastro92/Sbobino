@@ -270,6 +270,8 @@ impl WhisperStreamEngine {
                         emit_delta(RealtimeDelta {
                             kind: RealtimeDeltaKind::UpdatePreview,
                             text: cleaned,
+                            start_seconds: None,
+                            end_seconds: None,
                         });
                         return;
                     }
@@ -278,6 +280,8 @@ impl WhisperStreamEngine {
                         emit_delta(RealtimeDelta {
                             kind,
                             text: cleaned,
+                            start_seconds: None,
+                            end_seconds: None,
                         });
                     }
                 };

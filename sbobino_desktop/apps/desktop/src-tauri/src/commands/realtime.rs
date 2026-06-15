@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RealtimeDelta};
 use sbobino_domain::{
-    ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel,
-    TranscriptArtifact, TranscriptionEngine,
+    ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel, TimedSegment,
+    TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
 };
 
 use crate::parakeet_realtime::{ParakeetRealtimeEngine, ParakeetRealtimeStopResult};
@@ -82,24 +82,32 @@ fn resolve_parakeet_live_engine(state: &AppState) -> Result<ParakeetRealtimeEngi
 fn select_parakeet_live_model(
     models_dir: &std::path::Path,
     requested: ParakeetModel,
-) -> ParakeetModel {
+) -> Result<ParakeetModel, CommandError> {
+    let realtime_candidates = [
+        ParakeetModel::RealtimeEou120mV1F16,
+        ParakeetModel::RealtimeEou120mV1Q8,
+    ];
     if matches!(
         requested,
         ParakeetModel::RealtimeEou120mV1F16 | ParakeetModel::RealtimeEou120mV1Q8
     ) {
-        return requested;
-    }
-
-    for candidate in [
-        ParakeetModel::RealtimeEou120mV1F16,
-        ParakeetModel::RealtimeEou120mV1Q8,
-    ] {
-        if models_dir.join(candidate.gguf_filename()).exists() {
-            return candidate;
+        if models_dir.join(requested.gguf_filename()).exists() {
+            return Ok(requested);
         }
     }
 
-    requested
+    for candidate in realtime_candidates {
+        if models_dir.join(candidate.gguf_filename()).exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(CommandError::from(ApplicationError::SpeechToText(format!(
+        "Parakeet live requires {} or {} in {}. Install the realtime EOU model from Settings > Local Models.",
+        ParakeetModel::RealtimeEou120mV1F16.gguf_filename(),
+        ParakeetModel::RealtimeEou120mV1Q8.gguf_filename(),
+        models_dir.display()
+    ))))
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +141,7 @@ pub struct StopRealtimeResponse {
 
 struct RealtimeStopResult {
     transcript: String,
+    segments: Vec<TimedSegment>,
     saved_audio_path: Option<std::path::PathBuf>,
 }
 
@@ -257,7 +266,7 @@ pub async fn start_realtime(
                 .parakeet_model
                 .unwrap_or(settings.transcription.parakeet_model);
             let live_model =
-                select_parakeet_live_model(std::path::Path::new(&models_dir), requested_model);
+                select_parakeet_live_model(std::path::Path::new(&models_dir), requested_model)?;
             if let Some(id) = &payload.resume_artifact_id {
                 if let Some(artifact) = state
                     .artifact_service
@@ -415,6 +424,7 @@ pub async fn stop_realtime(
             stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
             RealtimeStopResult {
                 transcript: result.transcript,
+                segments: Vec::new(),
                 saved_audio_path: result.saved_audio_path,
             }
         }
@@ -430,6 +440,7 @@ pub async fn stop_realtime(
                 engine.stop().await.map_err(CommandError::from)?;
             RealtimeStopResult {
                 transcript: result.transcript,
+                segments: result.segments,
                 saved_audio_path: result.saved_audio_path,
             }
         }
@@ -497,6 +508,16 @@ pub async fn stop_realtime(
             "false".to_string()
         },
     );
+    if !stop_result.segments.is_empty() {
+        metadata.insert(
+            "timeline_v2".to_string(),
+            TranscriptionOutput {
+                text: stop_result.transcript.clone(),
+                segments: stop_result.segments.clone(),
+            }
+            .timeline_v2_metadata_json(),
+        );
+    }
 
     let source_label = stop_result
         .saved_audio_path
@@ -527,6 +548,7 @@ pub async fn stop_realtime(
         TranscriptionEngine::WhisperCpp => "whisper_stream".to_string(),
         TranscriptionEngine::ParakeetCpp => "parakeet_cpp".to_string(),
     });
+    artifact.processing_model = Some(model_filename.clone());
     artifact.processing_language = Some(state.realtime.language_code.lock().await.clone());
     if let Some(path) = stop_result.saved_audio_path.as_ref() {
         artifact.set_source_external_path(path.to_string_lossy().to_string());
@@ -580,4 +602,44 @@ pub async fn load_realtime_session(
     }
 
     Ok(artifact)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parakeet_live_uses_installed_realtime_model_when_tdt_is_selected() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            temp.path()
+                .join(ParakeetModel::RealtimeEou120mV1Q8.gguf_filename()),
+            b"model",
+        )
+        .expect("write realtime model");
+
+        let selected =
+            select_parakeet_live_model(temp.path(), ParakeetModel::Tdt06bV3Q4).expect("selected");
+
+        assert_eq!(selected, ParakeetModel::RealtimeEou120mV1Q8);
+    }
+
+    #[test]
+    fn parakeet_live_fails_closed_without_realtime_model() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            temp.path().join(ParakeetModel::Tdt06bV3Q4.gguf_filename()),
+            b"model",
+        )
+        .expect("write tdt model");
+
+        let error = select_parakeet_live_model(temp.path(), ParakeetModel::Tdt06bV3Q4)
+            .expect_err("tdt-only live should fail");
+
+        assert!(
+            error.message.contains("Parakeet live requires"),
+            "{:?}",
+            error
+        );
+    }
 }

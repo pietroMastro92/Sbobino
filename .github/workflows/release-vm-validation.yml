@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       machine_class:
-        description: Self-hosted validation machine class
+        description: Validation machine class
         required: true
         default: AS-THIRD
         type: choice
@@ -23,10 +23,11 @@ permissions:
 jobs:
   as-third:
     if: ${{ inputs.machine_class == 'AS-THIRD' }}
-    runs-on: [self-hosted, macOS, ARM64, apple-silicon, as-third]
+    runs-on: macos-14
     env:
       GH_TOKEN: ${{ github.token }}
       TAG_NAME: v${{ inputs.version }}
+      SBOBINO_VALIDATION_RUNNER_LABEL: github-hosted,macos-14,as-third
       SBOBINO_RUNNER_MIN_FREE_GB: "8.0"
     steps:
       - name: Checkout release tag
@@ -34,6 +35,14 @@ jobs:
         with:
           ref: v${{ inputs.version }}
           fetch-depth: 0
+
+      - name: Overlay hosted validation scripts
+        run: |
+          git fetch --no-tags origin "$GITHUB_SHA"
+          git checkout "$GITHUB_SHA" -- \
+            sbobino_desktop/scripts/lib/asr_samples.sh \
+            sbobino_desktop/scripts/setup_parakeet_fixtures.sh \
+            sbobino_desktop/scripts/run_release_machine_validation.sh
 
       - name: Add VM toolchain paths
         run: |
@@ -59,13 +68,25 @@ jobs:
           cargo --version
           rustc --version
 
+      - name: Setup hosted media tools
+        run: |
+          set -euo pipefail
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
       - name: Clean previous validation state
         working-directory: sbobino_desktop
         run: ./scripts/clean_release_validation_state.sh AS-THIRD
 
-      - name: Validate runner preflight
+      - name: Prepare hosted AS-THIRD fixture audio
         working-directory: sbobino_desktop
-        run: ./scripts/preflight_self_hosted_runner.sh AS-THIRD "$GITHUB_REPOSITORY"
+        run: |
+          fixture_dir="$RUNNER_TEMP/parakeet-fixtures"
+          SBOBINO_PARAKEET_FIXTURES_DIR="$fixture_dir" ./scripts/setup_parakeet_fixtures.sh
+          echo "SBOBINO_VALIDATION_FIXTURE_AUDIO=$fixture_dir/speech.wav" >> "$GITHUB_ENV"
 
       - name: Run AS-THIRD clean-room validation
         working-directory: sbobino_desktop

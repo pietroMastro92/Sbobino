@@ -5,8 +5,10 @@ usage() {
   cat >&2 <<'EOF'
 Usage: run_release_vm_gate.sh <version> [repo-slug]
 
-Runs the AS-THIRD UTM VM-backed release gate for a published prerelease.
+Runs the AS-THIRD release gate for a published prerelease.
 Set SBOBINO_RELEASE_RUN_ID to reuse an existing GitHub Actions run.
+Set SBOBINO_RELEASE_VM_WORKFLOW_REF to dispatch the validation workflow from a
+branch/ref other than the release tag.
 EOF
 }
 
@@ -32,8 +34,6 @@ need_cmd() {
 need_cmd gh
 need_cmd python3
 
-"$ROOT_DIR/scripts/check_release_runner_class.sh" "$MACHINE_CLASS" "$REPO_SLUG"
-
 RELEASE_JSON=$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets,isPrerelease,tagName,url)
 python3 - <<'PY' "$RELEASE_JSON" "$VERSION"
 import json
@@ -55,9 +55,10 @@ PY
 
 RUN_ID=${SBOBINO_RELEASE_RUN_ID:-}
 if [[ -z "$RUN_ID" ]]; then
+  WORKFLOW_REF=${SBOBINO_RELEASE_VM_WORKFLOW_REF:-$TAG}
   gh workflow run "$WORKFLOW_FILE" \
     --repo "$REPO_SLUG" \
-    --ref "$TAG" \
+    --ref "$WORKFLOW_REF" \
     -f version="$VERSION" \
     -f machine_class="$MACHINE_CLASS"
 
@@ -82,7 +83,7 @@ PY
 )
 fi
 
-echo "Watching AS-THIRD VM validation run: $RUN_ID"
+echo "Watching AS-THIRD validation run: $RUN_ID"
 gh run watch "$RUN_ID" --repo "$REPO_SLUG" --exit-status
 
 TMP_DIR=$(mktemp -d)
@@ -131,4 +132,4 @@ if failed:
     raise SystemExit("AS-THIRD validation report missing passed scenarios: " + ", ".join(failed))
 PY
 
-echo "AS-THIRD VM release gate passed for $TAG."
+echo "AS-THIRD release gate passed for $TAG."

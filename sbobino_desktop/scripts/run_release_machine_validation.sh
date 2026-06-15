@@ -115,6 +115,7 @@ write_report() {
     "$SCENARIO_BOOTSTRAP_LAYER_VALIDATION" \
     "$SCENARIO_ARM64_BINARY_EXECUTION"
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -185,6 +186,7 @@ definitions = {
 }
 
 definition = definitions[machine_class]
+runner_label = os.environ.get("SBOBINO_VALIDATION_RUNNER_LABEL") or definition["runner_label"]
 payload = {
     "schema_version": 1,
     "version": version,
@@ -196,7 +198,7 @@ payload = {
     "tester": tester,
     "os_name": os_name,
     "os_version": os_version,
-    "runner_label": definition["runner_label"],
+    "runner_label": runner_label,
     "tested_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "notes": notes,
     "required_scenarios": definition["required"],

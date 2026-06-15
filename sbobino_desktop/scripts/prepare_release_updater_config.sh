@@ -19,6 +19,8 @@ if [[ -z "$UPDATER_PUBKEY" ]]; then
   exit 1
 fi
 
+"$(dirname "$0")/check_updater_public_key.sh" "$TAURI_CONF_PATH" "$UPDATER_PUBKEY"
+
 python3 - "$TAURI_CONF_PATH" "$UPDATER_PUBKEY" <<'PY'
 import json
 import pathlib
