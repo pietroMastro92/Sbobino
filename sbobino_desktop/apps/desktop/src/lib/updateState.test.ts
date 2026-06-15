@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  deriveUpdateUiState,
   matchesPyannoteAutoActionMarker,
   readDismissedUpdateVersion,
   readLastPyannoteAutoActionMarker,
@@ -129,6 +130,7 @@ describe("updateState", () => {
       statusMessage: "Downloading update...",
       checking: false,
       installing: true,
+      installPhase: "downloading",
       downloadPercent: 42,
       syncedAt: 123,
     });
@@ -144,6 +146,7 @@ describe("updateState", () => {
       statusMessage: "Downloading update...",
       checking: false,
       installing: true,
+      installPhase: "downloading",
       downloadPercent: 42,
       syncedAt: 123,
     });
@@ -215,5 +218,76 @@ describe("updateState", () => {
         "0.1.17",
       ),
     ).toBe(true);
+  });
+
+  it("derives determinate update download progress when the native updater reports a size", () => {
+    expect(
+      deriveUpdateUiState({
+        updateInfo: {
+          has_update: true,
+          current_version: "0.1.16",
+          latest_version: "0.1.17",
+          download_url: null,
+        },
+        checking: false,
+        installing: true,
+        installPhase: "downloading",
+        downloadPercent: 42.4,
+        hasNativeUpdate: true,
+      }),
+    ).toEqual({
+      phase: "downloading",
+      showProgress: true,
+      progressKind: "determinate",
+      progressPercent: 42,
+      canInstall: false,
+    });
+  });
+
+  it("keeps update progress indeterminate when the download size is unknown", () => {
+    expect(
+      deriveUpdateUiState({
+        updateInfo: {
+          has_update: true,
+          current_version: "0.1.16",
+          latest_version: "0.1.17",
+          download_url: null,
+        },
+        checking: false,
+        installing: true,
+        installPhase: "downloading",
+        downloadPercent: null,
+        hasNativeUpdate: true,
+      }),
+    ).toMatchObject({
+      phase: "downloading",
+      showProgress: true,
+      progressKind: "indeterminate",
+      progressPercent: null,
+      canInstall: false,
+    });
+  });
+
+  it("keeps failed native updates actionable for retry", () => {
+    expect(
+      deriveUpdateUiState({
+        updateInfo: {
+          has_update: true,
+          current_version: "0.1.16",
+          latest_version: "0.1.17",
+          download_url: null,
+        },
+        checking: false,
+        installing: false,
+        installPhase: "failed",
+        downloadPercent: null,
+        hasNativeUpdate: true,
+      }),
+    ).toMatchObject({
+      phase: "failed",
+      showProgress: false,
+      progressKind: "none",
+      canInstall: true,
+    });
   });
 });

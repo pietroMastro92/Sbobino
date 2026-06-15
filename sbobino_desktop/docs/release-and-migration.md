@@ -120,6 +120,8 @@
 
 - Stable GitHub releases are immutable for distribution purposes.
 - Do not replace stable assets in place to repair a bad public release.
+- Keep the latest two stable GitHub releases available: the current stable and the immediately previous stable. This gives users a public rollback target if the newest stable release is later found to be bad.
+- `./scripts/promote_candidate_release.sh` enforces this retention after promotion. Override only with `SBOBINO_STABLE_RELEASE_RETENTION=<count>` when there is a deliberate operational reason to keep more stable releases.
 - A release is considered distributable only if the full Apple Silicon matrix in [`distribution-validation-plan.md`](distribution-validation-plan.md) is green on the exact public assets.
 - Stable promotion is blocked unless the release contains `release-readiness-proof.json`, `distribution-readiness-proof.json`, `AS-PRIMARY.validation-report.json`, `AS-THIRD.validation-report.json`, and `INTEL-PRIMARY.validation-report.json`.
 - `AS-PRIMARY` and `AS-THIRD` must be marked `passed`; `INTEL-PRIMARY` may be `passed` or `soft_pass` when `arm64_binary_execution` is intentionally `not_applicable`.

@@ -528,3 +528,111 @@ exit 0
         stop_result.transcript
     );
 }
+
+#[tokio::test]
+async fn realtime_start_passes_auto_language_to_avoid_english_default() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-stream");
+    let models_dir = temp.path().join("models");
+    let args_path = temp.path().join("args.txt");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+
+    let script = r#"#!/bin/sh
+printf '%s\n' "$@" > "__ARGS_PATH__"
+printf 'auto language ok\n' 1>&2
+sleep 0.2
+exit 0
+"#
+    .replace("__ARGS_PATH__", &args_path.to_string_lossy());
+    write_executable_script(&script_path, &script);
+
+    let engine = WhisperStreamEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    engine
+        .start(
+            "ggml-base.bin",
+            "auto",
+            Arc::new(|_delta: RealtimeDelta| {}),
+        )
+        .await
+        .expect("realtime start should succeed");
+
+    for _ in 0..STREAM_SETTLE_ATTEMPTS {
+        if args_path.exists() {
+            break;
+        }
+        tokio::time::sleep(STREAM_SETTLE_DELAY).await;
+    }
+
+    let stop_result = engine.stop().await.expect("realtime stop should succeed");
+    assert!(
+        stop_result.transcript.contains("auto language ok"),
+        "expected fake realtime transcript, got: {}",
+        stop_result.transcript
+    );
+
+    let args = std::fs::read_to_string(&args_path).expect("expected captured args");
+    let args = args.lines().collect::<Vec<_>>();
+    assert!(
+        args.windows(2).any(|pair| matches!(pair, ["-l", "auto"])),
+        "expected whisper-stream to receive '-l auto', got: {args:?}"
+    );
+}
+
+#[tokio::test]
+async fn realtime_start_passes_selected_language() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-stream");
+    let models_dir = temp.path().join("models");
+    let args_path = temp.path().join("args.txt");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+
+    let script = r#"#!/bin/sh
+printf '%s\n' "$@" > "__ARGS_PATH__"
+printf 'italian language ok\n' 1>&2
+sleep 0.2
+exit 0
+"#
+    .replace("__ARGS_PATH__", &args_path.to_string_lossy());
+    write_executable_script(&script_path, &script);
+
+    let engine = WhisperStreamEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    engine
+        .start("ggml-base.bin", "it", Arc::new(|_delta: RealtimeDelta| {}))
+        .await
+        .expect("realtime start should succeed");
+
+    for _ in 0..STREAM_SETTLE_ATTEMPTS {
+        if args_path.exists() {
+            break;
+        }
+        tokio::time::sleep(STREAM_SETTLE_DELAY).await;
+    }
+
+    let stop_result = engine.stop().await.expect("realtime stop should succeed");
+    assert!(
+        stop_result.transcript.contains("italian language ok"),
+        "expected fake realtime transcript, got: {}",
+        stop_result.transcript
+    );
+
+    let args = std::fs::read_to_string(&args_path).expect("expected captured args");
+    let args = args.lines().collect::<Vec<_>>();
+    assert!(
+        args.windows(2).any(|pair| matches!(pair, ["-l", "it"])),
+        "expected whisper-stream to receive '-l it', got: {args:?}"
+    );
+}

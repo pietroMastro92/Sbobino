@@ -44,11 +44,12 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            sbobino_desktop -> target
+      - name: Verify Rust toolchain
+        run: |
+          command -v cargo
+          cargo --version
+          cargo metadata --no-deps --format-version 1 >/dev/null
+          rustc --version
 
       - name: Install frontend dependencies
         run: npm ci

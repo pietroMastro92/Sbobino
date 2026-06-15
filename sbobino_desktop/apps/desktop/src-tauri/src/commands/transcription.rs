@@ -16,6 +16,8 @@ use sbobino_domain::{
 use crate::{
     commands::automatic_import::{
         record_automatic_import_failure, record_automatic_import_success,
+        IMPORT_FOLDER_METADATA_KEY, IMPORT_PRESET_METADATA_KEY, IMPORT_SOURCE_LABEL_METADATA_KEY,
+        IMPORT_WORKSPACE_METADATA_KEY,
     },
     error::CommandError,
     state::{AppState, TranscriptionTask},
@@ -49,6 +51,21 @@ pub struct StartTranscriptionPayload {
 #[derive(Debug, Serialize)]
 pub struct StartTranscriptionResponse {
     pub job_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobProgressEvent {
+    #[serde(flatten)]
+    pub progress: JobProgress,
+    pub input_path: String,
+    pub title: Option<String>,
+    pub source_origin: ArtifactSourceOrigin,
+    pub source_label: Option<String>,
+    pub source_folder: Option<String>,
+    pub model: SpeechModel,
+    pub language: LanguageCode,
+    pub preset: Option<String>,
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,10 +134,45 @@ pub(crate) async fn spawn_transcription_job(
     let transcription_gate = state.transcription_gate.clone();
     let automatic_import_metadata = request.metadata.clone();
     let automatic_import_state = state.clone();
+    let progress_input_path = request.input_path.clone();
+    let progress_title = request.title.clone();
+    let progress_source_origin = request.source_origin.clone();
+    let progress_source_label = request
+        .metadata
+        .get(IMPORT_SOURCE_LABEL_METADATA_KEY)
+        .cloned();
+    let progress_source_folder = request.metadata.get(IMPORT_FOLDER_METADATA_KEY).cloned();
+    let progress_model = request.model.clone();
+    let progress_language = request.language.clone();
+    let progress_preset = request.metadata.get(IMPORT_PRESET_METADATA_KEY).cloned();
+    let progress_workspace_id = request.metadata.get(IMPORT_WORKSPACE_METADATA_KEY).cloned();
 
     tauri::async_runtime::spawn(async move {
+        let progress_input_path = progress_input_path.clone();
+        let progress_title = progress_title.clone();
+        let progress_source_origin = progress_source_origin.clone();
+        let progress_source_label = progress_source_label.clone();
+        let progress_source_folder = progress_source_folder.clone();
+        let progress_model = progress_model.clone();
+        let progress_language = progress_language.clone();
+        let progress_preset = progress_preset.clone();
+        let progress_workspace_id = progress_workspace_id.clone();
         let emit_progress = Arc::new(move |progress: JobProgress| {
-            let _ = app_handle.emit("transcription://progress", progress);
+            let _ = app_handle.emit(
+                "transcription://progress",
+                JobProgressEvent {
+                    progress,
+                    input_path: progress_input_path.clone(),
+                    title: progress_title.clone(),
+                    source_origin: progress_source_origin.clone(),
+                    source_label: progress_source_label.clone(),
+                    source_folder: progress_source_folder.clone(),
+                    model: progress_model.clone(),
+                    language: progress_language.clone(),
+                    preset: progress_preset.clone(),
+                    workspace_id: progress_workspace_id.clone(),
+                },
+            );
         });
         let delta_sequence = delta_sequence.clone();
         let emit_delta = Arc::new(move |text: String| {

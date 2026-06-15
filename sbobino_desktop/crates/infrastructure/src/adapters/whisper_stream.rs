@@ -369,7 +369,8 @@ impl WhisperStreamEngine {
             .stderr(std::process::Stdio::piped())
             .current_dir(&session_dir);
 
-        if language_code != "auto" {
+        let language_code = language_code.trim();
+        if !language_code.is_empty() {
             command.arg("-l").arg(language_code);
         }
 

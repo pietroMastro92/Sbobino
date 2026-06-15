@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+export LC_ALL=C
+
 asr_fail() {
   echo "error: $*" >&2
   exit 1
@@ -102,12 +104,14 @@ asr_audio_duration_seconds() {
   local audio=$1
   command -v ffprobe >/dev/null 2>&1 || asr_fail "missing required command: ffprobe"
   local duration
-  duration=$(ffprobe -v error \
+  duration=$(LC_ALL=C ffprobe -v error \
+
     -show_entries format=duration \
     -of default=noprint_wrappers=1:nokey=1 \
     "$audio" 2>/dev/null || true)
   [[ -n "$duration" ]] || asr_fail "unable to determine audio duration for $audio"
-  printf '%.3f\n' "$duration"
+  LC_ALL=C printf '%.3f\n' "$duration"
+
 }
 
 asr_print_source_report() {

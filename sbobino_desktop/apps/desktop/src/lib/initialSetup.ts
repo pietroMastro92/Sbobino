@@ -1,4 +1,5 @@
 import type {
+  ParakeetModel,
   ProvisioningModelCatalogEntry,
   PyannoteRuntimeHealth,
   RuntimeHealth,
@@ -9,6 +10,9 @@ export const INITIAL_SETUP_REQUIRED_MODELS: SpeechModel[] = [
   "base",
   "large_turbo",
 ];
+export const INITIAL_SETUP_REQUIRED_PARAKEET_MODELS: ParakeetModel[] = [
+  "tdt06b_v3_q4",
+];
 export const INITIAL_SETUP_REQUIRES_PYANNOTE = false;
 
 export type InitialSetupStepId =
@@ -16,6 +20,7 @@ export type InitialSetupStepId =
   | "speech-runtime"
   | "pyannote-runtime"
   | "whisper-models"
+  | "parakeet-models"
   | "final-validation";
 
 export type InitialSetupStepStatus =
@@ -69,7 +74,7 @@ export function isProvisionedModelReady(
 
 export function findProvisioningModelEntry(
   modelCatalog: ProvisioningModelCatalogEntry[],
-  model: SpeechModel,
+  model: SpeechModel | ParakeetModel,
 ): ProvisioningModelCatalogEntry | undefined {
   return modelCatalog.find((entry) => entry.key === model);
 }
@@ -77,14 +82,22 @@ export function findProvisioningModelEntry(
 export function getInitialSetupMissingModels(
   modelCatalog: ProvisioningModelCatalogEntry[],
   requireCoreml: boolean,
-): SpeechModel[] {
-  return INITIAL_SETUP_REQUIRED_MODELS.filter(
+): Array<SpeechModel | ParakeetModel> {
+  const missingWhisper = INITIAL_SETUP_REQUIRED_MODELS.filter(
     (model) =>
       !isProvisionedModelReady(
         findProvisioningModelEntry(modelCatalog, model),
         requireCoreml,
       ),
   );
+  const missingParakeet = INITIAL_SETUP_REQUIRED_PARAKEET_MODELS.filter(
+    (model) =>
+      !isProvisionedModelReady(
+        findProvisioningModelEntry(modelCatalog, model),
+        false,
+      ),
+  );
+  return [...missingWhisper, ...missingParakeet];
 }
 
 export function shouldRepairPyannoteRuntime(

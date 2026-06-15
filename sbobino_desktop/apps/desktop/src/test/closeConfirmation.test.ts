@@ -27,13 +27,14 @@ function extractFunction(source: string, name: string): string {
 }
 
 describe("close and cancel confirmations", () => {
-  it("intercepts main-window close and offers quit or minimize", () => {
+  it("intercepts main-window close and offers quit or keep-open", () => {
     expect(appSource).toContain(".onCloseRequested((event) =>");
     expect(appSource).toContain("event.preventDefault()");
     expect(appSource).toContain("appClose.quitButton");
-    expect(appSource).toContain("appClose.minimizeButton");
+    expect(appSource).toContain("appClose.keepOpenButton");
     expect(appSource).toContain("await exitProcess(0)");
-    expect(appSource).toContain("await appWindow.minimize()");
+    expect(appSource).toContain("await appWindow.hide()");
+    expect(appSource).not.toContain("await appWindow.minimize()");
   });
 
   it("allows the Tauri window commands used by the close dialog", () => {
@@ -41,8 +42,21 @@ describe("close and cancel confirmations", () => {
       permissions?: string[];
     };
 
-    expect(capability.permissions).toContain("core:window:allow-close");
-    expect(capability.permissions).toContain("core:window:allow-minimize");
+    expect(capability.permissions).toContain("core:window:allow-hide");
+    expect(capability.permissions).not.toContain("core:window:allow-close");
+    expect(capability.permissions).not.toContain("core:window:allow-minimize");
+  });
+
+  it("reopens the hidden main window from the macOS Dock icon", () => {
+    const libSource = fs.readFileSync(
+      path.resolve(currentDir, "../../src-tauri/src/lib.rs"),
+      "utf8",
+    );
+
+    expect(libSource).toContain("RunEvent::Reopen");
+    expect(libSource).toContain("show_main_window");
+    expect(libSource).toContain("main_window.show()");
+    expect(libSource).toContain("main_window.set_focus()");
   });
 
   it("asks before cancelling an active transcription", () => {

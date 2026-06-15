@@ -2418,8 +2418,8 @@ fn verify_managed_runtime_binary(candidate: &Path, lib_dir: &Path) -> ManagedRun
 
     let mut child = match command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(process) => process,
@@ -2437,7 +2437,34 @@ fn verify_managed_runtime_binary(candidate: &Path, lib_dir: &Path) -> ManagedRun
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let output = match child.wait_with_output() {
+                    Ok(output) => output,
+                    Err(error) => {
+                        return ManagedRuntimeBinaryHealth {
+                            resolved_path,
+                            available: false,
+                            failure_reason: "wait_failed".to_string(),
+                            failure_message: format!(
+                                "Managed runtime binary failed while collecting probe output: {error}"
+                            ),
+                        };
+                    }
+                };
+
                 if status.success() {
+                    return ManagedRuntimeBinaryHealth {
+                        resolved_path,
+                        available: true,
+                        failure_reason: String::new(),
+                        failure_message: String::new(),
+                    };
+                }
+
+                if managed_runtime_probe_accepts_nonzero_exit(
+                    candidate,
+                    &output.stdout,
+                    &output.stderr,
+                ) {
                     return ManagedRuntimeBinaryHealth {
                         resolved_path,
                         available: true,
@@ -2492,6 +2519,26 @@ fn verify_managed_runtime_binary(candidate: &Path, lib_dir: &Path) -> ManagedRun
             }
         }
     }
+}
+
+fn managed_runtime_probe_accepts_nonzero_exit(
+    candidate: &Path,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> bool {
+    let file_name = candidate
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !file_name.eq_ignore_ascii_case("parakeet-cli") {
+        return false;
+    }
+
+    let mut output = String::from_utf8_lossy(stdout).to_string();
+    output.push_str(&String::from_utf8_lossy(stderr));
+    output.contains("parakeet-cli transcribe")
+        || output.contains("Usage:")
+        || output.contains("Available commands")
 }
 
 fn is_runnable_binary_file(candidate: &Path) -> bool {
@@ -4176,6 +4223,27 @@ mod tests {
         if let Some(script) = parakeet_cli_script {
             write_executable_file(&factory.managed_runtime_binary_path("parakeet-cli"), script);
         }
+    }
+
+    #[test]
+    fn managed_runtime_accepts_parakeet_usage_exit() {
+        let (_temp, factory) = build_factory();
+        prepare_managed_runtime_with_parakeet(
+            &factory,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            Some(
+                "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then\n  echo 'parakeet-cli transcribe' >&2\n  exit 2\nfi\nexit 1\n",
+            ),
+        );
+
+        let health = factory.managed_runtime_health();
+        assert!(
+            health.parakeet_cli.available,
+            "parakeet usage/help output should verify the managed runtime binary"
+        );
+        assert!(health.ready);
     }
 
     #[test]

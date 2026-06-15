@@ -1,3 +1,5 @@
+use std::fs;
+
 use tempfile::tempdir;
 
 use sbobino_application::SettingsRepository;
@@ -156,4 +158,56 @@ async fn save_then_load_preserves_automatic_import_and_workspace_settings() {
     );
     assert_eq!(loaded.organization.workspaces.len(), 1);
     assert_eq!(loaded.organization.workspaces[0].label, "Work");
+}
+
+#[tokio::test]
+async fn load_backfills_legacy_automatic_import_source_model_and_language() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let settings_path = temp.path().join("settings.json");
+    let mut settings = sbobino_domain::AppSettings::default();
+    settings.transcription.model = SpeechModel::LargeTurbo;
+    settings.transcription.language = LanguageCode::It;
+    settings.sync_legacy_from_sections();
+    settings.automation.enabled = true;
+    settings.automation.watched_sources = vec![sbobino_domain::AutomaticImportSource {
+        id: "legacy_source".to_string(),
+        label: "Legacy Source".to_string(),
+        folder_path: "/Users/test/Voice Memos".to_string(),
+        enabled: true,
+        preset: sbobino_domain::AutomaticImportPreset::VoiceMemo,
+        model: SpeechModel::Base,
+        language: LanguageCode::Auto,
+        workspace_id: None,
+        recursive: true,
+        enable_ai_post_processing: false,
+        post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(),
+    }];
+
+    let mut raw = serde_json::to_value(&settings).expect("settings should serialize");
+    raw["automation"]["watched_sources"][0]
+        .as_object_mut()
+        .expect("source should be object")
+        .remove("model");
+    raw["automation"]["watched_sources"][0]
+        .as_object_mut()
+        .expect("source should be object")
+        .remove("language");
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&raw).expect("settings JSON"),
+    )
+    .expect("write legacy settings");
+
+    let repo = FsSettingsRepository::new(settings_path);
+    let loaded = repo.load().await.expect("legacy load should succeed");
+
+    assert_eq!(
+        loaded.automation.watched_sources[0].model,
+        SpeechModel::LargeTurbo
+    );
+    assert_eq!(
+        loaded.automation.watched_sources[0].language,
+        LanguageCode::It
+    );
 }

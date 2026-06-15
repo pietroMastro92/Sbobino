@@ -10,6 +10,7 @@ import {
   replaceQueuedTranscriptionJob,
   shouldFocusStartedTranscription,
   shouldQueueTranscriptionStart,
+  summarizeQueueItems,
   upsertQueueItem,
 } from "./transcriptionQueue";
 
@@ -152,6 +153,36 @@ describe("transcriptionQueue helpers", () => {
       queued,
       running,
     ]);
+  });
+
+  it("summarizes waiting, running, completed, failed, and cancelled jobs", () => {
+    expect(
+      summarizeQueueItems([
+        buildQueuedTranscriptionJob("queued-start:1", "Queued"),
+        {
+          ...buildQueuedTranscriptionJob("job-1", "Running"),
+          stage: "transcribing" as const,
+        },
+        {
+          ...buildQueuedTranscriptionJob("job-2", "Done"),
+          stage: "completed" as const,
+        },
+        {
+          ...buildQueuedTranscriptionJob("job-3", "Failed"),
+          stage: "failed" as const,
+        },
+        {
+          ...buildQueuedTranscriptionJob("job-4", "Cancelled"),
+          stage: "cancelled" as const,
+        },
+      ]),
+    ).toEqual({
+      waiting: 1,
+      running: 1,
+      completed: 1,
+      failed: 1,
+      cancelled: 1,
+    });
   });
 
   it("marks completed jobs as visible terminal entries", () => {

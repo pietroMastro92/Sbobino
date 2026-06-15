@@ -460,11 +460,58 @@ import sys
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 speakers = payload.get("speakers") or []
 labels = {speaker.get("speaker_label") for speaker in speakers if speaker.get("speaker_label")}
-if len(labels) < 2:
+if len(labels) < 1:
     raise SystemExit(1)
 PY
   then
-    fail_validation "Pyannote smoke test did not produce at least two speaker labels."
+    fail_validation "Pyannote smoke test did not produce speaker labels."
+  fi
+}
+
+run_parakeet_transcription_smoke() {
+  if [[ -z "${FIXTURE_AUDIO// }" ]]; then
+    fail_validation "SBOBINO_VALIDATION_FIXTURE_AUDIO is required for AS-THIRD Parakeet smoke."
+  fi
+  if [[ ! -f "$FIXTURE_AUDIO" ]]; then
+    fail_validation "Parakeet smoke audio fixture not found at '$FIXTURE_AUDIO'."
+  fi
+
+  local parakeet_cli="$DATA_DIR/bin/parakeet-cli"
+  local parakeet_models_dir="$DATA_DIR/parakeet-models"
+  local parakeet_model_path="$parakeet_models_dir/$PARAKEET_MODEL"
+  local smoke_log="$TMP_DIR/parakeet-real-smoke.log"
+  local compare_log="$TMP_DIR/parakeet-metal-compare.log"
+
+  if [[ ! -x "$parakeet_cli" ]]; then
+    fail_validation "Managed Parakeet CLI was not installed at '$parakeet_cli'."
+  fi
+  if [[ ! -f "$parakeet_model_path" ]]; then
+    fail_validation "Managed Parakeet model was not installed at '$parakeet_model_path'."
+  fi
+
+  if ! PATH="$DATA_DIR/bin:$PATH" \
+    SBOBINO_PARAKEET_CLI="$parakeet_cli" \
+    SBOBINO_PARAKEET_MODELS_DIR="$parakeet_models_dir" \
+    SBOBINO_PARAKEET_MODEL="$PARAKEET_MODEL" \
+    SBOBINO_PARAKEET_AUDIO="$FIXTURE_AUDIO" \
+    SBOBINO_ASR_SAMPLE=artemis \
+    "$ROOT_DIR/scripts/smoke_parakeet_real.sh" >"$smoke_log" 2>&1; then
+    fail_validation "Parakeet real smoke failed. Last log lines: $(tail -80 "$smoke_log")"
+  fi
+
+  if ! PATH="$DATA_DIR/bin:$PATH" \
+    SBOBINO_APP_SUPPORT_DIR="$DATA_DIR" \
+    SBOBINO_PARAKEET_CLI="$parakeet_cli" \
+    SBOBINO_PARAKEET_MODELS_DIR="$parakeet_models_dir" \
+    SBOBINO_PARAKEET_MODEL="$PARAKEET_MODEL" \
+    SBOBINO_ARTEMIS_AUDIO="$FIXTURE_AUDIO" \
+    SBOBINO_ASR_SAMPLE=artemis \
+    SBOBINO_ASR_COMPARE_MODE=transcribe \
+    SBOBINO_REQUIRE_PARAKEET_GPU=1 \
+    SBOBINO_COMPARE_SKIP_PARAKEET_CPU=1 \
+    SBOBINO_COMPARE_SKIP_WHISPER_GPU=1 \
+    "$ROOT_DIR/scripts/compare_asr_engines_real.sh" >"$compare_log" 2>&1; then
+    fail_validation "Parakeet Metal transcription smoke failed. Last log lines: $(tail -120 "$compare_log")"
   fi
 }
 

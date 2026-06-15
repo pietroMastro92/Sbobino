@@ -5,14 +5,35 @@ import type {
 
 export type SharedUpdateSource = "native" | "github" | null;
 
+export type UpdateInstallPhase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "installing"
+  | "restarting"
+  | "installed"
+  | "failed";
+
 export type SharedUpdateSnapshot = {
   updateInfo: UpdateCheckResponse | null;
   updateSource: SharedUpdateSource;
   statusMessage: string | null;
   checking: boolean;
   installing: boolean;
+  installPhase?: UpdateInstallPhase;
   downloadPercent: number | null;
   syncedAt: number;
+};
+
+export type UpdateProgressKind = "none" | "determinate" | "indeterminate";
+
+export type UpdateUiState = {
+  phase: UpdateInstallPhase;
+  showProgress: boolean;
+  progressKind: UpdateProgressKind;
+  progressPercent: number | null;
+  canInstall: boolean;
 };
 
 export const LAST_SEEN_APP_VERSION_STORAGE_KEY = "sbobino.update.lastSeenAppVersion";
@@ -179,4 +200,85 @@ export function shouldShowUpdateBanner(
     return installing;
   }
   return true;
+}
+
+export function deriveUpdateUiState(input: {
+  updateInfo: UpdateCheckResponse | null;
+  checking: boolean;
+  installing: boolean;
+  installPhase: UpdateInstallPhase;
+  downloadPercent: number | null;
+  hasNativeUpdate: boolean;
+}): UpdateUiState {
+  const clampedPercent =
+    input.downloadPercent === null || !Number.isFinite(input.downloadPercent)
+      ? null
+      : Math.max(0, Math.min(100, Math.round(input.downloadPercent)));
+
+  if (input.installing) {
+    const phase =
+      input.installPhase === "installing" ||
+      input.installPhase === "restarting" ||
+      input.installPhase === "installed"
+        ? input.installPhase
+        : "downloading";
+    return {
+      phase,
+      showProgress: true,
+      progressKind:
+        phase === "downloading" && clampedPercent !== null
+          ? "determinate"
+          : "indeterminate",
+      progressPercent: phase === "downloading" ? clampedPercent : null,
+      canInstall: false,
+    };
+  }
+
+  if (input.checking) {
+    return {
+      phase: "checking",
+      showProgress: true,
+      progressKind: "indeterminate",
+      progressPercent: null,
+      canInstall: false,
+    };
+  }
+
+  if (input.installPhase === "failed") {
+    return {
+      phase: "failed",
+      showProgress: false,
+      progressKind: "none",
+      progressPercent: null,
+      canInstall: input.hasNativeUpdate && Boolean(input.updateInfo?.has_update),
+    };
+  }
+
+  if (input.installPhase === "installed") {
+    return {
+      phase: "installed",
+      showProgress: false,
+      progressKind: "none",
+      progressPercent: null,
+      canInstall: false,
+    };
+  }
+
+  if (input.updateInfo?.has_update) {
+    return {
+      phase: "available",
+      showProgress: false,
+      progressKind: "none",
+      progressPercent: null,
+      canInstall: input.hasNativeUpdate,
+    };
+  }
+
+  return {
+    phase: "idle",
+    showProgress: false,
+    progressKind: "none",
+    progressPercent: null,
+    canInstall: false,
+  };
 }

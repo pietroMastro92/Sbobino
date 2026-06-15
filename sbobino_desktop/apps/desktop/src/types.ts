@@ -311,6 +311,15 @@ export type JobProgress = {
   percentage: number;
   current_seconds?: number | null;
   total_seconds?: number | null;
+  input_path?: string | null;
+  title?: string | null;
+  source_origin?: ArtifactSourceOrigin | null;
+  source_label?: string | null;
+  source_folder?: string | null;
+  model?: SpeechModel | null;
+  language?: LanguageCode | null;
+  preset?: AutomaticImportPreset | null;
+  workspace_id?: string | null;
 };
 
 export type TranscriptionDelta = {
@@ -700,8 +709,11 @@ export type AutomaticImportQueuedJob = {
   job_id: string;
   source_id: string;
   source_label: string;
+  folder_path: string;
   file_path: string;
   title: string;
+  model: SpeechModel;
+  language: LanguageCode;
   workspace_id?: string | null;
   preset: AutomaticImportPreset;
 };

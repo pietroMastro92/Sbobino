@@ -1,6 +1,6 @@
 [package]
 name = "sbobino-desktop"
-version = "0.2.1"
+version = "2.0.0"
 description = "Sbobino Desktop Rewrite"
 authors.workspace = true
 license.workspace = true
@@ -41,6 +41,7 @@ sbobino-infrastructure = { path = "../../../crates/infrastructure" }
 window-vibrancy = "0.7.1"
 base64 = "0.22"
 hound.workspace = true
+libloading.workspace = true
 libc = "0.2"
 
 [dev-dependencies]

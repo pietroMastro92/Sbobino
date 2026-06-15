@@ -139,6 +139,8 @@ import {
   type InitialSetupReport,
   type InitialSetupStepId,
   INITIAL_SETUP_REQUIRES_PYANNOTE,
+  INITIAL_SETUP_REQUIRED_MODELS,
+  INITIAL_SETUP_REQUIRED_PARAKEET_MODELS,
   findProvisioningModelEntry,
   getRuntimeToolchainFailureMessage,
   getInitialSetupMissingModels,
@@ -153,6 +155,7 @@ import {
 } from "./lib/diarizationUi";
 import { loadInitialAppBootstrapData } from "./lib/appBootstrap";
 import {
+  deriveUpdateUiState,
   matchesPyannoteAutoActionMarker,
   PYANNOTE_AUTO_ACTION_MARKER_TTL_MS,
   readDismissedUpdateVersion,
@@ -160,6 +163,7 @@ import {
   readLastSeenAppVersion,
   readSharedUpdateSnapshot,
   shouldShowUpdateBanner,
+  type UpdateInstallPhase,
   writeDismissedUpdateVersion,
   writeLastPyannoteAutoActionMarker,
   writeLastSeenAppVersion,
@@ -194,6 +198,7 @@ import {
   replaceQueuedTranscriptionJob,
   shouldFocusStartedTranscription,
   shouldQueueTranscriptionStart,
+  summarizeQueueItems,
   upsertQueueItem,
 } from "./lib/transcriptionQueue";
 import { stripAnsi } from "./lib/ansiText";
@@ -205,10 +210,12 @@ import type {
   AppSettings,
   AutomaticImportPostProcessingSettings,
   AutomaticImportPreset,
+  AutomaticImportQueuedJob,
   AutomaticImportScanResponse,
   AutomaticImportSettings,
   AutomaticImportSource,
   ArtifactKind,
+  ArtifactSourceOrigin,
   EmotionAnalysisResult,
   JobProgress,
   LanguageCode,
@@ -408,6 +415,14 @@ function createInitialSetupReport(): InitialSetupReport {
         finished_at: null,
       },
       {
+        id: "parakeet-models",
+        label: "Parakeet models",
+        status: "pending",
+        detail: null,
+        started_at: null,
+        finished_at: null,
+      },
+      {
         id: "final-validation",
         label: "Final validation",
         status: "pending",
@@ -534,6 +549,13 @@ type PendingTranscriptionContext = {
   parentId?: string;
   title?: string;
   detailContext?: ActiveDetailContext | null;
+  sourceOrigin?: ArtifactSourceOrigin;
+  sourceLabel?: string | null;
+  sourceFolder?: string | null;
+  model?: SpeechModel;
+  language?: LanguageCode;
+  preset?: AutomaticImportPreset | null;
+  workspaceId?: string | null;
 };
 
 type TranscriptionStartRequest = PendingTranscriptionContext & {
@@ -550,6 +572,14 @@ type TranscriptionJobSnapshot = {
   deltaSequence: number;
   title: string;
   progress: JobProgress | null;
+  inputPath: string | null;
+  sourceOrigin: ArtifactSourceOrigin | null;
+  sourceLabel: string | null;
+  sourceFolder: string | null;
+  model: SpeechModel | null;
+  language: LanguageCode | null;
+  preset: AutomaticImportPreset | null;
+  workspaceId: string | null;
 };
 
 const languageOptions: Array<{ value: LanguageCode; label: string }> = [
@@ -1852,6 +1882,11 @@ function formatSpeechModelLabel(model: string, fallback?: string): string {
   return t(`speechModel.${model}`, fallback ?? model);
 }
 
+function formatLanguageLabel(language: LanguageCode): string {
+  const option = languageOptions.find((entry) => entry.value === language);
+  return t(`lang.${language}`, option?.label ?? language);
+}
+
 function formatParakeetModelLabel(model: string, fallback?: string): string {
   return t(`parakeetModel.${model}`, fallback ?? model);
 }
@@ -2440,7 +2475,6 @@ type DetailToolbarProps = {
   showRetranscribe?: boolean;
   isStartingTrimmedAudioRetranscription?: boolean;
   onRetranscribeTrimmedAudio?: () => void;
-  updateButton?: JSX.Element | null;
   realtimeControls?: {
     state: "idle" | "running" | "paused";
     isStopping: boolean;
@@ -2475,7 +2509,6 @@ function DetailToolbar({
   showRetranscribe,
   isStartingTrimmedAudioRetranscription,
   onRetranscribeTrimmedAudio,
-  updateButton,
   realtimeControls,
 }: DetailToolbarProps): JSX.Element {
   const { t } = useTranslation();
@@ -2551,7 +2584,6 @@ function DetailToolbar({
         </div>
 
         <div className="detail-toolbar-actions">
-          {updateButton}
           {realtimeControls ? (
             <>
               <button
@@ -3176,6 +3208,10 @@ export function App({
     // even when the running app is already up to date.
     return false;
   });
+  const [updateInstallPhase, setUpdateInstallPhase] =
+    useState<UpdateInstallPhase>(
+      () => readSharedUpdateSnapshot()?.installPhase ?? "idle",
+    );
   const [updateDownloadPercent, setUpdateDownloadPercent] = useState<
     number | null
   >(() => readSharedUpdateSnapshot()?.downloadPercent ?? null);
@@ -3214,6 +3250,7 @@ export function App({
   const copiedChatResetTimerRef = useRef<number | null>(null);
   const chatMessageSerialRef = useRef(0);
   const promptTestDefaultInputRef = useRef(getDefaultPromptTestInput());
+  const updateInstallInFlightRef = useRef(false);
   const previousAutoUpdateEnabledRef = useRef<boolean | null>(null);
   const [summaryIncludeTimestamps, setSummaryIncludeTimestamps] = useState(
     defaultSummaryControls.includeTimestamps,
@@ -3488,25 +3525,25 @@ export function App({
         appCloseDialogOpenRef.current = true;
         void (async () => {
           const quitLabel = t("appClose.quitButton", "Quit Sbobino");
-          const minimizeLabel = t("appClose.minimizeButton", "Minimize to Dock");
+          const keepOpenLabel = t("appClose.keepOpenButton", "Keep Open");
           const cancelLabel = t("action.cancel", "Cancel");
           try {
             const result = await messageDialog(
               activeJobIdRef.current
                 ? t(
                     "appClose.messageWithTranscription",
-                    "A transcription is running. Quit Sbobino to stop it, or minimize the window so it can continue in the Dock.",
+                    "A transcription is running. Quit Sbobino to stop it, or keep the app open in the Dock so the transcription can continue.",
                   )
                 : t(
                     "appClose.message",
-                    "Do you want to quit Sbobino or keep it available from the Dock?",
+                    "Do you want to quit Sbobino or keep the app open in the Dock?",
                   ),
               {
                 title: t("appClose.title", "Close Sbobino?"),
                 kind: activeJobIdRef.current ? "warning" : "info",
                 buttons: {
                   yes: quitLabel,
-                  no: minimizeLabel,
+                  no: keepOpenLabel,
                   cancel: cancelLabel,
                 },
               },
@@ -3520,8 +3557,8 @@ export function App({
               await exitProcess(0);
               return;
             }
-            if (result === minimizeLabel || result === "No") {
-              await appWindow.minimize();
+            if (result === keepOpenLabel || result === "No") {
+              await appWindow.hide();
             }
           } catch (closeDialogError) {
             setError(
@@ -4022,6 +4059,7 @@ export function App({
       statusMessage: updateStatusMessage,
       checking: checkingUpdates,
       installing: installingUpdate,
+      installPhase: updateInstallPhase,
       downloadPercent: updateDownloadPercent,
       syncedAt: Date.now(),
     });
@@ -4030,6 +4068,7 @@ export function App({
     installingUpdate,
     updateDownloadPercent,
     updateInfo,
+    updateInstallPhase,
     updateSource,
     updateStatusMessage,
   ]);
@@ -4077,6 +4116,7 @@ export function App({
       setUpdateSource(snapshot.updateSource);
       setUpdateStatusMessage(snapshot.statusMessage);
       setCheckingUpdates(snapshot.checking);
+      setUpdateInstallPhase(snapshot.installPhase ?? "idle");
       // Only mirror `installing` from secondary windows that report an
       // actual update in flight. A stale snapshot with installing=true
       // and has_update=false would otherwise pin the banner open.
@@ -4527,7 +4567,20 @@ export function App({
           ...event,
           message: resolvedMessage,
         };
-        updateTranscriptionJobSnapshot(event.job_id, { progress: queueEvent });
+        updateTranscriptionJobSnapshot(event.job_id, {
+          title:
+            event.title?.trim() ||
+            (event.input_path ? fileLabel(event.input_path) : undefined),
+          inputPath: event.input_path ?? undefined,
+          sourceOrigin: event.source_origin ?? undefined,
+          sourceLabel: event.source_label ?? undefined,
+          sourceFolder: event.source_folder ?? undefined,
+          model: event.model ?? undefined,
+          language: event.language ?? undefined,
+          preset: event.preset ?? undefined,
+          workspaceId: event.workspace_id ?? undefined,
+          progress: queueEvent,
+        });
         setQueueItems((previous) =>
           upsertQueueItem(previous, queueEvent),
         );
@@ -5813,21 +5866,10 @@ export function App({
     () => queueItems,
     [queueItems],
   );
-  const queueSessionCounts = useMemo(() => {
-    let waiting = 0;
-    let running = 0;
-    let finished = 0;
-    for (const item of queueItems) {
-      if (item.stage === "queued") {
-        waiting += 1;
-      } else if (isTerminalJobStage(item.stage)) {
-        finished += 1;
-      } else {
-        running += 1;
-      }
-    }
-    return { waiting, running, finished };
-  }, [queueItems]);
+  const queueSessionCounts = useMemo(
+    () => summarizeQueueItems(queueItems),
+    [queueItems],
+  );
 
   const exportPreviewText = useMemo(() => {
     const transcript = visibleTranscript.trim();
@@ -6105,6 +6147,14 @@ export function App({
       deltaSequence: patch.deltaSequence ?? previous?.deltaSequence ?? -1,
       title: patch.title ?? previous?.title ?? "",
       progress: patch.progress ?? previous?.progress ?? null,
+      inputPath: patch.inputPath ?? previous?.inputPath ?? null,
+      sourceOrigin: patch.sourceOrigin ?? previous?.sourceOrigin ?? null,
+      sourceLabel: patch.sourceLabel ?? previous?.sourceLabel ?? null,
+      sourceFolder: patch.sourceFolder ?? previous?.sourceFolder ?? null,
+      model: patch.model ?? previous?.model ?? null,
+      language: patch.language ?? previous?.language ?? null,
+      preset: patch.preset ?? previous?.preset ?? null,
+      workspaceId: patch.workspaceId ?? previous?.workspaceId ?? null,
     });
   }
 
@@ -6434,6 +6484,58 @@ export function App({
     }
   }
 
+  function registerAutomaticImportQueuedJobs(
+    jobs: AutomaticImportQueuedJob[],
+  ): void {
+    if (jobs.length === 0) {
+      return;
+    }
+    const queueMessage = t(
+      "queue.autoImportQueuedJob",
+      "Queued from watched folder.",
+    );
+    for (const job of jobs) {
+      pendingTranscriptionContextRef.current.set(job.job_id, {
+        inputPath: job.file_path,
+        title: job.title,
+        detailContext: null,
+        sourceOrigin: "imported",
+        sourceLabel: job.source_label,
+        sourceFolder: job.folder_path,
+        model: job.model,
+        language: job.language,
+        preset: job.preset,
+        workspaceId: job.workspace_id ?? null,
+      });
+      updateTranscriptionJobSnapshot(job.job_id, {
+        title: job.title || fileLabel(job.file_path),
+        context: null,
+        inputPath: job.file_path,
+        sourceOrigin: "imported",
+        sourceLabel: job.source_label,
+        sourceFolder: job.folder_path,
+        model: job.model,
+        language: job.language,
+        preset: job.preset,
+        workspaceId: job.workspace_id ?? null,
+        progress:
+          transcriptionJobSnapshotsRef.current.get(job.job_id)?.progress ??
+          buildQueuedTranscriptionJob(job.job_id, queueMessage),
+      });
+    }
+    setQueueItems((previous) =>
+      jobs.reduce((items, job) => {
+        if (items.some((entry) => entry.job_id === job.job_id)) {
+          return items;
+        }
+        return upsertQueueItem(
+          items,
+          buildQueuedTranscriptionJob(job.job_id, queueMessage),
+        );
+      }, previous),
+    );
+  }
+
   async function runAutomaticImportScan(
     reason: "manual" | "startup" | "interval",
   ): Promise<void> {
@@ -6445,6 +6547,7 @@ export function App({
     try {
       const result = await scanAutomaticImport({ reason });
       setAutomaticImportScanResult(result);
+      registerAutomaticImportQueuedJobs(result.queued_jobs);
       await refreshSettingsFromDisk();
     } catch (scanError) {
       setAutomaticImportScanError(
@@ -6465,6 +6568,7 @@ export function App({
     try {
       const result = await retryAutomaticImportQuarantineItem({ id });
       setAutomaticImportScanResult(result);
+      registerAutomaticImportQueuedJobs(result.queued_jobs);
       await refreshSettingsFromDisk();
     } catch (retryError) {
       setAutomaticImportScanError(
@@ -7092,7 +7196,7 @@ export function App({
           "This can take a few minutes the first time.",
         ),
       );
-      for (const model of ["base", "large_turbo"] as SpeechModel[]) {
+      for (const model of INITIAL_SETUP_REQUIRED_MODELS) {
         const entry = findProvisioningModelEntry(snapshot.modelCatalog, model);
         if (
           isProvisionedModelReady(
@@ -7126,6 +7230,48 @@ export function App({
       }
       await updateInitialSetupStepState(
         "whisper-models",
+        "completed",
+        t("setup.firstLaunch.downloading", "Downloading local models..."),
+        t("settings.localModels.readyMessage", "Local models are ready"),
+      );
+
+      await updateInitialSetupStepState(
+        "parakeet-models",
+        "running",
+        t("setup.firstLaunch.downloading", "Downloading local models..."),
+        t(
+          "setup.firstLaunch.downloadingDesc",
+          "This can take a few minutes the first time.",
+        ),
+      );
+      for (const model of INITIAL_SETUP_REQUIRED_PARAKEET_MODELS) {
+        const entry = findProvisioningModelEntry(snapshot.modelCatalog, model);
+        if (isProvisionedModelReady(entry, false)) {
+          continue;
+        }
+
+        initialSetupStepIdRef.current = "parakeet-models";
+        setInitialSetupStepLabel(
+          t("setup.firstLaunch.downloadingModel", "Downloading {model}...", {
+            model: entry?.label ?? model,
+          }),
+        );
+        setInitialSetupStepDetail(
+          t(
+            "setup.firstLaunch.downloadingDesc",
+            "This can take a few minutes the first time.",
+          ),
+        );
+        await waitForProvisioningRun(() =>
+          provisioningDownloadModel({
+            model,
+            include_coreml: false,
+          }),
+        );
+        snapshot = await loadStartupRequirements();
+      }
+      await updateInitialSetupStepState(
+        "parakeet-models",
         "completed",
         t("setup.firstLaunch.downloading", "Downloading local models..."),
         t("settings.localModels.readyMessage", "Local models are ready"),
@@ -7281,9 +7427,14 @@ export function App({
     if (requests.length === 0) {
       return;
     }
+    const defaultModel = settings?.transcription.model;
+    const defaultLanguage = settings?.transcription.language;
     const queueMessage = t("queue.queuedJob", "Queued transcription job.");
     const queuedStarts = requests.map((request) => ({
       ...request,
+      model: request.model ?? defaultModel,
+      language: request.language ?? defaultLanguage,
+      sourceOrigin: request.sourceOrigin ?? "imported",
       queueId: buildQueuedTranscriptionJobId(
         ++queuedTranscriptionSequenceRef.current,
       ),
@@ -7303,6 +7454,14 @@ export function App({
       updateTranscriptionJobSnapshot(queuedStart.queueId, {
         title: queuedStart.title ?? fileLabel(queuedStart.inputPath),
         context: queuedStart.detailContext ?? null,
+        inputPath: queuedStart.inputPath,
+        sourceOrigin: queuedStart.sourceOrigin ?? "imported",
+        sourceLabel: queuedStart.sourceLabel ?? null,
+        sourceFolder: queuedStart.sourceFolder ?? null,
+        model: queuedStart.model ?? null,
+        language: queuedStart.language ?? null,
+        preset: queuedStart.preset ?? null,
+        workspaceId: queuedStart.workspaceId ?? null,
         progress: buildQueuedTranscriptionJob(queuedStart.queueId, queueMessage),
       });
     }
@@ -7532,6 +7691,9 @@ export function App({
       const requestedTitle = request.title?.trim()
         ? request.title.trim()
         : undefined;
+      const effectiveModel = request.model ?? settings.transcription.model;
+      const effectiveLanguage =
+        request.language ?? settings.transcription.language;
       const nextDetailContext = request.detailContext ?? null;
       const preserveCurrentArtifact = Boolean(
         activeArtifact && section === "detail",
@@ -7572,6 +7734,14 @@ export function App({
         updateTranscriptionJobSnapshot(options.queuedJobId, {
           title: requestedTitle ?? fileLabel(targetFile),
           context: nextDetailContext,
+          inputPath: targetFile,
+          sourceOrigin: request.sourceOrigin ?? "imported",
+          sourceLabel: request.sourceLabel ?? null,
+          sourceFolder: request.sourceFolder ?? null,
+          model: effectiveModel,
+          language: effectiveLanguage,
+          preset: request.preset ?? null,
+          workspaceId: request.workspaceId ?? null,
           progress: {
             job_id: options.queuedJobId,
             stage: "failed",
@@ -7624,6 +7794,14 @@ export function App({
           updateTranscriptionJobSnapshot(optimisticJobId, {
             context: nextDetailContext,
             title: requestedTitle ?? fileLabel(targetFile),
+            inputPath: targetFile,
+            sourceOrigin: request.sourceOrigin ?? "imported",
+            sourceLabel: request.sourceLabel ?? null,
+            sourceFolder: request.sourceFolder ?? null,
+            model: effectiveModel,
+            language: effectiveLanguage,
+            preset: request.preset ?? null,
+            workspaceId: request.workspaceId ?? null,
             progress: optimisticProgress,
           });
           setProgress(optimisticProgress);
@@ -7679,7 +7857,7 @@ export function App({
           preflight = await withTimeout(
             fetchTranscriptionStartPreflight({
               engine: settings.transcription.engine,
-              model: settings.transcription.model,
+              model: effectiveModel,
               parakeet_model: settings.transcription.parakeet_model,
             }),
             // v0.1.36 lowered this to 3s; reverted to 8s after field reports
@@ -7737,8 +7915,8 @@ export function App({
           startTranscription({
             input_path: targetFile,
             engine: settings.transcription.engine,
-            language: settings.transcription.language,
-            model: settings.transcription.model,
+            language: effectiveLanguage,
+            model: effectiveModel,
             parakeet_model: settings.transcription.parakeet_model,
             enable_ai: settings.transcription.enable_ai_post_processing,
             whisper_options: sanitizeWhisperOptions(
@@ -7747,6 +7925,7 @@ export function App({
             ),
             title: requestedTitle,
             parent_id: parentId,
+            source_origin: request.sourceOrigin ?? "imported",
           }),
           12_000,
           t(
@@ -7761,10 +7940,25 @@ export function App({
           parentId,
           title: requestedTitle,
           detailContext: nextDetailContext,
+          sourceOrigin: request.sourceOrigin ?? "imported",
+          sourceLabel: request.sourceLabel ?? null,
+          sourceFolder: request.sourceFolder ?? null,
+          model: effectiveModel,
+          language: effectiveLanguage,
+          preset: request.preset ?? null,
+          workspaceId: request.workspaceId ?? null,
         });
         updateTranscriptionJobSnapshot(job_id, {
           context: nextDetailContext,
           title: requestedTitle ?? fileLabel(targetFile),
+          inputPath: targetFile,
+          sourceOrigin: request.sourceOrigin ?? "imported",
+          sourceLabel: request.sourceLabel ?? null,
+          sourceFolder: request.sourceFolder ?? null,
+          model: effectiveModel,
+          language: effectiveLanguage,
+          preset: request.preset ?? null,
+          workspaceId: request.workspaceId ?? null,
           progress: optimisticProgress
             ? { ...optimisticProgress, job_id }
             : null,
@@ -7976,7 +8170,13 @@ export function App({
       );
       setQueuedTranscriptionStarts((previous) => [
         ...previous,
-        { ...request, queueId },
+        {
+          ...request,
+          model: request.model ?? settings?.transcription.model,
+          language: request.language ?? settings?.transcription.language,
+          sourceOrigin: request.sourceOrigin ?? "imported",
+          queueId,
+        },
       ]);
       setQueueItems((previous) =>
         upsertQueueItem(
@@ -7987,6 +8187,22 @@ export function App({
           ),
         ),
       );
+      updateTranscriptionJobSnapshot(queueId, {
+        title: requestedTitle ?? fileLabel(targetFile),
+        context: nextDetailContext,
+        inputPath: targetFile,
+        sourceOrigin: request.sourceOrigin ?? "imported",
+        sourceLabel: request.sourceLabel ?? null,
+        sourceFolder: request.sourceFolder ?? null,
+        model: request.model ?? settings?.transcription.model ?? null,
+        language: request.language ?? settings?.transcription.language ?? null,
+        preset: request.preset ?? null,
+        workspaceId: request.workspaceId ?? null,
+        progress: buildQueuedTranscriptionJob(
+          queueId,
+          t("queue.queuedJob", "Queued transcription job."),
+        ),
+      });
       setError(null);
       setTrimRetranscriptionError(null);
       return;
@@ -9155,7 +9371,9 @@ export function App({
 
       const readiness = await withTimeout(
         fetchRealtimeStartReadiness({
+          engine: settings.transcription.engine,
           model: settings.transcription.model,
+          parakeet_model: settings.transcription.parakeet_model,
         }),
         8_000,
         t("error.preflightTimedOut", "Preflight timed out."),
@@ -9172,7 +9390,9 @@ export function App({
       setRealtimePreview("");
       setRealtimeSessionOpen(false);
       await startRealtime({
+        engine: settings.transcription.engine,
         model: settings.transcription.model,
+        parakeet_model: settings.transcription.parakeet_model,
         language: settings.transcription.language,
       });
       setDraftTitle(sessionTitle);
@@ -9801,56 +10021,63 @@ export function App({
     setCheckingUpdates(true);
     setUpdateStatusMessage(null);
     setUpdateDownloadPercent(null);
+    setUpdateInstallPhase("checking");
     setNativeUpdate(null);
     const isDevRuntime = import.meta.env.DEV;
-    if (!isDevRuntime) {
-      try {
-        const native = await checkAppUpdate();
-        if (shouldCancel?.()) {
-          return;
-        }
-        if (native) {
-          setNativeUpdate(native);
-          setUpdateSource("native");
-          setUpdateInfo({
-            has_update: true,
-            current_version: native.currentVersion,
-            latest_version: native.version,
-            download_url: null,
-          });
-          try {
-            const fallback = await checkUpdates();
-            if (shouldCancel?.()) {
-              return;
-            }
-            if (fallback.download_url) {
-              setUpdateInfo((previous) =>
-                previous
-                  ? {
-                      ...previous,
-                      download_url: fallback.download_url,
-                    }
-                  : previous,
-              );
-            }
-          } catch {
-            // optional GitHub download fallback is best-effort
-          }
-          return;
-        }
-      } catch {
-        // fallback to GitHub release polling
-      }
-    }
-
     try {
+      if (!isDevRuntime) {
+        try {
+          const native = await checkAppUpdate();
+          if (shouldCancel?.()) {
+            return;
+          }
+          if (native) {
+            setNativeUpdate(native);
+            setUpdateSource("native");
+            setUpdateInstallPhase("available");
+            setUpdateInfo({
+              has_update: true,
+              current_version: native.currentVersion,
+              latest_version: native.version,
+              download_url: null,
+            });
+            try {
+              const fallback = await checkUpdates();
+              if (shouldCancel?.()) {
+                return;
+              }
+              if (fallback.download_url) {
+                setUpdateInfo((previous) =>
+                  previous
+                    ? {
+                        ...previous,
+                        download_url: fallback.download_url,
+                      }
+                    : previous,
+                );
+              }
+            } catch {
+              // optional GitHub download fallback is best-effort
+            }
+            return;
+          }
+        } catch {
+          // fallback to GitHub release polling
+        }
+      }
+
       const update = await checkUpdates();
       if (shouldCancel?.()) {
         return;
       }
       setUpdateInfo(update);
       setUpdateSource("github");
+      setUpdateInstallPhase(update.has_update ? "available" : "idle");
     } catch (updateError) {
+      setUpdateInstallPhase("failed");
+      setUpdateStatusMessage(
+        t("settings.general.updateCheckFailed", "Unable to check for updates."),
+      );
       if (!silent) {
         setError(
           formatUiError(
@@ -9894,15 +10121,17 @@ export function App({
   }
 
   async function onInstallUpdate(): Promise<void> {
-    if (!nativeUpdate) {
+    if (!nativeUpdate || updateInstallInFlightRef.current) {
       return;
     }
 
+    updateInstallInFlightRef.current = true;
     setInstallingUpdate(true);
+    setUpdateInstallPhase("downloading");
     setUpdateStatusMessage(
       t("settings.general.downloadingUpdate", "Downloading update..."),
     );
-    setUpdateDownloadPercent(0);
+    setUpdateDownloadPercent(null);
     try {
       let expectedBytes = 0;
       let downloadedBytes = 0;
@@ -9910,6 +10139,8 @@ export function App({
         if (event.event === "Started") {
           expectedBytes = event.data.contentLength ?? 0;
           downloadedBytes = 0;
+          setUpdateInstallPhase("downloading");
+          setUpdateDownloadPercent(expectedBytes > 0 ? 0 : null);
           setUpdateStatusMessage(
             t("settings.general.downloadingUpdate", "Downloading update..."),
           );
@@ -9931,6 +10162,7 @@ export function App({
         }
         if (event.event === "Finished") {
           setUpdateDownloadPercent(100);
+          setUpdateInstallPhase("installing");
           setUpdateStatusMessage(
             t("settings.general.installingUpdate", "Installing update..."),
           );
@@ -9954,6 +10186,7 @@ export function App({
           : previous,
       );
       setNativeUpdate(null);
+      setUpdateInstallPhase("restarting");
       setUpdateStatusMessage(
         t(
           "settings.general.restartingAfterUpdate",
@@ -9977,8 +10210,10 @@ export function App({
             "Update installed. Restart the app to apply it.",
           ),
         );
+        setUpdateInstallPhase("installed");
       }
     } catch (installError) {
+      setUpdateInstallPhase("failed");
       setError(
         formatUiError(
           "error.updateInstallFailed",
@@ -9986,9 +10221,15 @@ export function App({
           installError,
         ),
       );
-      setUpdateStatusMessage(null);
+      setUpdateStatusMessage(
+        t(
+          "settings.general.updateInstallFailed",
+          "Update install failed. You can retry or use Manual Download.",
+        ),
+      );
     } finally {
       setInstallingUpdate(false);
+      updateInstallInFlightRef.current = false;
     }
   }
 
@@ -10358,7 +10599,7 @@ export function App({
             <p className="muted">
               {t(
                 "queue.sessionCounts",
-                "Waiting {waiting} · Running {running} · Finished {finished}",
+                "Waiting {waiting} · Running {running} · Completed {completed} · Failed {failed}",
                 queueSessionCounts,
               )}
             </p>
@@ -10435,6 +10676,50 @@ export function App({
                 item.job_id === activeJobId
                   ? runningJobPercentage
                   : percentageFromJobProgress(item);
+              const queueSourceName =
+                pendingContext?.sourceLabel ??
+                queuedStart?.sourceLabel ??
+                snapshot?.sourceLabel ??
+                null;
+              const queueSourceFolder =
+                pendingContext?.sourceFolder ??
+                queuedStart?.sourceFolder ??
+                snapshot?.sourceFolder ??
+                null;
+              const queueIsAutomatic = Boolean(
+                queueSourceName || queueSourceFolder,
+              );
+              const queueOriginLabel = queueIsAutomatic
+                ? t("queue.sourceAutomatic", "Watched folder")
+                : t("queue.sourceManual", "Manual import");
+              const queueModel =
+                pendingContext?.model ?? queuedStart?.model ?? snapshot?.model;
+              const queueLanguage =
+                pendingContext?.language ??
+                queuedStart?.language ??
+                snapshot?.language;
+              const queuePreset =
+                pendingContext?.preset ?? queuedStart?.preset ?? snapshot?.preset;
+              const queueWorkspaceId =
+                pendingContext?.workspaceId ??
+                queuedStart?.workspaceId ??
+                snapshot?.workspaceId ??
+                null;
+              const queueWorkspaceLabel = queueWorkspaceId
+                ? (workspaceLabelMap.get(queueWorkspaceId) ?? queueWorkspaceId)
+                : null;
+              const queuePath =
+                pendingContext?.inputPath ??
+                queuedStart?.inputPath ??
+                snapshot?.inputPath ??
+                null;
+              const progressTime =
+                item.current_seconds != null && item.total_seconds != null
+                  ? `${formatShortDuration(item.current_seconds)} / ${formatShortDuration(item.total_seconds)}`
+                  : null;
+              const translateToEnglish =
+                settings?.transcription.whisper_options?.translate_to_english ??
+                false;
 
               return (
                 <article
@@ -10457,11 +10742,44 @@ export function App({
                   }
                 >
                   <div className="queue-card-head">
-                    <strong>{queueItemTitle}</strong>
+                    <div className="queue-card-title">
+                      <strong>{queueItemTitle}</strong>
+                      {queuePath ? <small>{queuePath}</small> : null}
+                    </div>
                     <span className="queue-stage">
                       <ProgressRing percentage={displayPercentage} size={18} />
                       <small>{formatJobStageLabel(item.stage)}</small>
                     </span>
+                  </div>
+                  <div className="queue-meta-row">
+                    <span>{queueOriginLabel}</span>
+                    {queueSourceName ? <span>{queueSourceName}</span> : null}
+                    {queueSourceFolder ? (
+                      <span>{queueSourceFolder}</span>
+                    ) : null}
+                    {queueModel ? (
+                      <span>{formatSpeechModelLabel(queueModel)}</span>
+                    ) : null}
+                    {queueLanguage ? (
+                      <span>{formatLanguageLabel(queueLanguage)}</span>
+                    ) : null}
+                    {queuePreset ? (
+                      <span>
+                        {formatAutomaticImportPresetLabel(queuePreset, t)}
+                      </span>
+                    ) : null}
+                    {queueWorkspaceLabel ? (
+                      <span>{queueWorkspaceLabel}</span>
+                    ) : null}
+                    {translateToEnglish ? (
+                      <span>
+                        {t(
+                          "queue.translateToEnglishActive",
+                          "Translate to English active",
+                        )}
+                      </span>
+                    ) : null}
+                    {progressTime ? <span>{progressTime}</span> : null}
                   </div>
                   <p>{item.message}</p>
                   <div className="queue-progress">
@@ -12673,7 +12991,6 @@ export function App({
             isStartingTrimmedAudioRetranscription={
               isTrimRetranscriptionStarting
             }
-            updateButton={renderCompactUpdateButton()}
             onRetranscribeTrimmedAudio={() => {
               if (effectiveTrimmedAudioDraft) {
                 void onStartTranscription(effectiveTrimmedAudioDraft.path, {
@@ -13024,42 +13341,78 @@ export function App({
     checkingUpdates,
     dismissedUpdateVersion,
   );
+  const updateUiState = deriveUpdateUiState({
+    updateInfo,
+    checking: checkingUpdates,
+    installing: installingUpdate,
+    installPhase: updateInstallPhase,
+    downloadPercent: updateDownloadPercent,
+    hasNativeUpdate: Boolean(nativeUpdate),
+  });
 
-  function renderCompactUpdateButton(): JSX.Element | null {
+  function getUpdatePhaseLabel(phase: UpdateInstallPhase): string {
+    switch (phase) {
+      case "checking":
+        return t("updates.phase.checking", "Checking...");
+      case "available":
+        return t("updates.phase.available", "Update available");
+      case "downloading":
+        return t("updates.phase.downloading", "Downloading update...");
+      case "installing":
+        return t("updates.phase.installing", "Installing update...");
+      case "restarting":
+        return t("updates.phase.restarting", "Restarting...");
+      case "installed":
+        return t("updates.phase.installed", "Update installed");
+      case "failed":
+        return t("updates.phase.failed", "Update failed");
+      case "idle":
+      default:
+        return t("updates.phase.idle", "Up to date");
+    }
+  }
+
+  function renderSidebarUpdateButton(): JSX.Element | null {
     if (!updatePromptVisible || !updateInfo?.has_update) {
       return null;
     }
 
-    const label = installingUpdate
-      ? t("updates.topbar.installing", "Updating...")
-      : t("updates.topbar.update", "Update");
+    const label =
+      checkingUpdates || installingUpdate
+        ? t("updates.sidebar.updating", "Updating")
+        : t("updates.sidebar.update", "Update");
+    const phaseLabel = getUpdatePhaseLabel(updateUiState.phase);
+    const title =
+      updateUiState.phase === "available"
+        ? t("updates.sidebar.installTitle", "Download and install update")
+        : phaseLabel;
 
-    if (nativeUpdate) {
-      return (
-        <button
-          className="topbar-update-button"
-          onClick={() => void onInstallUpdate()}
-          disabled={installingUpdate || checkingUpdates}
-        >
-          {label}
-        </button>
-      );
-    }
-
-    if (updateInfo.download_url) {
-      return (
-        <a
-          className="topbar-update-button"
-          href={updateInfo.download_url}
-          target="_blank"
-          rel="noreferrer"
-        >
-          {t("updates.topbar.update", "Update")}
-        </a>
-      );
-    }
-
-    return null;
+    return (
+      <button
+        type="button"
+        className={`sidebar-update-pill sidebar-update-pill--${updateUiState.phase}`}
+        onClick={() => {
+          if (checkingUpdates || installingUpdate) {
+            void onOpenStandaloneSettingsWindow("general");
+            return;
+          }
+          if (nativeUpdate) {
+            void onInstallUpdate();
+            return;
+          }
+          if (updateInfo.download_url) {
+            window.open(updateInfo.download_url, "_blank", "noreferrer");
+            return;
+          }
+          void onOpenStandaloneSettingsWindow("general");
+        }}
+        title={title}
+        aria-label={title}
+      >
+        <span className="sidebar-update-dot" aria-hidden="true" />
+        <span className="sidebar-update-label">{label}</span>
+      </button>
+    );
   }
 
   function renderSettingsGeneral(): JSX.Element {
@@ -13172,7 +13525,7 @@ export function App({
             <button
               className="secondary-button"
               onClick={() => void onRefreshUpdates()}
-              disabled={checkingUpdates}
+              disabled={checkingUpdates || installingUpdate}
             >
               {checkingUpdates
                 ? t("settings.general.checking", "Checking...")
@@ -13198,32 +13551,76 @@ export function App({
                       )
                   : t("settings.general.upToDate", "Up to date ({version})", {
                       version: updateInfo.current_version,
-                    })}
+                  })}
               </small>
             ) : null}
           </div>
           {updateInfo?.has_update && nativeUpdate ? (
-            <button
-              className="cta-link-button"
-              onClick={() => void onInstallUpdate()}
-              disabled={installingUpdate}
-            >
-              {installingUpdate
-                ? t("settings.general.installing", "Installing{suffix}", {
-                    suffix:
-                      updateDownloadPercent !== null
-                        ? ` (${updateDownloadPercent}%)`
-                        : "...",
-                  })
-                : t(
-                    "settings.general.downloadAndInstall",
-                    "Download & Install",
+            <div className="settings-update-card">
+              <div className="settings-update-card-header">
+                <div>
+                  <strong>{getUpdatePhaseLabel(updateUiState.phase)}</strong>
+                  {updateStatusMessage ? <small>{updateStatusMessage}</small> : null}
+                </div>
+                {!installingUpdate && !checkingUpdates ? (
+                  <button
+                    className="primary-button settings-update-action"
+                    onClick={() => void onInstallUpdate()}
+                    disabled={!updateUiState.canInstall}
+                  >
+                    {updateUiState.phase === "failed"
+                      ? t("settings.general.retryInstall", "Retry Install")
+                      : t(
+                          "settings.general.downloadAndInstall",
+                          "Download & Install",
+                        )}
+                  </button>
+                ) : null}
+              </div>
+              {updateUiState.showProgress ? (
+                <div
+                  className={`settings-update-progress settings-update-progress--${updateUiState.progressKind}`}
+                  role="progressbar"
+                  aria-label={getUpdatePhaseLabel(updateUiState.phase)}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={
+                    updateUiState.progressKind === "determinate" &&
+                    updateUiState.progressPercent !== null
+                      ? updateUiState.progressPercent
+                      : undefined
+                  }
+                >
+                  <span
+                    style={
+                      updateUiState.progressKind === "determinate" &&
+                      updateUiState.progressPercent !== null
+                        ? { width: `${updateUiState.progressPercent}%` }
+                        : undefined
+                    }
+                  />
+                </div>
+              ) : null}
+              {updateUiState.progressKind === "determinate" &&
+              updateUiState.progressPercent !== null ? (
+                <small>
+                  {t("settings.general.downloadProgress", "{percent}% downloaded", {
+                    percent: updateUiState.progressPercent,
+                  })}
+                </small>
+              ) : updateUiState.showProgress ? (
+                <small>
+                  {t(
+                    "settings.general.indeterminateProgress",
+                    "Working... this may take a few minutes.",
                   )}
-            </button>
+                </small>
+              ) : null}
+            </div>
           ) : null}
           {updateInfo?.has_update && updateInfo.download_url ? (
             <a
-              className="cta-link-button"
+              className="secondary-button settings-update-manual-link"
               href={updateInfo.download_url}
               target="_blank"
               rel="noreferrer"
@@ -13233,7 +13630,9 @@ export function App({
                 : t("settings.general.downloadUpdate", "Download Update")}
             </a>
           ) : null}
-          {updateStatusMessage ? <small>{updateStatusMessage}</small> : null}
+          {!nativeUpdate && updateStatusMessage ? (
+            <small>{updateStatusMessage}</small>
+          ) : null}
         </section>
       </div>
     );
@@ -16834,7 +17233,6 @@ export function App({
               data-tauri-drag-region
               aria-hidden="true"
             />
-            {renderCompactUpdateButton()}
           </header>
           {renderSettings()}
           {error ? (
@@ -17008,6 +17406,7 @@ export function App({
           </div>
 
           <div className="sidebar-footer">
+            {renderSidebarUpdateButton()}
             <button
               className="sidebar-item"
               onClick={() => void onOpenStandaloneSettingsWindow("general")}
@@ -17063,8 +17462,6 @@ export function App({
                   aria-hidden="true"
                 />
               </div>
-
-              {renderCompactUpdateButton()}
 
               {section === "home" ||
               section === "queue" ||

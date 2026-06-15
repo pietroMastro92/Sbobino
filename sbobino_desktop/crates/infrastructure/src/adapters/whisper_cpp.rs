@@ -622,9 +622,11 @@ impl WhisperCppEngine {
             .arg(options.word_threshold.to_string())
             .arg("-sns");
 
-        if language_code != "auto" {
-            command.arg("-l").arg(language_code);
-        }
+        command.arg("-l").arg(if language_code.trim().is_empty() {
+            "auto"
+        } else {
+            language_code
+        });
 
         if options.translate_to_english {
             command.arg("-tr");
@@ -928,7 +930,11 @@ fn status_signal_is_crash(_status: Option<ExitStatus>) -> bool {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    use std::path::Path;
+    use tokio::process::Command;
+
     use super::{WhisperCppEngine, PROCESS_IDLE_TIMEOUT_MAX, PROCESS_IDLE_TIMEOUT_MIN};
+    use sbobino_domain::WhisperOptions;
 
     #[test]
     fn transcription_idle_timeout_defaults_to_minimum_without_duration() {
@@ -951,6 +957,60 @@ mod tests {
         assert_eq!(
             WhisperCppEngine::transcription_idle_timeout(Some(24_000.0)),
             PROCESS_IDLE_TIMEOUT_MAX
+        );
+    }
+
+    #[test]
+    fn append_cli_flags_passes_auto_language_explicitly() {
+        let mut command = Command::new("whisper-cli");
+        WhisperCppEngine::append_cli_flags(
+            &mut command,
+            Path::new("input.wav"),
+            Path::new("model.bin"),
+            "auto",
+            &WhisperOptions::default(),
+            Path::new("output"),
+            super::WhisperCliExecutionMode::Default,
+        );
+
+        let args = command
+            .as_std_mut()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let language_flag = args
+            .windows(2)
+            .any(|pair| pair[0] == "-l" && pair[1] == "auto");
+        assert!(
+            language_flag,
+            "expected whisper-cli args to contain -l auto: {args:?}"
+        );
+    }
+
+    #[test]
+    fn append_cli_flags_passes_explicit_language() {
+        let mut command = Command::new("whisper-cli");
+        WhisperCppEngine::append_cli_flags(
+            &mut command,
+            Path::new("input.wav"),
+            Path::new("model.bin"),
+            "it",
+            &WhisperOptions::default(),
+            Path::new("output"),
+            super::WhisperCliExecutionMode::Default,
+        );
+
+        let args = command
+            .as_std_mut()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let language_flag = args
+            .windows(2)
+            .any(|pair| pair[0] == "-l" && pair[1] == "it");
+        assert!(
+            language_flag,
+            "expected whisper-cli args to contain -l it: {args:?}"
         );
     }
 }

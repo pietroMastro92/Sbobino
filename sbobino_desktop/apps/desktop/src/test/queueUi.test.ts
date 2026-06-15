@@ -40,4 +40,38 @@ describe("queue UI wiring", () => {
     expect(appSource).toContain('stage: "completed"');
     expect(appSource).toContain("const queueActiveItems = useMemo(\n    () => queueItems");
   });
+
+  it("registers automatic-import jobs with queue metadata", () => {
+    expect(appSource).toContain("registerAutomaticImportQueuedJobs");
+    expect(appSource).toContain("sourceLabel: job.source_label");
+    expect(appSource).toContain("sourceFolder: job.folder_path");
+    expect(appSource).toContain("model: job.model");
+    expect(appSource).toContain("language: job.language");
+    expect(appSource).toContain("queue-meta-row");
+  });
+
+  it("keeps automatic-import queue registration in the background", () => {
+    const registerAutomaticImportQueuedJobs = extractFunction(
+      appSource,
+      "registerAutomaticImportQueuedJobs",
+    );
+
+    expect(registerAutomaticImportQueuedJobs).not.toContain('setSection("queue")');
+  });
+
+  it("hydrates queue metadata from cross-window progress events", () => {
+    expect(appSource).toContain("sourceLabel: event.source_label");
+    expect(appSource).toContain("sourceFolder: event.source_folder");
+    expect(appSource).toContain("inputPath: event.input_path");
+    expect(appSource).toContain("workspaceId: event.workspace_id");
+  });
+
+  it("renders informative queue metadata and separate terminal counts", () => {
+    expect(appSource).toContain("summarizeQueueItems(queueItems)");
+    expect(appSource).toContain("queue.sourceAutomatic");
+    expect(appSource).toContain("queue.translateToEnglishActive");
+    expect(appSource).toContain("workspaceLabelMap.get(queueWorkspaceId)");
+    expect(appSource).toContain("Completed {completed}");
+    expect(appSource).toContain("Failed {failed}");
+  });
 });

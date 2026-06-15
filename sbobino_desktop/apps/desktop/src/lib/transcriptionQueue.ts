@@ -60,6 +60,34 @@ export function clearFinishedQueueItems(items: JobProgress[]): JobProgress[] {
   return items.filter((item) => !isTerminalJobStage(item.stage));
 }
 
+export type QueueSessionCounts = {
+  waiting: number;
+  running: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+};
+
+export function summarizeQueueItems(items: JobProgress[]): QueueSessionCounts {
+  return items.reduce<QueueSessionCounts>(
+    (counts, item) => {
+      if (item.stage === "queued") {
+        counts.waiting += 1;
+      } else if (item.stage === "completed") {
+        counts.completed += 1;
+      } else if (item.stage === "failed") {
+        counts.failed += 1;
+      } else if (item.stage === "cancelled") {
+        counts.cancelled += 1;
+      } else {
+        counts.running += 1;
+      }
+      return counts;
+    },
+    { waiting: 0, running: 0, completed: 0, failed: 0, cancelled: 0 },
+  );
+}
+
 export function markQueueItemTerminal(
   items: JobProgress[],
   jobId: string,

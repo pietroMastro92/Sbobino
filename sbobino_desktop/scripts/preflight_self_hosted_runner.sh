@@ -19,6 +19,22 @@ MACHINE_CLASS=$1
 REPO_SLUG=${2:-pietroMastro92/Sbobino}
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FAILURES=()
+MIN_FREE_GB=${SBOBINO_RUNNER_MIN_FREE_GB:-12.0}
+
+validation_fixture_audio() {
+  if [[ -n "${SBOBINO_VALIDATION_FIXTURE_AUDIO:-}" ]]; then
+    printf '%s\n' "$SBOBINO_VALIDATION_FIXTURE_AUDIO"
+    return 0
+  fi
+  case "$MACHINE_CLASS" in
+    AS-THIRD)
+      printf '%s\n' "$HOME/Fixtures/as-third-diarization.wav"
+      ;;
+    *)
+      printf '%s\n' ""
+      ;;
+  esac
+}
 
 validation_fixture_audio() {
   if [[ -n "${SBOBINO_VALIDATION_FIXTURE_AUDIO:-}" ]]; then
@@ -106,14 +122,15 @@ free = shutil.disk_usage("/").free / (1024 ** 3)
 print(f"{free:.1f}")
 PY
 )
-if ! python3 - <<'PY' "$AVAILABLE_GB"
+if ! python3 - <<'PY' "$AVAILABLE_GB" "$MIN_FREE_GB"
 import sys
 available = float(sys.argv[1])
-if available < 30.0:
+minimum = float(sys.argv[2])
+if available < minimum:
     raise SystemExit(1)
 PY
 then
-  record_failure "Less than 30 GB free on the system volume."
+  record_failure "Less than ${MIN_FREE_GB} GB free on the system volume."
 fi
 
 if [[ "$MACHINE_CLASS" != "INTEL-PRIMARY" ]]; then
@@ -125,29 +142,34 @@ if [[ "$MACHINE_CLASS" != "INTEL-PRIMARY" ]]; then
   fi
 fi
 
-RUNNERS_JSON=$(gh api "repos/${REPO_SLUG}/actions/runners" 2>/dev/null || echo '{"runners":[]}')
 LABELS_EXPECTED=$(labels_for_machine "$MACHINE_CLASS")
-if ! python3 - <<'PY' "$RUNNERS_JSON" "$LABELS_EXPECTED"
-import json
-import sys
-
-runners = json.loads(sys.argv[1]).get("runners", [])
-expected = set(sys.argv[2].split(","))
-
-for runner in runners:
-    labels = {
-        label.get("name", "").lower()
-        for label in runner.get("labels", [])
-        if label.get("name")
-    }
-    if expected.issubset(labels) and runner.get("status") == "online":
-        print(f"online:{runner.get('name','unknown')}")
-        raise SystemExit(0)
-
-raise SystemExit(1)
-PY
-then
-  record_failure "No online GitHub runner is currently registered with labels: $LABELS_EXPECTED"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  :
+else
+  RUNNER_MATCH_FOUND=0
+  RUNNER_LINES=$(gh api "repos/${REPO_SLUG}/actions/runners" \
+    --jq '.runners[] | select(.status == "online") | [.name, ([.labels[].name | ascii_downcase] | join(","))] | @tsv' \
+    2>/dev/null || true)
+  while IFS=$'\t' read -r runner_name runner_labels; do
+    [[ -z "${runner_name:-}" ]] && continue
+    IFS=',' read -ra expected_labels <<<"$LABELS_EXPECTED"
+    runner_label_set=",$runner_labels,"
+    missing_label=0
+    for expected_label in "${expected_labels[@]}"; do
+      if [[ "$runner_label_set" != *",$expected_label,"* ]]; then
+        missing_label=1
+        break
+      fi
+    done
+    if [[ "$missing_label" == "0" ]]; then
+      echo "online:$runner_name"
+      RUNNER_MATCH_FOUND=1
+      break
+    fi
+  done <<<"$RUNNER_LINES"
+  if [[ "$RUNNER_MATCH_FOUND" != "1" ]]; then
+    record_failure "No online GitHub runner is currently registered with labels: $LABELS_EXPECTED"
+  fi
 fi
 
 if [[ ${#FAILURES[@]} -gt 0 ]]; then
@@ -165,4 +187,5 @@ Runner preflight passed.
   arch:     $CURRENT_ARCH
   labels:   $(labels_for_machine "$MACHINE_CLASS")
   free GB:  $AVAILABLE_GB
+  min GB:   $MIN_FREE_GB
 EOF

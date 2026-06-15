@@ -107,6 +107,15 @@ function createModelCatalogFixture(): ProvisioningModelCatalogEntry[] {
       engine: "whisper_cpp",
       experimental: false,
     },
+    {
+      key: "tdt06b_v3_q4",
+      label: "Parakeet TDT 0.6B v3 Q4_K",
+      model_file: "tdt-0.6b-v3-q4_k.gguf",
+      installed: true,
+      coreml_installed: true,
+      engine: "parakeet_cpp",
+      experimental: true,
+    },
   ];
 }
 
@@ -158,15 +167,20 @@ describe("initialSetup helpers", () => {
     ).toBe(false);
   });
 
-  it("requires base and large turbo during first-launch setup", () => {
+  it("requires whisper and Parakeet default models during first-launch setup", () => {
     const catalog = createModelCatalogFixture();
     catalog[1] = {
       ...catalog[1],
       coreml_installed: false,
     };
+    catalog[2] = {
+      ...catalog[2],
+      installed: false,
+    };
 
     expect(getInitialSetupMissingModels(catalog, true)).toEqual([
       "large_turbo",
+      "tdt06b_v3_q4",
     ]);
   });
 

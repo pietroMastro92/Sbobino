@@ -289,7 +289,9 @@ export async function optimizeArtifact(payload: OptimizeArtifactPayload): Promis
 }
 
 export async function startRealtime(payload?: {
+  engine?: StartTranscriptionPayload["engine"];
   model?: AppSettings["model"];
+  parakeet_model?: StartTranscriptionPayload["parakeet_model"];
   language?: AppSettings["language"];
   resume_artifact_id?: string;
 }): Promise<{ started: boolean }> {
@@ -395,7 +397,9 @@ export async function ensureTranscriptionRuntime(): Promise<EnsureRuntimeRespons
 }
 
 export async function fetchRealtimeStartReadiness(payload: {
+  engine?: StartTranscriptionPayload["engine"];
   model: StartTranscriptionPayload["model"];
+  parakeet_model?: StartTranscriptionPayload["parakeet_model"];
 }): Promise<RealtimeStartReadiness> {
   return invoke<RealtimeStartReadiness>("get_realtime_start_readiness", { payload });
 }

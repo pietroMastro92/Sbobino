@@ -56,8 +56,11 @@ pub struct AutomaticImportQueuedJob {
     pub job_id: String,
     pub source_id: String,
     pub source_label: String,
+    pub folder_path: String,
     pub file_path: String,
     pub title: String,
+    pub model: SpeechModel,
+    pub language: LanguageCode,
     pub workspace_id: Option<String>,
     pub preset: String,
 }
@@ -339,8 +342,11 @@ async fn scan_automatic_import_inner(
             job_id: response.job_id,
             source_id: candidate.source_id.clone(),
             source_label: candidate.source_label.clone(),
+            folder_path: candidate.folder_path.clone(),
             file_path: candidate.file_path.clone(),
             title: candidate.title.clone(),
+            model: candidate.model.clone(),
+            language: candidate.language.clone(),
             workspace_id: candidate.workspace_id.clone(),
             preset: automatic_import_preset_str(&candidate.source_preset).to_string(),
         });
@@ -1057,6 +1063,43 @@ mod tests {
         assert!(scan.candidates[0]
             .fingerprint_json
             .contains("\"dedupe_key\""));
+    }
+
+    #[test]
+    fn collect_candidates_preserves_auto_language_for_source() {
+        let temp = tempdir().expect("temp dir");
+        let root = temp.path();
+        fs::write(root.join("italian.m4a"), b"audio").expect("write audio");
+
+        let mut settings = AppSettings::default();
+        settings.automation = AutomaticImportSettings {
+            enabled: true,
+            run_scan_on_app_start: true,
+            scan_interval_minutes: 15,
+            allowed_extensions: vec!["m4a".to_string()],
+            watched_sources: vec![AutomaticImportSource {
+                id: "source_auto".to_string(),
+                label: "Italian Auto".to_string(),
+                folder_path: root.to_string_lossy().to_string(),
+                enabled: true,
+                preset: AutomaticImportPreset::General,
+                model: SpeechModel::LargeTurbo,
+                language: LanguageCode::Auto,
+                workspace_id: None,
+                recursive: true,
+                enable_ai_post_processing: false,
+                post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(),
+            }],
+            excluded_folders: Vec::new(),
+            source_statuses: Vec::new(),
+            recent_activity: Vec::new(),
+            quarantined_items: Vec::new(),
+        };
+
+        let scan = collect_candidates(&settings);
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(scan.candidates[0].model, SpeechModel::LargeTurbo);
+        assert_eq!(scan.candidates[0].language, LanguageCode::Auto);
     }
 
     #[test]

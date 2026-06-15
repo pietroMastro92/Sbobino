@@ -1,12 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
 use sbobino_application::{ArtifactService, SettingsService};
+use sbobino_domain::TranscriptionEngine;
 use sbobino_infrastructure::{
     adapters::whisper_stream::WhisperStreamEngine, RuntimeTranscriptionFactory,
 };
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+use crate::parakeet_realtime::ParakeetRealtimeEngine;
 use crate::realtime_audio::RealtimeInputPreviewHandle;
 
 pub struct TranscriptionTask {
@@ -16,6 +18,8 @@ pub struct TranscriptionTask {
 #[derive(Clone)]
 pub struct RealtimeRuntime {
     pub engine: Arc<Mutex<WhisperStreamEngine>>,
+    pub parakeet_engine: Arc<Mutex<Option<ParakeetRealtimeEngine>>>,
+    pub active_engine: Arc<Mutex<TranscriptionEngine>>,
     pub preview: Arc<Mutex<Option<RealtimeInputPreviewHandle>>>,
     pub session_name: Arc<Mutex<Option<String>>>,
     pub model_filename: Arc<Mutex<Option<String>>>,

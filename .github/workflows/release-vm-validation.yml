@@ -27,12 +27,41 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG_NAME: v${{ inputs.version }}
+      SBOBINO_RUNNER_MIN_FREE_GB: "8.0"
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
           ref: v${{ inputs.version }}
           fetch-depth: 0
+
+      - name: Add VM toolchain paths
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/sbin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain stable -y
+          else
+            rustup toolchain install stable --profile minimal --no-self-update
+            rustup default stable
+          fi
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          export PATH="$toolchain_bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          cargo --version
+          rustc --version
+
+      - name: Clean previous validation state
+        working-directory: sbobino_desktop
+        run: ./scripts/clean_release_validation_state.sh AS-THIRD
 
       - name: Validate runner preflight
         working-directory: sbobino_desktop
