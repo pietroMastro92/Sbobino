@@ -854,16 +854,23 @@ async fn run_file_transcription_with_ai_runs_enhancer_steps() {
     assert!(stages.contains(&JobStage::Optimizing));
     assert!(stages.contains(&JobStage::Summarizing));
 
-    assert_eq!(artifact.optimized_transcript, "meeting raw");
+    // The MockEnhancer returns "optimized::meeting raw", which is
+    // the source plus a 1-token addition. With the relaxed safety
+    // net (MAX_CONTEXTUAL_INSERT_TOKENS = 2), small additive topic-
+    // aware changes are preserved, so the optimization flows
+    // through to the persisted artifact. Summarization then runs
+    // against the optimized text, not the raw one.
+    assert_eq!(artifact.raw_transcript, "meeting raw");
+    assert_eq!(artifact.optimized_transcript, "optimized::meeting raw");
     assert_eq!(
         artifact
             .metadata
             .get(HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY)
             .map(String::as_str),
-        None
+        Some("true")
     );
-    assert_eq!(artifact.summary, "summary::meeting raw");
-    assert_eq!(artifact.faqs, "faqs::meeting raw");
+    assert_eq!(artifact.summary, "summary::optimized::meeting raw");
+    assert_eq!(artifact.faqs, "faqs::optimized::meeting raw");
 
     assert_eq!(
         *enhancer
