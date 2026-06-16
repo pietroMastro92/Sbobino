@@ -19,6 +19,7 @@ use crate::{
     },
     state::AppState,
 };
+use sbobino_domain::TranscriptionEngine;
 use sbobino_infrastructure::{
     ManagedPyannoteManifest, ManagedRuntimeHealth, ReconcileManagedPyannoteReleaseOutcome,
     RuntimeTranscriptionFactory, PYANNOTE_MANIFEST_FILENAME,
@@ -590,13 +591,27 @@ fn format_managed_runtime_install_error(health: &ManagedRuntimeHealth) -> String
 
 fn transcription_runtime_install_complete(health: &sbobino_infrastructure::RuntimeHealth) -> bool {
     if health.managed_runtime_required {
-        return health.managed_runtime.ready;
+        // All release binaries (ffmpeg, whisper CLI, whisper stream,
+        // parakeet CLI) must be present regardless of which engine is
+        // selected, so the user can switch engines at runtime without
+        // re-running setup. v2.0.4 commit 4d0a61c made this a single
+        // check; the ff5c896 merge reverted to per-engine checks.
+        return health.managed_runtime.ffmpeg.available
+            && health.managed_runtime.whisper_cli.available
+            && health.managed_runtime.whisper_stream.available
+            && health.managed_runtime.parakeet_cli.available;
     }
 
-    health.ffmpeg_available
-        && health.whisper_cli_available
-        && health.whisper_stream_available
-        && health.parakeet_cli_available
+    match health.configured_engine {
+        TranscriptionEngine::WhisperCpp => {
+            health.ffmpeg_available
+                && health.whisper_cli_available
+                && health.whisper_stream_available
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            health.ffmpeg_available && health.parakeet_cli_available
+        }
+    }
 }
 
 fn collect_missing_models(models_dir: &Path) -> Vec<String> {

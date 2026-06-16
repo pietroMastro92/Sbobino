@@ -211,24 +211,47 @@ describe("initialSetup helpers", () => {
     expect(isInitialSetupComplete(true, runtimeHealth, catalog)).toBe(true);
   });
 
-  it("does not trust managed runtime readiness when Parakeet CLI is missing", () => {
-    const runtimeHealth = createRuntimeHealthFixture();
-    runtimeHealth.managed_runtime.ready = true;
-    runtimeHealth.managed_runtime.parakeet_cli = {
+  it("respects configured engine for managed runtime readiness", () => {
+    const whisperRuntime = createRuntimeHealthFixture();
+    whisperRuntime.managed_runtime.ready = true;
+    whisperRuntime.managed_runtime.parakeet_cli = {
       resolved_path: "/tmp/parakeet-cli",
       available: false,
       failure_reason: "missing_file",
       failure_message: "Managed runtime binary is missing.",
     };
-    runtimeHealth.parakeet_cli_available = false;
+    whisperRuntime.parakeet_cli_available = false;
 
-    expect(isRuntimeToolchainReady(runtimeHealth)).toBe(false);
-    expect(getRuntimeToolchainFailureMessage(runtimeHealth)).toBe(
-      "Managed runtime binary is missing.",
+    // Whisper users should not be blocked by a missing Parakeet CLI.
+    expect(isRuntimeToolchainReady(whisperRuntime)).toBe(true);
+    expect(getRuntimeToolchainFailureMessage(whisperRuntime)).toBeNull();
+
+    // Parakeet users must still see Parakeet CLI as a hard requirement.
+    const parakeetRuntime = createRuntimeHealthFixture();
+    parakeetRuntime.configured_engine = "parakeet_cpp";
+    parakeetRuntime.managed_runtime.ready = false;
+    parakeetRuntime.managed_runtime.whisper_cli = {
+      resolved_path: "/tmp/whisper-cli",
+      available: false,
+      failure_reason: "missing_file",
+      failure_message: "Whisper CLI missing.",
+    };
+    parakeetRuntime.whisper_cli_available = false;
+
+    expect(isRuntimeToolchainReady(parakeetRuntime)).toBe(false);
+    expect(getRuntimeToolchainFailureMessage(parakeetRuntime)).toBeNull();
+
+    parakeetRuntime.managed_runtime.parakeet_cli = {
+      resolved_path: "/tmp/parakeet-cli",
+      available: false,
+      failure_reason: "missing_file",
+      failure_message: "Parakeet CLI missing.",
+    };
+    parakeetRuntime.parakeet_cli_available = false;
+    expect(isRuntimeToolchainReady(parakeetRuntime)).toBe(false);
+    expect(getRuntimeToolchainFailureMessage(parakeetRuntime)).toBe(
+      "Parakeet CLI missing.",
     );
-    expect(
-      isInitialSetupComplete(true, runtimeHealth, createModelCatalogFixture()),
-    ).toBe(false);
   });
 
   it("allows warm start only for trusted completed setup reports", () => {

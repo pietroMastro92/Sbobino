@@ -4,6 +4,7 @@ import type {
   PyannoteRuntimeHealth,
   RuntimeHealth,
   SpeechModel,
+  TranscriptionEngine,
 } from "../types";
 
 export const INITIAL_SETUP_REQUIRED_MODELS: SpeechModel[] = [
@@ -83,22 +84,37 @@ export function findProvisioningModelEntry(
 export function getInitialSetupMissingModels(
   modelCatalog: ProvisioningModelCatalogEntry[],
   requireCoreml: boolean,
+  engine?: TranscriptionEngine,
 ): Array<SpeechModel | ParakeetModel> {
-  const missingWhisper = INITIAL_SETUP_REQUIRED_MODELS.filter(
-    (model) =>
-      !isProvisionedModelReady(
-        findProvisioningModelEntry(modelCatalog, model),
-        requireCoreml,
-      ),
-  );
-  const missingParakeet = INITIAL_SETUP_REQUIRED_PARAKEET_MODELS.filter(
-    (model) =>
-      !isProvisionedModelReady(
-        findProvisioningModelEntry(modelCatalog, model),
-        false,
-      ),
-  );
-  return [...missingWhisper, ...missingParakeet];
+  const includeWhisper = !engine || engine === "whisper_cpp";
+  const includeParakeet = !engine || engine === "parakeet_cpp";
+
+  const missing: Array<SpeechModel | ParakeetModel> = [];
+  if (includeWhisper) {
+    for (const model of INITIAL_SETUP_REQUIRED_MODELS) {
+      if (
+        !isProvisionedModelReady(
+          findProvisioningModelEntry(modelCatalog, model),
+          requireCoreml,
+        )
+      ) {
+        missing.push(model);
+      }
+    }
+  }
+  if (includeParakeet) {
+    for (const model of INITIAL_SETUP_REQUIRED_PARAKEET_MODELS) {
+      if (
+        !isProvisionedModelReady(
+          findProvisioningModelEntry(modelCatalog, model),
+          false,
+        )
+      ) {
+        missing.push(model);
+      }
+    }
+  }
+  return missing;
 }
 
 export function shouldRepairPyannoteRuntime(
@@ -124,8 +140,11 @@ export function isInitialSetupComplete(
   const pyannoteReady =
     !INITIAL_SETUP_REQUIRES_PYANNOTE || runtimeHealth.pyannote.ready;
   const modelsReady =
-    getInitialSetupMissingModels(modelCatalog, runtimeHealth.is_apple_silicon)
-      .length === 0;
+    getInitialSetupMissingModels(
+      modelCatalog,
+      runtimeHealth.is_apple_silicon,
+      runtimeHealth.configured_engine,
+    ).length === 0;
 
   return runtimeReady && pyannoteReady && modelsReady;
 }
@@ -184,15 +203,23 @@ export function isRuntimeToolchainReady(
 
   const managedRuntime = getManagedRuntime(runtimeHealth);
   if (runtimeHealth.managed_runtime_required) {
+    if (runtimeHealth.configured_engine === "parakeet_cpp") {
+      return (
+        managedRuntime.ffmpeg.available && managedRuntime.parakeet_cli.available
+      );
+    }
     return (
-      managedRuntime.ready &&
       managedRuntime.ffmpeg.available &&
       managedRuntime.whisper_cli.available &&
-      managedRuntime.whisper_stream.available &&
-      managedRuntime.parakeet_cli.available
+      managedRuntime.whisper_stream.available
     );
   }
 
+  if (runtimeHealth.configured_engine === "parakeet_cpp") {
+    return (
+      runtimeHealth.ffmpeg_available && runtimeHealth.parakeet_cli_available
+    );
+  }
   return (
     runtimeHealth.ffmpeg_available &&
     runtimeHealth.whisper_cli_available &&
@@ -211,14 +238,17 @@ export function getRuntimeToolchainFailureMessage(
   if (!managedRuntime.ffmpeg.available) {
     return managedRuntime.ffmpeg.failure_message || null;
   }
+  if (runtimeHealth.configured_engine === "parakeet_cpp") {
+    if (!managedRuntime.parakeet_cli.available) {
+      return managedRuntime.parakeet_cli.failure_message || null;
+    }
+    return null;
+  }
   if (!managedRuntime.whisper_cli.available) {
     return managedRuntime.whisper_cli.failure_message || null;
   }
   if (!managedRuntime.whisper_stream.available) {
     return managedRuntime.whisper_stream.failure_message || null;
-  }
-  if (!managedRuntime.parakeet_cli.available) {
-    return managedRuntime.parakeet_cli.failure_message || null;
   }
 
   return null;

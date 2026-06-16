@@ -6988,6 +6988,7 @@ export function App({
       getInitialSetupMissingModels(
         snapshot.modelCatalog,
         snapshot.runtimeHealth.is_apple_silicon,
+        snapshot.runtimeHealth.configured_engine,
       ).length > 0
     ) {
       return "models_missing";
@@ -7361,6 +7362,7 @@ export function App({
         getInitialSetupMissingModels(
           snapshot.modelCatalog,
           snapshot.runtimeHealth.is_apple_silicon,
+          snapshot.runtimeHealth.configured_engine,
         ).length > 0
       ) {
         throw new Error(

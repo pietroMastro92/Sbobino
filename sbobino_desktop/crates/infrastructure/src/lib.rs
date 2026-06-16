@@ -1284,9 +1284,26 @@ impl RuntimeTranscriptionFactory {
             true
         };
         let runtime_ready = if self.managed_runtime_required() {
-            managed_runtime.ready
+            match settings.transcription.engine {
+                TranscriptionEngine::WhisperCpp => {
+                    managed_runtime.ffmpeg.available
+                        && managed_runtime.whisper_cli.available
+                        && managed_runtime.whisper_stream.available
+                }
+                TranscriptionEngine::ParakeetCpp => {
+                    managed_runtime.ffmpeg.available
+                        && managed_runtime.parakeet_cli.available
+                }
+            }
         } else {
-            ffmpeg_available && whisper_cli_available && whisper_stream_available
+            match settings.transcription.engine {
+                TranscriptionEngine::WhisperCpp => {
+                    ffmpeg_available && whisper_cli_available && whisper_stream_available
+                }
+                TranscriptionEngine::ParakeetCpp => {
+                    ffmpeg_available && parakeet_cli_available
+                }
+            }
         };
         let runtime_source = if self.managed_runtime_required() {
             managed_runtime.source.clone()

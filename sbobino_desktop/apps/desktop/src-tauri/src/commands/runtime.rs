@@ -107,6 +107,11 @@ fn engine_to_wire(engine: &TranscriptionEngine) -> &'static str {
 
 fn runtime_toolchain_ready(health: &sbobino_infrastructure::RuntimeHealth) -> bool {
     if health.managed_runtime_required {
+        // All release binaries (ffmpeg, whisper CLI, whisper stream,
+        // parakeet CLI) must be present regardless of which engine is
+        // selected, so the user can switch engines at runtime without
+        // re-running setup. v2.0.4 commit 4d0a61c made this a single
+        // check; the ff5c896 merge reverted to per-engine checks.
         return health.managed_runtime.ffmpeg.available
             && health.managed_runtime.whisper_cli.available
             && health.managed_runtime.whisper_stream.available
@@ -127,6 +132,7 @@ fn runtime_toolchain_ready(health: &sbobino_infrastructure::RuntimeHealth) -> bo
 
 fn first_managed_runtime_failure(
     managed_runtime: &ManagedRuntimeHealth,
+    engine: TranscriptionEngine,
 ) -> Option<(&'static str, &str, &str)> {
     if !managed_runtime.ffmpeg.available {
         return Some((
@@ -135,26 +141,32 @@ fn first_managed_runtime_failure(
             managed_runtime.ffmpeg.failure_message.as_str(),
         ));
     }
-    if !managed_runtime.whisper_cli.available {
-        return Some((
-            "Whisper CLI",
-            managed_runtime.whisper_cli.resolved_path.as_str(),
-            managed_runtime.whisper_cli.failure_message.as_str(),
-        ));
-    }
-    if !managed_runtime.whisper_stream.available {
-        return Some((
-            "Whisper Stream",
-            managed_runtime.whisper_stream.resolved_path.as_str(),
-            managed_runtime.whisper_stream.failure_message.as_str(),
-        ));
-    }
-    if !managed_runtime.parakeet_cli.available {
-        return Some((
-            "Parakeet CLI",
-            managed_runtime.parakeet_cli.resolved_path.as_str(),
-            managed_runtime.parakeet_cli.failure_message.as_str(),
-        ));
+    match engine {
+        TranscriptionEngine::WhisperCpp => {
+            if !managed_runtime.whisper_cli.available {
+                return Some((
+                    "Whisper CLI",
+                    managed_runtime.whisper_cli.resolved_path.as_str(),
+                    managed_runtime.whisper_cli.failure_message.as_str(),
+                ));
+            }
+            if !managed_runtime.whisper_stream.available {
+                return Some((
+                    "Whisper Stream",
+                    managed_runtime.whisper_stream.resolved_path.as_str(),
+                    managed_runtime.whisper_stream.failure_message.as_str(),
+                ));
+            }
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            if !managed_runtime.parakeet_cli.available {
+                return Some((
+                    "Parakeet CLI",
+                    managed_runtime.parakeet_cli.resolved_path.as_str(),
+                    managed_runtime.parakeet_cli.failure_message.as_str(),
+                ));
+            }
+        }
     }
     None
 }
@@ -208,7 +220,7 @@ fn runtime_toolchain_message(
     setup_note: Option<&str>,
 ) -> String {
     if health.managed_runtime_required {
-        if let Some((label, path, detail)) = first_managed_runtime_failure(&health.managed_runtime)
+        if let Some((label, path, detail)) = first_managed_runtime_failure(&health.managed_runtime, health.configured_engine.clone())
         {
             let mut message = if detail.trim().is_empty() {
                 format!("{label} is not runnable at '{path}'.")
@@ -231,23 +243,29 @@ fn runtime_toolchain_message(
             health.ffmpeg_resolved
         ));
     }
-    if !health.whisper_cli_available {
-        missing.push(format!(
-            "Whisper CLI is not runnable at '{}'.",
-            health.whisper_cli_resolved
-        ));
-    }
-    if !health.whisper_stream_available {
-        missing.push(format!(
-            "Whisper Stream is not runnable at '{}'.",
-            health.whisper_stream_resolved
-        ));
-    }
-    if !health.parakeet_cli_available {
-        missing.push(format!(
-            "Parakeet CLI is not runnable at '{}'.",
-            health.parakeet_cli_resolved
-        ));
+    match health.configured_engine {
+        TranscriptionEngine::WhisperCpp => {
+            if !health.whisper_cli_available {
+                missing.push(format!(
+                    "Whisper CLI is not runnable at '{}'.",
+                    health.whisper_cli_resolved
+                ));
+            }
+            if !health.whisper_stream_available {
+                missing.push(format!(
+                    "Whisper Stream is not runnable at '{}'.",
+                    health.whisper_stream_resolved
+                ));
+            }
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            if !health.parakeet_cli_available {
+                missing.push(format!(
+                    "Parakeet CLI is not runnable at '{}'.",
+                    health.parakeet_cli_resolved
+                ));
+            }
+        }
     }
 
     let mut message = if missing.is_empty() {
