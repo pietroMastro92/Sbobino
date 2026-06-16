@@ -189,12 +189,28 @@ fn build_optimize_prompt(
         })
     {
         return format!(
-            "{template}\n\nLanguage: {language_instruction}\n\nAdditional cleanup rules:\n- Preserve the original wording, structure, and order of the transcript as much as possible.\n- Improve punctuation, capitalization, spacing, and paragraph breaks.\n- Remove obvious accidental repetitions, duplicated lines, and looped sentences.\n- Keep only one occurrence when the same sentence is repeated in sequence by mistake.\n- Correct isolated words or short phrases that are clearly wrong ASR/transcription mistakes when the surrounding context makes the intended meaning highly likely.\n- Prefer minimal local corrections, especially for technical terms, acronyms, library names, product names, and domain-specific jargon.\n- If you are not confident about a correction, keep the original wording.\n- Do not paraphrase whole sentences, summarize, reorder ideas, or invent missing facts.\n\nTranscript:\n{text}\n\nReturn only the cleaned transcript."
+            "{template}\n\nLanguage: {language_instruction}\n\nAdditional cleanup rules:\n- Preserve the original language and the speaker's TONE, register, and level of formality — not the exact phrasing. The speaker's tone stays, but the words themselves should be the ones a careful editor would have chosen, not the ones that happened to come out of the speaker's mouth.\n- Produce a substantial, readable rewrite, not a light touch-up. Do not be timid: a transcript optimized by leaving 90% of the original words in place has not been optimized at all. Aggressively fix grammar, morphology, agreement, verb tenses, and word order.\n- Add proper punctuation (commas, periods, apostrophes, question marks, dashes, colons) and use correct capitalization. Insert paragraph breaks where the speaker clearly shifts topic or completes a thought.\n- Remove false starts, filler words, restarts, and verbal stumbles that do not change meaning. Merge broken sentences split across a pause or restart so the result reads naturally.\n- Restructure sentences for clarity when the spoken order is confusing, but keep the same ideas and topic order. Do not move ideas between topics.\n- Correct garbled or clearly misheard words and short phrases when the surrounding context makes the intended term highly likely. Pay special attention to technical terms, acronyms, library names, product names, names of people, and domain-specific jargon.\n- Understand the topic being discussed in the transcript. When the speaker's wording is ambiguous and the surrounding context makes the intended meaning clear, prefer the clearer wording. When the speaker's flow of ideas is logically sound but the connection between sentences is implicit, make that connection explicit with a short connective if it improves readability. When the speaker uses vague references like 'la cosa di cui parlavamo' or colloquial fillers like 'fare casino', and the topic is clear from the surrounding context, replace them with the topic-specific term or a more precise editorial form.\n- Normalize numbers, dates, and units to their most common written form when the context makes it unambiguous (for example \"twenty three\" -> \"23\", \"five kilometers\" -> \"5 km\").\n- Do not invent new facts, examples, names, numbers, or conclusions that are not in the original text. Do not summarize. Do not add introductory or meta phrases such as \"The speaker says that...\" or \"In this transcript...\".\n- Return only the cleaned transcript, with no commentary, headings, or labels.\n\nExample of the expected level of rewriting (Italian):\nInput: 'uh allora io dico che è importante capire il problema prima di iniziare a programmare e quindi dobbiamo prima fare una analisi attenta di quello che vogliamo realizzare'\nOutput: 'È importante capire il problema prima di iniziare a programmare. Dobbiamo quindi condurre un'analisi attenta di ciò che vogliamo realizzare.'
+Another example of the expected level of rewriting (Italian):
+Input: 'il progetto ha avuto successo. il team ha lavorato bene.'
+Output: 'Il progetto ha avuto successo perché il team ha lavorato bene.'
+Another example of topic-aware rewriting (Italian):
+Input: 'allora dobbiamo capire bene la cosa di cui parlavamo prima di iniziare a programmare perche senno facciamo casino'
+Output: 'Dobbiamo comprendere a fondo i requisiti del progetto software prima di iniziare a programmare, altrimenti creeremo confusione.'
+
+\n\nTranscript:\n{text}\n\nReturn only the cleaned transcript."
         );
     }
 
     format!(
-        "Clean this transcript while preserving the same language as the source text ({language_instruction}). Preserve the original wording, structure, and order as much as possible. Improve punctuation, capitalization, spacing, and paragraph breaks, and remove obvious transcription glitches such as consecutive duplicated lines, repeated phrases, looped sentences, and hallucinated filler. When the same sentence is repeated accidentally in sequence, keep only the single best occurrence. You may correct isolated words or short phrases that are clearly wrong ASR/transcription mistakes when the surrounding context makes the intended term highly likely, especially for technical terms, acronyms, library names, product names, and domain-specific jargon. Prefer minimal local corrections. If uncertain, keep the original wording. Do not paraphrase whole sentences, summarize, reorder ideas, or invent missing facts. Return only the cleaned transcript.\n\n{text}"
+        "Clean this transcript while preserving the same language as the source text ({language_instruction}). Produce a substantial, readable rewrite, not a light touch-up. Do not be timid: a transcript optimized by leaving 90% of the original words in place has not been optimized at all. Aggressively fix grammar, morphology, agreement, verb tenses, and word order; add proper punctuation (commas, periods, apostrophes, question marks, dashes, colons) and correct capitalization; insert paragraph breaks where the speaker clearly shifts topic or completes a thought. Remove false starts, filler words, restarts, and verbal stumbles that do not change meaning, and merge broken sentences that the speaker split across a pause or restart so the result reads naturally. Restructure sentences for clarity when the spoken order is confusing, but keep the same ideas and topic order and do not move ideas between topics. Correct garbled or clearly misheard words and short phrases when the surrounding context makes the intended term highly likely, with special attention to technical terms, acronyms, library names, product names, names of people, and domain-specific jargon. Understand the topic being discussed; when the speaker's wording is ambiguous and the surrounding context makes the intended meaning clear, prefer the clearer wording, and when the speaker's flow of ideas is logically sound but the connection between sentences is implicit, make that connection explicit with a short connective if it improves readability, and when the speaker uses vague references like 'la cosa di cui parlavamo' or colloquial fillers like 'fare casino' and the topic is clear from the surrounding context, replace them with the topic-specific term or a more precise editorial form. Normalize numbers, dates, and units to their most common written form when the context makes it unambiguous (for example \"twenty three\" -> \"23\", \"five kilometers\" -> \"5 km\"). Preserve the original speaker's TONE, register, and level of formality — not the exact phrasing. The speaker's tone stays, but the words themselves should be the ones a careful editor would have chosen, not the ones that happened to come out of the speaker's mouth. Do not invent new facts, examples, names, numbers, or conclusions that are not in the original text. Do not summarize. Do not add introductory or meta phrases such as \"The speaker says that...\" or \"In this transcript...\". Return only the cleaned transcript, with no commentary, headings, or labels.\n\nExample of the expected level of rewriting (Italian):\nInput: 'uh allora io dico che è importante capire il problema prima di iniziare a programmare e quindi dobbiamo prima fare una analisi attenta di quello che vogliamo realizzare'\nOutput: 'È importante capire il problema prima di iniziare a programmare. Dobbiamo quindi condurre un'analisi attenta di ciò che vogliamo realizzare.'
+Another example of the expected level of rewriting (Italian):
+Input: 'il progetto ha avuto successo. il team ha lavorato bene.'
+Output: 'Il progetto ha avuto successo perché il team ha lavorato bene.'
+Another example of topic-aware rewriting (Italian):
+Input: 'allora dobbiamo capire bene la cosa di cui parlavamo prima di iniziare a programmare perche senno facciamo casino'
+Output: 'Dobbiamo comprendere a fondo i requisiti del progetto software prima di iniziare a programmare, altrimenti creeremo confusione.'
+
+\n\n{text}"
     )
 }
 
@@ -362,7 +378,74 @@ mod tests {
         let prompt = build_optimize_prompt("ciao", "auto", None, None);
         assert!(prompt.contains("the same language as the source text"));
         assert!(prompt.contains("the same language as the transcript"));
-        assert!(prompt.contains("repeated phrases"));
+    }
+
+    #[test]
+    fn optimize_prompt_default_authorizes_substantial_rewrites() {
+        let prompt = build_optimize_prompt("ciao", "it", None, None);
+        assert!(prompt.contains("Produce a substantial, readable rewrite"));
+        assert!(prompt.contains("Remove false starts, filler words, restarts"));
+        assert!(prompt.contains("Restructure sentences for clarity"));
+        assert!(prompt.contains("Do not invent new facts"));
+        assert!(prompt.contains("Do not summarize"));
+        // Stronger framing: the prompt must explicitly tell the LLM not
+        // to be timid and to anchor the expected level of change with a
+        // concrete before/after example.
+        assert!(prompt.contains("Do not be timid"));
+        assert!(prompt.contains("90% of the original words"));
+        assert!(prompt.contains("speaker's TONE"));
+        assert!(prompt.contains("careful editor"));
+        assert!(prompt.contains("Example of the expected level of rewriting"));
+        // The 2nd example demonstrates the connective case enabled by the
+        // is_tail_addition relaxation: a short connective (1 token)
+        // inserted to make an implicit logical relationship explicit.
+        assert!(prompt.contains("Another example of the expected level of rewriting"));
+        assert!(prompt.contains("perché il team ha lavorato bene"));
+        // The 3rd example demonstrates the topic-aware rewrite case:
+        // vague placeholders ("la cosa di cui parlavamo", "casino")
+        // replaced with topic-specific terms. This guards the 3rd
+        // example directly so the prompt contract is locked in.
+        assert!(prompt.contains("Another example of topic-aware rewriting"));
+        assert!(prompt.contains("i requisiti del progetto software"));
+        // The 2nd example demonstrates the connective case enabled by the
+        // is_tail_addition relaxation: a short connective (1 token)
+        // inserted to make an implicit logical relationship explicit.
+        assert!(prompt.contains("Another example of the expected level of rewriting"));
+        assert!(prompt.contains("perché il team ha lavorato bene"));
+        // The 3rd example demonstrates the topic-aware rewrite case:
+        // vague placeholders ("la cosa di cui parlavamo", "casino")
+        // replaced with topic-specific terms. This guards the 3rd
+        // example directly so the prompt contract is locked in.
+        assert!(prompt.contains("Another example of topic-aware rewriting"));
+        assert!(prompt.contains("i requisiti del progetto software"));
+    }
+
+    #[test]
+    fn optimize_prompt_template_extends_user_template_with_substantial_cleanup_rules() {
+        let user_template = "You are a transcript editor.";
+        let prompt = build_optimize_prompt("ciao", "en", Some(user_template), None);
+        assert!(prompt.starts_with("You are a transcript editor."));
+        assert!(prompt.contains("Produce a substantial, readable rewrite"));
+        assert!(prompt.contains("Restructure sentences for clarity"));
+        assert!(prompt.contains("Do not invent new facts"));
+        // The user-template branch must carry the same anti-timid
+        // framing and the concrete before/after example as the default
+        // branch.
+        assert!(prompt.contains("Do not be timid"));
+        assert!(prompt.contains("90% of the original words"));
+        assert!(prompt.contains("speaker's TONE"));
+        assert!(prompt.contains("Example of the expected level of rewriting"));
+        // The 2nd example demonstrates the connective case enabled by the
+        // is_tail_addition relaxation: a short connective (1 token)
+        // inserted to make an implicit logical relationship explicit.
+        assert!(prompt.contains("Another example of the expected level of rewriting"));
+        assert!(prompt.contains("perché il team ha lavorato bene"));
+        // The 3rd example demonstrates the topic-aware rewrite case:
+        // vague placeholders ("la cosa di cui parlavamo", "casino")
+        // replaced with topic-specific terms. This guards the 3rd
+        // example directly so the prompt contract is locked in.
+        assert!(prompt.contains("Another example of topic-aware rewriting"));
+        assert!(prompt.contains("i requisiti del progetto software"));
     }
 
     #[test]
@@ -373,6 +456,101 @@ mod tests {
         assert!(message.contains("Switch AI Service"));
         assert!(message.contains("compatible Xcode toolchain"));
     }
+    #[test]
+    fn optimize_prompt_anchors_topic_and_contextual_logic() {
+        // Regression guard: the prompt must explicitly ask the LLM to
+        // understand the topic of the transcript and to make implicit
+        // logical connections explicit when the surrounding context
+        // makes the intended meaning clear. This addresses the
+        // "logico e contestuale di ciò di cui si discute" requirement
+        // that is not covered by the other substantial-rewrite anchors.
+        let default_prompt = build_optimize_prompt("ciao", "it", None, None);
+        let user_template = "You are a transcript editor.";
+        let template_prompt =
+            build_optimize_prompt("ciao", "en", Some(user_template), None);
+
+        for (label, prompt) in [
+            ("default", default_prompt.as_str()),
+            ("template", template_prompt.as_str()),
+        ] {
+            assert!(
+                prompt.contains("Understand the topic being discussed"),
+                "[{label}] prompt must ask the LLM to understand the topic"
+            );
+            assert!(
+                prompt.contains("surrounding context makes the intended meaning clear"),
+                "[{label}] prompt must anchor the topic-aware disambiguation rule"
+            );
+            assert!(
+                prompt.contains("make that connection explicit"),
+                "[{label}] prompt must anchor the explicit-connective rule"
+            );
+            assert!(
+                prompt.contains("vague references like 'la cosa di cui parlavamo'"),
+                "[{label}] prompt must anchor the topic-aware substitution rule"
+            );
+        }
+    }
+
+    #[test]
+    fn optimize_prompt_demonstrates_short_connective_case() {
+        // The 2nd example in the prompt demonstrates the connective case
+        // enabled by the is_tail_addition relaxation in
+        // transcript_cleanup.rs. See the parallel test in
+        // openai_compatible.rs for the full rationale.
+        let default_prompt = build_optimize_prompt("ciao", "it", None, None);
+        let user_template = "You are a transcript editor.";
+        let template_prompt =
+            build_optimize_prompt("ciao", "en", Some(user_template), None);
+
+        for (branch, prompt) in [("default", &default_prompt), ("template", &template_prompt)] {
+            assert!(
+                prompt.contains("Another example of the expected level of rewriting"),
+                "{branch} branch must include the 2nd example marker"
+            );
+            assert!(
+                prompt.contains("perché il team ha lavorato bene"),
+                "{branch} branch must demonstrate the connective output"
+            );
+            assert!(
+                prompt.contains("Another example of topic-aware rewriting"),
+                "{branch} branch must include the 3rd example marker"
+            );
+            assert!(
+                prompt.contains("i requisiti del progetto software"),
+                "{branch} branch must demonstrate the topic-aware rewrite"
+            );
+        }
+    }
+
+    #[test]
+    fn optimize_prompt_demonstrates_topic_aware_rewrite() {
+        // The 3rd example in the prompt demonstrates the topic-aware
+        // rewrite case: vague placeholders ("la cosa di cui parlavamo",
+        // "casino") replaced with topic-specific terms. Without this
+        // example, the LLM has no anchor for substitutions that go
+        // beyond the safe "insert connective / fix garbled term"
+        // family, and may default to the timid "light touch-up" output
+        // the user explicitly wants to avoid. This test guards the
+        // 3rd example directly so the prompt contract is locked in.
+        let default_prompt = build_optimize_prompt("ciao", "it", None, None);
+        let user_template = "You are a transcript editor.";
+        let template_prompt =
+            build_optimize_prompt("ciao", "en", Some(user_template), None);
+
+        for (branch, prompt) in [("default", &default_prompt), ("template", &template_prompt)] {
+            assert!(
+                prompt.contains("Another example of topic-aware rewriting"),
+                "{branch} branch must include the 3rd example marker"
+            );
+            assert!(
+                prompt.contains("i requisiti del progetto software"),
+                "{branch} branch must demonstrate the topic-aware rewrite"
+            );
+        }
+    }
+
+
 }
 
 fn ensure_bridge_script() -> Result<PathBuf, ApplicationError> {

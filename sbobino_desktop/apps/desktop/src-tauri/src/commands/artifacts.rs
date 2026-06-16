@@ -953,7 +953,15 @@ fn build_confidence_aware_optimize_prompt(
     }
 
     sections.push(
-        "Confidence-aware guidance: Whisper provided word-level confidence scores. Treat the suspect spans below as soft evidence about where ASR mistakes are most likely. Be more willing to locally repair garbled or nonsensical wording inside these spans when the surrounding context makes the intended term highly likely. Outside these spans, stay conservative. If a suspect span is still ambiguous, keep the original wording."
+        "Confidence-aware guidance: Whisper provided word-level confidence scores. The suspect spans below are SOFT HINTS about where the speech engine was least sure of itself, so they are the most likely places to need aggressive local repair (ASR mishearings, garbled words, dropped syllables). Treat the highlighted regions as priorities for fixing garbled or misheard words, NOT as a fence around which the rest of the transcript must be left alone. Do not be timid: a transcript optimized by leaving 90% of the original words in place has not been optimized at all. Preserve the original language and the speaker's TONE, register, and level of formality — not the exact phrasing. The speaker's tone stays, but the words themselves should be the ones a careful editor would have chosen, not the ones that happened to come out of the speaker's mouth. You should still apply the same level of substantive syntactic, logical, and contextual cleanup to the rest of the transcript as inside the highlighted regions. Outside these spans, fix grammar, punctuation, sentence structure, false starts, filler, and any clearly garbled words with the same confidence you would inside them. The goal is a fully cleaned transcript, not a mostly-original transcript with edits only in highlighted places. Understand the topic being discussed; when the speaker's wording is ambiguous and the surrounding context makes the intended meaning clear, prefer the clearer wording, and when the speaker's flow of ideas is logically sound but the connection between sentences is implicit, make that connection explicit with a short connective if it improves readability, and when the speaker uses vague references like 'la cosa di cui parlavamo' or colloquial fillers like 'fare casino' and the topic is clear from the surrounding context, replace them with the topic-specific term or a more precise editorial form. If a suspect span is still ambiguous after considering the surrounding context, keep the original wording; do not invent missing facts. Example of the expected level of rewriting (Italian): Input: 'uh allora io dico che è importante capire il problema prima di iniziare a programmare e quindi dobbiamo prima fare una analisi attenta di quello che vogliamo realizzare' Output: 'È importante capire il problema prima di iniziare a programmare. Dobbiamo quindi condurre un'analisi attenta di ciò che vogliamo realizzare.'
+Another example of the expected level of rewriting (Italian):
+Input: 'il progetto ha avuto successo. il team ha lavorato bene.'
+Output: 'Il progetto ha avuto successo perché il team ha lavorato bene.'
+Another example of topic-aware rewriting (Italian):
+Input: 'allora dobbiamo capire bene la cosa di cui parlavamo prima di iniziare a programmare perche senno facciamo casino'
+Output: 'Dobbiamo comprendere a fondo i requisiti del progetto software prima di iniziare a programmare, altrimenti creeremo confusione.'
+
+"
             .to_string(),
     );
 
@@ -976,7 +984,7 @@ fn build_confidence_aware_optimize_prompt(
         .join("\n");
 
     sections.push(format!(
-        "Low-confidence suspect spans from the original Whisper transcript:\n{low_confidence_lines}"
+        "Low-confidence suspect spans from the original Whisper transcript (prioritize aggressive local repair in these regions, but still apply the same level of substantive cleanup everywhere else):\n{low_confidence_lines}"
     ));
 
     Some(sections.join("\n\n"))
@@ -3013,6 +3021,8 @@ mod tests {
         fail_direct_attempts: AtomicUsize,
         hallucinate_optimize: bool,
         hallucinate_merge: bool,
+        hallucinate_long: bool,
+        substantial_rewrite_optimize: bool,
     }
 
     impl TrackingEnhancer {
@@ -3032,6 +3042,8 @@ mod tests {
                 fail_direct_attempts: AtomicUsize::new(fail_direct_attempts),
                 hallucinate_optimize: false,
                 hallucinate_merge: false,
+                hallucinate_long: false,
+                substantial_rewrite_optimize: false,
             }
         }
 
@@ -3045,6 +3057,46 @@ mod tests {
             Self {
                 hallucinate_optimize,
                 hallucinate_merge,
+                substantial_rewrite_optimize: false,
+                ..Self::new(
+                    prefer_single_pass,
+                    chunk_concurrency_limit,
+                    fail_direct_attempts,
+                )
+            }
+        }
+
+        fn with_long_hallucinations(
+            prefer_single_pass: bool,
+            chunk_concurrency_limit: usize,
+            fail_direct_attempts: usize,
+            hallucinate_optimize: bool,
+            hallucinate_merge: bool,
+        ) -> Self {
+            // Like with_hallucinations, but the optimize branch
+            // appends a longer tail so the additive change exceeds
+            // MAX_CONTEXTUAL_INSERT_TOKENS and the safety net
+            // reverts it.
+            Self {
+                hallucinate_optimize,
+                hallucinate_merge,
+                substantial_rewrite_optimize: false,
+                hallucinate_long: true,
+                ..Self::new(
+                    prefer_single_pass,
+                    chunk_concurrency_limit,
+                    fail_direct_attempts,
+                )
+            }
+        }
+
+        fn with_substantial_rewrite(
+            prefer_single_pass: bool,
+            chunk_concurrency_limit: usize,
+            fail_direct_attempts: usize,
+        ) -> Self {
+            Self {
+                substantial_rewrite_optimize: true,
                 ..Self::new(
                     prefer_single_pass,
                     chunk_concurrency_limit,
@@ -3078,7 +3130,15 @@ mod tests {
         ) -> Result<String, ApplicationError> {
             self.optimize_calls.fetch_add(1, Ordering::SeqCst);
             if self.hallucinate_optimize {
-                Ok(format!("{text} added commentary"))
+                if self.hallucinate_long {
+                    Ok(format!(
+                        "{text} extra trailing words here and a final sentence that should be rejected"
+                    ))
+                } else {
+                    Ok(format!("{text} added commentary"))
+                }
+            } else if self.substantial_rewrite_optimize {
+                Ok(simulate_substantial_transcript_rewrite(text))
             } else {
                 Ok(text.to_string())
             }
@@ -3153,7 +3213,57 @@ mod tests {
 
     impl Default for TrackingEnhancer {
         fn default() -> Self {
-            Self::new(false, 3, 0)
+            Self {
+                hallucinate_optimize: false,
+                hallucinate_merge: false,
+                hallucinate_long: false,
+                substantial_rewrite_optimize: false,
+                ..Self::new(false, 3, 0)
+            }
+        }
+    }
+
+    fn simulate_substantial_transcript_rewrite(text: &str) -> String {
+        // Simulate what an LLM following the new optimize prompt would
+        // do: drop common filler, capitalize the first letter of the
+        // chunk, and add a trailing period if the chunk has no terminal
+        // punctuation. Deterministic so tests can assert exact output.
+        let lowered = text.to_lowercase();
+        let filler_words = [
+            "uh", "ehm", "allora", "diciamo", "cioe", "cioè", "insomma",
+            "tipo", "beh", "mmh", "mhh", "ah",
+        ];
+
+        let mut tokens: Vec<String> = Vec::new();
+        for word in lowered.split_whitespace() {
+            let stripped = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+            if filler_words.iter().any(|filler| stripped == *filler) {
+                continue;
+            }
+            tokens.push(word.to_string());
+        }
+
+        let joined = tokens.join(" ");
+        let trimmed = joined.trim().to_string();
+        if trimmed.is_empty() {
+            return text.to_string();
+        }
+
+        let mut chars: Vec<char> = trimmed.chars().collect();
+        if let Some(first) = chars.first_mut() {
+            *first = first.to_ascii_uppercase();
+        }
+        let capitalized: String = chars.into_iter().collect();
+
+        let ends_with_terminal = capitalized
+            .chars()
+            .last()
+            .map(|c| matches!(c, '.' | '?' | '!' | ':' | ';'))
+            .unwrap_or(false);
+        if ends_with_terminal {
+            capitalized
+        } else {
+            format!("{capitalized}.")
         }
     }
 
@@ -3554,7 +3664,98 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn optimize_with_rag_rejects_added_text_from_enhancer() {
+    async fn optimize_with_rag_preserves_distributed_short_connectives_through_chunking() {
+        // The 7th anchor invites the LLM to insert short connectives
+        // throughout the transcript, not just at the end. When a
+        // long transcript is chunked, each chunk's optimization can
+        // independently add a short connective. The safety net's
+        // early-rejection branch must let these DISTRIBUTED small
+        // additions survive the final stitched safety net step
+        // (not just single tail additions).
+        //
+        // The previous safety net used `is_token_subsequence` to
+        // detect additive changes. That check fires whenever the
+        // source is a subsequence of the candidate, which is true
+        // for any additive change (tail or distributed). It would
+        // revert the distributed additions at the final stitched
+        // step because the accumulated additions exceed
+        // MAX_CONTEXTUAL_INSERT_TOKENS.
+        //
+        // The fix replaces the subsequence check with a true
+        // `is_tail_addition` check: the candidate must start with
+        // the source tokens, and any extra tokens must come AFTER
+        // the source. Distributed additions (connectives in the
+        // middle of each chunk) are NOT tail additions, so the
+        // early-rejection branch falls through to the multiset-
+        // overlap and bigram-overlap checks, which accept the
+        // small distributed edits and still reject truly off-topic
+        // content.
+        let enhancer = TrackingEnhancer::with_hallucinations(false, 1, 0, true, false);
+        // Use a long transcript that forces chunking (>2600 chars
+        // target). The enhancer appends " added commentary" (2
+        // tokens) to EACH chunk, so the distributed additions
+        // accumulate in the merged result.
+        let transcript =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(450);
+        let source_word_count = transcript.split_whitespace().count();
+
+        let optimized = optimize_with_rag(&enhancer, &transcript, "en")
+            .await
+            .expect("optimization should succeed");
+
+        // Verify the transcript was actually chunked (multiple
+        // optimize calls). Without chunking, the test would be
+        // trivially true via the single-pass path.
+        let chunk_count = enhancer.optimize_calls.load(Ordering::SeqCst);
+        assert!(
+            chunk_count > 1,
+            "transcript should have been chunked into multiple calls, got {chunk_count}"
+        );
+
+        // The distributed " added commentary" connective must
+        // survive the final stitched safety net step. Each chunk
+        // gets one appendage, so the merged result has at least
+        // `chunk_count` occurrences (the merge may dedupe
+        // overlapping tails, but cannot remove all of them).
+        let added_count = optimized.matches("added commentary").count();
+        assert!(
+            added_count >= 2,
+            "distributed connectives must survive chunking + merge + safety net,              got {added_count} occurrences of the additive phrase in {chunk_count} chunks"
+        );
+
+        // No source word should be lost. The merged result is
+        // made of substrings of the source plus the additive
+        // tokens, so every source word must still appear in the
+        // optimized output.
+        let optimized_lower = optimized.to_lowercase();
+        for word in transcript.split_whitespace() {
+            let needle = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            if needle.is_empty() {
+                continue;
+            }
+            assert!(
+                optimized_lower.contains(&needle),
+                "source word {needle:?} should be preserved in optimized output"
+            );
+        }
+
+        // The optimized output should be slightly longer than the
+        // source (each chunk added 2 tokens).
+        let optimized_word_count = optimized.split_whitespace().count();
+        assert!(
+            optimized_word_count > source_word_count,
+            "optimized output should be longer than source ({optimized_word_count} vs {source_word_count})              when each chunk adds 2 tokens"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_accepts_short_addition_from_enhancer() {
+        // The 7th anchor in the strengthened prompt invites the LLM to
+        // make an implicit logical connection explicit by inserting a
+        // short connective. MAX_CONTEXTUAL_INSERT_TOKENS now allows
+        // the small additive change (" added commentary" = 2 added
+        // tokens) to flow through the safety net so the optimization
+        // is preserved end-to-end.
         let enhancer = TrackingEnhancer::with_hallucinations(false, 1, 0, true, false);
         let transcript = "Alice reviews the roadmap and confirms the launch checklist is complete.";
 
@@ -3562,7 +3763,263 @@ mod tests {
             .await
             .expect("optimization should succeed");
 
+        assert_ne!(optimized, transcript);
+        assert!(optimized.contains("added commentary"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_rejects_large_addition_from_enhancer() {
+        // The safety net still reverts large additive changes. Here
+        // the enhancer appends 4 extra tokens, which exceeds
+        // MAX_CONTEXTUAL_INSERT_TOKENS = 2 and the early-rejection
+        // branch fires. The transcript must come back unchanged.
+        let enhancer = TrackingEnhancer::with_long_hallucinations(false, 1, 0, true, false);
+        let transcript = "Alice reviews the roadmap and confirms the launch checklist is complete.";
+
+        let optimized = optimize_with_rag(&enhancer, transcript, "en")
+            .await
+            .expect("optimization should succeed");
+
         assert_eq!(optimized, transcript);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_accepts_substantial_rewrite_for_short_transcript() {
+        // Short transcript goes through the single-pass path. The
+        // simulated substantial rewrite must flow through to the final
+        // result (i.e. the relaxed safety net accepts it).
+        let enhancer = TrackingEnhancer::with_substantial_rewrite(false, 1, 0);
+        let transcript =
+            "uh allora io dico che è importante capire il problema prima di iniziare a programmare";
+
+        let optimized = optimize_with_rag(&enhancer, transcript, "it")
+            .await
+            .expect("optimization should succeed");
+
+        assert_eq!(enhancer.optimize_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(enhancer.ask_calls.load(Ordering::SeqCst), 0);
+        // Filler words ("uh", "allora") must be removed by the rewrite.
+        // The simulation does not drop the self-reference phrase
+        // "io dico che" (an LLM following the new prompt would); we
+        // just assert the safety net allowed the rewrite through.
+        assert!(!optimized.contains(" uh "));
+        assert!(!optimized.contains(" allora "));
+        assert!(!optimized.starts_with("uh"));
+        assert_ne!(optimized, transcript);
+        // Capitalization and trailing punctuation are added.
+        let first_char = optimized.chars().next().expect("non-empty");
+        assert!(first_char.is_ascii_uppercase());
+        let last_char = optimized.chars().last().expect("non-empty");
+        assert!(matches!(last_char, '.' | '?' | '!'));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_chunks_large_transcripts_with_substantial_rewrite() {
+        // Large transcript: each chunk gets the simulated substantial
+        // rewrite, then they are merged. The relaxed safety net must
+        // accept the merged result even though the rewrites no longer
+        // share exact token overlap with the source.
+        let enhancer = Arc::new(TrackingEnhancer::with_substantial_rewrite(true, 1, 0));
+        let transcript = "uh alice opens the meeting. ehm bob reviews the launch checklist.             allora we need to confirm the deployment plan for next quarter.             tipo the next step is to update the documentation and share it with the team.             beh the deadline is end of next week and we have to ship."
+            .repeat(120);
+
+        let optimized = optimize_with_rag(enhancer.as_ref(), &transcript, "en")
+            .await
+            .expect("optimization should succeed");
+
+        assert!(!optimized.trim().is_empty());
+        assert!(enhancer.optimize_calls.load(Ordering::SeqCst) > 1);
+        assert_eq!(enhancer.ask_calls.load(Ordering::SeqCst), 0);
+        // Filler ("uh", "ehm", "allora", "tipo", "beh") should be removed
+        // from the merged result.
+        assert!(!optimized.contains(" uh "));
+        assert!(!optimized.contains(" ehm "));
+        assert!(!optimized.contains(" allora "));
+        assert!(!optimized.contains(" tipo "));
+        assert!(!optimized.contains(" beh "));
+        assert!(!optimized.contains("[Section"));
+    }
+
+    #[test]
+    fn confidence_aware_optimize_prompt_preserves_substantial_rewrite_guidance() {
+        // Verify the confidence-aware guidance text tells the LLM to
+        // apply the same level of substantive cleanup everywhere (not
+        // only inside the suspect spans), and that it carries the same
+        // anti-timid framing and concrete before/after example that
+        // the adapter prompts use.
+        let artifact = sample_artifact_with_confidence_timeline(
+            "Questo quesito riguarda Cheras Tuner e GSM Scheme.",
+        );
+
+        let prompt = build_confidence_aware_optimize_prompt(
+            &artifact,
+            Some("User prompt".to_string()),
+        )
+        .expect("prompt should be generated");
+
+        assert!(prompt.contains("substantive"));
+        assert!(prompt.contains("syntactic, logical, and contextual cleanup"));
+        assert!(prompt.contains("apply the same level of substantive"));
+        assert!(prompt.contains("fully cleaned transcript, not a mostly-original transcript"));
+        assert!(prompt.contains("prioritize aggressive local repair"));
+        assert!(prompt.contains("Cheras Tuner"));
+        // Anti-timid framing: the confidence-aware section must reinforce
+        // that the suspect spans are priorities, not a fence, and that
+        // leaving 90% of the original words in place is not optimization.
+        assert!(
+            prompt.contains("Do not be timid"),
+            "confidence-aware section must contain anti-timid framing"
+        );
+        assert!(
+            prompt.contains("90% of the original words"),
+            "confidence-aware section must anchor the expected level of change"
+        );
+        assert!(
+            prompt.contains("the speaker's TONE"),
+            "confidence-aware section must preserve the speaker's tone"
+        );
+        assert!(
+            prompt.contains("careful editor"),
+            "confidence-aware section must invoke the careful-editor framing"
+        );
+        assert!(
+            prompt.contains("Example of the expected level of rewriting"),
+            "confidence-aware section must include the concrete before/after example"
+        );
+        // The 2nd example demonstrates the connective case enabled by the
+        // is_tail_addition relaxation: a short connective (1 token)
+        // inserted to make an implicit logical relationship explicit.
+        assert!(
+            prompt.contains("Another example of the expected level of rewriting"),
+            "confidence-aware section must include the connective example"
+        );
+        assert!(
+            prompt.contains("perché il team ha lavorato bene"),
+            "confidence-aware section must show the connective output"
+        );
+        assert!(
+            prompt.contains("Another example of topic-aware rewriting"),
+            "confidence-aware section must include the 3rd example marker"
+        );
+        assert!(
+            prompt.contains("i requisiti del progetto software"),
+            "confidence-aware section must demonstrate the topic-aware rewrite"
+        );
+    }
+
+    #[test]
+    fn confidence_aware_optimize_prompt_anchors_topic_and_contextual_logic() {
+        // Regression guard: the confidence-aware guidance text must also
+        // ask the LLM to understand the topic of the transcript and to
+        // make implicit logical connections explicit when the surrounding
+        // context makes the intended meaning clear. Without this anchor,
+        // the confidence-aware path would still be able to fall back to a
+        // "mostly-original transcript with edits only in highlighted
+        // places" output, even though the user's stated goal is broader.
+        let artifact = sample_artifact_with_confidence_timeline(
+            "Questo quesito riguarda Cheras Tuner e GSM Scheme.",
+        );
+
+        let prompt = build_confidence_aware_optimize_prompt(
+            &artifact,
+            Some("User prompt".to_string()),
+        )
+        .expect("prompt should be generated");
+
+        assert!(
+            prompt.contains("Understand the topic being discussed"),
+            "confidence-aware section must ask the LLM to understand the topic"
+        );
+        assert!(
+            prompt.contains("surrounding context makes the intended meaning clear"),
+            "confidence-aware section must anchor the topic-aware disambiguation rule"
+        );
+        assert!(
+            prompt.contains("make that connection explicit"),
+            "confidence-aware section must anchor the explicit-connective rule"
+        );
+        assert!(
+            prompt.contains("vague references like 'la cosa di cui parlavamo'"),
+            "confidence-aware section must anchor the topic-aware substitution rule"
+        );
+    }
+
+    #[test]
+    fn confidence_aware_optimize_prompt_demonstrates_short_connective_case() {
+        // The 2nd example in the confidence-aware prompt demonstrates
+        // the connective case enabled by the is_tail_addition
+        // relaxation. See the parallel tests in the adapter files for
+        // the full rationale.
+        let artifact = sample_artifact_with_confidence_timeline(
+            "Questo quesito riguarda Cheras Tuner e GSM Scheme.",
+        );
+
+        let prompt = build_confidence_aware_optimize_prompt(
+            &artifact,
+            Some("User prompt".to_string()),
+        )
+        .expect("prompt should be generated");
+
+        assert!(
+            prompt.contains("Another example of the expected level of rewriting"),
+            "confidence-aware section must include the 2nd example marker"
+        );
+        assert!(
+            prompt.contains("perché il team ha lavorato bene"),
+            "confidence-aware section must demonstrate the connective output"
+        );
+        assert!(
+            prompt.contains("Another example of topic-aware rewriting"),
+            "confidence-aware section must include the 3rd example marker"
+        );
+        assert!(
+            prompt.contains("i requisiti del progetto software"),
+            "confidence-aware section must demonstrate the topic-aware rewrite"
+        );
+    }
+
+    #[test]
+    fn confidence_aware_optimize_prompt_demonstrates_topic_aware_rewrite() {
+        // The 3rd example in the confidence-aware prompt demonstrates
+        // the topic-aware rewrite case. See the parallel tests in the
+        // adapter files for the full rationale.
+        let artifact = sample_artifact_with_confidence_timeline(
+            "Questo quesito riguarda Cheras Tuner e GSM Scheme.",
+        );
+
+        let prompt = build_confidence_aware_optimize_prompt(
+            &artifact,
+            Some("User prompt".to_string()),
+        )
+        .expect("prompt should be generated");
+
+        assert!(
+            prompt.contains("Another example of topic-aware rewriting"),
+            "confidence-aware section must include the 3rd example marker"
+        );
+        assert!(
+            prompt.contains("i requisiti del progetto software"),
+            "confidence-aware section must demonstrate the topic-aware rewrite"
+        );
+    }
+
+
+
+    #[test]
+    fn confidence_aware_optimize_prompt_without_spans_falls_back_to_user_prompt() {
+        // Without low-confidence spans the helper returns the user prompt
+        // verbatim, leaving the substantial-rewrite language to be
+        // appended by the adapter as Additional cleanup rules.
+        let artifact = sample_artifact("Plain transcript with no timeline.");
+
+        let prompt = build_confidence_aware_optimize_prompt(
+            &artifact,
+            Some("User prompt only.".to_string()),
+        )
+        .expect("prompt should be generated");
+
+        assert_eq!(prompt, "User prompt only.");
+        assert!(!prompt.contains("Confidence-aware guidance"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
