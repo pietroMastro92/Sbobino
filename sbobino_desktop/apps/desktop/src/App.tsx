@@ -5277,12 +5277,13 @@ export function App({
   }, [isStarting, modelCatalog, selectedFile, settings]);
 
   const canStartRealtime = useMemo(() => {
-    // Do not gate live start on the currently selected file-transcription model.
-    // Whisper and Parakeet both run a backend preflight before starting; for
-    // Parakeet specifically, live uses realtime EOU models even when the file
-    // model is a TDT model. A disabled button here hides the actionable runtime
-    // error and prevents parity with Whisper's visible start/preflight flow.
-    return Boolean(settings) && realtimeState === "idle" && !isStoppingRealtime;
+    // Do not gate live start on the currently selected file-transcription model
+    // or on frontend-only preview state. Whisper and Parakeet both run a backend
+    // preflight before starting; for Parakeet specifically, live uses realtime
+    // EOU models even when the file model is TDT. Keeping the button enabled
+    // lets the backend surface the real actionable error instead of leaving the
+    // UI apparently dead.
+    return Boolean(settings) && realtimeState !== "running" && !isStoppingRealtime;
   }, [isStoppingRealtime, realtimeState, settings]);
 
   const aiFeaturesAvailable = useMemo(
@@ -9451,6 +9452,11 @@ export function App({
 
   async function onStartRealtime(): Promise<void> {
     if (!settings) return;
+
+    if (realtimeState === "running") {
+      setRealtimeMessage(t("realtime.alreadyRunning", "Live transcription is already running."));
+      return;
+    }
 
     try {
       setRealtimePreviewState("connecting");
