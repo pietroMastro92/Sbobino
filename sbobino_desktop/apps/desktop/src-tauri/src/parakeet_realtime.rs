@@ -1,24 +1,25 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_float, c_int};
-use std::path::{Path, PathBuf};
 use std::panic::{self, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
     BuildStreamError, SampleFormat, Stream, StreamConfig,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use libloading::Library;
 
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
 use sbobino_domain::TimedSegment;
 
-use crate::realtime_audio::{classify_input_error, RealtimeInputLevelEvent};
+use crate::realtime_audio::{RealtimeInputLevelEvent, classify_input_error};
 
 type ParakeetCtx = std::ffi::c_void;
 type ParakeetStream = std::ffi::c_void;
@@ -124,10 +125,7 @@ impl ParakeetRealtimeEngine {
             eprintln!("[parakeet-live] model file missing: {error}");
             return Err(error);
         }
-        eprintln!(
-            "[parakeet-live] model resolved at {}",
-            model_path.display()
-        );
+        eprintln!("[parakeet-live] model resolved at {}", model_path.display());
 
         let session_dir = create_session_dir()?;
         let saved_audio_path = session_dir.join("parakeet-live.wav");
@@ -469,9 +467,7 @@ fn run_parakeet_capture(
     let stream = unsafe { (api.stream_begin)(ctx) };
     if stream.is_null() {
         let detail = last_error(&api, ctx);
-        eprintln!(
-            "[parakeet-live] parakeet_capi_stream_begin returned null: {detail}"
-        );
+        eprintln!("[parakeet-live] parakeet_capi_stream_begin returned null: {detail}");
         unsafe { (api.free)(ctx) };
         let hint = if model_path
             .file_name()
@@ -646,8 +642,12 @@ fn run_capture_loop(
         ))
     })?;
 
+    const PARAKEET_LIVE_FEED_SAMPLES: usize = 16_000;
+
     let mut resampler = LinearResampler::new(sample_rate, 16_000);
-    let mut processed_samples: u64 = 0;
+    let mut captured_samples: u64 = 0;
+    let mut fed_samples: u64 = 0;
+    let mut pending_feed = Vec::<f32>::with_capacity(PARAKEET_LIVE_FEED_SAMPLES * 2);
     let mut assembler = ParakeetLiveAssembler::new(transcript, segments, emit_delta);
     let _stream_guard = input_stream;
     emit_parakeet_input_level(
@@ -696,52 +696,52 @@ fn run_capture_loop(
         if pcm_16k.is_empty() {
             continue;
         }
-        processed_samples = processed_samples.saturating_add(pcm_16k.len() as u64);
-        let current_seconds = processed_samples as f32 / 16_000.0;
+        captured_samples = captured_samples.saturating_add(pcm_16k.len() as u64);
         write_pcm_i16(&mut writer, &pcm_16k)?;
+        pending_feed.extend_from_slice(&pcm_16k);
 
-        let mut eou = 0;
-        let ptr = unsafe {
-            (api.stream_feed)(
+        while pending_feed.len() >= PARAKEET_LIVE_FEED_SAMPLES {
+            let feed_chunk = pending_feed
+                .drain(..PARAKEET_LIVE_FEED_SAMPLES)
+                .collect::<Vec<_>>();
+            fed_samples = fed_samples.saturating_add(feed_chunk.len() as u64);
+            let current_seconds = fed_samples as f32 / 16_000.0;
+            let eou = feed_parakeet_live_chunk(
+                api,
+                ctx,
                 stream,
-                pcm_16k.as_ptr(),
-                pcm_16k.len() as c_int,
-                &mut eou as *mut c_int,
-            )
-        };
-        let delta = take_c_string(api, ptr).ok_or_else(|| {
-            ApplicationError::SpeechToText(format!(
-                "Parakeet live stream feed failed: {}",
-                last_error(api, ctx)
-            ))
-        })?;
-        assembler.push_delta(&delta, current_seconds);
-        if eou != 0 {
-            assembler.finish_segment(current_seconds);
+                &feed_chunk,
+                current_seconds,
+                &mut assembler,
+            )?;
+            if eou {
+                assembler.finish_segment(current_seconds);
+            }
         }
     }
 
     let tail = resampler.finish();
     if !tail.is_empty() {
-        processed_samples = processed_samples.saturating_add(tail.len() as u64);
-        let current_seconds = processed_samples as f32 / 16_000.0;
+        captured_samples = captured_samples.saturating_add(tail.len() as u64);
         write_pcm_i16(&mut writer, &tail)?;
-        let mut eou = 0;
-        let ptr = unsafe {
-            (api.stream_feed)(
-                stream,
-                tail.as_ptr(),
-                tail.len() as c_int,
-                &mut eou as *mut c_int,
-            )
-        };
-        let delta = take_c_string(api, ptr).ok_or_else(|| {
-            ApplicationError::SpeechToText(format!(
-                "Parakeet live stream final feed failed: {}",
-                last_error(api, ctx)
-            ))
-        })?;
-        assembler.push_delta(&delta, current_seconds);
+        pending_feed.extend_from_slice(&tail);
+    }
+
+    if !pending_feed.is_empty() {
+        fed_samples = fed_samples.saturating_add(pending_feed.len() as u64);
+        let current_seconds = fed_samples as f32 / 16_000.0;
+        let eou = feed_parakeet_live_chunk(
+            api,
+            ctx,
+            stream,
+            &pending_feed,
+            current_seconds,
+            &mut assembler,
+        )?;
+        if eou {
+            assembler.finish_segment(current_seconds);
+        }
+        pending_feed.clear();
     }
 
     let ptr = unsafe { (api.stream_finalize)(stream) };
@@ -751,7 +751,7 @@ fn run_capture_loop(
             last_error(api, ctx)
         ))
     })?;
-    let final_seconds = processed_samples as f32 / 16_000.0;
+    let final_seconds = captured_samples.max(fed_samples) as f32 / 16_000.0;
     assembler.push_delta(&delta, final_seconds);
     assembler.finish_segment(final_seconds);
     writer.finalize().map_err(|error| {
@@ -761,6 +761,33 @@ fn run_capture_loop(
         ))
     })?;
     Ok(())
+}
+
+fn feed_parakeet_live_chunk(
+    api: &ParakeetApi,
+    ctx: *mut ParakeetCtx,
+    stream: *mut ParakeetStream,
+    samples: &[f32],
+    current_seconds: f32,
+    assembler: &mut ParakeetLiveAssembler,
+) -> Result<bool, ApplicationError> {
+    let mut eou = 0;
+    let ptr = unsafe {
+        (api.stream_feed)(
+            stream,
+            samples.as_ptr(),
+            samples.len() as c_int,
+            &mut eou as *mut c_int,
+        )
+    };
+    let delta = take_c_string(api, ptr).ok_or_else(|| {
+        ApplicationError::SpeechToText(format!(
+            "Parakeet live stream feed failed: {}",
+            last_error(api, ctx)
+        ))
+    })?;
+    assembler.push_delta(&delta, current_seconds);
+    Ok(eou != 0)
 }
 
 struct ParakeetLiveAssembler {
