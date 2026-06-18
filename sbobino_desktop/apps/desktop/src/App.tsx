@@ -9478,6 +9478,7 @@ export function App({
           engine: settings.transcription.engine,
           model: settings.transcription.model,
           parakeet_model: settings.transcription.parakeet_model,
+          language: settings.transcription.language,
         }),
         8_000,
         t("error.preflightTimedOut", "Preflight timed out."),

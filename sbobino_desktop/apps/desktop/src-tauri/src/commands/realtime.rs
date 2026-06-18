@@ -317,6 +317,14 @@ pub async fn start_realtime(
         }
         TranscriptionEngine::ParakeetCpp => {
             eprintln!("[realtime-start] parakeet branch entered");
+            let language_code = language.as_whisper_code();
+            if language_code != "en" {
+                let message = format!(
+                    "Parakeet live uses NVIDIA's Realtime EOU 120M model, which supports English only and has no reliable language auto-detection. Selected language '{language_code}' cannot be transcribed with Parakeet live; select English for Parakeet live, use Whisper.cpp for non-English live transcription, or use Parakeet TDT for file transcription."
+                );
+                emit_level_event(&app, "blocked", 0.0, &message);
+                return Err(CommandError::from(ApplicationError::SpeechToText(message)));
+            }
             stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
             let parakeet_engine = resolve_parakeet_live_engine(&state)?;
             let models_dir = state
@@ -332,7 +340,10 @@ pub async fn start_realtime(
             eprintln!(
                 "[realtime-start] parakeet live model requested={requested_model:?} selected={live_model:?} models_dir={models_dir}"
             );
-            running_message = format!("Live listening with '{}'.", live_model.gguf_filename());
+            running_message = format!(
+                "Live listening with '{}' (English-only Parakeet realtime model).",
+                live_model.gguf_filename()
+            );
             if let Some(id) = &payload.resume_artifact_id {
                 if let Some(artifact) = state
                     .artifact_service

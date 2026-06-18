@@ -329,6 +329,77 @@ exit 0
 }
 
 #[tokio::test]
+async fn non_english_progressive_preview_uses_final_tdt_model_not_english_eou() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
+        .expect("failed to create final model");
+    std::fs::write(
+        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
+        b"fake english realtime model",
+    )
+    .expect("failed to create realtime model");
+    write_test_wav(&input_wav, 18);
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+case "$*" in
+  *realtime_eou_120m-v1-f16.gguf*)
+    echo 'English-only realtime model must not be used for Italian preview' 1>&2
+    exit 43
+    ;;
+  *tdt-0.6b-v3-q4_k.gguf*chunk-0000.wav*)
+    echo '{"text":"primo blocco","words":[{"w":"primo","start":0.1,"end":0.3},{"w":"blocco","start":0.3,"end":0.6}]}'
+    exit 0
+    ;;
+  *tdt-0.6b-v3-q4_k.gguf*chunk-0001.wav*)
+    echo '{"text":"secondo blocco","words":[{"w":"secondo","start":0.1,"end":0.3},{"w":"blocco","start":0.3,"end":0.6}]}'
+    exit 0
+    ;;
+esac
+echo '{"text":"primo blocco secondo blocco","words":[{"w":"primo","start":0.0,"end":0.2},{"w":"blocco","start":0.2,"end":0.4},{"w":"secondo","start":8.0,"end":8.2},{"w":"blocco","start":8.2,"end":8.4}]}'
+exit 0
+"#,
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_ref = emitted.clone();
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-q4_k.gguf",
+            "it",
+            &WhisperOptions::default(),
+            Some(18.0),
+            Arc::new(move |line: String| {
+                emitted_ref.lock().expect("emit lock poisoned").push(line);
+            }),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("Italian transcription should use the multilingual TDT model");
+
+    assert_eq!(transcript.text, "primo blocco secondo blocco");
+    let emitted = emitted.lock().expect("emit lock poisoned");
+    assert!(
+        emitted
+            .iter()
+            .any(|line| line.starts_with("\u{001F}REPLACE:") && line.contains("primo blocco")),
+        "expected Italian TDT preview deltas, got {emitted:?}"
+    );
+}
+
+#[tokio::test]
 async fn transcribe_splits_root_words_into_multiple_timed_segments() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");
@@ -568,7 +639,7 @@ async fn transcribe_rejects_missing_realtime_preview_model_before_starting_cli()
         .transcribe(
             &input_wav,
             "tdt-0.6b-v3-f16.gguf",
-            "it",
+            "en",
             &WhisperOptions::default(),
             None,
             Arc::new(|_line: String| {}),
@@ -577,9 +648,11 @@ async fn transcribe_rejects_missing_realtime_preview_model_before_starting_cli()
         .await
         .expect_err("missing realtime preview model should fail");
 
-    assert!(error
-        .to_string()
-        .contains("Parakeet progressive preview requires"));
+    assert!(
+        error
+            .to_string()
+            .contains("Parakeet progressive preview requires")
+    );
     assert!(!error.to_string().contains("cli should not run"));
 }
 

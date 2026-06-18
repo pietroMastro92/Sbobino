@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use tracing::warn;
 
-use sbobino_domain::{ParakeetModel, SpeechModel, TranscriptionEngine};
+use sbobino_domain::{LanguageCode, ParakeetModel, SpeechModel, TranscriptionEngine};
 use sbobino_infrastructure::{ManagedRuntimeHealth, PyannoteRuntimeHealth};
 
 use crate::commands::realtime::{resolve_parakeet_live_library_path, select_parakeet_live_model};
@@ -58,6 +58,8 @@ pub struct StartPreflightPayload {
     pub model: SpeechModel,
     #[serde(default)]
     pub parakeet_model: Option<ParakeetModel>,
+    #[serde(default)]
+    pub language: Option<LanguageCode>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -437,6 +439,11 @@ pub async fn get_realtime_start_readiness(
     }
 
     if selected_engine == TranscriptionEngine::ParakeetCpp {
+        let selected_language = payload
+            .as_ref()
+            .and_then(|value| value.language.clone())
+            .unwrap_or_else(|| settings.transcription.language.clone());
+        let selected_language_code = selected_language.as_whisper_code();
         let requested_parakeet_model = payload
             .as_ref()
             .and_then(|value| value.parakeet_model.clone())
@@ -556,6 +563,26 @@ pub async fn get_realtime_start_readiness(
             });
         }
 
+        if selected_language_code != "en" {
+            eprintln!(
+                "[realtime-readiness] blocked: parakeet_live_language_unsupported language={selected_language_code}"
+            );
+            return Ok(RealtimeStartReadinessResponse {
+                allowed: false,
+                reason_code: "parakeet_live_language_unsupported".to_string(),
+                message: format!(
+                    "Parakeet live uses NVIDIA's Realtime EOU 120M model, which supports English only and has no reliable language auto-detection. Selected language '{selected_language_code}' cannot be transcribed with Parakeet live; select English for Parakeet live, use Whisper.cpp for non-English live transcription, or use Parakeet TDT for file transcription."
+                ),
+                engine: "parakeet_cpp".to_string(),
+                model_filename,
+                model_path,
+                ffmpeg_resolved: health.ffmpeg_resolved,
+                whisper_stream_resolved: health.whisper_stream_resolved,
+                parakeet_cli_resolved: health.parakeet_cli_resolved,
+                input_device_name: None,
+            });
+        }
+
         let input_device_name = match crate::realtime_audio::probe_input_device_name() {
             Ok(name) => Some(name),
             Err(error) => {
@@ -585,7 +612,10 @@ pub async fn get_realtime_start_readiness(
         return Ok(RealtimeStartReadinessResponse {
             allowed: true,
             reason_code: "ok".to_string(),
-            message: format!("Parakeet.cpp live is ready with '{}'.", model_filename),
+            message: format!(
+                "Parakeet.cpp live is ready with '{}' (English-only realtime model).",
+                model_filename
+            ),
             engine: "parakeet_cpp".to_string(),
             model_filename,
             model_path,

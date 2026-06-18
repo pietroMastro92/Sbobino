@@ -400,6 +400,7 @@ export async function fetchRealtimeStartReadiness(payload: {
   engine?: StartTranscriptionPayload["engine"];
   model: StartTranscriptionPayload["model"];
   parakeet_model?: StartTranscriptionPayload["parakeet_model"];
+  language?: StartTranscriptionPayload["language"];
 }): Promise<RealtimeStartReadiness> {
   return invoke<RealtimeStartReadiness>("get_realtime_start_readiness", { payload });
 }

@@ -105,14 +105,33 @@ impl ParakeetCppEngine {
         )))
     }
 
+    fn is_english_realtime_language(language_code: &str) -> bool {
+        language_code.trim().eq_ignore_ascii_case("en")
+    }
+
+    fn is_realtime_eou_model(model_filename: &str) -> bool {
+        matches!(
+            model_filename,
+            REALTIME_EOU_F16_MODEL | REALTIME_EOU_Q8_MODEL
+        )
+    }
+
     fn validate_preview_model_exists(
         &self,
         final_model_filename: &str,
+        language_code: &str,
     ) -> Result<PathBuf, ApplicationError> {
-        if matches!(
-            final_model_filename,
-            REALTIME_EOU_F16_MODEL | REALTIME_EOU_Q8_MODEL
-        ) {
+        if !Self::is_english_realtime_language(language_code) {
+            if Self::is_realtime_eou_model(final_model_filename) {
+                return Err(ApplicationError::SpeechToText(format!(
+                    "Parakeet realtime EOU models support English only and have no reliable language auto-detection. For language '{language_code}', select a Parakeet TDT model for file transcription or use Whisper.cpp for live transcription."
+                )));
+            }
+
+            return self.validate_model_exists(final_model_filename);
+        }
+
+        if Self::is_realtime_eou_model(final_model_filename) {
             return self.validate_model_exists(final_model_filename);
         }
 
@@ -1107,7 +1126,8 @@ impl SpeechToTextEngine for ParakeetCppEngine {
         }
 
         let model_path = self.validate_model_exists(model_filename)?;
-        let preview_model_path = self.validate_preview_model_exists(model_filename)?;
+        let preview_model_path =
+            self.validate_preview_model_exists(model_filename, _language_code)?;
         let preview_state = Arc::new(Mutex::new(PreviewStreamState::default()));
         match tokio::time::timeout(
             PREVIEW_TIMEOUT,
