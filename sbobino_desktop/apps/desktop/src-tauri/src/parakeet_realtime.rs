@@ -464,7 +464,7 @@ fn run_parakeet_capture(
     }
     eprintln!("[parakeet-live] parakeet_capi_load OK");
 
-    let stream = unsafe { (api.stream_begin)(ctx) };
+    let mut stream = unsafe { (api.stream_begin)(ctx) };
     if stream.is_null() {
         let detail = last_error(&api, ctx);
         eprintln!("[parakeet-live] parakeet_capi_stream_begin returned null: {detail}");
@@ -494,7 +494,7 @@ fn run_parakeet_capture(
     let result = run_capture_loop(
         &api,
         ctx,
-        stream,
+        &mut stream,
         &audio_path,
         shutdown_rx,
         startup_tx,
@@ -543,7 +543,7 @@ fn emit_parakeet_input_level(
 fn run_capture_loop(
     api: &ParakeetApi,
     ctx: *mut ParakeetCtx,
-    stream: *mut ParakeetStream,
+    stream: &mut *mut ParakeetStream,
     audio_path: &Path,
     shutdown_rx: mpsc::Receiver<()>,
     startup_tx: mpsc::Sender<Result<(), ApplicationError>>,
@@ -643,11 +643,15 @@ fn run_capture_loop(
     })?;
 
     const PARAKEET_LIVE_FEED_SAMPLES: usize = 16_000;
+    const PARAKEET_LIVE_FORCE_SEGMENT_SECONDS: f32 = 12.0;
+    const PARAKEET_LIVE_NO_DELTA_RESTART_SECONDS: f32 = 10.0;
 
     let mut resampler = LinearResampler::new(sample_rate, 16_000);
     let mut captured_samples: u64 = 0;
     let mut fed_samples: u64 = 0;
     let mut pending_feed = Vec::<f32>::with_capacity(PARAKEET_LIVE_FEED_SAMPLES * 2);
+    let mut last_delta_seconds = 0.0_f32;
+    let mut last_stream_restart_seconds = 0.0_f32;
     let mut assembler = ParakeetLiveAssembler::new(transcript, segments, emit_delta);
     let _stream_guard = input_stream;
     emit_parakeet_input_level(
@@ -706,16 +710,39 @@ fn run_capture_loop(
                 .collect::<Vec<_>>();
             fed_samples = fed_samples.saturating_add(feed_chunk.len() as u64);
             let current_seconds = fed_samples as f32 / 16_000.0;
-            let eou = feed_parakeet_live_chunk(
+            let outcome = feed_parakeet_live_chunk(
                 api,
                 ctx,
-                stream,
+                *stream,
                 &feed_chunk,
                 current_seconds,
                 &mut assembler,
             )?;
-            if eou {
+            if outcome.had_delta {
+                last_delta_seconds = current_seconds;
+            }
+            if outcome.eou
+                || assembler.should_force_finish_segment(
+                    current_seconds,
+                    PARAKEET_LIVE_FORCE_SEGMENT_SECONDS,
+                )
+            {
                 assembler.finish_segment(current_seconds);
+            }
+            if current_seconds - last_delta_seconds >= PARAKEET_LIVE_NO_DELTA_RESTART_SECONDS
+                && current_seconds - last_stream_restart_seconds
+                    >= PARAKEET_LIVE_NO_DELTA_RESTART_SECONDS
+            {
+                if assembler.has_current_text() {
+                    assembler.finish_segment(current_seconds);
+                }
+                eprintln!(
+                    "[parakeet-live] no transcript delta for {:.1}s; restarting C API stream",
+                    current_seconds - last_delta_seconds
+                );
+                restart_parakeet_live_stream(api, ctx, stream)?;
+                last_stream_restart_seconds = current_seconds;
+                last_delta_seconds = current_seconds;
             }
         }
     }
@@ -730,21 +757,24 @@ fn run_capture_loop(
     if !pending_feed.is_empty() {
         fed_samples = fed_samples.saturating_add(pending_feed.len() as u64);
         let current_seconds = fed_samples as f32 / 16_000.0;
-        let eou = feed_parakeet_live_chunk(
+        let outcome = feed_parakeet_live_chunk(
             api,
             ctx,
-            stream,
+            *stream,
             &pending_feed,
             current_seconds,
             &mut assembler,
         )?;
-        if eou {
+        if outcome.eou
+            || assembler
+                .should_force_finish_segment(current_seconds, PARAKEET_LIVE_FORCE_SEGMENT_SECONDS)
+        {
             assembler.finish_segment(current_seconds);
         }
         pending_feed.clear();
     }
 
-    let ptr = unsafe { (api.stream_finalize)(stream) };
+    let ptr = unsafe { (api.stream_finalize)(*stream) };
     let delta = take_c_string(api, ptr).ok_or_else(|| {
         ApplicationError::SpeechToText(format!(
             "Parakeet live stream finalize failed: {}",
@@ -763,6 +793,11 @@ fn run_capture_loop(
     Ok(())
 }
 
+struct ParakeetLiveFeedOutcome {
+    eou: bool,
+    had_delta: bool,
+}
+
 fn feed_parakeet_live_chunk(
     api: &ParakeetApi,
     ctx: *mut ParakeetCtx,
@@ -770,7 +805,7 @@ fn feed_parakeet_live_chunk(
     samples: &[f32],
     current_seconds: f32,
     assembler: &mut ParakeetLiveAssembler,
-) -> Result<bool, ApplicationError> {
+) -> Result<ParakeetLiveFeedOutcome, ApplicationError> {
     let mut eou = 0;
     let ptr = unsafe {
         (api.stream_feed)(
@@ -786,8 +821,31 @@ fn feed_parakeet_live_chunk(
             last_error(api, ctx)
         ))
     })?;
-    assembler.push_delta(&delta, current_seconds);
-    Ok(eou != 0)
+    let had_delta = assembler.push_delta(&delta, current_seconds);
+    Ok(ParakeetLiveFeedOutcome {
+        eou: eou != 0,
+        had_delta,
+    })
+}
+
+fn restart_parakeet_live_stream(
+    api: &ParakeetApi,
+    ctx: *mut ParakeetCtx,
+    stream: &mut *mut ParakeetStream,
+) -> Result<(), ApplicationError> {
+    unsafe {
+        if !stream.is_null() {
+            (api.stream_free)(*stream);
+        }
+        *stream = (api.stream_begin)(ctx);
+    }
+    if stream.is_null() {
+        return Err(ApplicationError::SpeechToText(format!(
+            "Parakeet live stream restart failed: {}",
+            last_error(api, ctx)
+        )));
+    }
+    Ok(())
 }
 
 struct ParakeetLiveAssembler {
@@ -817,11 +875,11 @@ impl ParakeetLiveAssembler {
         }
     }
 
-    fn push_delta(&mut self, delta: &str, current_seconds: f32) {
+    fn push_delta(&mut self, delta: &str, current_seconds: f32) -> bool {
         let display = normalize_parakeet_live_delta(delta);
         let display_text = display.trim();
         if display_text.is_empty() {
-            return;
+            return false;
         }
 
         if self.current_start_seconds.is_none() {
@@ -847,6 +905,18 @@ impl ParakeetLiveAssembler {
             start_seconds: self.current_start_seconds,
             end_seconds: self.current_end_seconds,
         });
+        true
+    }
+
+    fn has_current_text(&self) -> bool {
+        !self.current_text.trim().is_empty()
+    }
+
+    fn should_force_finish_segment(&self, current_seconds: f32, max_seconds: f32) -> bool {
+        let Some(start_seconds) = self.current_start_seconds else {
+            return false;
+        };
+        self.has_current_text() && current_seconds - start_seconds >= max_seconds
     }
 
     fn finish_segment(&mut self, current_seconds: f32) {
@@ -1131,6 +1201,43 @@ mod tests {
                 .last()
                 .map(|delta| delta.text.as_str()),
             Some("the closest point of")
+        );
+    }
+
+    #[test]
+    fn live_assembler_forces_segments_without_eou() {
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let segments = Arc::new(Mutex::new(Vec::new()));
+        let emitted: Arc<Mutex<Vec<RealtimeDelta>>> = Arc::new(Mutex::new(Vec::new()));
+        let emitted_ref = emitted.clone();
+        let mut assembler = ParakeetLiveAssembler::new(
+            transcript.clone(),
+            segments.clone(),
+            Arc::new(move |delta| {
+                emitted_ref
+                    .lock()
+                    .expect("emitted lock poisoned")
+                    .push(delta);
+            }),
+        );
+
+        assert!(assembler.push_delta("first sentence", 1.0));
+        assert!(!assembler.should_force_finish_segment(6.0, 12.0));
+        assert!(assembler.should_force_finish_segment(13.1, 12.0));
+        assembler.finish_segment(13.1);
+        assert!(assembler.push_delta(" second sentence", 14.0));
+        assembler.finish_segment(15.0);
+
+        let segments = segments.lock().expect("segments lock poisoned");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].text, "first sentence");
+        assert_eq!(segments[1].text, "second sentence");
+        assert_eq!(
+            transcript
+                .lock()
+                .expect("transcript lock poisoned")
+                .as_str(),
+            "first sentence\nsecond sentence"
         );
     }
 

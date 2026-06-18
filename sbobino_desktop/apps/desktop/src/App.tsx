@@ -7917,7 +7917,10 @@ export function App({
           void refreshRuntimeHealth();
         }
 
-        if (settings.transcription.speaker_diarization?.enabled) {
+        if (
+          settings.transcription.speaker_diarization?.enabled &&
+          settings.transcription.engine !== "parakeet_cpp"
+        ) {
           try {
             await ensurePyannoteReadyForDiarizedJob();
           } catch (pyannoteError) {
