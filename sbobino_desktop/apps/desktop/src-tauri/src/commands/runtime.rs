@@ -417,9 +417,8 @@ pub async fn get_realtime_start_readiness(
     payload: Option<StartPreflightPayload>,
 ) -> Result<RealtimeStartReadinessResponse, CommandError> {
     eprintln!("[realtime-readiness] command received payload={payload:?}");
-    let _ = normalize_runtime_settings_for_whisper_cpp(&state).await;
 
-    let settings = state
+    let mut settings = state
         .runtime_factory
         .load_settings()
         .map_err(|e| CommandError::new("settings", e))?;
@@ -428,6 +427,15 @@ pub async fn get_realtime_start_readiness(
         .and_then(|value| value.engine.clone())
         .unwrap_or_else(|| settings.transcription.engine.clone());
     eprintln!("[realtime-readiness] selected_engine={selected_engine:?}");
+
+    if selected_engine == TranscriptionEngine::WhisperCpp {
+        let _ = normalize_runtime_settings_for_whisper_cpp(&state).await;
+        settings = state
+            .runtime_factory
+            .load_settings()
+            .map_err(|e| CommandError::new("settings", e))?;
+    }
+
     if selected_engine == TranscriptionEngine::ParakeetCpp {
         let requested_parakeet_model = payload
             .as_ref()
@@ -435,7 +443,7 @@ pub async fn get_realtime_start_readiness(
             .unwrap_or_else(|| settings.transcription.parakeet_model.clone());
         let health = state
             .runtime_factory
-            .runtime_health()
+            .runtime_health_preflight()
             .map_err(|e| CommandError::new("runtime_health", e))?;
         let models_dir = PathBuf::from(&health.parakeet_models_dir_resolved);
         let selected_parakeet_model =
