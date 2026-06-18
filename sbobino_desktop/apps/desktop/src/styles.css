@@ -575,15 +575,36 @@ code {
   -webkit-backdrop-filter: blur(26px) saturate(1.12);
 }
 
-[data-tauri-drag-region]:not([data-tauri-drag-region="false"]) {
+[data-tauri-drag-region]:not([data-tauri-drag-region="false"]),
+[data-window-drag-area] {
   user-select: none;
   -webkit-app-region: drag;
+  app-region: drag;
 }
 
-.main-topbar[data-tauri-drag-region] :is(button, input, select, textarea, a, label, [role="button"], [role="switch"], .segmented-control, .select-chip, .search-chip, .history-filter-chip, .toolbar-search),
-.detail-toolbar[data-tauri-drag-region] :is(button, input, select, textarea, a, label, [role="button"], [role="switch"], .segmented-control, .select-chip, .search-chip, .history-filter-chip, .toolbar-search),
-.settings-window-header[data-tauri-drag-region] :is(button, input, select, textarea, a, label, [role="button"], [role="switch"]) {
+[data-tauri-drag-region="false"],
+[data-window-drag-ignore],
+button,
+input,
+select,
+textarea,
+a,
+label,
+audio,
+video,
+canvas,
+summary,
+[role="button"],
+[role="menuitem"],
+[role="switch"],
+[contenteditable="true"],
+.segmented-control,
+.select-chip,
+.search-chip,
+.history-filter-chip,
+.toolbar-search {
   -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .main-content {
@@ -2487,10 +2508,11 @@ code {
 
 .detail-body {
   flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   min-width: 0;
-  overflow: auto;
-  overflow-x: hidden;
+  overflow: hidden;
 }
 
 .detail-body--chat {
@@ -2498,7 +2520,9 @@ code {
 }
 
 .detail-body > * {
+  flex: 1 1 auto;
   min-height: 0;
+  min-width: 0;
 }
 
 .transcript-container {
@@ -3101,10 +3125,13 @@ code {
 .segments-view {
   display: grid;
   align-content: start;
+  flex: 1 1 auto;
+  height: 100%;
   min-height: 0;
   min-width: 0;
   overflow: auto;
   overflow-x: hidden;
+  scroll-padding-top: 12px;
 }
 
 .segment-row {

@@ -3525,6 +3525,7 @@ export function App({
   const focusedJobIdRef = useRef<string | null>(focusedJobId);
   const activeJobDeltaSequenceRef = useRef<number>(-1);
   const activeJobPreviewTextareaRef = useRef<HTMLDivElement>(null);
+  const realtimeTranscriptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const detailMainRef = useRef<HTMLElement | null>(null);
   const mainAreaRef = useRef<HTMLElement | null>(null);
   const leftSidebarRef = useRef<HTMLElement | null>(null);
@@ -3735,14 +3736,6 @@ export function App({
       return;
     }
 
-    const hasTauriRuntime = Boolean(
-      (window as unknown as { __TAURI_INTERNALS__?: unknown })
-        .__TAURI_INTERNALS__,
-    );
-    if (!hasTauriRuntime) {
-      return;
-    }
-
     let disposed = false;
     let startDragging: (() => Promise<void>) | null = null;
 
@@ -3806,6 +3799,7 @@ export function App({
     });
     return () => window.cancelAnimationFrame(frame);
   }, [focusedJobId, activeJobPreviewText]);
+
 
   useEffect(() => {
     setSelectedSegmentSourceIndex(null);
@@ -5743,6 +5737,20 @@ export function App({
     realtimeTranscriptText.trim().length > 0 || realtimePreviewText.length > 0;
   const isRealtimeDetailActive =
     realtimeSessionOpen && !activeArtifact && !focusedJobId;
+
+  useEffect(() => {
+    if (!isRealtimeDetailActive) {
+      return;
+    }
+    const transcriptEditor = realtimeTranscriptTextareaRef.current;
+    if (!transcriptEditor) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      transcriptEditor.scrollTop = transcriptEditor.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [isRealtimeDetailActive, realtimeTranscriptDisplayText]);
 
   const detailAudioInputPath = useMemo(() => {
     if (effectiveDetailContext?.inputPath) {
@@ -11197,6 +11205,7 @@ export function App({
             style={{ position: "relative", height: "100%" }}
           >
             <textarea
+              ref={realtimeTranscriptTextareaRef}
               className="detail-editor realtime-detail-editor"
               value={realtimeTranscriptDisplayText}
               readOnly
