@@ -5277,20 +5277,13 @@ export function App({
   }, [isStarting, modelCatalog, selectedFile, settings]);
 
   const canStartRealtime = useMemo(() => {
-    if (!settings || realtimeState !== "idle" || isStoppingRealtime) {
-      return false;
-    }
-
-    const modelEntry = findSelectedTranscriptionModelEntry(
-      modelCatalog,
-      settings.transcription,
-    );
-    if (!modelEntry) {
-      return true;
-    }
-
-    return modelEntry.installed;
-  }, [isStoppingRealtime, modelCatalog, realtimeState, settings]);
+    // Do not gate live start on the currently selected file-transcription model.
+    // Whisper and Parakeet both run a backend preflight before starting; for
+    // Parakeet specifically, live uses realtime EOU models even when the file
+    // model is a TDT model. A disabled button here hides the actionable runtime
+    // error and prevents parity with Whisper's visible start/preflight flow.
+    return Boolean(settings) && realtimeState === "idle" && !isStoppingRealtime;
+  }, [isStoppingRealtime, realtimeState, settings]);
 
   const aiFeaturesAvailable = useMemo(
     () => aiActionsAvailable(aiCapabilityStatus),

@@ -222,7 +222,8 @@ fn runtime_toolchain_message(
     setup_note: Option<&str>,
 ) -> String {
     if health.managed_runtime_required {
-        if let Some((label, path, detail)) = first_managed_runtime_failure(&health.managed_runtime, health.configured_engine.clone())
+        if let Some((label, path, detail)) =
+            first_managed_runtime_failure(&health.managed_runtime, health.configured_engine.clone())
         {
             let mut message = if detail.trim().is_empty() {
                 format!("{label} is not runnable at '{path}'.")
@@ -415,6 +416,7 @@ pub async fn get_realtime_start_readiness(
     state: State<'_, AppState>,
     payload: Option<StartPreflightPayload>,
 ) -> Result<RealtimeStartReadinessResponse, CommandError> {
+    eprintln!("[realtime-readiness] command received payload={payload:?}");
     let _ = normalize_runtime_settings_for_whisper_cpp(&state).await;
 
     let settings = state
@@ -425,6 +427,7 @@ pub async fn get_realtime_start_readiness(
         .as_ref()
         .and_then(|value| value.engine.clone())
         .unwrap_or_else(|| settings.transcription.engine.clone());
+    eprintln!("[realtime-readiness] selected_engine={selected_engine:?}");
     if selected_engine == TranscriptionEngine::ParakeetCpp {
         let requested_parakeet_model = payload
             .as_ref()
@@ -444,7 +447,20 @@ pub async fn get_realtime_start_readiness(
         let parakeet_lib =
             resolve_parakeet_live_library_path(PathBuf::from(&health.parakeet_cli_resolved));
 
+        eprintln!(
+            "[realtime-readiness] parakeet health cli_available={} cli={} models_dir={}",
+            health.parakeet_cli_available,
+            health.parakeet_cli_resolved,
+            health.parakeet_models_dir_resolved
+        );
+        eprintln!(
+            "[realtime-readiness] parakeet resolved lib={} model={}",
+            parakeet_lib.display(),
+            model_path
+        );
+
         if !health.parakeet_cli_available {
+            eprintln!("[realtime-readiness] blocked: parakeet_cli_missing");
             return Ok(RealtimeStartReadinessResponse {
                 allowed: false,
                 reason_code: "parakeet_cli_missing".to_string(),
@@ -463,6 +479,10 @@ pub async fn get_realtime_start_readiness(
         }
 
         if !parakeet_lib.exists() {
+            eprintln!(
+                "[realtime-readiness] blocked: parakeet_live_library_missing path={}",
+                parakeet_lib.display()
+            );
             return Ok(RealtimeStartReadinessResponse {
                 allowed: false,
                 reason_code: "parakeet_live_library_missing".to_string(),
@@ -483,6 +503,11 @@ pub async fn get_realtime_start_readiness(
         if let Err(error) =
             ParakeetRealtimeEngine::new(parakeet_lib.clone(), models_dir.clone()).validate_library()
         {
+            eprintln!(
+                "[realtime-readiness] blocked: parakeet_live_library_unloadable path={} error={}",
+                parakeet_lib.display(),
+                error
+            );
             return Ok(RealtimeStartReadinessResponse {
                 allowed: false,
                 reason_code: "parakeet_live_library_unloadable".to_string(),
@@ -502,6 +527,10 @@ pub async fn get_realtime_start_readiness(
         }
 
         if !model_path_buf.exists() {
+            eprintln!(
+                "[realtime-readiness] blocked: parakeet_realtime_model_missing path={}",
+                model_path_buf.display()
+            );
             return Ok(RealtimeStartReadinessResponse {
                 allowed: false,
                 reason_code: "parakeet_realtime_model_missing".to_string(),
@@ -522,6 +551,10 @@ pub async fn get_realtime_start_readiness(
         let input_device_name = match crate::realtime_audio::probe_input_device_name() {
             Ok(name) => Some(name),
             Err(error) => {
+                eprintln!(
+                    "[realtime-readiness] blocked: input_device reason={} message={}",
+                    error.reason_code, error.message
+                );
                 return Ok(RealtimeStartReadinessResponse {
                     allowed: false,
                     reason_code: error.reason_code,
@@ -537,6 +570,10 @@ pub async fn get_realtime_start_readiness(
             }
         };
 
+        eprintln!(
+            "[realtime-readiness] allowed: parakeet model={} input_device={input_device_name:?}",
+            model_filename
+        );
         return Ok(RealtimeStartReadinessResponse {
             allowed: true,
             reason_code: "ok".to_string(),

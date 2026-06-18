@@ -5,7 +5,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RealtimeDelta};
@@ -15,7 +15,7 @@ use sbobino_domain::{
 };
 
 use crate::parakeet_realtime::{ParakeetRealtimeEngine, ParakeetRealtimeStopResult};
-use crate::realtime_audio::{emit_level_event, start_input_preview, RealtimeInputLevelEvent};
+use crate::realtime_audio::{RealtimeInputLevelEvent, emit_level_event, start_input_preview};
 use crate::{error::CommandError, state::AppState};
 
 fn resolve_realtime_engine(
@@ -82,9 +82,7 @@ fn resolve_parakeet_live_runtime_paths(
     Ok((lib_path, models_dir))
 }
 
-pub(crate) fn resolve_parakeet_live_library_path(
-    parakeet_cli_path: impl AsRef<Path>,
-) -> PathBuf {
+pub(crate) fn resolve_parakeet_live_library_path(parakeet_cli_path: impl AsRef<Path>) -> PathBuf {
     let cli_path = parakeet_cli_path.as_ref();
     let Some(bin_dir) = cli_path.parent() else {
         return PathBuf::from("libparakeet.dylib");
@@ -126,8 +124,7 @@ pub(crate) fn resolve_parakeet_live_library_path(
     }
     // Fall back to the first candidate so the loader can produce a clear error
     // message that points to the expected path.
-    seen
-        .into_iter()
+    seen.into_iter()
         .next()
         .unwrap_or_else(|| bin_dir.join("libparakeet.dylib"))
 }
@@ -232,6 +229,7 @@ pub async fn start_realtime(
     state: State<'_, AppState>,
     payload: Option<StartRealtimePayload>,
 ) -> Result<StartRealtimeResponse, CommandError> {
+    eprintln!("[realtime-start] command received payload={payload:?}");
     let payload = payload.unwrap_or(StartRealtimePayload {
         engine: None,
         model: None,
@@ -279,6 +277,9 @@ pub async fn start_realtime(
     });
     let mut running_message = "Live listening".to_string();
 
+    eprintln!(
+        "[realtime-start] selected engine={engine_kind:?} model={model:?} language={language:?}"
+    );
     match engine_kind {
         TranscriptionEngine::WhisperCpp => {
             let engine = resolve_realtime_engine(&state)?;
@@ -315,6 +316,7 @@ pub async fn start_realtime(
             }
         }
         TranscriptionEngine::ParakeetCpp => {
+            eprintln!("[realtime-start] parakeet branch entered");
             stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
             let parakeet_engine = resolve_parakeet_live_engine(&state)?;
             let models_dir = state
@@ -323,8 +325,13 @@ pub async fn start_realtime(
             let requested_model = payload
                 .parakeet_model
                 .unwrap_or(settings.transcription.parakeet_model);
-            let live_model =
-                select_parakeet_live_model(std::path::Path::new(&models_dir), requested_model)?;
+            let live_model = select_parakeet_live_model(
+                std::path::Path::new(&models_dir),
+                requested_model.clone(),
+            )?;
+            eprintln!(
+                "[realtime-start] parakeet live model requested={requested_model:?} selected={live_model:?} models_dir={models_dir}"
+            );
             running_message = format!("Live listening with '{}'.", live_model.gguf_filename());
             if let Some(id) = &payload.resume_artifact_id {
                 if let Some(artifact) = state
@@ -345,6 +352,7 @@ pub async fn start_realtime(
                 *current_engine = Some(parakeet_engine.clone());
             }
 
+            eprintln!("[realtime-start] starting parakeet engine");
             if let Err(error) = parakeet_engine
                 .start(
                     live_model.gguf_filename(),
@@ -353,9 +361,11 @@ pub async fn start_realtime(
                 )
                 .await
             {
+                eprintln!("[realtime-start] parakeet engine start failed: {error}");
                 emit_level_event(&app, "idle", 0.0, error.to_string());
                 return Err(CommandError::from(error));
             }
+            eprintln!("[realtime-start] parakeet engine start returned ok");
         }
     }
 
@@ -373,6 +383,7 @@ pub async fn start_realtime(
             }
         }
     };
+    eprintln!("[realtime-start] post-start running={running}");
     if !running {
         match engine_kind {
             TranscriptionEngine::WhisperCpp => {
@@ -411,6 +422,7 @@ pub async fn start_realtime(
         },
     );
 
+    eprintln!("[realtime-start] command completed started=true");
     Ok(StartRealtimeResponse { started: true })
 }
 
