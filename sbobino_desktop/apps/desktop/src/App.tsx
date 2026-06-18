@@ -5270,7 +5270,21 @@ export function App({
     return modelEntry.installed;
   }, [isStarting, modelCatalog, selectedFile, settings]);
 
+  const parakeetLiveLanguageUnsupported = useMemo(
+    () =>
+      settings?.transcription.engine === "parakeet_cpp" &&
+      settings.transcription.language !== "en",
+    [settings],
+  );
+  const parakeetLiveLanguageUnsupportedMessage = t(
+    "realtime.parakeetLiveEnglishOnlyMessage",
+    "Parakeet live uses NVIDIA's Realtime EOU 120M model, which supports English only. Select English for Parakeet live, use Whisper.cpp for non-English live transcription, or use Parakeet TDT for file transcription.",
+  );
+
   const canStartRealtime = useMemo(() => {
+    if (parakeetLiveLanguageUnsupported) {
+      return false;
+    }
     // Do not gate live start on the currently selected file-transcription model
     // or on frontend-only preview state. Whisper and Parakeet both run a backend
     // preflight before starting; for Parakeet specifically, live uses realtime
@@ -5278,7 +5292,7 @@ export function App({
     // lets the backend surface the real actionable error instead of leaving the
     // UI apparently dead.
     return Boolean(settings) && realtimeState !== "running" && !isStoppingRealtime;
-  }, [isStoppingRealtime, realtimeState, settings]);
+  }, [isStoppingRealtime, parakeetLiveLanguageUnsupported, realtimeState, settings]);
 
   const aiFeaturesAvailable = useMemo(
     () => aiActionsAvailable(aiCapabilityStatus),
@@ -9464,6 +9478,14 @@ export function App({
   async function onStartRealtime(): Promise<void> {
     if (!settings) return;
 
+    if (parakeetLiveLanguageUnsupported) {
+      setRealtimeMessage(parakeetLiveLanguageUnsupportedMessage);
+      setRealtimePreviewState("blocked");
+      setRealtimeInputLevels([]);
+      setError(parakeetLiveLanguageUnsupportedMessage);
+      return;
+    }
+
     if (realtimeState === "running") {
       setRealtimeMessage(t("realtime.alreadyRunning", "Live transcription is already running."));
       return;
@@ -10602,9 +10624,16 @@ export function App({
             className="quick-action"
             onClick={() => void onStartRealtime()}
             disabled={!canStartRealtime}
+            title={
+              parakeetLiveLanguageUnsupported
+                ? parakeetLiveLanguageUnsupportedMessage
+                : undefined
+            }
           >
             <Mic size={18} strokeWidth={2.5} />
-            {t("home.startLive", "Start Live")}
+            {parakeetLiveLanguageUnsupported
+              ? t("home.startLiveEnglishOnly", "Live only in English")
+              : t("home.startLive", "Start Live")}
           </button>
           <button
             className="quick-action"
@@ -10628,6 +10657,18 @@ export function App({
             {t("home.history", "History")}
           </button>
         </div>
+
+        {parakeetLiveLanguageUnsupported ? (
+          <section className="notice-card" role="status">
+            <strong>
+              {t(
+                "realtime.parakeetLiveEnglishOnlyTitle",
+                "Parakeet live is English-only",
+              )}
+            </strong>
+            <p>{parakeetLiveLanguageUnsupportedMessage}</p>
+          </section>
+        ) : null}
 
         {homeAudioInputPath ? (
           <section className="panel-card home-audio-player-card">
@@ -13337,11 +13378,18 @@ export function App({
               className="realtime-toolbar-button realtime-toolbar-button--start"
               onClick={() => void onStartRealtime()}
               disabled={!canStartRealtime}
+              title={
+                parakeetLiveLanguageUnsupported
+                  ? parakeetLiveLanguageUnsupportedMessage
+                  : undefined
+              }
             >
               <span className="button-content">
                 <Play size={14} />
                 <span className="detail-action-label">
-                  {t("realtime.start", "Start")}
+                  {parakeetLiveLanguageUnsupported
+                    ? t("realtime.englishOnlyShort", "English only")
+                    : t("realtime.start", "Start")}
                 </span>
               </span>
             </button>
