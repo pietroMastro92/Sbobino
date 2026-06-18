@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -14,7 +15,7 @@ use sbobino_domain::{
 };
 
 use crate::parakeet_realtime::{ParakeetRealtimeEngine, ParakeetRealtimeStopResult};
-use crate::realtime_audio::start_input_preview;
+use crate::realtime_audio::{emit_level_event, start_input_preview, RealtimeInputLevelEvent};
 use crate::{error::CommandError, state::AppState};
 
 fn resolve_realtime_engine(
@@ -49,6 +50,13 @@ fn resolve_realtime_engine(
 }
 
 fn resolve_parakeet_live_engine(state: &AppState) -> Result<ParakeetRealtimeEngine, CommandError> {
+    let (lib_path, models_dir) = resolve_parakeet_live_runtime_paths(state)?;
+    Ok(ParakeetRealtimeEngine::new(lib_path, models_dir.into()))
+}
+
+fn resolve_parakeet_live_runtime_paths(
+    state: &AppState,
+) -> Result<(PathBuf, String), CommandError> {
     let settings = state
         .runtime_factory
         .load_settings()
@@ -56,31 +64,76 @@ fn resolve_parakeet_live_engine(state: &AppState) -> Result<ParakeetRealtimeEngi
     let parakeet_cli_path = state
         .runtime_factory
         .resolve_binary_path(&settings.transcription.parakeet_cli_path, "parakeet-cli");
-    let bin_dir = std::path::PathBuf::from(&parakeet_cli_path)
-        .parent()
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| {
-            CommandError::from(ApplicationError::SpeechToText(format!(
-                "Unable to resolve Parakeet runtime directory from {parakeet_cli_path}"
-            )))
-        })?;
-    let lib_path = if bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
-        bin_dir
-            .parent()
-            .unwrap_or(&bin_dir)
-            .join("lib")
-            .join("libparakeet.dylib")
-    } else {
-        bin_dir.join("libparakeet.dylib")
-    };
+    eprintln!(
+        "[parakeet-live] resolve_parakeet_live_engine: cli_path={}",
+        parakeet_cli_path
+    );
+    let lib_path = resolve_parakeet_live_library_path(&parakeet_cli_path);
+    eprintln!("[parakeet-live] resolved lib_path={}", lib_path.display());
+    if !lib_path.exists() {
+        return Err(CommandError::from(ApplicationError::SpeechToText(format!(
+            "Parakeet live library not found at {}. Reinstall the local runtime from Settings > Local Models.",
+            lib_path.display()
+        ))));
+    }
     let models_dir = state
         .runtime_factory
         .resolve_models_dir(&settings.transcription.parakeet_models_dir);
-    Ok(ParakeetRealtimeEngine::new(lib_path, models_dir.into()))
+    Ok((lib_path, models_dir))
 }
 
-fn select_parakeet_live_model(
-    models_dir: &std::path::Path,
+pub(crate) fn resolve_parakeet_live_library_path(
+    parakeet_cli_path: impl AsRef<Path>,
+) -> PathBuf {
+    let cli_path = parakeet_cli_path.as_ref();
+    let Some(bin_dir) = cli_path.parent() else {
+        return PathBuf::from("libparakeet.dylib");
+    };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
+        // Managed install layout: <root>/bin/parakeet-cli -> <root>/lib/libparakeet.dylib
+        candidates.push(bin_dir.join("../lib/libparakeet.dylib"));
+        if let Some(parent) = bin_dir.parent() {
+            candidates.push(parent.join("lib/libparakeet.dylib"));
+            candidates.push(parent.join("libparakeet.dylib"));
+            candidates.push(parent.join("../lib/libparakeet.dylib"));
+        }
+    } else {
+        candidates.push(bin_dir.join("libparakeet.dylib"));
+        if let Some(parent) = bin_dir.parent() {
+            candidates.push(parent.join("lib/libparakeet.dylib"));
+            candidates.push(parent.join("libparakeet.dylib"));
+        }
+    }
+    if let Some(parent) = cli_path.parent() {
+        candidates.push(parent.join("libparakeet.dylib"));
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.join("lib/libparakeet.dylib"));
+        }
+    }
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        if !seen.iter().any(|existing| existing == &candidate) {
+            seen.push(candidate);
+        }
+    }
+    for candidate in &seen {
+        if candidate.exists() {
+            return candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.clone());
+        }
+    }
+    // Fall back to the first candidate so the loader can produce a clear error
+    // message that points to the expected path.
+    seen
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| bin_dir.join("libparakeet.dylib"))
+}
+
+pub(crate) fn select_parakeet_live_model(
+    models_dir: &Path,
     requested: ParakeetModel,
 ) -> Result<ParakeetModel, CommandError> {
     let realtime_candidates = [
@@ -220,6 +273,11 @@ pub async fn start_realtime(
     let emit_delta = Arc::new(move |delta: RealtimeDelta| {
         let _ = app_handle.emit("realtime://delta", delta);
     });
+    let app_handle = app.clone();
+    let emit_input_level = Arc::new(move |event: RealtimeInputLevelEvent| {
+        let _ = app_handle.emit("realtime://input_level", event);
+    });
+    let mut running_message = "Live listening".to_string();
 
     match engine_kind {
         TranscriptionEngine::WhisperCpp => {
@@ -267,6 +325,7 @@ pub async fn start_realtime(
                 .unwrap_or(settings.transcription.parakeet_model);
             let live_model =
                 select_parakeet_live_model(std::path::Path::new(&models_dir), requested_model)?;
+            running_message = format!("Live listening with '{}'.", live_model.gguf_filename());
             if let Some(id) = &payload.resume_artifact_id {
                 if let Some(artifact) = state
                     .artifact_service
@@ -287,9 +346,14 @@ pub async fn start_realtime(
             }
 
             if let Err(error) = parakeet_engine
-                .start(live_model.gguf_filename(), emit_delta)
+                .start(
+                    live_model.gguf_filename(),
+                    emit_delta,
+                    emit_input_level.clone(),
+                )
                 .await
             {
+                emit_level_event(&app, "idle", 0.0, error.to_string());
                 return Err(CommandError::from(error));
             }
         }
@@ -310,8 +374,13 @@ pub async fn start_realtime(
         }
     };
     if !running {
-        if engine_kind == TranscriptionEngine::WhisperCpp {
-            stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+        match engine_kind {
+            TranscriptionEngine::WhisperCpp => {
+                stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+            }
+            TranscriptionEngine::ParakeetCpp => {
+                emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
+            }
         }
         let diagnostics = match engine_kind {
             TranscriptionEngine::WhisperCpp => {
@@ -338,7 +407,7 @@ pub async fn start_realtime(
         "realtime://status",
         RealtimeStatusEvent {
             state: "running".to_string(),
-            message: "Live listening".to_string(),
+            message: running_message,
         },
     );
 
@@ -360,6 +429,7 @@ pub async fn pause_realtime(
             if let Some(engine) = state.realtime.parakeet_engine.lock().await.clone() {
                 engine.pause().await.map_err(CommandError::from)?;
             }
+            emit_level_event(&app, "paused", 0.0, "Microphone preview paused.");
         }
     }
 
@@ -389,6 +459,7 @@ pub async fn resume_realtime(
             if let Some(engine) = state.realtime.parakeet_engine.lock().await.clone() {
                 engine.resume().await.map_err(CommandError::from)?;
             }
+            emit_level_event(&app, "running", 0.0, "Microphone preview resumed.");
         }
     }
 
@@ -438,6 +509,7 @@ pub async fn stop_realtime(
                 .ok_or_else(|| CommandError::new("realtime", "Parakeet live is not running"))?;
             let result: ParakeetRealtimeStopResult =
                 engine.stop().await.map_err(CommandError::from)?;
+            emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
             RealtimeStopResult {
                 transcript: result.transcript,
                 segments: result.segments,
@@ -641,5 +713,75 @@ mod tests {
             "{:?}",
             error
         );
+    }
+
+    #[test]
+    fn parakeet_live_library_resolution_supports_managed_runtime_layout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bin_dir = temp.path().join("runtime/bin");
+        let lib_dir = temp.path().join("runtime/lib");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        std::fs::create_dir_all(&lib_dir).expect("lib dir");
+        let cli = bin_dir.join("parakeet-cli");
+        let lib = lib_dir.join("libparakeet.dylib");
+        std::fs::write(&cli, b"cli").expect("cli");
+        std::fs::write(&lib, b"lib").expect("lib");
+
+        assert_eq!(
+            resolve_parakeet_live_library_path(&cli),
+            lib.canonicalize().expect("canonical lib")
+        );
+    }
+
+    #[test]
+    fn parakeet_live_library_resolution_supports_dev_sidecar_layout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let binaries_dir = temp.path().join("apps/desktop/src-tauri/binaries");
+        let lib_dir = temp.path().join("apps/desktop/src-tauri/lib");
+        std::fs::create_dir_all(&binaries_dir).expect("binaries dir");
+        std::fs::create_dir_all(&lib_dir).expect("lib dir");
+        let cli = binaries_dir.join("parakeet-cli-aarch64-apple-darwin");
+        let lib = lib_dir.join("libparakeet.dylib");
+        std::fs::write(&cli, b"cli").expect("cli");
+        std::fs::write(&lib, b"lib").expect("lib");
+
+        assert_eq!(
+            resolve_parakeet_live_library_path(&cli),
+            lib.canonicalize().expect("canonical lib")
+        );
+    }
+
+    #[test]
+    fn parakeet_live_library_resolution_supports_direct_sibling_layout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cli_dir = temp.path().join("dev-runtime");
+        std::fs::create_dir_all(&cli_dir).expect("cli dir");
+        let cli = cli_dir.join("parakeet-cli");
+        let lib = cli_dir.join("libparakeet.dylib");
+        std::fs::write(&cli, b"cli").expect("cli");
+        std::fs::write(&lib, b"lib").expect("lib");
+
+        assert_eq!(
+            resolve_parakeet_live_library_path(&cli),
+            lib.canonicalize().expect("canonical lib")
+        );
+    }
+
+    #[test]
+    fn parakeet_live_library_resolution_returns_expected_missing_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bin_dir = temp.path().join("runtime/bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let cli = bin_dir.join("parakeet-cli");
+        std::fs::write(&cli, b"cli").expect("cli");
+
+        let resolved = resolve_parakeet_live_library_path(&cli);
+
+        assert!(
+            resolved.ends_with("lib/libparakeet.dylib"),
+            "{}",
+            resolved.display()
+        );
+        assert!(!resolved.exists());
     }
 }

@@ -1,6 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_float, c_int};
 use std::path::{Path, PathBuf};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
@@ -16,6 +17,8 @@ use libloading::Library;
 
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
 use sbobino_domain::TimedSegment;
+
+use crate::realtime_audio::{classify_input_error, RealtimeInputLevelEvent};
 
 type ParakeetCtx = std::ffi::c_void;
 type ParakeetStream = std::ffi::c_void;
@@ -85,6 +88,7 @@ impl ParakeetRealtimeEngine {
         &self,
         model_filename: &str,
         emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
+        emit_input_level: Arc<dyn Fn(RealtimeInputLevelEvent) + Send + Sync>,
     ) -> Result<(), ApplicationError> {
         let mut state = self.state.lock().map_err(lock_error)?;
         if state.running {
@@ -93,14 +97,37 @@ impl ParakeetRealtimeEngine {
             ));
         }
 
-        let api = self.load_api()?;
+        eprintln!(
+            "[parakeet-live] start requested: lib_path={} models_dir={} model={}",
+            self.lib_path.display(),
+            self.models_dir.display(),
+            model_filename,
+        );
+
+        let api = match self.load_api() {
+            Ok(api) => {
+                eprintln!("[parakeet-live] FFI library loaded successfully");
+                api
+            }
+            Err(error) => {
+                eprintln!("[parakeet-live] FFI library load FAILED: {error}");
+                return Err(error);
+            }
+        };
         let model_path = self.models_dir.join(model_filename);
         if !model_path.exists() {
-            return Err(ApplicationError::SpeechToText(format!(
-                "Parakeet realtime model file not found at {}",
-                model_path.display()
-            )));
+            let error = ApplicationError::SpeechToText(format!(
+                "Parakeet realtime model file not found at {}. Download '{}' from Settings > Local Models.",
+                model_path.display(),
+                model_filename,
+            ));
+            eprintln!("[parakeet-live] model file missing: {error}");
+            return Err(error);
         }
+        eprintln!(
+            "[parakeet-live] model resolved at {}",
+            model_path.display()
+        );
 
         let session_dir = create_session_dir()?;
         let saved_audio_path = session_dir.join("parakeet-live.wav");
@@ -117,23 +144,61 @@ impl ParakeetRealtimeEngine {
         let diagnostics_for_thread = diagnostics.clone();
         let paused_for_thread = paused.clone();
 
-        let worker = thread::spawn(move || {
-            let result = run_parakeet_capture(
-                api,
-                model_for_thread,
-                audio_for_thread,
-                shutdown_rx,
-                startup_tx.clone(),
-                paused_for_thread,
-                transcript_for_thread,
-                segments_for_thread,
-                diagnostics_for_thread,
-                emit_delta,
-            );
-            if let Err(error) = result {
-                let _ = startup_tx.send(Err(error));
-            }
-        });
+        emit_parakeet_input_level(
+            emit_input_level.as_ref(),
+            "connecting",
+            0.0,
+            "Connecting to the microphone...",
+        );
+
+        let startup_tx_for_panic = startup_tx.clone();
+        let worker = thread::Builder::new()
+            .name("parakeet-realtime-capture".to_string())
+            .spawn(move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    run_parakeet_capture(
+                        api,
+                        model_for_thread,
+                        audio_for_thread,
+                        shutdown_rx,
+                        startup_tx.clone(),
+                        paused_for_thread,
+                        transcript_for_thread,
+                        segments_for_thread,
+                        diagnostics_for_thread,
+                        emit_delta,
+                        emit_input_level,
+                    )
+                }));
+
+                match result {
+                    Ok(Ok(())) => {
+                        eprintln!("[parakeet-live] capture loop exited cleanly");
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!("[parakeet-live] capture loop returned error: {error}");
+                        let _ = startup_tx.send(Err(error));
+                    }
+                    Err(panic_payload) => {
+                        let detail = if let Some(message) = panic_payload.downcast_ref::<&str>() {
+                            (*message).to_string()
+                        } else if let Some(message) = panic_payload.downcast_ref::<String>() {
+                            message.clone()
+                        } else {
+                            "unknown panic payload".to_string()
+                        };
+                        eprintln!("[parakeet-live] capture thread PANICKED: {detail}");
+                        let _ = startup_tx_for_panic.send(Err(ApplicationError::SpeechToText(
+                            format!("Parakeet live capture thread panicked: {detail}"),
+                        )));
+                    }
+                }
+            })
+            .map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "failed to spawn Parakeet realtime capture thread: {error}"
+                ))
+            })?;
 
         match startup_rx.recv_timeout(Duration::from_secs(90)) {
             Ok(Ok(())) => {
@@ -263,6 +328,10 @@ impl ParakeetRealtimeEngine {
         }
     }
 
+    pub fn validate_library(&self) -> Result<(), ApplicationError> {
+        self.load_api().map(|_| ())
+    }
+
     fn load_api(&self) -> Result<ParakeetApi, ApplicationError> {
         if !self.lib_path.exists() {
             return Err(ApplicationError::SpeechToText(format!(
@@ -374,24 +443,48 @@ fn run_parakeet_capture(
     segments: Arc<Mutex<Vec<TimedSegment>>>,
     diagnostics: Arc<Mutex<Vec<String>>>,
     emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
+    emit_input_level: Arc<dyn Fn(RealtimeInputLevelEvent) + Send + Sync>,
 ) -> Result<(), ApplicationError> {
+    eprintln!(
+        "[parakeet-live] run_parakeet_capture: model={} audio={}",
+        model_path.display(),
+        audio_path.display(),
+    );
     let model_c = CString::new(model_path.to_string_lossy().as_bytes()).map_err(|_| {
         ApplicationError::SpeechToText("Parakeet model path contains a NUL byte".to_string())
     })?;
     let ctx = unsafe { (api.load)(model_c.as_ptr()) };
     if ctx.is_null() {
+        eprintln!(
+            "[parakeet-live] parakeet_capi_load returned null for {}",
+            model_path.display()
+        );
         return Err(ApplicationError::SpeechToText(format!(
-            "failed to load Parakeet realtime model {}",
+            "failed to load Parakeet realtime model {}. The model file may be corrupt or incompatible with the installed libparakeet.",
             model_path.display()
         )));
     }
+    eprintln!("[parakeet-live] parakeet_capi_load OK");
 
     let stream = unsafe { (api.stream_begin)(ctx) };
     if stream.is_null() {
         let detail = last_error(&api, ctx);
+        eprintln!(
+            "[parakeet-live] parakeet_capi_stream_begin returned null: {detail}"
+        );
         unsafe { (api.free)(ctx) };
+        let hint = if model_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("tdt-"))
+            .unwrap_or(false)
+        {
+            " TDT models are batch-only and cannot be used for live streaming. Switch to a Realtime EOU 120M model in Settings > Local Models."
+        } else {
+            ""
+        };
         return Err(ApplicationError::SpeechToText(format!(
-            "failed to start Parakeet realtime stream for {}: {}",
+            "failed to start Parakeet realtime stream for {}.{hint} Detail: {}",
             model_path.display(),
             if detail.is_empty() {
                 "model is not a cache-aware streaming model"
@@ -400,6 +493,7 @@ fn run_parakeet_capture(
             }
         )));
     }
+    eprintln!("[parakeet-live] parakeet_capi_stream_begin OK");
 
     let result = run_capture_loop(
         &api,
@@ -413,6 +507,7 @@ fn run_parakeet_capture(
         segments,
         diagnostics,
         emit_delta,
+        emit_input_level,
     );
 
     unsafe {
@@ -421,6 +516,32 @@ fn run_parakeet_capture(
     }
 
     result
+}
+
+fn mean_abs_input_level(samples: impl Iterator<Item = f32>) -> f32 {
+    let mut sum = 0.0_f32;
+    let mut count = 0_u32;
+    for sample in samples {
+        sum += sample.abs();
+        count += 1;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    ((sum / count as f32) * 3.2).clamp(0.0, 1.0)
+}
+
+fn emit_parakeet_input_level(
+    emit_input_level: &(dyn Fn(RealtimeInputLevelEvent) + Send + Sync),
+    state: &str,
+    level: f32,
+    message: impl Into<String>,
+) {
+    emit_input_level(RealtimeInputLevelEvent {
+        state: state.to_string(),
+        level: level.clamp(0.0, 1.0),
+        message: message.into(),
+    });
 }
 
 fn run_capture_loop(
@@ -435,19 +556,45 @@ fn run_capture_loop(
     segments: Arc<Mutex<Vec<TimedSegment>>>,
     diagnostics: Arc<Mutex<Vec<String>>>,
     emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
+    emit_input_level: Arc<dyn Fn(RealtimeInputLevelEvent) + Send + Sync>,
 ) -> Result<(), ApplicationError> {
+    eprintln!("[parakeet-live] run_capture_loop: probing default input device");
     let host = cpal::default_host();
-    let device = host.default_input_device().ok_or_else(|| {
-        ApplicationError::SpeechToText("No audio input device is available.".to_string())
-    })?;
+    let device = match host.default_input_device() {
+        Some(device) => {
+            eprintln!("[parakeet-live] default input device resolved");
+            device
+        }
+        None => {
+            eprintln!("[parakeet-live] no audio input device available");
+            let message = "No audio input device is available. Connect a microphone and grant Sbobino microphone access in System Settings > Privacy & Security > Microphone.";
+            emit_parakeet_input_level(emit_input_level.as_ref(), "unavailable", 0.0, message);
+            return Err(ApplicationError::SpeechToText(message.to_string()));
+        }
+    };
+    let device_name = device
+        .name()
+        .unwrap_or_else(|_| "Default microphone".to_string());
     let supported_config = device.default_input_config().map_err(|error| {
+        let input_error = classify_input_error(&error.to_string());
+        emit_parakeet_input_level(
+            emit_input_level.as_ref(),
+            &input_error.state,
+            0.0,
+            input_error.message.clone(),
+        );
         ApplicationError::SpeechToText(format!(
-            "failed to read default microphone config for Parakeet live: {error}"
+            "failed to read default microphone config for Parakeet live: {error}. {}",
+            input_error.message
         ))
     })?;
     let config = supported_config.config();
     let sample_rate = config.sample_rate.0;
     let channels = usize::from(config.channels.max(1));
+    eprintln!(
+        "[parakeet-live] input config: sample_rate={} channels={}",
+        sample_rate, channels
+    );
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>();
     let last_capture_error = Arc::new(Mutex::new(None::<String>));
     let input_stream = build_input_stream(
@@ -459,11 +606,31 @@ fn run_capture_loop(
         last_capture_error.clone(),
     )
     .map_err(|error| {
-        ApplicationError::SpeechToText(format!("Parakeet live microphone setup failed: {error}"))
+        let input_error = classify_input_error(&error.to_string());
+        emit_parakeet_input_level(
+            emit_input_level.as_ref(),
+            &input_error.state,
+            0.0,
+            input_error.message.clone(),
+        );
+        ApplicationError::SpeechToText(format!(
+            "Parakeet live microphone setup failed: {error}. {}",
+            input_error.message
+        ))
     })?;
 
     input_stream.play().map_err(|error| {
-        ApplicationError::SpeechToText(format!("Parakeet live microphone start failed: {error}"))
+        let input_error = classify_input_error(&error.to_string());
+        emit_parakeet_input_level(
+            emit_input_level.as_ref(),
+            &input_error.state,
+            0.0,
+            input_error.message.clone(),
+        );
+        ApplicationError::SpeechToText(format!(
+            "Parakeet live microphone start failed: {error}. {}",
+            input_error.message
+        ))
     })?;
 
     let spec = hound::WavSpec {
@@ -483,6 +650,12 @@ fn run_capture_loop(
     let mut processed_samples: u64 = 0;
     let mut assembler = ParakeetLiveAssembler::new(transcript, segments, emit_delta);
     let _stream_guard = input_stream;
+    emit_parakeet_input_level(
+        emit_input_level.as_ref(),
+        "running",
+        0.0,
+        format!("Using {device_name}"),
+    );
     let _ = startup_tx.send(Ok(()));
 
     loop {
@@ -504,8 +677,20 @@ fn run_capture_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if paused.load(Ordering::Relaxed) {
+            emit_parakeet_input_level(
+                emit_input_level.as_ref(),
+                "paused",
+                0.0,
+                "Microphone preview paused.",
+            );
             continue;
         }
+        emit_parakeet_input_level(
+            emit_input_level.as_ref(),
+            "running",
+            mean_abs_input_level(chunk.iter().copied()),
+            format!("Using {device_name}"),
+        );
 
         let pcm_16k = resampler.push(&chunk);
         if pcm_16k.is_empty() {
@@ -943,6 +1128,36 @@ mod tests {
 
         assert!(segments.lock().expect("segments lock poisoned").is_empty());
         assert!(emitted.lock().expect("emitted lock poisoned").is_empty());
+    }
+
+    #[test]
+    fn live_input_level_events_match_realtime_waveform_contract() {
+        let emitted: Arc<Mutex<Vec<RealtimeInputLevelEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let emitted_ref = emitted.clone();
+        let emit = move |event: RealtimeInputLevelEvent| {
+            emitted_ref
+                .lock()
+                .expect("input event lock poisoned")
+                .push(event);
+        };
+
+        emit_parakeet_input_level(&emit, "connecting", 0.0, "Connecting to the microphone...");
+        emit_parakeet_input_level(
+            &emit,
+            "running",
+            mean_abs_input_level([0.25_f32, -0.5, 0.75].into_iter()),
+            "Using Default microphone",
+        );
+        emit_parakeet_input_level(&emit, "paused", 0.0, "Microphone preview paused.");
+        emit_parakeet_input_level(&emit, "idle", 0.0, "Microphone preview stopped.");
+
+        let emitted = emitted.lock().expect("input event lock poisoned");
+        assert_eq!(emitted[0].state, "connecting");
+        assert_eq!(emitted[1].state, "running");
+        assert!(emitted[1].level > 0.0);
+        assert!(emitted[1].level <= 1.0);
+        assert_eq!(emitted[2].state, "paused");
+        assert_eq!(emitted[3].state, "idle");
     }
 
     #[test]

@@ -226,7 +226,7 @@ describe("initialSetup helpers", () => {
     expect(isRuntimeToolchainReady(whisperRuntime)).toBe(true);
     expect(getRuntimeToolchainFailureMessage(whisperRuntime)).toBeNull();
 
-    // Parakeet users must still see Parakeet CLI as a hard requirement.
+    // Parakeet users should not be blocked by a missing Whisper CLI.
     const parakeetRuntime = createRuntimeHealthFixture();
     parakeetRuntime.configured_engine = "parakeet_cpp";
     parakeetRuntime.managed_runtime.ready = false;
@@ -238,9 +238,10 @@ describe("initialSetup helpers", () => {
     };
     parakeetRuntime.whisper_cli_available = false;
 
-    expect(isRuntimeToolchainReady(parakeetRuntime)).toBe(false);
+    expect(isRuntimeToolchainReady(parakeetRuntime)).toBe(true);
     expect(getRuntimeToolchainFailureMessage(parakeetRuntime)).toBeNull();
 
+    // Parakeet users must still see Parakeet CLI as a hard requirement.
     parakeetRuntime.managed_runtime.parakeet_cli = {
       resolved_path: "/tmp/parakeet-cli",
       available: false,

@@ -79,7 +79,7 @@ fn map_input_error(reason_code: &str, detail: impl Into<String>) -> RealtimeInpu
     }
 }
 
-fn classify_input_error(detail: &str) -> RealtimeInputError {
+pub(crate) fn classify_input_error(detail: &str) -> RealtimeInputError {
     let lower = detail.to_ascii_lowercase();
     if lower.contains("not permitted")
         || lower.contains("permission")
@@ -99,7 +99,12 @@ fn classify_input_error(detail: &str) -> RealtimeInputError {
     }
 }
 
-fn emit_level_event(app: &AppHandle, state: &str, level: f32, message: impl Into<String>) {
+pub(crate) fn emit_level_event(
+    app: &AppHandle,
+    state: &str,
+    level: f32,
+    message: impl Into<String>,
+) {
     let _ = app.emit(
         "realtime://input_level",
         RealtimeInputLevelEvent {

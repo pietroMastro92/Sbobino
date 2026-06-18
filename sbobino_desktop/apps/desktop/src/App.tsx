@@ -230,6 +230,7 @@ import type {
   PyannoteBackgroundActionTrigger,
   RealtimeDelta,
   RealtimeInputLevelEvent,
+  RealtimeStartReadiness,
   RemoteServiceConfig,
   RemoteServiceKind,
   RuntimeHealth,
@@ -741,7 +742,7 @@ const allTranscriptionEngineOptions: Array<{
   label: string;
 }> = [
   { value: "whisper_cpp", label: "Whisper.cpp" },
-  { value: "parakeet_cpp", label: "Parakeet.cpp Metal (Experimental)" },
+  { value: "parakeet_cpp", label: "Parakeet.cpp Metal" },
 ];
 
 const chunkingOptions: Array<{
@@ -2023,6 +2024,26 @@ function formatRealtimeStatusMessage(state: string): string {
     default:
       return t("realtime.idle", "Realtime idle");
   }
+}
+
+function realtimePreviewStateForReadinessFailure(
+  readiness: RealtimeStartReadiness,
+): "idle" | "blocked" | "unavailable" {
+  const reason = readiness.reason_code.toLowerCase();
+  if (reason.includes("blocked") || reason.includes("permission")) {
+    return "blocked";
+  }
+  if (
+    reason.includes("microphone") ||
+    reason.includes("library") ||
+    reason.includes("runtime") ||
+    reason.includes("model") ||
+    reason.includes("missing") ||
+    reason.includes("unloadable")
+  ) {
+    return "unavailable";
+  }
+  return "idle";
 }
 
 function formatRuntimeNotReadyMessage(
@@ -4938,7 +4959,12 @@ export function App({
       }
 
       const uRealtimeStatus = await subscribeRealtimeStatus((event) => {
-        setRealtimeMessage(formatRealtimeStatusMessage(event.state));
+        const backendMessage = event.message?.trim() ?? "";
+        setRealtimeMessage(
+          backendMessage.includes("with '")
+            ? backendMessage
+            : formatRealtimeStatusMessage(event.state),
+        );
         if (event.state === "running") {
           setRealtimeState("running");
         } else if (event.state === "paused") {
@@ -9447,8 +9473,13 @@ export function App({
         t("error.preflightTimedOut", "Preflight timed out."),
       );
       if (!readiness.allowed) {
+        const message =
+          readiness.message || formatRuntimeNotReadyMessage(runtimeHealth);
+        setRealtimeMessage(message);
+        setRealtimePreviewState(realtimePreviewStateForReadinessFailure(readiness));
+        setRealtimeInputLevels([]);
         setError(
-          readiness.message || formatRuntimeNotReadyMessage(runtimeHealth),
+          message,
         );
         return;
       }
@@ -14681,7 +14712,7 @@ export function App({
               <small>
                 {t(
                   "settings.transcription.engineDesc",
-                  "Whisper.cpp remains the default; Parakeet.cpp Metal is experimental.",
+                  "Whisper.cpp remains the default; Parakeet.cpp Metal uses Apple Silicon acceleration.",
                 )}
               </small>
             </div>
