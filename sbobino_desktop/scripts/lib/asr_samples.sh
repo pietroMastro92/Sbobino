@@ -105,13 +105,11 @@ asr_audio_duration_seconds() {
   command -v ffprobe >/dev/null 2>&1 || asr_fail "missing required command: ffprobe"
   local duration
   duration=$(LC_ALL=C ffprobe -v error \
-
     -show_entries format=duration \
     -of default=noprint_wrappers=1:nokey=1 \
     "$audio" 2>/dev/null || true)
   [[ -n "$duration" ]] || asr_fail "unable to determine audio duration for $audio"
   LC_ALL=C printf '%.3f\n' "$duration"
-
 }
 
 asr_print_source_report() {
