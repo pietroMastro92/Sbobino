@@ -14,8 +14,36 @@ WHISPER_LANGUAGE=${SBOBINO_WHISPER_LANGUAGE:-en}
 COMPARE_MODE=${SBOBINO_ASR_COMPARE_MODE:-transcribe}
 THREADS=${SBOBINO_ASR_THREADS:-8}
 BENCH_REPS=${SBOBINO_ASR_BENCH_REPS:-5}
-REQUIRE_PARAKEET_GPU=${SBOBINO_REQUIRE_PARAKEET_GPU:-1}
 SKIP_PARAKEET_CPU=${SBOBINO_COMPARE_SKIP_PARAKEET_CPU:-}
+
+truthy_env_value() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_base_apple_m1_host() {
+  local brand
+  brand=$(/usr/sbin/sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+  [[ "$brand" == *"Apple M1"* && "$brand" != *"M1 Pro"* && "$brand" != *"M1 Max"* && "$brand" != *"M1 Ultra"* ]]
+}
+
+if [[ -n "${SBOBINO_REQUIRE_PARAKEET_GPU:-}" ]]; then
+  REQUIRE_PARAKEET_GPU=$SBOBINO_REQUIRE_PARAKEET_GPU
+elif is_base_apple_m1_host && ! truthy_env_value "${SBOBINO_PARAKEET_FORCE_METAL:-}"; then
+  REQUIRE_PARAKEET_GPU=0
+else
+  REQUIRE_PARAKEET_GPU=1
+fi
+
+PARAKEET_DEFAULT_DEVICE=inherit
+if truthy_env_value "${SBOBINO_PARAKEET_FORCE_CPU:-}"; then
+  PARAKEET_DEFAULT_DEVICE=cpu
+elif [[ -z "${PARAKEET_DEVICE:-}" ]] && is_base_apple_m1_host && ! truthy_env_value "${SBOBINO_PARAKEET_FORCE_METAL:-}"; then
+  PARAKEET_DEFAULT_DEVICE=cpu
+fi
+
 if [[ -z "$SKIP_PARAKEET_CPU" && "$COMPARE_MODE" == "bench" ]]; then
   # parakeet-cli bench-decode currently hangs on CPU-forced runs on this Apple Silicon setup.
   # Use transcribe mode for Metal-vs-CPU comparisons, and bench mode for Metal steady-state.
@@ -188,15 +216,22 @@ echo "parakeet_cli=$PARAKEET_CLI"
 echo "parakeet_model=$PARAKEET_MODEL_PATH"
 echo "parakeet_quantization=$(model_quantization "$PARAKEET_MODEL")"
 echo "parakeet_required_device=$([[ "$REQUIRE_PARAKEET_GPU" == "1" ]] && echo metal || echo any)"
+echo "parakeet_default_device=$PARAKEET_DEFAULT_DEVICE"
 echo "whisper_cli=${WHISPER_CLI:-missing}"
 echo "whisper_model=$WHISPER_MODEL_PATH"
 echo
 
 parakeet_command_args
 PARAKEET_STATUS=0
-run_timed parakeet_default \
-  env DYLD_LIBRARY_PATH="$BIN_DIR:${DYLD_LIBRARY_PATH:-}" "$PARAKEET_CLI" "${PARAKEET_ARGS[@]}" \
-  || PARAKEET_STATUS=$?
+if [[ "$PARAKEET_DEFAULT_DEVICE" == "cpu" ]]; then
+  run_timed parakeet_default \
+    env PARAKEET_DEVICE=cpu DYLD_LIBRARY_PATH="$BIN_DIR:${DYLD_LIBRARY_PATH:-}" "$PARAKEET_CLI" "${PARAKEET_ARGS[@]}" \
+    || PARAKEET_STATUS=$?
+else
+  run_timed parakeet_default \
+    env DYLD_LIBRARY_PATH="$BIN_DIR:${DYLD_LIBRARY_PATH:-}" "$PARAKEET_CLI" "${PARAKEET_ARGS[@]}" \
+    || PARAKEET_STATUS=$?
+fi
 if [[ "$PARAKEET_STATUS" -eq 0 && "$REQUIRE_PARAKEET_GPU" == "1" ]]; then
   if parakeet_gpu_used "$RUN_DIR/parakeet_default.stderr"; then
     echo "parakeet_default_gpu=used"

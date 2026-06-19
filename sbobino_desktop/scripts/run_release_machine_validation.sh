@@ -84,6 +84,29 @@ need_cmd() {
   fi
 }
 
+truthy_env_value() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_base_apple_m1_host() {
+  local brand
+  brand=$(/usr/sbin/sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+  [[ "$brand" == *"Apple M1"* && "$brand" != *"M1 Pro"* && "$brand" != *"M1 Max"* && "$brand" != *"M1 Ultra"* ]]
+}
+
+parakeet_release_smoke_requires_gpu() {
+  if [[ -n "${SBOBINO_REQUIRE_PARAKEET_GPU:-}" ]]; then
+    printf '%s\n' "$SBOBINO_REQUIRE_PARAKEET_GPU"
+  elif is_base_apple_m1_host && ! truthy_env_value "${SBOBINO_PARAKEET_FORCE_METAL:-}"; then
+    printf '%s\n' "0"
+  else
+    printf '%s\n' "1"
+  fi
+}
+
 need_cmd cargo
 need_cmd curl
 need_cmd ditto
@@ -482,7 +505,15 @@ run_parakeet_transcription_smoke() {
   local parakeet_models_dir="$DATA_DIR/parakeet-models"
   local parakeet_model_path="$parakeet_models_dir/$PARAKEET_MODEL"
   local smoke_log="$TMP_DIR/parakeet-real-smoke.log"
-  local compare_log="$TMP_DIR/parakeet-metal-compare.log"
+  local compare_log="$TMP_DIR/parakeet-compare.log"
+  local require_parakeet_gpu
+  local skip_parakeet_cpu
+  require_parakeet_gpu=$(parakeet_release_smoke_requires_gpu)
+  if [[ "$require_parakeet_gpu" == "1" ]]; then
+    skip_parakeet_cpu=1
+  else
+    skip_parakeet_cpu=0
+  fi
 
   if [[ ! -x "$parakeet_cli" ]]; then
     fail_validation "Managed Parakeet CLI was not installed at '$parakeet_cli'."
@@ -509,11 +540,11 @@ run_parakeet_transcription_smoke() {
     SBOBINO_ARTEMIS_AUDIO="$FIXTURE_AUDIO" \
     SBOBINO_ASR_SAMPLE=artemis \
     SBOBINO_ASR_COMPARE_MODE=transcribe \
-    SBOBINO_REQUIRE_PARAKEET_GPU=1 \
-    SBOBINO_COMPARE_SKIP_PARAKEET_CPU=1 \
+    SBOBINO_REQUIRE_PARAKEET_GPU="$require_parakeet_gpu" \
+    SBOBINO_COMPARE_SKIP_PARAKEET_CPU="$skip_parakeet_cpu" \
     SBOBINO_COMPARE_SKIP_WHISPER_GPU=1 \
     "$ROOT_DIR/scripts/compare_asr_engines_real.sh" >"$compare_log" 2>&1; then
-    fail_validation "Parakeet Metal transcription smoke failed. Last log lines: $(tail -120 "$compare_log")"
+    fail_validation "Parakeet transcription smoke failed. Last log lines: $(tail -120 "$compare_log")"
   fi
 }
 
