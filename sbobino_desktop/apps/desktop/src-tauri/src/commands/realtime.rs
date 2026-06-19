@@ -168,7 +168,7 @@ pub(crate) fn select_parakeet_live_model(
     }
 
     Err(CommandError::from(ApplicationError::SpeechToText(format!(
-        "Parakeet live requires the Multilingual Live model in {}. Install it from Settings > Local Models.",
+        "Parakeet live requires the NVIDIA Nemotron live model in {}. Install it from Settings > Local Models.",
         models_dir.display()
     ))))
 }
@@ -812,7 +812,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("requires the Multilingual Live model"),
+                .contains("requires the NVIDIA Nemotron live model"),
             "{:?}",
             error
         );

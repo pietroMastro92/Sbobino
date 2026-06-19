@@ -111,21 +111,21 @@ function createModelCatalogFixture(): ProvisioningModelCatalogEntry[] {
     },
     {
       key: "tdt06b_v3_q4",
-      label: "Fast",
+      label: "Parakeet TDT 0.6B Q4 — file only",
       model_file: "tdt-0.6b-v3-q4_k.gguf",
       installed: true,
       coreml_installed: true,
       engine: "parakeet_cpp",
-      experimental: true,
+      experimental: false,
     },
     {
       key: "nemotron35_asr_streaming_06b_q4",
-      label: "Multilingual Live",
+      label: "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual",
       model_file: "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
       installed: true,
       coreml_installed: true,
       engine: "parakeet_cpp",
-      experimental: true,
+      experimental: false,
     },
   ];
 }

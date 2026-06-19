@@ -471,7 +471,7 @@ Homebrew, host Python, or previously installed Sbobino runtime assets.
    - runtime downloads and validates successfully
    - required whisper models download successfully
    - required Parakeet model downloads successfully
-   - `Parakeet.cpp Metal (Experimental)` can transcribe the fixture audio
+   - `Parakeet.cpp` can transcribe the fixture audio
    - pyannote runtime and model install successfully
    - app enters the main UI without manual fixes
 5. Quit the app and launch it again.

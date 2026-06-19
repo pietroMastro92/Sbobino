@@ -138,7 +138,7 @@ impl ParakeetCppEngine {
             && Self::is_realtime_eou_model(final_model_filename)
         {
             return Err(ApplicationError::SpeechToText(format!(
-                "The selected legacy Parakeet live model cannot transcribe language '{language_code}'. Select Fast or Multilingual Live."
+                "The selected legacy Parakeet live model cannot transcribe language '{language_code}'. Select NVIDIA Nemotron for multilingual live transcription or Parakeet TDT for file transcription."
             )));
         }
 
@@ -146,6 +146,15 @@ impl ParakeetCppEngine {
     }
 
     fn configure_command_environment(command: &mut Command, binary_path: &str) {
+        // Keep Metal enabled where it is stable, but avoid ggml residency-set
+        // teardown assertions and M1-only Metal backend failures. parakeet.cpp
+        // honors PARAKEET_DEVICE=cpu, so first-generation Apple Silicon remains
+        // functional instead of looking unsupported to users.
+        command.env("GGML_METAL_NO_RESIDENCY", "1");
+        if let Some(device) = Self::parakeet_device_override() {
+            command.env("PARAKEET_DEVICE", device);
+        }
+
         if let Some(binary_dir) = Path::new(binary_path)
             .canonicalize()
             .ok()
@@ -161,6 +170,58 @@ impl ParakeetCppEngine {
             }
             command.env("DYLD_LIBRARY_PATH", dyld_paths.join(":"));
         }
+    }
+
+    fn parakeet_device_override() -> Option<&'static str> {
+        if Self::truthy_env("SBOBINO_PARAKEET_FORCE_CPU") {
+            return Some("cpu");
+        }
+        if Self::truthy_env("SBOBINO_PARAKEET_FORCE_METAL") {
+            return None;
+        }
+        if std::env::var_os("PARAKEET_DEVICE").is_some() {
+            return None;
+        }
+        if Self::is_first_generation_apple_silicon() {
+            return Some("cpu");
+        }
+        None
+    }
+
+    fn truthy_env(name: &str) -> bool {
+        std::env::var(name)
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_first_generation_apple_silicon() -> bool {
+        std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|brand| Self::is_first_generation_apple_silicon_brand(&brand))
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn is_first_generation_apple_silicon() -> bool {
+        false
+    }
+
+    fn is_first_generation_apple_silicon_brand(brand: &str) -> bool {
+        let normalized = brand.to_ascii_lowercase();
+        normalized.contains("apple m1")
+            && !normalized.contains("m1 pro")
+            && !normalized.contains("m1 max")
+            && !normalized.contains("m1 ultra")
     }
 
     fn extract_json_payload(stdout: &str) -> Result<&str, ApplicationError> {
@@ -1233,5 +1294,26 @@ impl SpeechToTextEngine for ParakeetCppEngine {
             emit_progress_seconds(total);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParakeetCppEngine;
+
+    #[test]
+    fn detects_base_m1_for_parakeet_cpu_fallback() {
+        assert!(ParakeetCppEngine::is_first_generation_apple_silicon_brand(
+            "Apple M1"
+        ));
+        assert!(ParakeetCppEngine::is_first_generation_apple_silicon_brand(
+            "Apple M1 @ 3.20GHz"
+        ));
+        assert!(!ParakeetCppEngine::is_first_generation_apple_silicon_brand(
+            "Apple M1 Pro"
+        ));
+        assert!(!ParakeetCppEngine::is_first_generation_apple_silicon_brand(
+            "Apple M2"
+        ));
     }
 }

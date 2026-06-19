@@ -239,11 +239,12 @@ describe("i18n catalog", () => {
     ).toEqual([]);
   });
 
-  it("presents Parakeet.cpp Metal as a peer engine without experimental wording", () => {
+  it("presents Parakeet.cpp as a peer engine without experimental wording", () => {
     const appSource = fs.readFileSync(path.join(sourceDir, "App.tsx"), "utf8");
 
-    expect(appSource).toContain('label: "Parakeet.cpp Metal"');
+    expect(appSource).toContain('label: "Parakeet.cpp"');
     expect(appSource).not.toContain("Parakeet.cpp Metal (Experimental)");
+    expect(appSource).not.toContain('label: "Parakeet.cpp Metal"');
     for (const entries of Object.values(translationsCatalog)) {
       expect(entries["settings.transcription.engineDesc"]).not.toMatch(
         /experimental|sperimentale|experimentell/i,

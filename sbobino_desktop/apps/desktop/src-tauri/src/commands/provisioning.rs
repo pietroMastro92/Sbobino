@@ -98,10 +98,14 @@ const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resol
 const PARAKEET_MODEL_BASE_URL: &str =
     "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/";
 const PARAKEET_MODEL_CATALOG: [(&str, &str, &str); 2] = [
-    ("tdt06b_v3_q4", "Fast", "tdt-0.6b-v3-q4_k.gguf"),
+    (
+        "tdt06b_v3_q4",
+        "Parakeet TDT 0.6B Q4 — file only",
+        "tdt-0.6b-v3-q4_k.gguf",
+    ),
     (
         "nemotron35_asr_streaming_06b_q4",
-        "Multilingual Live",
+        "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual",
         "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
     ),
 ];
@@ -706,7 +710,7 @@ pub async fn provisioning_models(
                 installed: parakeet_models_dir.join(model_file).exists(),
                 coreml_installed: false,
                 engine: "parakeet_cpp".to_string(),
-                experimental: true,
+                experimental: false,
             }),
     );
 

@@ -67,10 +67,10 @@ const REQUIRED_MODEL_FILES: [&str; 5] = [
 ];
 
 const PARAKEET_MODEL_CATALOG: [(&str, &str); 2] = [
-    ("tdt-0.6b-v3-q4_k.gguf", "Fast"),
+    ("tdt-0.6b-v3-q4_k.gguf", "Parakeet TDT 0.6B Q4 — file only"),
     (
         "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
-        "Multilingual Live",
+        "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual",
     ),
 ];
 const REQUIRED_COREML_ENCODERS: [(&str, &str); 5] = [
@@ -450,7 +450,7 @@ impl RuntimeTranscriptionFactory {
                     return Err(format_managed_runtime_binary_error(
                         "Parakeet CLI",
                         &runtime_check.parakeet_cli,
-                        "Install or repair the experimental Parakeet runtime from Settings > Local Models.",
+                        "Install or repair the Parakeet runtime from Settings > Local Models.",
                     ));
                 }
                 return Err(format!(

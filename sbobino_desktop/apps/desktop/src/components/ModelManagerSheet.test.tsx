@@ -48,7 +48,7 @@ describe("ModelManagerSheet", () => {
     expect(onRefresh).toHaveBeenCalledTimes(1);
   });
 
-  it("shows parakeet models as experimental without coreml state", () => {
+  it("shows parakeet models without coreml state or experimental badge", () => {
     const onDownloadModel = vi.fn().mockResolvedValue(undefined);
 
     render(
@@ -63,7 +63,7 @@ describe("ModelManagerSheet", () => {
             installed: false,
             coreml_installed: false,
             engine: "parakeet_cpp",
-            experimental: true,
+            experimental: false,
           },
         ]}
         running={false}
@@ -78,7 +78,7 @@ describe("ModelManagerSheet", () => {
     );
 
     expect(screen.getByText("TDT 0.6B v3 F16")).toBeInTheDocument();
-    expect(screen.getByText("Experimental")).toBeInTheDocument();
+    expect(screen.queryByText("Experimental")).not.toBeInTheDocument();
     expect(screen.queryByText(/CoreML/i)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /^download$/i }));

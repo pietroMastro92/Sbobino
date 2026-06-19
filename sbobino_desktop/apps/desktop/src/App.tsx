@@ -605,8 +605,11 @@ const modelOptions: Array<{ value: SpeechModel; label: string }> = [
 ];
 
 const parakeetModelOptions: Array<{ value: ParakeetModel; label: string }> = [
-  { value: "tdt06b_v3_q4", label: "Fast" },
-  { value: "nemotron35_asr_streaming_06b_q4", label: "Multilingual Live" },
+  { value: "tdt06b_v3_q4", label: "Parakeet TDT 0.6B Q4 — file only" },
+  {
+    value: "nemotron35_asr_streaming_06b_q4",
+    label: "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual",
+  },
 ];
 
 type PrimaryTranscriptionModelOption =
@@ -733,7 +736,7 @@ const allTranscriptionEngineOptions: Array<{
   label: string;
 }> = [
   { value: "whisper_cpp", label: "Whisper.cpp" },
-  { value: "parakeet_cpp", label: "Parakeet.cpp Metal" },
+  { value: "parakeet_cpp", label: "Parakeet.cpp" },
 ];
 
 const chunkingOptions: Array<{
@@ -14723,7 +14726,7 @@ export function App({
               <small>
                 {t(
                   "settings.transcription.engineDesc",
-                  "Whisper.cpp remains the default; Parakeet.cpp Metal uses Apple Silicon acceleration.",
+                  "Whisper.cpp remains the default; Parakeet.cpp uses Apple Silicon acceleration when available.",
                 )}
               </small>
             </div>
@@ -14770,7 +14773,7 @@ export function App({
               >
                 {parakeetModelOptions.map((option) => (
                   <option key={option.value} value={option.value}>
-                    {option.label}
+                    {formatParakeetModelLabel(option.value, option.label)}
                   </option>
                 ))}
               </select>

@@ -46,7 +46,7 @@ if [[ ! -f "$MODEL_PATH" ]]; then
 fi
 
 if [[ ! -f "$SBOBINO_PARAKEET_MODELS_DIR/$NEMOTRON_STREAMING_Q4_MODEL" ]]; then
-  echo "missing Parakeet Multilingual Live model in: $SBOBINO_PARAKEET_MODELS_DIR" >&2
+  echo "missing Parakeet NVIDIA Nemotron live model in: $SBOBINO_PARAKEET_MODELS_DIR" >&2
   echo "download manually:" >&2
   echo "  curl -L -o '$SBOBINO_PARAKEET_MODELS_DIR/$NEMOTRON_STREAMING_Q4_MODEL' '$NEMOTRON_STREAMING_Q4_URL'" >&2
   exit 1
