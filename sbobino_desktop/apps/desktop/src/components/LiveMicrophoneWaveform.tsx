@@ -126,9 +126,10 @@ function drawWaveform(
 
   for (let index = 0; index < visibleLevels.length; index += 1) {
     const dataIndex = visibleLevels.length - 1 - index;
-    const value = clamp(visibleLevels[dataIndex] ?? 0.05, 0.05, 1);
+    const rawValue = visibleLevels[dataIndex] ?? 0.05;
+    const value = clamp(rawValue, 0.02, 1);
     const x = width - (index + 1) * step;
-    const barHeight = Math.max(BAR_HEIGHT, value * height * 0.8);
+    const barHeight = Math.max(BAR_HEIGHT, value * height * 0.9);
     const y = centerY - barHeight / 2;
 
     context.fillStyle = computedBarColor;

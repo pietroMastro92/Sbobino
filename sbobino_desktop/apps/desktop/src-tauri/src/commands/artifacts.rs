@@ -3230,8 +3230,8 @@ mod tests {
         // punctuation. Deterministic so tests can assert exact output.
         let lowered = text.to_lowercase();
         let filler_words = [
-            "uh", "ehm", "allora", "diciamo", "cioe", "cioè", "insomma",
-            "tipo", "beh", "mmh", "mhh", "ah",
+            "uh", "ehm", "allora", "diciamo", "cioe", "cioè", "insomma", "tipo", "beh", "mmh",
+            "mhh", "ah",
         ];
 
         let mut tokens: Vec<String> = Vec::new();
@@ -3729,7 +3729,9 @@ mod tests {
         // optimized output.
         let optimized_lower = optimized.to_lowercase();
         for word in transcript.split_whitespace() {
-            let needle = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+            let needle = word
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase();
             if needle.is_empty() {
                 continue;
             }
@@ -3851,11 +3853,9 @@ mod tests {
             "Questo quesito riguarda Cheras Tuner e GSM Scheme.",
         );
 
-        let prompt = build_confidence_aware_optimize_prompt(
-            &artifact,
-            Some("User prompt".to_string()),
-        )
-        .expect("prompt should be generated");
+        let prompt =
+            build_confidence_aware_optimize_prompt(&artifact, Some("User prompt".to_string()))
+                .expect("prompt should be generated");
 
         assert!(prompt.contains("substantive"));
         assert!(prompt.contains("syntactic, logical, and contextual cleanup"));
@@ -3920,11 +3920,9 @@ mod tests {
             "Questo quesito riguarda Cheras Tuner e GSM Scheme.",
         );
 
-        let prompt = build_confidence_aware_optimize_prompt(
-            &artifact,
-            Some("User prompt".to_string()),
-        )
-        .expect("prompt should be generated");
+        let prompt =
+            build_confidence_aware_optimize_prompt(&artifact, Some("User prompt".to_string()))
+                .expect("prompt should be generated");
 
         assert!(
             prompt.contains("Understand the topic being discussed"),
@@ -3954,11 +3952,9 @@ mod tests {
             "Questo quesito riguarda Cheras Tuner e GSM Scheme.",
         );
 
-        let prompt = build_confidence_aware_optimize_prompt(
-            &artifact,
-            Some("User prompt".to_string()),
-        )
-        .expect("prompt should be generated");
+        let prompt =
+            build_confidence_aware_optimize_prompt(&artifact, Some("User prompt".to_string()))
+                .expect("prompt should be generated");
 
         assert!(
             prompt.contains("Another example of the expected level of rewriting"),
@@ -3987,11 +3983,9 @@ mod tests {
             "Questo quesito riguarda Cheras Tuner e GSM Scheme.",
         );
 
-        let prompt = build_confidence_aware_optimize_prompt(
-            &artifact,
-            Some("User prompt".to_string()),
-        )
-        .expect("prompt should be generated");
+        let prompt =
+            build_confidence_aware_optimize_prompt(&artifact, Some("User prompt".to_string()))
+                .expect("prompt should be generated");
 
         assert!(
             prompt.contains("Another example of topic-aware rewriting"),
@@ -4002,8 +3996,6 @@ mod tests {
             "confidence-aware section must demonstrate the topic-aware rewrite"
         );
     }
-
-
 
     #[test]
     fn confidence_aware_optimize_prompt_without_spans_falls_back_to_user_prompt() {

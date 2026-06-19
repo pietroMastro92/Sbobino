@@ -16,6 +16,7 @@ use crate::adapters::transcript_segmentation::normalize_transcript_segments;
 const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
 const REALTIME_EOU_F16_MODEL: &str = "realtime_eou_120m-v1-f16.gguf";
 const REALTIME_EOU_Q8_MODEL: &str = "realtime_eou_120m-v1-q8_0.gguf";
+const NEMOTRON_STREAMING_PREFIX: &str = "nemotron-3.5-asr-streaming-0.6b";
 const WORD_SEGMENT_GAP_BREAK_SECONDS: f32 = 1.25;
 const WORD_SEGMENT_MAX_CHARS: usize = 140;
 const WORD_SEGMENT_MAX_DURATION_SECONDS: f32 = 12.0;
@@ -116,36 +117,32 @@ impl ParakeetCppEngine {
         )
     }
 
+    fn is_nemotron_streaming_model(model_filename: &str) -> bool {
+        model_filename.starts_with(NEMOTRON_STREAMING_PREFIX)
+    }
+
+    fn parakeet_target_lang(language_code: &str) -> &str {
+        match language_code.trim() {
+            "" => "auto",
+            "ja" => "ja-JP",
+            value => value,
+        }
+    }
+
     fn validate_preview_model_exists(
         &self,
         final_model_filename: &str,
         language_code: &str,
     ) -> Result<PathBuf, ApplicationError> {
-        if !Self::is_english_realtime_language(language_code) {
-            if Self::is_realtime_eou_model(final_model_filename) {
-                return Err(ApplicationError::SpeechToText(format!(
-                    "Parakeet realtime EOU models support English only and have no reliable language auto-detection. For language '{language_code}', select a Parakeet TDT model for file transcription or use Whisper.cpp for live transcription."
-                )));
-            }
-
-            return self.validate_model_exists(final_model_filename);
+        if !Self::is_english_realtime_language(language_code)
+            && Self::is_realtime_eou_model(final_model_filename)
+        {
+            return Err(ApplicationError::SpeechToText(format!(
+                "The selected legacy Parakeet live model cannot transcribe language '{language_code}'. Select Fast or Multilingual Live."
+            )));
         }
 
-        if Self::is_realtime_eou_model(final_model_filename) {
-            return self.validate_model_exists(final_model_filename);
-        }
-
-        for candidate in [REALTIME_EOU_F16_MODEL, REALTIME_EOU_Q8_MODEL] {
-            let model_path = self.model_path(candidate);
-            if model_path.exists() {
-                return Ok(model_path);
-            }
-        }
-
-        Err(ApplicationError::SpeechToText(format!(
-            "Parakeet progressive preview requires {REALTIME_EOU_F16_MODEL} or {REALTIME_EOU_Q8_MODEL} in {}. Repair Parakeet models from Settings > Local Models.",
-            self.models_dir
-        )))
+        self.validate_model_exists(final_model_filename)
     }
 
     fn configure_command_environment(command: &mut Command, binary_path: &str) {
@@ -767,6 +764,7 @@ impl ParakeetCppEngine {
         state: Arc<Mutex<PreviewStreamState>>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+        language_code: &str,
     ) -> Result<(), ApplicationError> {
         let mut command = Command::new(&self.binary_path);
         Self::configure_command_environment(&mut command, &self.binary_path);
@@ -777,7 +775,18 @@ impl ParakeetCppEngine {
             .arg("--input")
             .arg(input_wav)
             .arg("--stream")
-            .arg("--timestamps")
+            .arg("--timestamps");
+        if preview_model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(Self::is_nemotron_streaming_model)
+            .unwrap_or(false)
+        {
+            command
+                .arg("--lang")
+                .arg(Self::parakeet_target_lang(language_code));
+        }
+        command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         command.kill_on_drop(true);
@@ -1013,6 +1022,7 @@ impl ParakeetCppEngine {
         &self,
         chunk_path: &Path,
         preview_model_path: &Path,
+        language_code: &str,
     ) -> Result<String, ApplicationError> {
         let mut command = Command::new(&self.binary_path);
         Self::configure_command_environment(&mut command, &self.binary_path);
@@ -1022,7 +1032,18 @@ impl ParakeetCppEngine {
             .arg(preview_model_path)
             .arg("--input")
             .arg(chunk_path)
-            .arg("--json")
+            .arg("--json");
+        if preview_model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(Self::is_nemotron_streaming_model)
+            .unwrap_or(false)
+        {
+            command
+                .arg("--lang")
+                .arg(Self::parakeet_target_lang(language_code));
+        }
+        command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
@@ -1063,6 +1084,7 @@ impl ParakeetCppEngine {
         state: Arc<Mutex<PreviewStreamState>>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+        language_code: &str,
     ) -> Result<(), ApplicationError> {
         let (_temp_dir, chunks) = match Self::prepare_preview_chunks(input_wav) {
             Ok(chunks) => chunks,
@@ -1077,6 +1099,7 @@ impl ParakeetCppEngine {
                         state,
                         emit_partial,
                         emit_progress_seconds,
+                        language_code,
                     )
                     .await;
             }
@@ -1087,7 +1110,7 @@ impl ParakeetCppEngine {
 
         for chunk in chunks.into_iter().take(PREVIEW_MAX_CHUNKS) {
             let text = self
-                .run_preview_json_for_chunk(&chunk.path, preview_model_path)
+                .run_preview_json_for_chunk(&chunk.path, preview_model_path, language_code)
                 .await?;
             let preview = {
                 let mut state = state.lock().expect("parakeet preview state lock poisoned");
@@ -1113,7 +1136,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
         &self,
         input_wav: &Path,
         model_filename: &str,
-        _language_code: &str,
+        language_code: &str,
         options: &WhisperOptions,
         total_audio_seconds: Option<f32>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
@@ -1127,7 +1150,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
 
         let model_path = self.validate_model_exists(model_filename)?;
         let preview_model_path =
-            self.validate_preview_model_exists(model_filename, _language_code)?;
+            self.validate_preview_model_exists(model_filename, language_code)?;
         let preview_state = Arc::new(Mutex::new(PreviewStreamState::default()));
         match tokio::time::timeout(
             PREVIEW_TIMEOUT,
@@ -1137,6 +1160,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
                 preview_state.clone(),
                 emit_partial.clone(),
                 emit_progress_seconds.clone(),
+                language_code,
             ),
         )
         .await
@@ -1158,7 +1182,13 @@ impl SpeechToTextEngine for ParakeetCppEngine {
             .arg(&model_path)
             .arg("--input")
             .arg(input_wav)
-            .arg("--json")
+            .arg("--json");
+        if Self::is_nemotron_streaming_model(model_filename) {
+            command
+                .arg("--lang")
+                .arg(Self::parakeet_target_lang(language_code));
+        }
+        command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 

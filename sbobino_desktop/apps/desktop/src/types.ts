@@ -15,6 +15,9 @@ export type SpeechModel = "tiny" | "base" | "small" | "medium" | "large_turbo";
 export type ParakeetModel =
   | "realtime_eou120m_v1_f16"
   | "realtime_eou120m_v1_q8"
+  | "nemotron35_asr_streaming_06b_f16"
+  | "nemotron35_asr_streaming_06b_q4"
+  | "nemotron35_asr_streaming_06b_q8"
   | "tdt06b_v3_f16"
   | "tdt06b_v3_q8"
   | "tdt06b_v3_q4";

@@ -97,31 +97,12 @@ const MODEL_CATALOG: [(&str, &str, &str, &str, &str); 5] = [
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 const PARAKEET_MODEL_BASE_URL: &str =
     "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/";
-const PARAKEET_MODEL_CATALOG: [(&str, &str, &str); 5] = [
+const PARAKEET_MODEL_CATALOG: [(&str, &str, &str); 2] = [
+    ("tdt06b_v3_q4", "Fast", "tdt-0.6b-v3-q4_k.gguf"),
     (
-        "tdt06b_v3_q4",
-        "Parakeet TDT 0.6B v3 Q4_K",
-        "tdt-0.6b-v3-q4_k.gguf",
-    ),
-    (
-        "realtime_eou120m_v1_f16",
-        "Parakeet Realtime EOU 120M F16",
-        "realtime_eou_120m-v1-f16.gguf",
-    ),
-    (
-        "realtime_eou120m_v1_q8",
-        "Parakeet Realtime EOU 120M Q8",
-        "realtime_eou_120m-v1-q8_0.gguf",
-    ),
-    (
-        "tdt06b_v3_f16",
-        "Parakeet TDT 0.6B v3 F16",
-        "tdt-0.6b-v3-f16.gguf",
-    ),
-    (
-        "tdt06b_v3_q8",
-        "Parakeet TDT 0.6B v3 Q8",
-        "tdt-0.6b-v3-q8_0.gguf",
+        "nemotron35_asr_streaming_06b_q4",
+        "Multilingual Live",
+        "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
     ),
 ];
 const LOCAL_RELEASE_ASSETS_DIR_ENV: &str = "SBOBINO_LOCAL_RELEASE_ASSETS_DIR";

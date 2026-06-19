@@ -111,7 +111,7 @@ function createModelCatalogFixture(): ProvisioningModelCatalogEntry[] {
     },
     {
       key: "tdt06b_v3_q4",
-      label: "Parakeet TDT 0.6B v3 Q4_K",
+      label: "Fast",
       model_file: "tdt-0.6b-v3-q4_k.gguf",
       installed: true,
       coreml_installed: true,
@@ -119,9 +119,9 @@ function createModelCatalogFixture(): ProvisioningModelCatalogEntry[] {
       experimental: true,
     },
     {
-      key: "realtime_eou120m_v1_f16",
-      label: "Parakeet Realtime EOU 120M F16",
-      model_file: "realtime_eou_120m-v1-f16.gguf",
+      key: "nemotron35_asr_streaming_06b_q4",
+      label: "Multilingual Live",
+      model_file: "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
       installed: true,
       coreml_installed: true,
       engine: "parakeet_cpp",
@@ -192,11 +192,10 @@ describe("initialSetup helpers", () => {
       ...catalog[3],
       installed: false,
     };
-
     expect(getInitialSetupMissingModels(catalog, true)).toEqual([
       "large_turbo",
       "tdt06b_v3_q4",
-      "realtime_eou120m_v1_f16",
+      "nemotron35_asr_streaming_06b_q4",
     ]);
   });
 

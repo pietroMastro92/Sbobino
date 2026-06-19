@@ -6,9 +6,8 @@ source "$ROOT_DIR/scripts/lib/asr_samples.sh"
 
 MODEL_FILENAME=${SBOBINO_PARAKEET_MODEL:-tdt-0.6b-v3-q4_k.gguf}
 MODEL_URL="https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/$MODEL_FILENAME"
-REALTIME_EOU_F16_MODEL="realtime_eou_120m-v1-f16.gguf"
-REALTIME_EOU_Q8_MODEL="realtime_eou_120m-v1-q8_0.gguf"
-REALTIME_EOU_F16_URL="https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/$REALTIME_EOU_F16_MODEL"
+NEMOTRON_STREAMING_Q4_MODEL="nemotron-3.5-asr-streaming-0.6b-q4_k.gguf"
+NEMOTRON_STREAMING_Q4_URL="https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/$NEMOTRON_STREAMING_Q4_MODEL"
 
 fail() {
   echo "error: $*" >&2
@@ -46,14 +45,10 @@ if [[ ! -f "$MODEL_PATH" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$SBOBINO_PARAKEET_MODELS_DIR/$REALTIME_EOU_F16_MODEL" \
-  && ! -f "$SBOBINO_PARAKEET_MODELS_DIR/$REALTIME_EOU_Q8_MODEL" ]]; then
-  echo "missing Parakeet realtime EOU preview model in: $SBOBINO_PARAKEET_MODELS_DIR" >&2
-  echo "Progressive Parakeet file smoke requires one of:" >&2
-  echo "  $REALTIME_EOU_F16_MODEL" >&2
-  echo "  $REALTIME_EOU_Q8_MODEL" >&2
+if [[ ! -f "$SBOBINO_PARAKEET_MODELS_DIR/$NEMOTRON_STREAMING_Q4_MODEL" ]]; then
+  echo "missing Parakeet Multilingual Live model in: $SBOBINO_PARAKEET_MODELS_DIR" >&2
   echo "download manually:" >&2
-  echo "  curl -L -o '$SBOBINO_PARAKEET_MODELS_DIR/$REALTIME_EOU_F16_MODEL' '$REALTIME_EOU_F16_URL'" >&2
+  echo "  curl -L -o '$SBOBINO_PARAKEET_MODELS_DIR/$NEMOTRON_STREAMING_Q4_MODEL' '$NEMOTRON_STREAMING_Q4_URL'" >&2
   exit 1
 fi
 

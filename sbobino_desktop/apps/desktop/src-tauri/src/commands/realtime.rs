@@ -5,17 +5,18 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
-use sbobino_application::{ApplicationError, RealtimeDelta};
+use sbobino_application::{ApplicationError, RealtimeDelta, TranscriptionService};
 use sbobino_domain::{
-    ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel, TimedSegment,
-    TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
+    AppSettings, ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel,
+    TimedSegment, TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
 };
+use tracing::warn;
 
 use crate::parakeet_realtime::{ParakeetRealtimeEngine, ParakeetRealtimeStopResult};
-use crate::realtime_audio::{RealtimeInputLevelEvent, emit_level_event, start_input_preview};
+use crate::realtime_audio::{emit_level_event, start_input_preview, RealtimeInputLevelEvent};
 use crate::{error::CommandError, state::AppState};
 
 fn resolve_realtime_engine(
@@ -129,33 +130,45 @@ pub(crate) fn resolve_parakeet_live_library_path(parakeet_cli_path: impl AsRef<P
         .unwrap_or_else(|| bin_dir.join("libparakeet.dylib"))
 }
 
+pub(crate) fn parakeet_live_target_lang(language: LanguageCode) -> &'static str {
+    match language {
+        LanguageCode::Auto => "auto",
+        LanguageCode::En => "en",
+        LanguageCode::It => "it",
+        LanguageCode::Fr => "fr",
+        LanguageCode::De => "de",
+        LanguageCode::Es => "es",
+        LanguageCode::Pt => "pt",
+        LanguageCode::Zh => "zh",
+        // Nemotron's locale dictionary uses ja-JP, not bare ja.
+        LanguageCode::Ja => "ja-JP",
+    }
+}
+
 pub(crate) fn select_parakeet_live_model(
     models_dir: &Path,
     requested: ParakeetModel,
+    _language: LanguageCode,
 ) -> Result<ParakeetModel, CommandError> {
-    let realtime_candidates = [
-        ParakeetModel::RealtimeEou120mV1F16,
-        ParakeetModel::RealtimeEou120mV1Q8,
+    let live_candidates = [
+        ParakeetModel::Nemotron35AsrStreaming06bQ4,
+        ParakeetModel::Nemotron35AsrStreaming06bQ8,
+        ParakeetModel::Nemotron35AsrStreaming06bF16,
     ];
-    if matches!(
-        requested,
-        ParakeetModel::RealtimeEou120mV1F16 | ParakeetModel::RealtimeEou120mV1Q8
-    ) {
-        if models_dir.join(requested.gguf_filename()).exists() {
-            return Ok(requested);
-        }
+
+    if requested.is_multilingual_streaming() && models_dir.join(requested.gguf_filename()).exists()
+    {
+        return Ok(requested);
     }
 
-    for candidate in realtime_candidates {
+    for candidate in live_candidates {
         if models_dir.join(candidate.gguf_filename()).exists() {
             return Ok(candidate);
         }
     }
 
     Err(CommandError::from(ApplicationError::SpeechToText(format!(
-        "Parakeet live requires {} or {} in {}. Install the realtime EOU model from Settings > Local Models.",
-        ParakeetModel::RealtimeEou120mV1F16.gguf_filename(),
-        ParakeetModel::RealtimeEou120mV1Q8.gguf_filename(),
+        "Parakeet live requires the Multilingual Live model in {}. Install it from Settings > Local Models.",
         models_dir.display()
     ))))
 }
@@ -221,6 +234,68 @@ async fn start_realtime_preview(
         .map_err(|error| CommandError::from(ApplicationError::SpeechToText(error.message)))?;
     *state.realtime.preview.lock().await = Some(preview);
     Ok(())
+}
+
+async fn apply_realtime_speaker_diarization(
+    state: &AppState,
+    settings: &AppSettings,
+    audio_path: Option<&Path>,
+    segments: &mut Vec<TimedSegment>,
+    metadata: &mut BTreeMap<String, String>,
+) {
+    if !settings.transcription.speaker_diarization.enabled {
+        return;
+    }
+
+    let Some(audio_path) = audio_path else {
+        metadata.insert(
+            "speaker_diarization_status".to_string(),
+            "skipped_no_audio".to_string(),
+        );
+        return;
+    };
+
+    if segments.is_empty() {
+        metadata.insert(
+            "speaker_diarization_status".to_string(),
+            "skipped_no_segments".to_string(),
+        );
+        return;
+    }
+
+    let diarizer = match state.runtime_factory.build_speaker_diarizer(settings) {
+        Ok(Some(diarizer)) => diarizer,
+        Ok(None) => return,
+        Err(error) => {
+            metadata.insert(
+                "speaker_diarization_status".to_string(),
+                "failed".to_string(),
+            );
+            metadata.insert("speaker_diarization_error".to_string(), error.clone());
+            warn!("speaker diarization skipped for realtime session: {error}");
+            return;
+        }
+    };
+
+    match diarizer.diarize(audio_path).await {
+        Ok(turns) => {
+            metadata.insert(
+                "speaker_diarization_status".to_string(),
+                "completed".to_string(),
+            );
+            if !turns.is_empty() {
+                *segments = TranscriptionService::assign_speakers_to_segments(segments, &turns);
+            }
+        }
+        Err(error) => {
+            metadata.insert(
+                "speaker_diarization_status".to_string(),
+                "failed".to_string(),
+            );
+            metadata.insert("speaker_diarization_error".to_string(), error.to_string());
+            warn!("speaker diarization failed for realtime session: {error}");
+        }
+    }
 }
 
 #[tauri::command]
@@ -317,14 +392,6 @@ pub async fn start_realtime(
         }
         TranscriptionEngine::ParakeetCpp => {
             eprintln!("[realtime-start] parakeet branch entered");
-            let language_code = language.as_whisper_code();
-            if language_code != "en" {
-                let message = format!(
-                    "Parakeet live uses NVIDIA's Realtime EOU 120M model, which supports English only and has no reliable language auto-detection. Selected language '{language_code}' cannot be transcribed with Parakeet live; select English for Parakeet live, use Whisper.cpp for non-English live transcription, or use Parakeet TDT for file transcription."
-                );
-                emit_level_event(&app, "blocked", 0.0, &message);
-                return Err(CommandError::from(ApplicationError::SpeechToText(message)));
-            }
             stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
             let parakeet_engine = resolve_parakeet_live_engine(&state)?;
             let models_dir = state
@@ -336,14 +403,12 @@ pub async fn start_realtime(
             let live_model = select_parakeet_live_model(
                 std::path::Path::new(&models_dir),
                 requested_model.clone(),
+                language.clone(),
             )?;
             eprintln!(
                 "[realtime-start] parakeet live model requested={requested_model:?} selected={live_model:?} models_dir={models_dir}"
             );
-            running_message = format!(
-                "Live listening with '{}' (English-only Parakeet realtime model).",
-                live_model.gguf_filename()
-            );
+            running_message = "Live listening".to_string();
             if let Some(id) = &payload.resume_artifact_id {
                 if let Some(artifact) = state
                     .artifact_service
@@ -367,6 +432,7 @@ pub async fn start_realtime(
             if let Err(error) = parakeet_engine
                 .start(
                     live_model.gguf_filename(),
+                    parakeet_live_target_lang(language.clone()),
                     emit_delta,
                     emit_input_level.clone(),
                 )
@@ -511,7 +577,7 @@ pub async fn stop_realtime(
     let save = payload.save.unwrap_or(true);
 
     let active_engine = state.realtime.active_engine.lock().await.clone();
-    let stop_result = match active_engine {
+    let mut stop_result = match active_engine {
         TranscriptionEngine::WhisperCpp => {
             let engine = state.realtime.engine.lock().await.clone();
             let result = engine.stop().await.map_err(CommandError::from)?;
@@ -603,6 +669,16 @@ pub async fn stop_realtime(
             "false".to_string()
         },
     );
+
+    apply_realtime_speaker_diarization(
+        &state,
+        &settings,
+        stop_result.saved_audio_path.as_deref(),
+        &mut stop_result.segments,
+        &mut metadata,
+    )
+    .await;
+
     if !stop_result.segments.is_empty() {
         metadata.insert(
             "timeline_v2".to_string(),
@@ -704,19 +780,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parakeet_live_uses_installed_realtime_model_when_tdt_is_selected() {
+    fn parakeet_live_uses_installed_multilingual_model_when_tdt_is_selected() {
         let temp = tempfile::tempdir().expect("temp dir");
         std::fs::write(
             temp.path()
-                .join(ParakeetModel::RealtimeEou120mV1Q8.gguf_filename()),
+                .join(ParakeetModel::Nemotron35AsrStreaming06bQ4.gguf_filename()),
             b"model",
         )
-        .expect("write realtime model");
+        .expect("write multilingual live model");
 
         let selected =
-            select_parakeet_live_model(temp.path(), ParakeetModel::Tdt06bV3Q4).expect("selected");
+            select_parakeet_live_model(temp.path(), ParakeetModel::Tdt06bV3Q4, LanguageCode::En)
+                .expect("selected");
 
-        assert_eq!(selected, ParakeetModel::RealtimeEou120mV1Q8);
+        assert_eq!(selected, ParakeetModel::Nemotron35AsrStreaming06bQ4);
     }
 
     #[test]
@@ -728,16 +805,45 @@ mod tests {
         )
         .expect("write tdt model");
 
-        let error = select_parakeet_live_model(temp.path(), ParakeetModel::Tdt06bV3Q4)
-            .expect_err("tdt-only live should fail");
+        let error =
+            select_parakeet_live_model(temp.path(), ParakeetModel::Tdt06bV3Q4, LanguageCode::It)
+                .expect_err("tdt-only live should fail");
 
         assert!(
-            error.message.contains("Parakeet live requires"),
+            error
+                .message
+                .contains("requires the Multilingual Live model"),
             "{:?}",
             error
         );
     }
 
+    #[test]
+    fn parakeet_live_uses_nemotron_for_non_english_or_auto_language() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            temp.path()
+                .join(ParakeetModel::Nemotron35AsrStreaming06bQ4.gguf_filename()),
+            b"model",
+        )
+        .expect("write nemotron model");
+        std::fs::write(
+            temp.path()
+                .join(ParakeetModel::RealtimeEou120mV1F16.gguf_filename()),
+            b"model",
+        )
+        .expect("write english eou model");
+
+        let selected =
+            select_parakeet_live_model(temp.path(), ParakeetModel::Tdt06bV3Q4, LanguageCode::It)
+                .expect("selected");
+        assert_eq!(selected, ParakeetModel::Nemotron35AsrStreaming06bQ4);
+
+        let auto_selected =
+            select_parakeet_live_model(temp.path(), ParakeetModel::Tdt06bV3Q4, LanguageCode::Auto)
+                .expect("auto selected");
+        assert_eq!(auto_selected, ParakeetModel::Nemotron35AsrStreaming06bQ4);
+    }
     #[test]
     fn parakeet_live_library_resolution_supports_managed_runtime_layout() {
         let temp = tempfile::tempdir().expect("temp dir");

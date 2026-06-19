@@ -66,14 +66,13 @@ const REQUIRED_MODEL_FILES: [&str; 5] = [
     "ggml-large-v3-turbo-q8_0.bin",
 ];
 
-const PARAKEET_MODEL_CATALOG: [(&str, &str); 5] = [
-    ("tdt-0.6b-v3-q4_k.gguf", "TDT 0.6B v3 Q4_K"),
-    ("realtime_eou_120m-v1-f16.gguf", "Realtime EOU 120M F16"),
-    ("realtime_eou_120m-v1-q8_0.gguf", "Realtime EOU 120M Q8"),
-    ("tdt-0.6b-v3-f16.gguf", "TDT 0.6B v3 F16"),
-    ("tdt-0.6b-v3-q8_0.gguf", "TDT 0.6B v3 Q8"),
+const PARAKEET_MODEL_CATALOG: [(&str, &str); 2] = [
+    ("tdt-0.6b-v3-q4_k.gguf", "Fast"),
+    (
+        "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+        "Multilingual Live",
+    ),
 ];
-
 const REQUIRED_COREML_ENCODERS: [(&str, &str); 5] = [
     ("ggml-tiny.bin", "ggml-tiny-encoder.mlmodelc"),
     ("ggml-base.bin", "ggml-base-encoder.mlmodelc"),
@@ -1043,7 +1042,7 @@ impl RuntimeTranscriptionFactory {
         Ok(WhisperStreamEngine::new(whisper_stream_path, models_dir))
     }
 
-    fn build_speaker_diarizer(
+    pub fn build_speaker_diarizer(
         &self,
         settings: &AppSettings,
     ) -> Result<Option<Arc<dyn sbobino_application::SpeakerDiarizationEngine>>, String> {
@@ -1291,8 +1290,7 @@ impl RuntimeTranscriptionFactory {
                         && managed_runtime.whisper_stream.available
                 }
                 TranscriptionEngine::ParakeetCpp => {
-                    managed_runtime.ffmpeg.available
-                        && managed_runtime.parakeet_cli.available
+                    managed_runtime.ffmpeg.available && managed_runtime.parakeet_cli.available
                 }
             }
         } else {
@@ -1300,9 +1298,7 @@ impl RuntimeTranscriptionFactory {
                 TranscriptionEngine::WhisperCpp => {
                     ffmpeg_available && whisper_cli_available && whisper_stream_available
                 }
-                TranscriptionEngine::ParakeetCpp => {
-                    ffmpeg_available && parakeet_cli_available
-                }
+                TranscriptionEngine::ParakeetCpp => ffmpeg_available && parakeet_cli_available,
             }
         };
         let runtime_source = if self.managed_runtime_required() {

@@ -88,7 +88,7 @@ jobs:
           export SBOBINO_PARAKEET_MODELS_DIR="$HOME/Library/Application Support/com.sbobino.desktop/parakeet-models"
           export SBOBINO_PARAKEET_MODEL="tdt-0.6b-v3-q4_k.gguf"
           mkdir -p "$SBOBINO_PARAKEET_MODELS_DIR"
-          for model in "$SBOBINO_PARAKEET_MODEL" "realtime_eou_120m-v1-f16.gguf"; do
+          for model in "$SBOBINO_PARAKEET_MODEL" "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf"; do
             if [[ ! -f "$SBOBINO_PARAKEET_MODELS_DIR/$model" ]]; then
               curl --fail --location --continue-at - \
                 --output "$SBOBINO_PARAKEET_MODELS_DIR/$model" \

@@ -3,23 +3,22 @@ use std::os::raw::{c_char, c_float, c_int};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc,
+    mpsc, Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::{
-    BuildStreamError, SampleFormat, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
+    BuildStreamError, SampleFormat, Stream, StreamConfig,
 };
 use libloading::Library;
 
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
 use sbobino_domain::TimedSegment;
 
-use crate::realtime_audio::{RealtimeInputLevelEvent, classify_input_error};
+use crate::realtime_audio::{classify_input_error, RealtimeInputLevelEvent};
 
 type ParakeetCtx = std::ffi::c_void;
 type ParakeetStream = std::ffi::c_void;
@@ -27,6 +26,8 @@ type ParakeetStream = std::ffi::c_void;
 type LoadFn = unsafe extern "C" fn(*const c_char) -> *mut ParakeetCtx;
 type FreeFn = unsafe extern "C" fn(*mut ParakeetCtx);
 type StreamBeginFn = unsafe extern "C" fn(*mut ParakeetCtx) -> *mut ParakeetStream;
+type StreamBeginLangFn =
+    unsafe extern "C" fn(*mut ParakeetCtx, *const c_char) -> *mut ParakeetStream;
 type StreamFeedFn =
     unsafe extern "C" fn(*mut ParakeetStream, *const c_float, c_int, *mut c_int) -> *mut c_char;
 type StreamFinalizeFn = unsafe extern "C" fn(*mut ParakeetStream) -> *mut c_char;
@@ -40,6 +41,7 @@ struct ParakeetApi {
     load: LoadFn,
     free: FreeFn,
     stream_begin: StreamBeginFn,
+    stream_begin_lang: Option<StreamBeginLangFn>,
     stream_feed: StreamFeedFn,
     stream_finalize: StreamFinalizeFn,
     stream_free: StreamFreeFn,
@@ -88,6 +90,7 @@ impl ParakeetRealtimeEngine {
     pub async fn start(
         &self,
         model_filename: &str,
+        target_lang: &str,
         emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
         emit_input_level: Arc<dyn Fn(RealtimeInputLevelEvent) + Send + Sync>,
     ) -> Result<(), ApplicationError> {
@@ -99,10 +102,11 @@ impl ParakeetRealtimeEngine {
         }
 
         eprintln!(
-            "[parakeet-live] start requested: lib_path={} models_dir={} model={}",
+            "[parakeet-live] start requested: lib_path={} models_dir={} model={} target_lang={}",
             self.lib_path.display(),
             self.models_dir.display(),
             model_filename,
+            target_lang,
         );
 
         let api = match self.load_api() {
@@ -136,6 +140,7 @@ impl ParakeetRealtimeEngine {
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::channel();
         let model_for_thread = model_path.clone();
+        let target_lang_for_thread = target_lang.to_string();
         let audio_for_thread = saved_audio_path.clone();
         let transcript_for_thread = transcript.clone();
         let segments_for_thread = segments.clone();
@@ -157,6 +162,7 @@ impl ParakeetRealtimeEngine {
                     run_parakeet_capture(
                         api,
                         model_for_thread,
+                        target_lang_for_thread,
                         audio_for_thread,
                         shutdown_rx,
                         startup_tx.clone(),
@@ -362,6 +368,10 @@ impl ParakeetRealtimeEngine {
                 stream_begin: *library
                     .get(b"parakeet_capi_stream_begin\0")
                     .map_err(map_symbol_error)?,
+                stream_begin_lang: library
+                    .get(b"parakeet_capi_stream_begin_lang\0")
+                    .map(|symbol: libloading::Symbol<StreamBeginLangFn>| *symbol)
+                    .ok(),
                 stream_feed: *library
                     .get(b"parakeet_capi_stream_feed\0")
                     .map_err(map_symbol_error)?,
@@ -433,6 +443,7 @@ fn take_c_string(api: &ParakeetApi, ptr: *mut c_char) -> Option<String> {
 fn run_parakeet_capture(
     api: ParakeetApi,
     model_path: PathBuf,
+    target_lang: String,
     audio_path: PathBuf,
     shutdown_rx: mpsc::Receiver<()>,
     startup_tx: mpsc::Sender<Result<(), ApplicationError>>,
@@ -444,8 +455,9 @@ fn run_parakeet_capture(
     emit_input_level: Arc<dyn Fn(RealtimeInputLevelEvent) + Send + Sync>,
 ) -> Result<(), ApplicationError> {
     eprintln!(
-        "[parakeet-live] run_parakeet_capture: model={} audio={}",
+        "[parakeet-live] run_parakeet_capture: model={} target_lang={} audio={}",
         model_path.display(),
+        target_lang,
         audio_path.display(),
     );
     let model_c = CString::new(model_path.to_string_lossy().as_bytes()).map_err(|_| {
@@ -464,7 +476,7 @@ fn run_parakeet_capture(
     }
     eprintln!("[parakeet-live] parakeet_capi_load OK");
 
-    let mut stream = unsafe { (api.stream_begin)(ctx) };
+    let mut stream = begin_parakeet_stream(&api, ctx, &target_lang)?;
     if stream.is_null() {
         let detail = last_error(&api, ctx);
         eprintln!("[parakeet-live] parakeet_capi_stream_begin returned null: {detail}");
@@ -475,7 +487,7 @@ fn run_parakeet_capture(
             .map(|n| n.starts_with("tdt-"))
             .unwrap_or(false)
         {
-            " TDT models are batch-only and cannot be used for live streaming. Switch to a Realtime EOU 120M model in Settings > Local Models."
+            " This model is for file transcription. Use the Multilingual Live model for live transcription."
         } else {
             ""
         };
@@ -496,6 +508,7 @@ fn run_parakeet_capture(
         ctx,
         &mut stream,
         &audio_path,
+        target_lang.as_str(),
         shutdown_rx,
         startup_tx,
         paused,
@@ -514,17 +527,59 @@ fn run_parakeet_capture(
     result
 }
 
+fn begin_parakeet_stream(
+    api: &ParakeetApi,
+    ctx: *mut ParakeetCtx,
+    target_lang: &str,
+) -> Result<*mut ParakeetStream, ApplicationError> {
+    let lang = target_lang.trim();
+    let stream = if lang.is_empty() || lang == "en" {
+        unsafe { (api.stream_begin)(ctx) }
+    } else {
+        let Some(stream_begin_lang) = api.stream_begin_lang else {
+            return Err(ApplicationError::SpeechToText(
+                "Parakeet local runtime is outdated for live transcription. Repair it from Settings > Local Models.".to_string(),
+            ));
+        };
+        let lang_c = CString::new(lang).map_err(|_| {
+            ApplicationError::SpeechToText(
+                "Parakeet target language contains a NUL byte".to_string(),
+            )
+        })?;
+        unsafe { stream_begin_lang(ctx, lang_c.as_ptr()) }
+    };
+    if stream.is_null() {
+        return Err(ApplicationError::SpeechToText(format!(
+            "failed to start Parakeet realtime stream for target language '{}'. Detail: {}",
+            if lang.is_empty() { "default" } else { lang },
+            last_error(api, ctx)
+        )));
+    }
+    Ok(stream)
+}
+
 fn mean_abs_input_level(samples: impl Iterator<Item = f32>) -> f32 {
-    let mut sum = 0.0_f32;
+    let mut sum_squares = 0.0_f32;
+    let mut peak = 0.0_f32;
     let mut count = 0_u32;
     for sample in samples {
-        sum += sample.abs();
+        let abs = sample.abs();
+        peak = peak.max(abs);
+        sum_squares += sample * sample;
         count += 1;
     }
     if count == 0 {
         return 0.0;
     }
-    ((sum / count as f32) * 3.2).clamp(0.0, 1.0)
+
+    let rms = (sum_squares / count as f32).sqrt().max(0.000_001);
+    // Speech captured by macOS input devices is often around -45..-20 dBFS.
+    // Map that range aggressively so the live waveform remains visible while
+    // still showing silence as a low baseline.
+    let rms_db = 20.0 * rms.log10();
+    let rms_level = ((rms_db + 58.0) / 38.0).clamp(0.0, 1.0);
+    let peak_level = (peak * 9.0).clamp(0.0, 1.0);
+    (rms_level * 0.72 + peak_level * 0.28).clamp(0.0, 1.0)
 }
 
 fn emit_parakeet_input_level(
@@ -545,6 +600,7 @@ fn run_capture_loop(
     ctx: *mut ParakeetCtx,
     stream: &mut *mut ParakeetStream,
     audio_path: &Path,
+    target_lang: &str,
     shutdown_rx: mpsc::Receiver<()>,
     startup_tx: mpsc::Sender<Result<(), ApplicationError>>,
     paused: Arc<AtomicBool>,
@@ -653,6 +709,8 @@ fn run_capture_loop(
     let mut last_delta_seconds = 0.0_f32;
     let mut last_stream_restart_seconds = 0.0_f32;
     let mut assembler = ParakeetLiveAssembler::new(transcript, segments, emit_delta);
+    let mut last_input_level_emit = Instant::now();
+    let mut pending_input_level = 0.0_f32;
     let _stream_guard = input_stream;
     emit_parakeet_input_level(
         emit_input_level.as_ref(),
@@ -689,12 +747,18 @@ fn run_capture_loop(
             );
             continue;
         }
-        emit_parakeet_input_level(
-            emit_input_level.as_ref(),
-            "running",
-            mean_abs_input_level(chunk.iter().copied()),
-            format!("Using {device_name}"),
-        );
+
+        pending_input_level = pending_input_level.max(mean_abs_input_level(chunk.iter().copied()));
+        if last_input_level_emit.elapsed() >= Duration::from_millis(45) {
+            emit_parakeet_input_level(
+                emit_input_level.as_ref(),
+                "running",
+                pending_input_level,
+                format!("Using {device_name}"),
+            );
+            pending_input_level = 0.0;
+            last_input_level_emit = Instant::now();
+        }
 
         let pcm_16k = resampler.push(&chunk);
         if pcm_16k.is_empty() {
@@ -740,7 +804,7 @@ fn run_capture_loop(
                     "[parakeet-live] no transcript delta for {:.1}s; restarting C API stream",
                     current_seconds - last_delta_seconds
                 );
-                restart_parakeet_live_stream(api, ctx, stream)?;
+                restart_parakeet_live_stream(api, ctx, stream, target_lang)?;
                 last_stream_restart_seconds = current_seconds;
                 last_delta_seconds = current_seconds;
             }
@@ -832,19 +896,14 @@ fn restart_parakeet_live_stream(
     api: &ParakeetApi,
     ctx: *mut ParakeetCtx,
     stream: &mut *mut ParakeetStream,
+    target_lang: &str,
 ) -> Result<(), ApplicationError> {
     unsafe {
         if !stream.is_null() {
             (api.stream_free)(*stream);
         }
-        *stream = (api.stream_begin)(ctx);
     }
-    if stream.is_null() {
-        return Err(ApplicationError::SpeechToText(format!(
-            "Parakeet live stream restart failed: {}",
-            last_error(api, ctx)
-        )));
-    }
+    *stream = begin_parakeet_stream(api, ctx, target_lang)?;
     Ok(())
 }
 
@@ -970,7 +1029,8 @@ impl ParakeetLiveAssembler {
 
 fn normalize_parakeet_live_delta(delta: &str) -> String {
     let starts_new_word = delta.chars().next().is_some_and(char::is_whitespace);
-    let text = delta
+    let cleaned = strip_parakeet_language_markers(delta);
+    let text = cleaned
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -984,6 +1044,80 @@ fn normalize_parakeet_live_delta(delta: &str) -> String {
     } else {
         text
     }
+}
+
+fn strip_parakeet_language_markers(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find('<') {
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start..];
+        let Some(end) = after_start.find('>') else {
+            output.push_str(after_start);
+            return output;
+        };
+        let candidate = &after_start[..=end];
+        if is_parakeet_language_marker(candidate) {
+            remaining = trim_marker_trailing_punctuation(&after_start[end + 1..]);
+        } else {
+            output.push('<');
+            remaining = &after_start[1..];
+        }
+    }
+
+    output.push_str(remaining);
+    output
+}
+
+fn trim_marker_trailing_punctuation(text: &str) -> &str {
+    let mut remaining = text;
+    loop {
+        let Some(next) = remaining.chars().next() else {
+            return remaining;
+        };
+        if !matches!(next, '.' | ',' | ';' | ':' | '!' | '?') {
+            return remaining;
+        }
+        let after_next = &remaining[next.len_utf8()..];
+        if after_next
+            .chars()
+            .next()
+            .is_some_and(|value| !value.is_whitespace())
+        {
+            return remaining;
+        }
+        remaining = after_next;
+    }
+}
+
+fn is_parakeet_language_marker(token: &str) -> bool {
+    let trimmed = token.trim_matches(|c: char| {
+        matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
+        )
+    });
+    let Some(inner) = trimmed
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let inner = inner
+        .strip_prefix('|')
+        .and_then(|value| value.strip_suffix('|'))
+        .unwrap_or(inner);
+    let parts = inner.split(['-', '_']).collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 3 {
+        return false;
+    }
+    let primary = parts[0];
+    primary.len() == 2
+        && primary.chars().all(|c| c.is_ascii_alphabetic())
+        && parts.iter().skip(1).all(|part| {
+            (part.len() == 2 || part.len() == 4) && part.chars().all(|c| c.is_ascii_alphanumeric())
+        })
 }
 
 fn build_input_stream(
@@ -1262,6 +1396,25 @@ mod tests {
 
         assert!(segments.lock().expect("segments lock poisoned").is_empty());
         assert!(emitted.lock().expect("emitted lock poisoned").is_empty());
+    }
+
+    #[test]
+    fn live_delta_normalization_removes_language_prompt_tokens() {
+        assert_eq!(
+            normalize_parakeet_live_delta(" <it-IT> Ciao mondo"),
+            " Ciao mondo"
+        );
+        assert_eq!(normalize_parakeet_live_delta("<en> hello"), "hello");
+        assert_eq!(normalize_parakeet_live_delta("<|it|> ciao"), "ciao");
+        assert_eq!(
+            normalize_parakeet_live_delta("ciao<it-IT> mondo"),
+            "ciao mondo"
+        );
+        assert_eq!(
+            normalize_parakeet_live_delta("<it_IT>ciao <en-US>."),
+            "ciao"
+        );
+        assert_eq!(normalize_parakeet_live_delta("test < b"), "test < b");
     }
 
     #[test]

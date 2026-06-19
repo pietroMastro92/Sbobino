@@ -165,6 +165,9 @@ fn parakeet_model_for_filename(filename: &str) -> ParakeetModel {
     match filename {
         "realtime_eou_120m-v1-f16.gguf" => ParakeetModel::RealtimeEou120mV1F16,
         "realtime_eou_120m-v1-q8_0.gguf" => ParakeetModel::RealtimeEou120mV1Q8,
+        "nemotron-3.5-asr-streaming-0.6b-f16.gguf" => ParakeetModel::Nemotron35AsrStreaming06bF16,
+        "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf" => ParakeetModel::Nemotron35AsrStreaming06bQ4,
+        "nemotron-3.5-asr-streaming-0.6b-q8_0.gguf" => ParakeetModel::Nemotron35AsrStreaming06bQ8,
         "tdt-0.6b-v3-f16.gguf" => ParakeetModel::Tdt06bV3F16,
         "tdt-0.6b-v3-q8_0.gguf" => ParakeetModel::Tdt06bV3Q8,
         "tdt-0.6b-v3-q4_k.gguf" => ParakeetModel::Tdt06bV3Q4,

@@ -7,7 +7,9 @@ use tracing::warn;
 use sbobino_domain::{LanguageCode, ParakeetModel, SpeechModel, TranscriptionEngine};
 use sbobino_infrastructure::{ManagedRuntimeHealth, PyannoteRuntimeHealth};
 
-use crate::commands::realtime::{resolve_parakeet_live_library_path, select_parakeet_live_model};
+use crate::commands::realtime::{
+    parakeet_live_target_lang, resolve_parakeet_live_library_path, select_parakeet_live_model,
+};
 use crate::parakeet_realtime::ParakeetRealtimeEngine;
 use crate::realtime_audio::probe_input_device_name;
 use crate::{error::CommandError, state::AppState};
@@ -443,7 +445,6 @@ pub async fn get_realtime_start_readiness(
             .as_ref()
             .and_then(|value| value.language.clone())
             .unwrap_or_else(|| settings.transcription.language.clone());
-        let selected_language_code = selected_language.as_whisper_code();
         let requested_parakeet_model = payload
             .as_ref()
             .and_then(|value| value.parakeet_model.clone())
@@ -453,9 +454,12 @@ pub async fn get_realtime_start_readiness(
             .runtime_health_preflight()
             .map_err(|e| CommandError::new("runtime_health", e))?;
         let models_dir = PathBuf::from(&health.parakeet_models_dir_resolved);
-        let selected_parakeet_model =
-            select_parakeet_live_model(&models_dir, requested_parakeet_model)
-                .unwrap_or(ParakeetModel::RealtimeEou120mV1F16);
+        let selected_parakeet_model = select_parakeet_live_model(
+            &models_dir,
+            requested_parakeet_model,
+            selected_language.clone(),
+        )
+        .map_err(|e| CommandError::new("runtime_health", e.message))?;
         let model_filename = selected_parakeet_model.gguf_filename().to_string();
         let model_path_buf = models_dir.join(&model_filename);
         let model_path = model_path_buf.to_string_lossy().to_string();
@@ -550,28 +554,8 @@ pub async fn get_realtime_start_readiness(
                 allowed: false,
                 reason_code: "parakeet_realtime_model_missing".to_string(),
                 message: format!(
-                    "Parakeet.cpp live requires a realtime EOU model. Download '{}' in Local Models.",
+                    "Parakeet.cpp live requires the selected streaming model. Download '{}' in Local Models.",
                     model_filename
-                ),
-                engine: "parakeet_cpp".to_string(),
-                model_filename,
-                model_path,
-                ffmpeg_resolved: health.ffmpeg_resolved,
-                whisper_stream_resolved: health.whisper_stream_resolved,
-                parakeet_cli_resolved: health.parakeet_cli_resolved,
-                input_device_name: None,
-            });
-        }
-
-        if selected_language_code != "en" {
-            eprintln!(
-                "[realtime-readiness] blocked: parakeet_live_language_unsupported language={selected_language_code}"
-            );
-            return Ok(RealtimeStartReadinessResponse {
-                allowed: false,
-                reason_code: "parakeet_live_language_unsupported".to_string(),
-                message: format!(
-                    "Parakeet live uses NVIDIA's Realtime EOU 120M model, which supports English only and has no reliable language auto-detection. Selected language '{selected_language_code}' cannot be transcribed with Parakeet live; select English for Parakeet live, use Whisper.cpp for non-English live transcription, or use Parakeet TDT for file transcription."
                 ),
                 engine: "parakeet_cpp".to_string(),
                 model_filename,
@@ -613,8 +597,9 @@ pub async fn get_realtime_start_readiness(
             allowed: true,
             reason_code: "ok".to_string(),
             message: format!(
-                "Parakeet.cpp live is ready with '{}' (English-only realtime model).",
-                model_filename
+                "Parakeet.cpp live is ready with '{}' (lang {}).",
+                model_filename,
+                parakeet_live_target_lang(selected_language)
             ),
             engine: "parakeet_cpp".to_string(),
             model_filename,

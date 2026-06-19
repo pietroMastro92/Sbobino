@@ -254,26 +254,21 @@ async fn transcribe_uses_realtime_json_chunks_for_progressive_preview() {
     std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
     std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
         .expect("failed to create final model");
-    std::fs::write(
-        models_dir.join("realtime_eou_120m-v1-f16.gguf"),
-        b"fake realtime model",
-    )
-    .expect("failed to create preview model");
     write_test_wav(&input_wav, 18);
 
     write_executable_script(
         &script_path,
         r#"#!/bin/sh
 case "$*" in
-  *realtime_eou_120m-v1-f16.gguf*chunk-0000.wav*)
+  *tdt-0.6b-v3-q4_k.gguf*chunk-0000.wav*)
     echo '{"text":"first chunk<EOU>","words":[{"w":"first","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
     exit 0
     ;;
-  *realtime_eou_120m-v1-f16.gguf*chunk-0001.wav*)
+  *tdt-0.6b-v3-q4_k.gguf*chunk-0001.wav*)
     echo '{"text":"second chunk<EOU>","words":[{"w":"second","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
     exit 0
     ;;
-  *realtime_eou_120m-v1-f16.gguf*chunk-0002.wav*)
+  *tdt-0.6b-v3-q4_k.gguf*chunk-0002.wav*)
     echo '{"text":"third chunk<EOU>","words":[{"w":"third","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
     exit 0
     ;;
@@ -615,7 +610,7 @@ async fn transcribe_rejects_missing_model_before_starting_cli() {
 }
 
 #[tokio::test]
-async fn transcribe_rejects_missing_realtime_preview_model_before_starting_cli() {
+async fn transcribe_does_not_require_separate_realtime_preview_model() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");
     let models_dir = temp.path().join("parakeet-models");
@@ -624,10 +619,13 @@ async fn transcribe_rejects_missing_realtime_preview_model_before_starting_cli()
     std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
     std::fs::write(models_dir.join("tdt-0.6b-v3-f16.gguf"), b"fake model")
         .expect("failed to create model");
-    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+    write_test_wav(&input_wav, 1);
     write_executable_script(
         &script_path,
-        "#!/bin/sh\necho cli should not run >&2\nexit 99\n",
+        r#"#!/bin/sh
+echo '{"text":"ok","segments":[{"text":"ok","start":0.0,"end":0.5}],"words":[{"word":"ok","start":0.0,"end":0.5}]}'
+exit 0
+"#,
     );
 
     let engine = ParakeetCppEngine::new(
@@ -635,7 +633,7 @@ async fn transcribe_rejects_missing_realtime_preview_model_before_starting_cli()
         models_dir.to_string_lossy().to_string(),
     );
 
-    let error = engine
+    let transcript = engine
         .transcribe(
             &input_wav,
             "tdt-0.6b-v3-f16.gguf",
@@ -646,14 +644,9 @@ async fn transcribe_rejects_missing_realtime_preview_model_before_starting_cli()
             Arc::new(|_seconds: f32| {}),
         )
         .await
-        .expect_err("missing realtime preview model should fail");
+        .expect("selected final model should also be usable for preview");
 
-    assert!(
-        error
-            .to_string()
-            .contains("Parakeet progressive preview requires")
-    );
-    assert!(!error.to_string().contains("cli should not run"));
+    assert_eq!(transcript.text, "ok");
 }
 
 #[tokio::test]

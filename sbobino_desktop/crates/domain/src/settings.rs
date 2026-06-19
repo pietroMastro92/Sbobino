@@ -71,6 +71,12 @@ impl SpeechModel {
 pub enum ParakeetModel {
     RealtimeEou120mV1F16,
     RealtimeEou120mV1Q8,
+    #[serde(rename = "nemotron35_asr_streaming_06b_f16")]
+    Nemotron35AsrStreaming06bF16,
+    #[serde(rename = "nemotron35_asr_streaming_06b_q4")]
+    Nemotron35AsrStreaming06bQ4,
+    #[serde(rename = "nemotron35_asr_streaming_06b_q8")]
+    Nemotron35AsrStreaming06bQ8,
     Tdt06bV3F16,
     Tdt06bV3Q8,
     #[default]
@@ -82,10 +88,26 @@ impl ParakeetModel {
         match self {
             Self::RealtimeEou120mV1F16 => "realtime_eou_120m-v1-f16.gguf",
             Self::RealtimeEou120mV1Q8 => "realtime_eou_120m-v1-q8_0.gguf",
+            Self::Nemotron35AsrStreaming06bF16 => "nemotron-3.5-asr-streaming-0.6b-f16.gguf",
+            Self::Nemotron35AsrStreaming06bQ4 => "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
+            Self::Nemotron35AsrStreaming06bQ8 => "nemotron-3.5-asr-streaming-0.6b-q8_0.gguf",
             Self::Tdt06bV3F16 => "tdt-0.6b-v3-f16.gguf",
             Self::Tdt06bV3Q8 => "tdt-0.6b-v3-q8_0.gguf",
             Self::Tdt06bV3Q4 => "tdt-0.6b-v3-q4_k.gguf",
         }
+    }
+
+    pub fn is_english_realtime_eou(&self) -> bool {
+        matches!(self, Self::RealtimeEou120mV1F16 | Self::RealtimeEou120mV1Q8)
+    }
+
+    pub fn is_multilingual_streaming(&self) -> bool {
+        matches!(
+            self,
+            Self::Nemotron35AsrStreaming06bF16
+                | Self::Nemotron35AsrStreaming06bQ4
+                | Self::Nemotron35AsrStreaming06bQ8
+        )
     }
 }
 

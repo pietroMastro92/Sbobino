@@ -533,7 +533,7 @@ run_parakeet_live_smoke() {
   if [[ ! -f "$parakeet_lib" ]]; then
     fail_validation "Managed Parakeet live library was not installed at '$parakeet_lib'."
   fi
-  for candidate in realtime_eou_120m-v1-f16.gguf realtime_eou_120m-v1-q8_0.gguf; do
+  for candidate in nemotron-3.5-asr-streaming-0.6b-q4_k.gguf; do
     if [[ -f "$parakeet_models_dir/$candidate" ]]; then
       realtime_model=$candidate
       break

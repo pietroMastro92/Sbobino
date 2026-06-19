@@ -787,7 +787,7 @@ impl TranscriptionService {
         Some(frames / (spec.sample_rate as f32))
     }
 
-    fn assign_speakers_to_segments(
+    pub fn assign_speakers_to_segments(
         segments: &[TimedSegment],
         turns: &[SpeakerTurn],
     ) -> Vec<TimedSegment> {

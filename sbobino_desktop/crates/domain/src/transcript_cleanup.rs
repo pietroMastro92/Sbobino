@@ -605,9 +605,9 @@ mod tests {
     fn constrain_transcript_edit_allows_substantial_syntactic_rewrite() {
         // Filler + false start + dangling restarts get removed and the
         // sentence is restructured. The result is shorter, not longer.
-        let source = "uh allora io dico che è importante capire il problema prima di iniziare a programmare";
-        let edited =
-            "È importante capire il problema prima di iniziare a programmare.";
+        let source =
+            "uh allora io dico che è importante capire il problema prima di iniziare a programmare";
+        let edited = "È importante capire il problema prima di iniziare a programmare.";
 
         assert_eq!(constrain_transcript_edit(source, edited), edited);
     }
@@ -728,7 +728,6 @@ mod tests {
         assert_eq!(constrain_transcript_edit(source, edited), edited);
     }
 
-
     #[test]
     fn constrain_transcript_edit_allows_punctuation_and_reorder() {
         let source = "Il progetto ha avuto successo perché il team ha lavorato bene e abbiamo rispettato le scadenze";
@@ -793,9 +792,10 @@ mod tests {
         );
         // All content tokens from both sections must appear in the
         // merged result.
-        for token in &["alpha", "beta", "gamma", "delta", "epsilon",
-                       "zeta", "eta", "theta", "iota",
-                       "kappa", "lambda", "mu", "nu"] {
+        for token in &[
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+            "lambda", "mu", "nu",
+        ] {
             assert!(
                 merged.contains(token),
                 "merge must preserve token {token:?}; got {merged:?}"
@@ -924,8 +924,7 @@ mod tests {
         // early-rejection branch does not fire, and the multiset/
         // bigram safety net checks pass.
         let source = "bisogna capire la cosa prima di farla";
-        let edited =
-            "Bisogna capire l'obiettivo prima di procedere con la sua realizzazione.";
+        let edited = "Bisogna capire l'obiettivo prima di procedere con la sua realizzazione.";
 
         assert_eq!(constrain_transcript_edit(source, edited), edited);
     }
@@ -949,8 +948,7 @@ mod tests {
         // have reverted the optimization. This test locks in the
         // new contract: distributed small additions are preserved.
         let source = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
-        let edited =
-            "Alpha beta perché gamma delta, quindi epsilon zeta eta theta iota kappa.";
+        let edited = "Alpha beta perché gamma delta, quindi epsilon zeta eta theta iota kappa.";
 
         assert_eq!(constrain_transcript_edit(source, edited), edited);
     }

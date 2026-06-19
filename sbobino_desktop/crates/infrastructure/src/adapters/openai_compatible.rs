@@ -417,8 +417,7 @@ mod tests {
         // that is not covered by the other substantial-rewrite anchors.
         let default_prompt = build_optimize_prompt("ciao", "it", None, None);
         let user_template = "You are a transcript editor.";
-        let template_prompt =
-            build_optimize_prompt("ciao", "en", Some(user_template), None);
+        let template_prompt = build_optimize_prompt("ciao", "en", Some(user_template), None);
 
         for (label, prompt) in [
             ("default", default_prompt.as_str()),
@@ -455,8 +454,7 @@ mod tests {
         // directly so the prompt contract is locked in.
         let default_prompt = build_optimize_prompt("ciao", "it", None, None);
         let user_template = "You are a transcript editor.";
-        let template_prompt =
-            build_optimize_prompt("ciao", "en", Some(user_template), None);
+        let template_prompt = build_optimize_prompt("ciao", "en", Some(user_template), None);
 
         for (branch, prompt) in [("default", &default_prompt), ("template", &template_prompt)] {
             assert!(
@@ -490,8 +488,7 @@ mod tests {
         // 3rd example directly so the prompt contract is locked in.
         let default_prompt = build_optimize_prompt("ciao", "it", None, None);
         let user_template = "You are a transcript editor.";
-        let template_prompt =
-            build_optimize_prompt("ciao", "en", Some(user_template), None);
+        let template_prompt = build_optimize_prompt("ciao", "en", Some(user_template), None);
 
         for (branch, prompt) in [("default", &default_prompt), ("template", &template_prompt)] {
             assert!(
@@ -504,8 +501,6 @@ mod tests {
             );
         }
     }
-
-
 }
 
 fn extract_content(content: MessageContent) -> Option<String> {
