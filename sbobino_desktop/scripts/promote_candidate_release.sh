@@ -56,7 +56,6 @@ expected_assets = {
     "release-readiness-proof.json",
     "distribution-readiness-proof.json",
     "portability-smoke-report.json",
-    "AS-THIRD.validation-report.json",
 }
 present_assets = {
     asset.get("name", "").strip()
@@ -84,8 +83,7 @@ gh release download "$TAG" \
   --dir "$TMP_DIR" \
   --pattern "release-readiness-proof.json" \
   --pattern "distribution-readiness-proof.json" \
-  --pattern "portability-smoke-report.json" \
-  --pattern "AS-THIRD.validation-report.json"
+  --pattern "portability-smoke-report.json"
 
 python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG"
 import json
@@ -141,38 +139,41 @@ if portability.get("release_tag") != tag:
 if str(portability.get("status", "")).strip().lower() != "passed":
     raise SystemExit("Stable promotion blocked: portability-smoke-report.json is not marked passed.")
 
-as_third = load_json(
-    report_dir / "AS-THIRD.validation-report.json",
-    "AS-THIRD.validation-report.json",
-)
-if int(as_third.get("schema_version", 0)) != 1:
-    raise SystemExit(
-        "Stable promotion blocked: AS-THIRD.validation-report.json has unsupported schema_version."
-    )
-if as_third.get("machine_class") != "AS-THIRD":
-    raise SystemExit("Stable promotion blocked: AS-THIRD validation report machine_class mismatch.")
-if as_third.get("version") != version:
-    raise SystemExit("Stable promotion blocked: AS-THIRD validation report version mismatch.")
-if as_third.get("release_tag") != tag:
-    raise SystemExit("Stable promotion blocked: AS-THIRD validation report release_tag mismatch.")
-if str(as_third.get("status", "")).strip().lower() != "passed":
-    raise SystemExit("Stable promotion blocked: AS-THIRD validation report is not marked passed.")
+# AS-THIRD validation is optional. The release candidate workflow already
+# produces the required GitHub-hosted portability smoke report; when an
+# AS-THIRD report is attached, validate it strictly, but do not require the
+# user's private VM for stable promotion.
+as_third_path = report_dir / "AS-THIRD.validation-report.json"
+if as_third_path.is_file():
+    as_third = load_json(as_third_path, "AS-THIRD.validation-report.json")
+    if int(as_third.get("schema_version", 0)) != 1:
+        raise SystemExit(
+            "Stable promotion blocked: AS-THIRD.validation-report.json has unsupported schema_version."
+        )
+    if as_third.get("machine_class") != "AS-THIRD":
+        raise SystemExit("Stable promotion blocked: AS-THIRD validation report machine_class mismatch.")
+    if as_third.get("version") != version:
+        raise SystemExit("Stable promotion blocked: AS-THIRD validation report version mismatch.")
+    if as_third.get("release_tag") != tag:
+        raise SystemExit("Stable promotion blocked: AS-THIRD validation report release_tag mismatch.")
+    if str(as_third.get("status", "")).strip().lower() != "passed":
+        raise SystemExit("Stable promotion blocked: AS-THIRD validation report is not marked passed.")
 
-as_third_results = as_third.get("scenario_results") or {}
-required_as_third_scenarios = {
-    "clean_room_install",
-    "warm_restart",
-    "functional_parakeet_smoke",
-    "functional_diarization_smoke",
-}
-missing_as_third = sorted(
-    name for name in required_as_third_scenarios if as_third_results.get(name) != "passed"
-)
-if missing_as_third:
-    raise SystemExit(
-        "Stable promotion blocked: AS-THIRD scenarios did not pass: "
-        + ", ".join(missing_as_third)
+    as_third_results = as_third.get("scenario_results") or {}
+    required_as_third_scenarios = {
+        "clean_room_install",
+        "warm_restart",
+        "functional_parakeet_smoke",
+        "functional_diarization_smoke",
+    }
+    missing_as_third = sorted(
+        name for name in required_as_third_scenarios if as_third_results.get(name) != "passed"
     )
+    if missing_as_third:
+        raise SystemExit(
+            "Stable promotion blocked: AS-THIRD scenarios did not pass: "
+            + ", ".join(missing_as_third)
+        )
 PY
 
 gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease=false
