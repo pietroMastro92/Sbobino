@@ -146,11 +146,13 @@ impl ParakeetCppEngine {
     }
 
     fn configure_command_environment(command: &mut Command, binary_path: &str) {
-        // Keep Metal enabled where it is stable, but avoid ggml residency-set
-        // teardown assertions and M1-only Metal backend failures. parakeet.cpp
-        // honors PARAKEET_DEVICE=cpu, so first-generation Apple Silicon remains
-        // functional instead of looking unsupported to users.
-        command.env("GGML_METAL_NO_RESIDENCY", "1");
+        // Keep Metal enabled, but disable ggml Metal features that can make
+        // the packaged runtime diverge from the dev runtime on Apple Silicon.
+        // Do not auto-force CPU: CPU transcription is too heavy for the app UX
+        // and must remain an explicit diagnostic override only.
+        for (name, value) in Self::safe_metal_environment() {
+            command.env(name, value);
+        }
         if let Some(device) = Self::parakeet_device_override() {
             command.env("PARAKEET_DEVICE", device);
         }
@@ -179,13 +181,15 @@ impl ParakeetCppEngine {
         if Self::truthy_env("SBOBINO_PARAKEET_FORCE_METAL") {
             return None;
         }
-        if std::env::var_os("PARAKEET_DEVICE").is_some() {
-            return None;
-        }
-        if Self::is_first_generation_apple_silicon() {
-            return Some("cpu");
-        }
         None
+    }
+
+    fn safe_metal_environment() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("GGML_METAL_NO_RESIDENCY", "1"),
+            ("GGML_METAL_SHARED_BUFFERS_DISABLE", "1"),
+            ("GGML_METAL_CONCURRENCY_DISABLE", "1"),
+        ]
     }
 
     fn truthy_env(name: &str) -> bool {
@@ -198,30 +202,6 @@ impl ParakeetCppEngine {
                 )
             })
             .unwrap_or(false)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn is_first_generation_apple_silicon() -> bool {
-        std::process::Command::new("sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()
-            .and_then(|output| String::from_utf8(output.stdout).ok())
-            .map(|brand| Self::is_first_generation_apple_silicon_brand(&brand))
-            .unwrap_or(false)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn is_first_generation_apple_silicon() -> bool {
-        false
-    }
-
-    fn is_first_generation_apple_silicon_brand(brand: &str) -> bool {
-        let normalized = brand.to_ascii_lowercase();
-        normalized.contains("apple m1")
-            && !normalized.contains("m1 pro")
-            && !normalized.contains("m1 max")
-            && !normalized.contains("m1 ultra")
     }
 
     fn extract_json_payload(stdout: &str) -> Result<&str, ApplicationError> {
@@ -1302,18 +1282,14 @@ mod tests {
     use super::ParakeetCppEngine;
 
     #[test]
-    fn detects_base_m1_for_parakeet_cpu_fallback() {
-        assert!(ParakeetCppEngine::is_first_generation_apple_silicon_brand(
-            "Apple M1"
-        ));
-        assert!(ParakeetCppEngine::is_first_generation_apple_silicon_brand(
-            "Apple M1 @ 3.20GHz"
-        ));
-        assert!(!ParakeetCppEngine::is_first_generation_apple_silicon_brand(
-            "Apple M1 Pro"
-        ));
-        assert!(!ParakeetCppEngine::is_first_generation_apple_silicon_brand(
-            "Apple M2"
-        ));
+    fn parakeet_metal_safety_env_keeps_metal_enabled() {
+        let env = ParakeetCppEngine::safe_metal_environment();
+        assert!(env.contains(&("GGML_METAL_NO_RESIDENCY", "1")));
+        assert!(env.contains(&("GGML_METAL_SHARED_BUFFERS_DISABLE", "1")));
+        assert!(env.contains(&("GGML_METAL_CONCURRENCY_DISABLE", "1")));
+        assert!(
+            !env.iter().any(|(name, _)| *name == "PARAKEET_DEVICE"),
+            "Metal safety must not force the CPU backend"
+        );
     }
 }

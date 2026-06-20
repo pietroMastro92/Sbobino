@@ -473,8 +473,20 @@ assert_runtime_asset_portability() {
 
   unzip -q "$runtime_zip" -d "$runtime_stage"
 
+  local wrapper="$runtime_stage/runtime/bin/parakeet-cli"
+  if [[ ! -x "$wrapper" ]]; then
+    echo "Runtime asset is missing expected executable wrapper: $wrapper" >&2
+    exit 1
+  fi
+  if ! grep -q "GGML_METAL_NO_RESIDENCY" "$wrapper" \
+    || ! grep -q "GGML_METAL_SHARED_BUFFERS_DISABLE" "$wrapper" \
+    || ! grep -q "GGML_METAL_CONCURRENCY_DISABLE" "$wrapper"; then
+    echo "Parakeet CLI wrapper is missing required Metal safety environment." >&2
+    exit 1
+  fi
+
   local binary
-  for binary in ffmpeg whisper-cli whisper-stream parakeet-cli; do
+  for binary in ffmpeg whisper-cli whisper-stream parakeet-cli-bin; do
     local candidate="$runtime_stage/runtime/bin/$binary"
     if [[ ! -x "$candidate" ]]; then
       echo "Runtime asset is missing expected executable: $candidate" >&2

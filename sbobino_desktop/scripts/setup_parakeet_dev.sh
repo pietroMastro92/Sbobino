@@ -115,12 +115,29 @@ write_runtime_manifest() {
     echo "parakeet_cpp_resolved_ref=$resolved_ref"
     echo "parakeet_ggml_metal=$PARAKEET_GGML_METAL"
     echo "cmake_arch=$CMAKE_ARCH"
+    echo "parakeet_cli_wrapper=$INSTALL_CLI"
+    echo "parakeet_cli_binary=$INSTALL_CLI_BIN"
     echo "parakeet_live_library=$INSTALL_LIB"
     echo "model=$MODEL_FILENAME"
     if [[ -n "$EXTRA_MODELS" ]]; then
       echo "extra_models=$EXTRA_MODELS"
     fi
   } > "$MANIFEST_PATH"
+}
+
+write_parakeet_cli_wrapper() {
+  local wrapper=$1
+  local binary_name=$2
+  cat > "$wrapper" <<EOF
+#!/bin/sh
+set -eu
+SCRIPT_DIR=\$(cd "\$(dirname "\$0")" && pwd -P)
+export GGML_METAL_NO_RESIDENCY=1
+export GGML_METAL_SHARED_BUFFERS_DISABLE=1
+export GGML_METAL_CONCURRENCY_DISABLE=1
+exec "\$SCRIPT_DIR/$binary_name" "\$@"
+EOF
+  run chmod 755 "$wrapper"
 }
 
 need_cmd cmake
@@ -139,6 +156,7 @@ trap cleanup EXIT
 SOURCE_ROOT="$WORK_DIR/parakeet.cpp"
 BUILD_ROOT="$WORK_DIR/parakeet-build"
 INSTALL_CLI="$INSTALL_BIN_DIR/parakeet-cli"
+INSTALL_CLI_BIN="$INSTALL_BIN_DIR/parakeet-cli-bin"
 INSTALL_LIB="$INSTALL_LIB_DIR/libparakeet.dylib"
 MODEL_PATH="$MODELS_DIR/$MODEL_FILENAME"
 MANIFEST_PATH="$INSTALL_BIN_DIR/parakeet-runtime-manifest.txt"
@@ -179,7 +197,8 @@ if [[ "${SBOBINO_PARAKEET_SKIP_BUILD:-0}" != "1" ]]; then
     if [[ -z "$BUILT_LIB" ]]; then
       fail "Unable to find libparakeet.dylib after building parakeet.cpp"
     fi
-    run cp "$BUILT_CLI" "$INSTALL_CLI"
+    run cp "$BUILT_CLI" "$INSTALL_CLI_BIN"
+    write_parakeet_cli_wrapper "$INSTALL_CLI" "parakeet-cli-bin"
     while IFS= read -r dylib; do
       run cp "$dylib" "$INSTALL_LIB_DIR/$(basename "$dylib")"
     done < <(find "$BUILD_ROOT" -type f -name 'lib*.dylib' -print)
@@ -191,7 +210,7 @@ if [[ "${SBOBINO_PARAKEET_SKIP_BUILD:-0}" != "1" ]]; then
         run ln -sf "$dylib" "${dylib/.0.13.0.dylib/.dylib}"
       done
     )
-    run chmod 755 "$INSTALL_CLI"
+    run chmod 755 "$INSTALL_CLI_BIN"
     for dylib in "$INSTALL_LIB_DIR"/lib*.dylib; do
       run chmod 755 "$dylib"
     done
@@ -199,10 +218,11 @@ if [[ "${SBOBINO_PARAKEET_SKIP_BUILD:-0}" != "1" ]]; then
     probe_parakeet_cli
   else
     echo "+ find '$BUILD_ROOT' -type f -name parakeet-cli -print -quit"
-    echo "+ cp <built-parakeet-cli> '$INSTALL_CLI'"
+    echo "+ cp <built-parakeet-cli> '$INSTALL_CLI_BIN'"
+    echo "+ write parakeet CLI wrapper '$INSTALL_CLI'"
     echo "+ cp <built-lib*.dylib> '$INSTALL_LIB_DIR/'"
     echo "+ ln -sf versioned ggml dylib names in '$INSTALL_LIB_DIR'"
-    echo "+ chmod 755 '$INSTALL_CLI'"
+    echo "+ chmod 755 '$INSTALL_CLI_BIN'"
     echo "+ chmod 755 '$INSTALL_LIB_DIR'/lib*.dylib"
     echo "+ write '$MANIFEST_PATH'"
     echo "+ probe '$INSTALL_CLI' --help"

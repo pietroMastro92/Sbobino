@@ -57,10 +57,26 @@ use crate::commands::window::open_settings_window;
 use crate::state::{ProvisioningRuntime, RealtimeRuntime};
 use sbobino_infrastructure::adapters::whisper_stream::WhisperStreamEngine;
 
+const PARAKEET_SAFE_METAL_ENV: [(&str, &str); 3] = [
+    ("GGML_METAL_NO_RESIDENCY", "1"),
+    ("GGML_METAL_SHARED_BUFFERS_DISABLE", "1"),
+    ("GGML_METAL_CONCURRENCY_DISABLE", "1"),
+];
+
 #[cfg(target_os = "macos")]
 const MENU_CHECK_UPDATES_ID: &str = "app_menu_check_updates";
 #[cfg(target_os = "macos")]
 const MENU_CHECK_UPDATES_EVENT: &str = "app://menu-check-updates";
+
+fn configure_parakeet_metal_environment() {
+    // This must run before any Parakeet CLI child process or in-process live
+    // dylib is initialized. Keep Metal active, but force the ggml Metal safety
+    // flags that made dev and packaged runtime behavior diverge on Apple
+    // Silicon. CPU fallback remains an explicit diagnostic override only.
+    for (name, value) in PARAKEET_SAFE_METAL_ENV {
+        std::env::set_var(name, value);
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn show_main_window(app_handle: &tauri::AppHandle) {
@@ -114,6 +130,7 @@ fn setup_macos_app_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 
 pub fn run() {
     init_tracing();
+    configure_parakeet_metal_environment();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

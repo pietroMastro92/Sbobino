@@ -186,6 +186,21 @@ assert_binary_portable() {
   fi
 }
 
+write_parakeet_cli_wrapper() {
+  local wrapper=$1
+  local binary_name=$2
+  cat > "$wrapper" <<EOF
+#!/bin/sh
+set -eu
+SCRIPT_DIR=\$(cd "\$(dirname "\$0")" && pwd -P)
+export GGML_METAL_NO_RESIDENCY=1
+export GGML_METAL_SHARED_BUFFERS_DISABLE=1
+export GGML_METAL_CONCURRENCY_DISABLE=1
+exec "\$SCRIPT_DIR/$binary_name" "\$@"
+EOF
+  chmod 755 "$wrapper"
+}
+
 build_sdl2_static() {
   local archive="$SOURCE_DIR/SDL2-${SDL2_VERSION}.tar.gz"
   local source_root="$BUILD_DIR/SDL2-${SDL2_VERSION}"
@@ -271,7 +286,8 @@ build_parakeet_binary() {
     exit 1
   fi
 
-  cp "$binary" "$TARGET_BIN/parakeet-cli"
+  cp "$binary" "$TARGET_BIN/parakeet-cli-bin"
+  write_parakeet_cli_wrapper "$TARGET_BIN/parakeet-cli" "parakeet-cli-bin"
   library=$(find "$build_root" -type f -name libparakeet.dylib -print -quit)
   if [[ -z "$library" ]]; then
     echo "Unable to find libparakeet.dylib after building parakeet.cpp." >&2
@@ -293,6 +309,8 @@ build_parakeet_binary() {
     echo "parakeet_cpp_resolved_ref=$resolved_ref"
     echo "parakeet_ggml_metal=$PARAKEET_GGML_METAL"
     echo "cmake_arch=arm64"
+    echo "parakeet_cli_wrapper=bin/parakeet-cli"
+    echo "parakeet_cli_binary=bin/parakeet-cli-bin"
     echo "parakeet_live_library=lib/libparakeet.dylib"
     echo "parakeet_shared_libraries=$(find "$TARGET_LIB" -type f -name 'lib*.dylib' | wc -l | tr -d ' ')"
   } > "$TARGET_BIN/parakeet-runtime-manifest.txt"
@@ -378,10 +396,11 @@ build_whisper_binaries
 build_parakeet_binary
 build_ffmpeg_binary
 
-for binary in ffmpeg whisper-cli whisper-stream parakeet-cli; do
+for binary in ffmpeg whisper-cli whisper-stream parakeet-cli-bin; do
   chmod 755 "$TARGET_BIN/$binary"
   codesign --force --sign - "$TARGET_BIN/$binary" >/dev/null 2>&1 || true
 done
+chmod 755 "$TARGET_BIN/parakeet-cli"
 chmod 755 "$TARGET_LIB/libparakeet.dylib"
 for dylib in "$TARGET_LIB"/lib*.dylib; do
   chmod 755 "$dylib"
@@ -391,7 +410,7 @@ done
 assert_binary_portable "$TARGET_BIN/ffmpeg" "ffmpeg"
 assert_binary_portable "$TARGET_BIN/whisper-cli" "whisper-cli"
 assert_binary_portable "$TARGET_BIN/whisper-stream" "whisper-stream"
-assert_binary_portable "$TARGET_BIN/parakeet-cli" "parakeet-cli"
+assert_binary_portable "$TARGET_BIN/parakeet-cli-bin" "parakeet-cli-bin"
 for dylib in "$TARGET_LIB"/lib*.dylib; do
   assert_binary_portable "$dylib" "$(basename "$dylib")"
 done
