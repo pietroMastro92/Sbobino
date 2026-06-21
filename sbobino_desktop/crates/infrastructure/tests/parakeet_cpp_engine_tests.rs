@@ -395,6 +395,97 @@ exit 0
 }
 
 #[tokio::test]
+async fn long_file_transcription_uses_worker_chunks_and_progressive_deltas() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let worker_path = temp.path().join("parakeet-batch-json");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
+        .expect("failed to create model");
+    write_test_wav(&input_wav, 605);
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+case "$*" in
+  *audio.wav*)
+    echo 'full input must not be used for long Parakeet files' 1>&2
+    exit 44
+    ;;
+  *chunk-*)
+    echo '{"text":"preview chunk","words":[{"w":"preview","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
+    exit 0
+    ;;
+esac
+echo 'unexpected parakeet-cli invocation' 1>&2
+exit 45
+"#,
+    );
+    write_executable_script(
+        &worker_path,
+        r#"#!/bin/sh
+manifest=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+while IFS='	' read -r idx start end path; do
+  echo "{\"index\":$idx,\"start\":$start,\"end\":$end,\"result\":{\"text\":\"worker chunk $idx\",\"words\":[{\"w\":\"worker\",\"start\":3.10,\"end\":3.30},{\"w\":\"chunk\",\"start\":3.30,\"end\":3.50},{\"w\":\"$idx\",\"start\":3.50,\"end\":3.70}]}}"
+done < "$manifest"
+exit 0
+"#,
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_ref = emitted.clone();
+    let progress: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let progress_ref = progress.clone();
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-q4_k.gguf",
+            "it",
+            &WhisperOptions::default(),
+            Some(605.0),
+            Arc::new(move |line: String| {
+                emitted_ref.lock().expect("emit lock poisoned").push(line);
+            }),
+            Arc::new(move |seconds: f32| {
+                progress_ref
+                    .lock()
+                    .expect("progress lock poisoned")
+                    .push(seconds);
+            }),
+        )
+        .await
+        .expect("long Parakeet transcription should use chunked worker path");
+
+    assert!(transcript.text.contains("worker chunk 0"));
+    assert!(transcript.text.contains("worker chunk 1"));
+    assert!(transcript.segments.len() >= 2);
+    assert!(transcript.segments[1].start_seconds.unwrap_or_default() > 100.0);
+    let emitted = emitted.lock().expect("emit lock poisoned");
+    assert!(
+        emitted
+            .iter()
+            .any(|line| line.starts_with("\u{001F}REPLACE:") && line.contains("worker chunk 1")),
+        "expected cumulative long-file deltas, got {emitted:?}"
+    );
+    let progress = progress.lock().expect("progress lock poisoned");
+    assert!(progress.iter().any(|seconds| *seconds > 300.0));
+}
+
+#[tokio::test]
 async fn transcribe_splits_root_words_into_multiple_timed_segments() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");

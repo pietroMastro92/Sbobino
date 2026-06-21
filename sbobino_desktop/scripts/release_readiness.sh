@@ -217,6 +217,10 @@ for binary, args, timeout, cold_timeout, allow_usage_exit in (
     run_probe(binary, args, cold_timeout, True, allow_usage_exit)
     run_probe(binary, args, timeout, False, allow_usage_exit)
 
+worker = os.path.join(bin_dir, "parakeet-batch-json")
+if not os.path.isfile(worker):
+    raise SystemExit(f"Runtime asset is missing expected binary: {worker}")
+
 input_wav = os.path.join(root, "runtime", "smoke-input.wav")
 output_wav = os.path.join(root, "runtime", "smoke-output.wav")
 generate_test_wav(input_wav)
@@ -486,7 +490,7 @@ assert_runtime_asset_portability() {
   fi
 
   local binary
-  for binary in ffmpeg whisper-cli whisper-stream parakeet-cli-bin; do
+  for binary in ffmpeg whisper-cli whisper-stream parakeet-cli-bin parakeet-batch-json; do
     local candidate="$runtime_stage/runtime/bin/$binary"
     if [[ ! -x "$candidate" ]]; then
       echo "Runtime asset is missing expected executable: $candidate" >&2

@@ -7,6 +7,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 OUTPUT_ZIP=$1
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ROOT_NAME="runtime"
 MACOS_DEPLOYMENT_TARGET=${SBOBINO_MACOS_RUNTIME_DEPLOYMENT_TARGET:-13.0}
 SDL2_VERSION=${SBOBINO_RUNTIME_SDL2_VERSION:-2.32.10}
@@ -296,6 +297,13 @@ build_parakeet_binary() {
   while IFS= read -r dylib; do
     cp "$dylib" "$TARGET_LIB/$(basename "$dylib")"
   done < <(find "$build_root" -type f -name 'lib*.dylib' -print)
+  clang++ -std=c++17 \
+    -I"$source_root/include" \
+    "$SCRIPT_DIR/parakeet_batch_json.cpp" \
+    -L"$TARGET_LIB" \
+    -lparakeet \
+    -Wl,-rpath,@loader_path/../lib \
+    -o "$TARGET_BIN/parakeet-batch-json"
   (
     cd "$TARGET_LIB"
     for dylib in lib*.0.13.0.dylib; do
@@ -311,6 +319,7 @@ build_parakeet_binary() {
     echo "cmake_arch=arm64"
     echo "parakeet_cli_wrapper=bin/parakeet-cli"
     echo "parakeet_cli_binary=bin/parakeet-cli-bin"
+    echo "parakeet_batch_worker=bin/parakeet-batch-json"
     echo "parakeet_live_library=lib/libparakeet.dylib"
     echo "parakeet_shared_libraries=$(find "$TARGET_LIB" -type f -name 'lib*.dylib' | wc -l | tr -d ' ')"
   } > "$TARGET_BIN/parakeet-runtime-manifest.txt"
@@ -396,7 +405,7 @@ build_whisper_binaries
 build_parakeet_binary
 build_ffmpeg_binary
 
-for binary in ffmpeg whisper-cli whisper-stream parakeet-cli-bin; do
+for binary in ffmpeg whisper-cli whisper-stream parakeet-cli-bin parakeet-batch-json; do
   chmod 755 "$TARGET_BIN/$binary"
   codesign --force --sign - "$TARGET_BIN/$binary" >/dev/null 2>&1 || true
 done
@@ -411,6 +420,7 @@ assert_binary_portable "$TARGET_BIN/ffmpeg" "ffmpeg"
 assert_binary_portable "$TARGET_BIN/whisper-cli" "whisper-cli"
 assert_binary_portable "$TARGET_BIN/whisper-stream" "whisper-stream"
 assert_binary_portable "$TARGET_BIN/parakeet-cli-bin" "parakeet-cli-bin"
+assert_binary_portable "$TARGET_BIN/parakeet-batch-json" "parakeet-batch-json"
 for dylib in "$TARGET_LIB"/lib*.dylib; do
   assert_binary_portable "$dylib" "$(basename "$dylib")"
 done

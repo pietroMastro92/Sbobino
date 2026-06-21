@@ -11,6 +11,7 @@ if [[ $# -ne 0 ]]; then
   exit 1
 fi
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 APP_ID=${SBOBINO_APP_ID:-com.sbobino.desktop}
 APP_SUPPORT_DIR=${SBOBINO_APP_SUPPORT_DIR:-"$HOME/Library/Application Support/$APP_ID"}
 INSTALL_BIN_DIR=${SBOBINO_PARAKEET_INSTALL_BIN_DIR:-"$APP_SUPPORT_DIR/bin"}
@@ -117,6 +118,7 @@ write_runtime_manifest() {
     echo "cmake_arch=$CMAKE_ARCH"
     echo "parakeet_cli_wrapper=$INSTALL_CLI"
     echo "parakeet_cli_binary=$INSTALL_CLI_BIN"
+    echo "parakeet_batch_worker=$INSTALL_WORKER"
     echo "parakeet_live_library=$INSTALL_LIB"
     echo "model=$MODEL_FILENAME"
     if [[ -n "$EXTRA_MODELS" ]]; then
@@ -157,6 +159,7 @@ SOURCE_ROOT="$WORK_DIR/parakeet.cpp"
 BUILD_ROOT="$WORK_DIR/parakeet-build"
 INSTALL_CLI="$INSTALL_BIN_DIR/parakeet-cli"
 INSTALL_CLI_BIN="$INSTALL_BIN_DIR/parakeet-cli-bin"
+INSTALL_WORKER="$INSTALL_BIN_DIR/parakeet-batch-json"
 INSTALL_LIB="$INSTALL_LIB_DIR/libparakeet.dylib"
 MODEL_PATH="$MODELS_DIR/$MODEL_FILENAME"
 MANIFEST_PATH="$INSTALL_BIN_DIR/parakeet-runtime-manifest.txt"
@@ -202,6 +205,13 @@ if [[ "${SBOBINO_PARAKEET_SKIP_BUILD:-0}" != "1" ]]; then
     while IFS= read -r dylib; do
       run cp "$dylib" "$INSTALL_LIB_DIR/$(basename "$dylib")"
     done < <(find "$BUILD_ROOT" -type f -name 'lib*.dylib' -print)
+    run clang++ -std=c++17 \
+      -I"$SOURCE_ROOT/include" \
+      "$SCRIPT_DIR/parakeet_batch_json.cpp" \
+      -L"$INSTALL_LIB_DIR" \
+      -lparakeet \
+      -Wl,-rpath,@loader_path/../lib \
+      -o "$INSTALL_WORKER"
     (
       cd "$INSTALL_LIB_DIR"
       for dylib in lib*.0.13.0.dylib; do
@@ -211,6 +221,7 @@ if [[ "${SBOBINO_PARAKEET_SKIP_BUILD:-0}" != "1" ]]; then
       done
     )
     run chmod 755 "$INSTALL_CLI_BIN"
+    run chmod 755 "$INSTALL_WORKER"
     for dylib in "$INSTALL_LIB_DIR"/lib*.dylib; do
       run chmod 755 "$dylib"
     done
@@ -220,9 +231,11 @@ if [[ "${SBOBINO_PARAKEET_SKIP_BUILD:-0}" != "1" ]]; then
     echo "+ find '$BUILD_ROOT' -type f -name parakeet-cli -print -quit"
     echo "+ cp <built-parakeet-cli> '$INSTALL_CLI_BIN'"
     echo "+ write parakeet CLI wrapper '$INSTALL_CLI'"
+    echo "+ compile parakeet batch worker '$INSTALL_WORKER'"
     echo "+ cp <built-lib*.dylib> '$INSTALL_LIB_DIR/'"
     echo "+ ln -sf versioned ggml dylib names in '$INSTALL_LIB_DIR'"
     echo "+ chmod 755 '$INSTALL_CLI_BIN'"
+    echo "+ chmod 755 '$INSTALL_WORKER'"
     echo "+ chmod 755 '$INSTALL_LIB_DIR'/lib*.dylib"
     echo "+ write '$MANIFEST_PATH'"
     echo "+ probe '$INSTALL_CLI' --help"
