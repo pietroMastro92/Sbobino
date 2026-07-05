@@ -1364,3 +1364,106 @@ async fn run_file_transcription_transcodes_wav_inputs_unconditionally() {
         "ffmpeg transcoder must be invoked for every input"
     );
 }
+
+/// Engine that replays a fixed sequence of progress values (in seconds) to its
+/// `emit_progress_seconds` callback, simulating the non-monotonic sequence an
+/// engine emits when it resets progress before a CPU-safe retry.
+struct ProgressReplayEngine {
+    progress_seconds: Vec<f32>,
+}
+
+#[async_trait]
+impl SpeechToTextEngine for ProgressReplayEngine {
+    async fn transcribe(
+        &self,
+        _input_wav: &Path,
+        _model_filename: &str,
+        _language_code: &str,
+        _options: &WhisperOptions,
+        _total_audio_seconds: Option<f32>,
+        _emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+    ) -> Result<TranscriptionOutput, ApplicationError> {
+        for seconds in &self.progress_seconds {
+            emit_progress_seconds(*seconds);
+        }
+        Ok(TranscriptionOutput {
+            text: "replayed transcript".to_string(),
+            segments: Vec::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn progress_callback_lets_through_reset_after_retry_progress() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("lecture.mp3");
+    tokio::fs::write(&input_path, b"fake mp3 content")
+        .await
+        .expect("failed to create test input file");
+
+    let transcoder = Arc::new(MockTranscoder::default());
+    // Sequence simulating: first attempt advances to 10s, then a CPU-safe retry
+    // resets to 0.0 and re-advances through 1.0s -> 2.0s -> 3.0s. Without a
+    // reset-aware throttle, every value after 10.0 would be suppressed.
+    let speech = Arc::new(ProgressReplayEngine {
+        progress_seconds: vec![10.0, 0.0, 1.0, 2.0, 3.0],
+    });
+    let enhancer = Arc::new(MockEnhancer::default());
+    let repo = Arc::new(InMemoryArtifactRepository::default());
+
+    let service =
+        TranscriptionService::new(transcoder.clone(), speech, enhancer.clone(), repo.clone());
+
+    let emitted: Arc<Mutex<Vec<JobProgress>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_clone = emitted.clone();
+
+    service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-progress".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Base,
+                engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+            },
+            Arc::new(move |event| {
+                emitted_clone
+                    .lock()
+                    .expect("emitted lock poisoned")
+                    .push(event);
+            }),
+            Arc::new(|_text: String| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("transcription service should succeed");
+
+    // Collect only the Transcribing progress events driven by the engine's
+    // seconds callback (those carry current_seconds).
+    let progress_seconds: Vec<f32> = emitted
+        .lock()
+        .expect("emitted lock poisoned")
+        .iter()
+        .filter(|event| event.stage == JobStage::Transcribing)
+        .filter_map(|event| event.current_seconds)
+        .collect();
+
+    // The reset value (1.0, first value after the 0.0 reset) must survive the
+    // throttle and reach the UI instead of being suppressed as non-monotonic.
+    assert!(
+        progress_seconds
+            .iter()
+            .any(|value| (*value - 1.0).abs() < 0.001),
+        "expected the post-reset progress value 1.0 to reach the UI, got: {:?}",
+        progress_seconds
+    );
+}

@@ -36,6 +36,14 @@ describe("speakerColors", () => {
     })).toBe(getDefaultSpeakerColorForKey("speaker_2"));
   });
 
+  it("does not use the rejected purple diarization default", () => {
+    const defaultColors = Array.from({ length: 24 }, (_, index) =>
+      getDefaultSpeakerColorForKey(`speaker_${index + 1}`),
+    );
+
+    expect(defaultColors).not.toContain("#B06BF2");
+  });
+
   it("drops custom overrides when the chosen color matches the default", () => {
     const defaultColor = getDefaultSpeakerColorForKey("speaker_1");
     expect(setSpeakerColorForKey({ speaker_1: "#112233" }, "speaker_1", defaultColor)).toEqual({});

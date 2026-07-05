@@ -177,8 +177,8 @@ BIN_DIR="$ROOT_DIR/apps/desktop/src-tauri/binaries"
 PARAKEET_CLI=${SBOBINO_PARAKEET_CLI:-}
 if [[ -z "$PARAKEET_CLI" ]]; then
   PARAKEET_CLI=$(first_executable \
-    "$BIN_DIR/parakeet-cli-$TRIPLE" \
     "$APP_SUPPORT_DIR/bin/parakeet-cli" \
+    "$BIN_DIR/parakeet-cli-$TRIPLE" \
     "$(resolve_command_path parakeet-cli)") || true
 fi
 [[ -n "$PARAKEET_CLI" && -x "$PARAKEET_CLI" ]] || asr_fail "missing executable parakeet-cli"
@@ -186,6 +186,7 @@ fi
 WHISPER_CLI=${SBOBINO_WHISPER_CLI:-}
 if [[ -z "$WHISPER_CLI" ]]; then
   WHISPER_CLI=$(first_executable \
+    "$APP_SUPPORT_DIR/bin/whisper-cli" \
     "$BIN_DIR/whisper-cli-$TRIPLE" \
     "$(resolve_command_path whisper-cli)") || true
 fi
@@ -266,15 +267,19 @@ elif [[ -n "${WHISPER_CLI:-}" && -x "$WHISPER_CLI" && -f "$WHISPER_MODEL_PATH" ]
       -np || true
   fi
 
-  run_timed whisper_cpu \
-    env DYLD_LIBRARY_PATH="$BIN_DIR:${DYLD_LIBRARY_PATH:-}" "$WHISPER_CLI" \
-    --no-gpu \
-    -m "$WHISPER_MODEL_PATH" \
-    -f "$ASR_NORMALIZED_WAV" \
-    -l "$WHISPER_LANGUAGE" \
-    -oj -ojf \
-    -of "$RUN_DIR/whisper_cpu" \
-    -np || true
+  if [[ "${SBOBINO_COMPARE_SKIP_WHISPER_CPU:-0}" != "1" ]]; then
+    run_timed whisper_cpu \
+      env DYLD_LIBRARY_PATH="$BIN_DIR:${DYLD_LIBRARY_PATH:-}" "$WHISPER_CLI" \
+      --no-gpu \
+      -m "$WHISPER_MODEL_PATH" \
+      -f "$ASR_NORMALIZED_WAV" \
+      -l "$WHISPER_LANGUAGE" \
+      -oj -ojf \
+      -of "$RUN_DIR/whisper_cpu" \
+      -np || true
+  else
+    echo "whisper_cpu_status=skipped"
+  fi
 else
   echo "whisper_status=missing"
 fi

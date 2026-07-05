@@ -68,4 +68,35 @@ describe("close and cancel confirmations", () => {
     expect(onCancel).toContain("transcriptionCancel.keepRunning");
     expect(onCancel).toContain("await cancelTranscription(activeJobId)");
   });
+
+  it("asks before stopping artifact speaker diarization without leaving detail", () => {
+    const onCancelSpeakerDiarization = extractFunction(
+      appSource,
+      "onRequestCancelSpeakerDiarization",
+    );
+
+    expect(onCancelSpeakerDiarization).toContain("confirmDialog(");
+    expect(onCancelSpeakerDiarization).toContain("speakerDiarizationCancel.message");
+    expect(onCancelSpeakerDiarization).toContain(
+      "speakerDiarizationCancel.confirmButton",
+    );
+    expect(onCancelSpeakerDiarization).toContain(
+      "speakerDiarizationCancel.keepRunning",
+    );
+    expect(onCancelSpeakerDiarization).toContain(
+      "await cancelArtifactSpeakerDiarization(activeArtifact.id)",
+    );
+    expect(onCancelSpeakerDiarization).not.toContain("setSection(");
+    expect(onCancelSpeakerDiarization).not.toContain("setActiveArtifact(null)");
+    expect(onCancelSpeakerDiarization).not.toContain("clearActiveJob()");
+  });
+
+  it("routes the speaker diarization progress pill through the same stop confirmation", () => {
+    expect(appSource).toContain("speaker-diarization-progress-pill");
+    expect(appSource).toContain("onCancelSpeakerDiarization");
+    expect(appSource).toContain("onRequestCancelSpeakerDiarization()");
+    expect(appSource).not.toContain(
+      "cancelArtifactSpeakerDiarization(activeArtifact.id)}",
+    );
+  });
 });

@@ -325,6 +325,13 @@ export type JobProgress = {
   workspace_id?: string | null;
 };
 
+export type ArtifactSpeakerDiarizationProgress = {
+  artifact_id: string;
+  state: "running" | "cancelled" | "failed" | "completed";
+  message: string;
+  percentage: number;
+};
+
 export type TranscriptionDelta = {
   job_id: string;
   text: string;

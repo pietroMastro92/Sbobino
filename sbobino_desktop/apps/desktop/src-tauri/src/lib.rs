@@ -21,11 +21,12 @@ use tracing::warn;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::commands::artifacts::{
-    analyze_artifact_emotions, chat_artifact, delete_artifacts, empty_deleted_artifacts,
-    export_artifact, generate_artifact_pack, get_artifact, hard_delete_artifacts, list_artifacts,
-    list_deleted_artifacts, list_recent_artifacts, optimize_artifact, read_artifact_audio,
-    read_audio_file, rename_artifact, restore_artifacts, summarize_artifact, update_artifact,
-    update_artifact_timeline, write_trimmed_audio,
+    analyze_artifact_emotions, cancel_artifact_speaker_diarization, chat_artifact,
+    delete_artifacts, empty_deleted_artifacts, export_artifact, generate_artifact_pack,
+    get_artifact, hard_delete_artifacts, list_artifacts, list_deleted_artifacts,
+    list_recent_artifacts, optimize_artifact, read_artifact_audio, read_audio_file,
+    rename_artifact, restore_artifacts, run_artifact_speaker_diarization, summarize_artifact,
+    update_artifact, update_artifact_timeline, write_trimmed_audio,
 };
 use crate::commands::automatic_import::{
     clear_automatic_import_quarantine_item, retry_automatic_import_quarantine_item,
@@ -192,6 +193,7 @@ pub fn run() {
                 settings_service: bundle.settings_service,
                 runtime_factory: bundle.runtime_factory,
                 transcription_tasks: Arc::new(Mutex::new(HashMap::new())),
+                diarization_tasks: Arc::new(Mutex::new(HashMap::new())),
                 transcription_gate: Arc::new(Semaphore::new(1)),
                 realtime: RealtimeRuntime {
                     engine: Arc::new(Mutex::new(realtime_engine)),
@@ -230,6 +232,8 @@ pub fn run() {
             test_prompt,
             start_transcription,
             cancel_transcription,
+            run_artifact_speaker_diarization,
+            cancel_artifact_speaker_diarization,
             list_artifacts,
             list_deleted_artifacts,
             list_recent_artifacts,

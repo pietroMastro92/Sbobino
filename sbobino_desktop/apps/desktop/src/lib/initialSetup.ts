@@ -202,29 +202,16 @@ export function isRuntimeToolchainReady(
   }
 
   const managedRuntime = getManagedRuntime(runtimeHealth);
+  // `managed_runtime.ready` is aggregate health for every bundled binary. The
+  // startup gate is engine-aware, so a missing Whisper binary must not block a
+  // Parakeet user, and vice versa.
   if (runtimeHealth.managed_runtime_required) {
-    if (runtimeHealth.configured_engine === "parakeet_cpp") {
-      return (
-        managedRuntime.ffmpeg.available && managedRuntime.parakeet_cli.available
-      );
-    }
-    return (
-      managedRuntime.ffmpeg.available &&
-      managedRuntime.whisper_cli.available &&
-      managedRuntime.whisper_stream.available
+    return engineBinaryRequirements(managedRuntime, runtimeHealth).every(
+      (binary) => binary.available,
     );
   }
 
-  if (runtimeHealth.configured_engine === "parakeet_cpp") {
-    return (
-      runtimeHealth.ffmpeg_available && runtimeHealth.parakeet_cli_available
-    );
-  }
-  return (
-    runtimeHealth.ffmpeg_available &&
-    runtimeHealth.whisper_cli_available &&
-    runtimeHealth.whisper_stream_available
-  );
+  return engineFlatRequirements(runtimeHealth).every((available) => available);
 }
 
 export function getRuntimeToolchainFailureMessage(
@@ -235,23 +222,86 @@ export function getRuntimeToolchainFailureMessage(
   }
 
   const managedRuntime = getManagedRuntime(runtimeHealth);
-  if (!managedRuntime.ffmpeg.available) {
+  // For the managed path we surface the first engine-relevant binary that is
+  // explicitly unavailable (carrying its own failure_message). A generic
+  // `ready = false` without a specific missing binary returns null so the UI
+  // falls back to the engine-neutral "setup incomplete" messaging.
+  if (runtimeHealth.managed_runtime_required) {
+    const missing = engineBinaryRequirements(managedRuntime, runtimeHealth).find(
+      (binary) => !binary.available,
+    );
+    return missing?.failure_message || null;
+  }
+
+  if (!runtimeHealth.ffmpeg_available) {
     return managedRuntime.ffmpeg.failure_message || null;
   }
   if (runtimeHealth.configured_engine === "parakeet_cpp") {
-    if (!managedRuntime.parakeet_cli.available) {
+    if (!runtimeHealth.parakeet_cli_available) {
       return managedRuntime.parakeet_cli.failure_message || null;
     }
     return null;
   }
-  if (!managedRuntime.whisper_cli.available) {
+  if (!runtimeHealth.whisper_cli_available) {
     return managedRuntime.whisper_cli.failure_message || null;
   }
-  if (!managedRuntime.whisper_stream.available) {
+  if (!runtimeHealth.whisper_stream_available) {
     return managedRuntime.whisper_stream.failure_message || null;
   }
 
   return null;
+}
+
+type RuntimeBinary = {
+  available: boolean;
+  failure_message: string;
+};
+
+// Binaries that are hard requirements for the *configured* engine, in priority
+// order (used to pick the most relevant failure message). ffmpeg is always
+// required; the speech CLI depends on the active engine.
+function engineBinaryRequirements(
+  managedRuntime: RuntimeHealth["managed_runtime"],
+  runtimeHealth: RuntimeHealth,
+): RuntimeBinary[] {
+  const binaries: RuntimeBinary[] = [
+    {
+      available: managedRuntime.ffmpeg.available,
+      failure_message: managedRuntime.ffmpeg.failure_message,
+    },
+  ];
+  if (runtimeHealth.configured_engine === "parakeet_cpp") {
+    binaries.push({
+      available: managedRuntime.parakeet_cli.available,
+      failure_message: managedRuntime.parakeet_cli.failure_message,
+    });
+  } else {
+    binaries.push(
+      {
+        available: managedRuntime.whisper_cli.available,
+        failure_message: managedRuntime.whisper_cli.failure_message,
+      },
+      {
+        available: managedRuntime.whisper_stream.available,
+        failure_message: managedRuntime.whisper_stream.failure_message,
+      },
+    );
+  }
+  return binaries;
+}
+
+function engineFlatRequirements(runtimeHealth: RuntimeHealth): boolean[] {
+  if (runtimeHealth.configured_engine === "parakeet_cpp") {
+    return [
+      runtimeHealth.ffmpeg_available,
+      runtimeHealth.parakeet_cli_available,
+    ];
+  }
+  return [
+    runtimeHealth.ffmpeg_available,
+    runtimeHealth.whisper_cli_available,
+    runtimeHealth.whisper_stream_available,
+  ];
 }
 
 function getManagedRuntime(

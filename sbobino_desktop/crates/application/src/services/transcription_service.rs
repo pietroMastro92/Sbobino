@@ -153,6 +153,14 @@ impl TranscriptionService {
                 Arc::new(move |current_seconds: f32| {
                     let sanitized_seconds = current_seconds.max(0.0);
                     if let Ok(mut last) = last_emitted_seconds_ref.lock() {
+                        // An engine may reset progress to zero before a CPU-safe
+                        // retry. Detect that backward jump and re-anchor the
+                        // monotonic baseline so the retry's early progress is not
+                        // suppressed as "non-monotonic" (which would leave the UI
+                        // stuck at the first attempt's last value).
+                        if sanitized_seconds + 1.0 < *last {
+                            *last = 0.0;
+                        }
                         if sanitized_seconds <= *last + 0.05 {
                             return;
                         }

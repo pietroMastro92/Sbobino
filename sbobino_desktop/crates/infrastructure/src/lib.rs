@@ -17,7 +17,8 @@ use std::{
 use tracing::{info, warn};
 
 use sbobino_application::{
-    ArtifactService, SettingsService, TranscriptEnhancer, TranscriptionService,
+    ArtifactService, AudioTranscoder, SettingsService, SpeakerDiarizationEngine,
+    TranscriptEnhancer, TranscriptionService,
 };
 use sbobino_domain::{
     AiProvider, AppSettings, PromptTask, RemoteServiceConfig, RemoteServiceKind, SpeechModel,
@@ -515,6 +516,40 @@ impl RuntimeTranscriptionFactory {
         }
 
         Ok(Arc::new(service))
+    }
+
+    pub fn build_speaker_diarization_runtime(
+        &self,
+    ) -> Result<Option<(Arc<dyn AudioTranscoder>, Arc<dyn SpeakerDiarizationEngine>)>, String> {
+        let settings = self.load_settings()?;
+        let ffmpeg_path = self
+            .resolve_transcription_binary_details(&settings.transcription.ffmpeg_path, "ffmpeg")
+            .resolved_path;
+        let runtime_check = self.managed_runtime_health();
+        let ffmpeg_runnable = if self.managed_runtime_required() {
+            runtime_check.ffmpeg.available
+        } else {
+            self.binary_path_is_runnable(&ffmpeg_path)
+        };
+
+        if !ffmpeg_runnable {
+            if self.managed_runtime_required() {
+                return Err(format_managed_runtime_binary_error(
+                    "FFmpeg",
+                    &runtime_check.ffmpeg,
+                    "Repair the local runtime from Settings > Local Models.",
+                ));
+            }
+            return Err(format!(
+                "FFmpeg is not runnable at '{}'. Configure FFmpeg path in Settings > Advanced.",
+                ffmpeg_path
+            ));
+        }
+
+        let speaker_diarizer = self.build_speaker_diarizer(&settings)?;
+        let transcoder = Arc::new(FfmpegAdapter::new(ffmpeg_path)) as Arc<dyn AudioTranscoder>;
+
+        Ok(speaker_diarizer.map(|diarizer| (transcoder, diarizer)))
     }
 
     pub fn settings_service(&self) -> Arc<SettingsService> {

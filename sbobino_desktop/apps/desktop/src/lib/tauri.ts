@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   AiSettings,
   AiCapabilityStatus,
+  ArtifactSpeakerDiarizationProgress,
   AutomaticImportScanResponse,
   AppSettings,
   ChatArtifactPayload,
@@ -194,6 +195,24 @@ export async function updateArtifactTimeline(payload: {
   timeline_v2: string;
 }): Promise<TranscriptArtifact | null> {
   return invoke<TranscriptArtifact | null>("update_artifact_timeline", { payload });
+}
+
+export async function runArtifactSpeakerDiarization(
+  artifact_id: string,
+): Promise<{ artifact_id: string; state: string }> {
+  return invoke<{ artifact_id: string; state: string }>(
+    "run_artifact_speaker_diarization",
+    { payload: { artifact_id } },
+  );
+}
+
+export async function cancelArtifactSpeakerDiarization(
+  artifact_id: string,
+): Promise<{ artifact_id: string; state: string }> {
+  return invoke<{ artifact_id: string; state: string }>(
+    "cancel_artifact_speaker_diarization",
+    { payload: { artifact_id } },
+  );
 }
 
 export async function renameArtifact(payload: {
@@ -487,6 +506,27 @@ export async function subscribeJobCompleted(
   const unlisten = await listen<TranscriptArtifact>("transcription://completed", (event) => {
     onCompleted(event.payload);
   });
+  return unlisten;
+}
+
+export async function subscribeArtifactUpdated(
+  onUpdated: (artifact: TranscriptArtifact) => void,
+): Promise<() => void> {
+  const unlisten = await listen<TranscriptArtifact>("artifact://updated", (event) => {
+    onUpdated(event.payload);
+  });
+  return unlisten;
+}
+
+export async function subscribeArtifactSpeakerDiarizationProgress(
+  onProgress: (progress: ArtifactSpeakerDiarizationProgress) => void,
+): Promise<() => void> {
+  const unlisten = await listen<ArtifactSpeakerDiarizationProgress>(
+    "artifact://speaker-diarization-progress",
+    (event) => {
+      onProgress(event.payload);
+    },
+  );
   return unlisten;
 }
 

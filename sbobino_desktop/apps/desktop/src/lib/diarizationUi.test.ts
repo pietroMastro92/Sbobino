@@ -74,6 +74,52 @@ describe("getArtifactDiarizationUiState", () => {
     });
   });
 
+  it("reports running diarization before existing speaker labels", () => {
+    expect(
+      getArtifactDiarizationUiState(
+        artifact({
+          speaker_diarization_status: "running",
+          speaker_diarization_progress: "35",
+        }),
+        ["Speaker 1"],
+      ),
+    ).toEqual({
+      kind: "running",
+      speakerCount: 0,
+      speakerLabels: [],
+      error: null,
+      progress: 35,
+    });
+  });
+
+  it("reports cancelled diarization before existing speaker labels", () => {
+    expect(
+      getArtifactDiarizationUiState(
+        artifact({ speaker_diarization_status: "cancelled" }),
+        ["Speaker 1"],
+      ),
+    ).toEqual({
+      kind: "cancelled",
+      speakerCount: 0,
+      speakerLabels: [],
+      error: null,
+    });
+  });
+
+  it("reports completed diarization without speaker labels", () => {
+    expect(
+      getArtifactDiarizationUiState(
+        artifact({ speaker_diarization_status: "completed" }),
+        [],
+      ),
+    ).toEqual({
+      kind: "no_speakers_detected",
+      speakerCount: 0,
+      speakerLabels: [],
+      error: null,
+    });
+  });
+
   it("reports missing speaker labels as not requested when no metadata exists", () => {
     expect(getArtifactDiarizationUiState(artifact(), [])).toEqual({
       kind: "not_requested",

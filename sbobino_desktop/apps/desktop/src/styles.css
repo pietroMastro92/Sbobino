@@ -2397,11 +2397,25 @@ summary,
   );
   font-size: 0.84rem;
   font-weight: 670;
-  letter-spacing: -0.05em;
+  letter-spacing: 0;
   font-variant-numeric: tabular-nums lining-nums;
   font-feature-settings: "tnum" 1, "lnum" 1;
   white-space: nowrap;
   text-shadow: 0 0 16px color-mix(in srgb, var(--progress-ring-fill) 24%, transparent);
+}
+
+.transcribing-cancel-pill-value-digit {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 0.62em;
+  height: 16px;
+  overflow: hidden;
+}
+
+.transcribing-cancel-pill-value-digit:last-child {
+  width: 0.72em;
 }
 
 .transcribing-cancel-pill-value-slot {
@@ -2409,7 +2423,7 @@ summary,
   inset: 0;
   display: inline-flex;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: center;
   transition:
     transform 240ms cubic-bezier(0.22, 1, 0.36, 1),
     opacity 240ms cubic-bezier(0.22, 1, 0.36, 1);
@@ -2425,18 +2439,26 @@ summary,
 }
 
 .transcribing-cancel-pill-value-slot-out.is-rolling {
-  transform: translateY(-115%);
+  transform: translateY(115%);
   opacity: 0;
 }
 
 .transcribing-cancel-pill-value-slot-in {
-  transform: translateY(115%);
+  transform: translateY(-115%);
   opacity: 0;
 }
 
 .transcribing-cancel-pill-value-slot-in.is-rolling {
   transform: translateY(0);
   opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transcribing-cancel-pill-value-slot {
+    transition: none;
+    transform: translateY(0) !important;
+    opacity: 1 !important;
+  }
 }
 
 .transcribing-cancel-pill-cancel {
@@ -2553,6 +2575,10 @@ summary,
   background: color-mix(in srgb, var(--danger) 10%, var(--surface));
 }
 
+.transcript-speaker-banner.is-running {
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+}
+
 .transcript-speaker-banner-copy {
   display: grid;
   gap: 4px;
@@ -2574,6 +2600,30 @@ summary,
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.speaker-detection-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.speaker-detection-progress-button {
+  --progress-ring-fill: var(--accent);
+  --progress-ring-track: color-mix(in srgb, var(--accent) 18%, var(--line-soft));
+  --progress-ring-core-bg: var(--surface);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-width: 74px;
+  min-height: 32px;
+  padding-inline: 10px;
+  color: var(--detail-active-text);
 }
 
 .detail-editor {
@@ -4647,25 +4697,30 @@ body.sidebar-resizing {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 8px;
   background: var(--panel-soft);
   padding: 8px;
+  min-width: 0;
 }
 
 .mode-tile {
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 8px;
   min-height: 92px;
+  height: 92px;
   min-width: 0;
+  width: 100%;
   background: var(--surface);
   color: var(--muted);
   display: grid;
   justify-items: center;
   align-content: center;
+  grid-template-rows: 42px minmax(18px, auto);
   gap: 6px;
   font-weight: 600;
   cursor: pointer;
-  padding: 8px;
+  padding: 8px 6px;
+  overflow: hidden;
 }
 
 .mode-tile.active {
@@ -4678,17 +4733,61 @@ body.sidebar-resizing {
 .mode-tile-icon {
   width: 40px;
   height: 40px;
-  border-radius: 10px;
+  border-radius: 8px;
   border: 1px solid var(--line);
   background: var(--surface);
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  place-self: center;
+  flex: 0 0 auto;
+}
+
+.mode-tile-icon svg {
+  display: block;
+  width: 18px;
+  height: 18px;
+}
+
+.mode-tile-label {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.92rem;
+  line-height: 1.12;
 }
 
 .mode-tile.active .mode-tile-icon {
   border-color: var(--detail-active-border);
   background: var(--surface);
+}
+
+@media (max-width: 1100px) {
+  .inspector-mode-grid {
+    gap: 6px;
+    padding: 6px;
+  }
+
+  .mode-tile {
+    min-height: 84px;
+    height: 84px;
+    grid-template-rows: 36px minmax(16px, auto);
+    padding: 6px 4px;
+    gap: 5px;
+  }
+
+  .mode-tile-icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .mode-tile-label {
+    font-size: 0.82rem;
+  }
 }
 
 .inspector-block {
@@ -4736,6 +4835,11 @@ body.sidebar-resizing {
 .pill-warning {
   background: color-mix(in srgb, var(--danger) 14%, #f2e6e6);
   color: color-mix(in srgb, var(--danger) 82%, var(--text));
+}
+
+.pill-progress {
+  background: color-mix(in srgb, var(--accent) 14%, #e6e9ef);
+  color: var(--detail-active-text);
 }
 
 .inspector-input,

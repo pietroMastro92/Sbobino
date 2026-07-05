@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::future::Future;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use docx_rs::{Docx, Paragraph, Run};
@@ -11,15 +12,18 @@ use printpdf::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tauri::State;
+use tauri::{Emitter, State};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use sbobino_application::{
     summarize_transcript_adaptive, ApplicationError, ArtifactQuery, TranscriptEnhancer,
+    TranscriptionService,
 };
 use sbobino_domain::{
     constrain_transcript_edit, merge_optimized_transcript_sections,
-    minimize_transcript_repetitions, ArtifactKind, PromptTask, TranscriptArtifact,
+    minimize_transcript_repetitions, ArtifactKind, PromptTask, TimedSegment, TimedWord,
+    TranscriptArtifact, TranscriptionOutput,
 };
 
 use crate::{
@@ -32,12 +36,13 @@ use crate::{
         parse_timeline_document, ArtifactAiContextOptions, PreparedTranscriptContext,
     },
     error::CommandError,
-    state::AppState,
+    state::{AppState, DiarizationTask},
 };
 
 const MIN_TRIMMED_AUDIO_DURATION_SECONDS: f64 = 1.5;
 const SPEAKER_COLOR_PALETTE: &[&str] = &[
-    "#4F7CFF", "#EC6A5E", "#27A376", "#B06BF2", "#D88B15", "#1293A5", "#E255A1", "#6C7A2D",
+    "#4F7CFF", "#EC6A5E", "#27A376", "#D88B15", "#1293A5", "#C85F39", "#5F8D3D", "#B04A64",
+    "#6C7A2D",
 ];
 
 fn default_summary_language() -> String {
@@ -77,6 +82,25 @@ pub struct UpdateArtifactPayload {
 pub struct UpdateArtifactTimelinePayload {
     pub id: String,
     pub timeline_v2: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArtifactSpeakerDiarizationPayload {
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArtifactSpeakerDiarizationResponse {
+    pub artifact_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactSpeakerDiarizationProgressEvent {
+    pub artifact_id: String,
+    pub state: String,
+    pub message: String,
+    pub percentage: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,6 +446,471 @@ pub async fn update_artifact_timeline(
         .update_timeline_v2(&payload.id, &payload.timeline_v2)
         .await
         .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn run_artifact_speaker_diarization(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    payload: ArtifactSpeakerDiarizationPayload,
+) -> Result<ArtifactSpeakerDiarizationResponse, CommandError> {
+    let artifact_id = payload.artifact_id.trim().to_string();
+    if artifact_id.is_empty() {
+        return Err(CommandError::new(
+            "speaker_diarization",
+            "artifact id cannot be empty",
+        ));
+    }
+
+    let run_id = Uuid::new_v4().to_string();
+    let cancellation_token = CancellationToken::new();
+    {
+        let mut registry = state.diarization_tasks.lock().await;
+        if registry.contains_key(&artifact_id) {
+            return Ok(ArtifactSpeakerDiarizationResponse {
+                artifact_id,
+                state: "running".to_string(),
+            });
+        }
+        registry.insert(
+            artifact_id.clone(),
+            DiarizationTask {
+                run_id: run_id.clone(),
+                cancel_token: cancellation_token.clone(),
+            },
+        );
+    }
+
+    if let Some(updated) =
+        set_diarization_metadata(state.inner(), &artifact_id, "running", None, Some(0)).await?
+    {
+        emit_artifact_updated(&app, &updated);
+    }
+    emit_diarization_progress(
+        &app,
+        &artifact_id,
+        "running",
+        "Preparing speaker diarization",
+        0,
+    );
+
+    let task_state = state.inner().clone();
+    let task_app = app.clone();
+    let task_artifact_id = artifact_id.clone();
+    tauri::async_runtime::spawn(async move {
+        run_artifact_speaker_diarization_task(
+            task_app,
+            task_state,
+            task_artifact_id,
+            run_id,
+            cancellation_token,
+        )
+        .await;
+    });
+
+    Ok(ArtifactSpeakerDiarizationResponse {
+        artifact_id,
+        state: "running".to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn cancel_artifact_speaker_diarization(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    payload: ArtifactSpeakerDiarizationPayload,
+) -> Result<ArtifactSpeakerDiarizationResponse, CommandError> {
+    let artifact_id = payload.artifact_id.trim().to_string();
+    if artifact_id.is_empty() {
+        return Err(CommandError::new(
+            "speaker_diarization",
+            "artifact id cannot be empty",
+        ));
+    }
+
+    let task = {
+        let mut registry = state.diarization_tasks.lock().await;
+        registry.remove(&artifact_id)
+    };
+
+    if let Some(task) = task {
+        task.cancel_token.cancel();
+    }
+
+    if let Some(updated) =
+        set_diarization_metadata(state.inner(), &artifact_id, "cancelled", None, Some(100)).await?
+    {
+        emit_artifact_updated(&app, &updated);
+    }
+    emit_diarization_progress(
+        &app,
+        &artifact_id,
+        "cancelled",
+        "Speaker diarization cancelled",
+        100,
+    );
+
+    Ok(ArtifactSpeakerDiarizationResponse {
+        artifact_id,
+        state: "cancelled".to_string(),
+    })
+}
+
+async fn run_artifact_speaker_diarization_task(
+    app: tauri::AppHandle,
+    state: AppState,
+    artifact_id: String,
+    run_id: String,
+    cancellation_token: CancellationToken,
+) {
+    let result = run_artifact_speaker_diarization_inner(
+        &app,
+        &state,
+        &artifact_id,
+        &run_id,
+        &cancellation_token,
+    )
+    .await;
+
+    match result {
+        Ok(()) => {}
+        Err(error) if cancellation_token.is_cancelled() => {
+            if let Ok(Some(updated)) =
+                set_diarization_metadata(&state, &artifact_id, "cancelled", None, Some(100)).await
+            {
+                emit_artifact_updated(&app, &updated);
+            }
+            emit_diarization_progress(
+                &app,
+                &artifact_id,
+                "cancelled",
+                "Speaker diarization cancelled",
+                100,
+            );
+            tracing::debug!(
+                code = %error.code,
+                message = %error.message,
+                "artifact speaker diarization cancelled"
+            );
+        }
+        Err(error) => {
+            let message = error.message;
+            if let Ok(Some(updated)) =
+                set_diarization_metadata(&state, &artifact_id, "failed", Some(&message), Some(100))
+                    .await
+            {
+                emit_artifact_updated(&app, &updated);
+            }
+            emit_diarization_progress(&app, &artifact_id, "failed", &message, 100);
+        }
+    }
+
+    let mut registry = state.diarization_tasks.lock().await;
+    let should_remove = registry
+        .get(&artifact_id)
+        .map(|task| task.run_id == run_id)
+        .unwrap_or(false);
+    if should_remove {
+        registry.remove(&artifact_id);
+    }
+}
+
+async fn run_artifact_speaker_diarization_inner(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    artifact_id: &str,
+    run_id: &str,
+    cancellation_token: &CancellationToken,
+) -> Result<(), CommandError> {
+    let artifact = state
+        .artifact_service
+        .get(artifact_id)
+        .await
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::new("speaker_diarization", "transcript not found"))?;
+    let segments = timeline_segments_for_diarization(&artifact)?;
+    if segments.is_empty() {
+        return Err(CommandError::new(
+            "speaker_diarization",
+            "timeline segments are not available for this transcript",
+        ));
+    }
+
+    let audio_bytes = state
+        .artifact_service
+        .read_audio_bytes(artifact_id)
+        .await
+        .map_err(CommandError::from)?
+        .ok_or_else(|| {
+            CommandError::new(
+                "speaker_diarization",
+                "artifact audio is not available for speaker diarization",
+            )
+        })?;
+
+    if cancellation_token.is_cancelled() {
+        return Err(CommandError::from(ApplicationError::Cancelled));
+    }
+
+    let source_path = diarization_temp_source_path(&artifact, run_id);
+    tokio::fs::write(&source_path, audio_bytes)
+        .await
+        .map_err(|error| {
+            CommandError::new(
+                "speaker_diarization",
+                format!("failed to write temporary diarization audio: {error}"),
+            )
+        })?;
+
+    let result = run_artifact_speaker_diarization_from_source(
+        app,
+        state,
+        artifact_id,
+        &source_path,
+        &segments,
+        cancellation_token,
+    )
+    .await;
+
+    if let Err(error) = tokio::fs::remove_file(&source_path).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %source_path.display(),
+                "failed to remove temporary speaker diarization source: {error}"
+            );
+        }
+    }
+
+    result
+}
+
+async fn run_artifact_speaker_diarization_from_source(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    artifact_id: &str,
+    source_path: &Path,
+    segments: &[TimedSegment],
+    cancellation_token: &CancellationToken,
+) -> Result<(), CommandError> {
+    let Some((transcoder, speaker_diarizer)) = state
+        .runtime_factory
+        .build_speaker_diarization_runtime()
+        .map_err(|error| CommandError::new("speaker_diarization", error))?
+    else {
+        return Err(CommandError::new(
+            "speaker_diarization",
+            "Speaker diarization is disabled in transcription settings.",
+        ));
+    };
+
+    let wav_path = diarization_temp_wav_path(artifact_id);
+    emit_diarization_progress(
+        app,
+        artifact_id,
+        "running",
+        "Preparing audio for speaker diarization",
+        8,
+    );
+    let result = async {
+        run_cancellable(
+            cancellation_token,
+            transcoder.to_wav_mono_16k(source_path, &wav_path),
+        )
+        .await?;
+        emit_diarization_progress(
+            app,
+            artifact_id,
+            "running",
+            "Assigning speakers with pyannote",
+            35,
+        );
+        let turns =
+            run_cancellable(cancellation_token, speaker_diarizer.diarize(&wav_path)).await?;
+        if cancellation_token.is_cancelled() {
+            return Err(ApplicationError::Cancelled);
+        }
+        emit_diarization_progress(app, artifact_id, "running", "Updating speaker timeline", 90);
+        let assigned_segments = TranscriptionService::assign_speakers_to_segments(segments, &turns);
+        let timeline_v2 = TranscriptionOutput {
+            text: String::new(),
+            segments: assigned_segments,
+        }
+        .timeline_v2_metadata_json();
+        if cancellation_token.is_cancelled() {
+            return Err(ApplicationError::Cancelled);
+        }
+        state
+            .artifact_service
+            .update_timeline_v2(artifact_id, &timeline_v2)
+            .await?;
+        if cancellation_token.is_cancelled() {
+            return Err(ApplicationError::Cancelled);
+        }
+        Ok::<(), ApplicationError>(())
+    }
+    .await;
+
+    if let Err(error) = tokio::fs::remove_file(&wav_path).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %wav_path.display(),
+                "failed to remove temporary speaker diarization wav: {error}"
+            );
+        }
+    }
+
+    result.map_err(CommandError::from)?;
+    if let Some(updated) =
+        set_diarization_metadata(state, artifact_id, "completed", None, Some(100)).await?
+    {
+        emit_artifact_updated(app, &updated);
+    }
+    emit_diarization_progress(
+        app,
+        artifact_id,
+        "completed",
+        "Speaker diarization completed",
+        100,
+    );
+    Ok(())
+}
+
+async fn run_cancellable<T, F>(
+    cancellation_token: &CancellationToken,
+    operation: F,
+) -> Result<T, ApplicationError>
+where
+    F: Future<Output = Result<T, ApplicationError>>,
+{
+    tokio::select! {
+        _ = cancellation_token.cancelled() => Err(ApplicationError::Cancelled),
+        result = operation => result,
+    }
+}
+
+async fn set_diarization_metadata(
+    state: &AppState,
+    artifact_id: &str,
+    status: &str,
+    error: Option<&str>,
+    progress: Option<u8>,
+) -> Result<Option<TranscriptArtifact>, CommandError> {
+    let mut latest = None;
+    if let Some(updated) = state
+        .artifact_service
+        .update_metadata_entry(artifact_id, "speaker_diarization_status", Some(status))
+        .await
+        .map_err(CommandError::from)?
+    {
+        latest = Some(updated);
+    }
+    if let Some(updated) = state
+        .artifact_service
+        .update_metadata_entry(artifact_id, "speaker_diarization_error", error)
+        .await
+        .map_err(CommandError::from)?
+    {
+        latest = Some(updated);
+    }
+    let progress_string = progress.map(|value| value.to_string());
+    if let Some(updated) = state
+        .artifact_service
+        .update_metadata_entry(
+            artifact_id,
+            "speaker_diarization_progress",
+            progress_string.as_deref(),
+        )
+        .await
+        .map_err(CommandError::from)?
+    {
+        latest = Some(updated);
+    }
+
+    Ok(latest)
+}
+
+fn emit_artifact_updated(app: &tauri::AppHandle, artifact: &TranscriptArtifact) {
+    let _ = app.emit("artifact://updated", artifact);
+}
+
+fn emit_diarization_progress(
+    app: &tauri::AppHandle,
+    artifact_id: &str,
+    state: &str,
+    message: &str,
+    percentage: u8,
+) {
+    let _ = app.emit(
+        "artifact://speaker-diarization-progress",
+        ArtifactSpeakerDiarizationProgressEvent {
+            artifact_id: artifact_id.to_string(),
+            state: state.to_string(),
+            message: message.to_string(),
+            percentage,
+        },
+    );
+}
+
+fn timeline_segments_for_diarization(
+    artifact: &TranscriptArtifact,
+) -> Result<Vec<TimedSegment>, CommandError> {
+    let parsed = parse_timeline_document(artifact).ok_or_else(|| {
+        CommandError::new(
+            "speaker_diarization",
+            "timeline_v2 metadata is missing or invalid",
+        )
+    })?;
+    Ok(parsed
+        .segments
+        .into_iter()
+        .map(|segment| TimedSegment {
+            text: segment.text,
+            start_seconds: segment.start_seconds.filter(|value| value.is_finite()),
+            end_seconds: segment.end_seconds.filter(|value| value.is_finite()),
+            speaker_id: None,
+            speaker_label: None,
+            words: segment
+                .words
+                .into_iter()
+                .map(|word| TimedWord {
+                    text: word.text,
+                    start_seconds: word.start_seconds.filter(|value| value.is_finite()),
+                    end_seconds: word.end_seconds.filter(|value| value.is_finite()),
+                    confidence: word.confidence.filter(|value| value.is_finite()),
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+fn diarization_temp_source_path(artifact: &TranscriptArtifact, run_id: &str) -> PathBuf {
+    let extension = Path::new(&artifact.source_label)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(sanitize_audio_extension)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "audio".to_string());
+    std::env::temp_dir().join(format!(
+        "sbobino_diarization_source_{}_{}.{}",
+        artifact.id, run_id, extension
+    ))
+}
+
+fn diarization_temp_wav_path(artifact_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "sbobino_diarization_{}_{}.wav",
+        artifact_id,
+        Uuid::new_v4()
+    ))
+}
+
+fn sanitize_audio_extension(extension: &str) -> String {
+    extension
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 #[tauri::command]
@@ -2998,16 +3487,19 @@ mod tests {
     use sbobino_application::dto::SummaryFaq;
     use serde_json::json;
     use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
 
     use super::{
         build_artifact_context_transcript, build_chat_context_candidates, build_chunk_note_prompt,
         build_confidence_aware_optimize_prompt, build_direct_summary_prompt, build_export_content,
         build_export_document, build_export_segments, build_summary_instructions,
         build_summary_synthesis_prompt, chunk_text_by_words, extract_low_confidence_spans,
-        is_context_window_error, optimize_with_rag, render_plain_text_document, summarize_with_rag,
-        trimmed_audio_output_metadata, validate_trimmed_audio_output, ApplicationError,
-        ArtifactAiContextOptions, ArtifactKind, ExportStyle, SummarizeArtifactPayload,
-        TranscriptArtifact, TranscriptEnhancer, MIN_TRIMMED_AUDIO_DURATION_SECONDS,
+        is_context_window_error, optimize_with_rag, render_markdown_document,
+        render_plain_text_document, run_cancellable, summarize_with_rag,
+        timeline_segments_for_diarization, trimmed_audio_output_metadata,
+        validate_trimmed_audio_output, ApplicationError, ArtifactAiContextOptions, ArtifactKind,
+        ExportStyle, SummarizeArtifactPayload, TranscriptArtifact, TranscriptEnhancer,
+        MIN_TRIMMED_AUDIO_DURATION_SECONDS,
     };
 
     struct TrackingEnhancer {
@@ -3524,6 +4016,113 @@ mod tests {
         assert!(plain_text.contains("Segmenti\n[00:00] Linea uno"));
         assert!(plain_text.contains("Riassunto\nSintesi breve"));
         assert!(plain_text.contains("Domande frequenti\nD: Chi segue?\nR: Marta."));
+    }
+
+    #[test]
+    fn export_writers_create_all_supported_formats() {
+        let temp = tempdir().expect("tempdir");
+        let mut artifact = sample_artifact_with_timeline("fallback transcript");
+        artifact.summary = "Short summary".to_string();
+        artifact.faqs = "Q: Next?\nA: Follow up.".to_string();
+        let segments = build_export_segments(&artifact, "fallback transcript");
+        let mut speaker_colors = BTreeMap::new();
+        speaker_colors.insert("speaker_1".to_string(), "#123456".to_string());
+        let document = build_export_document(
+            "en",
+            &artifact.title,
+            &artifact.raw_transcript,
+            &artifact.summary,
+            &artifact.faqs,
+            &artifact.metadata,
+            &segments,
+            ExportStyle::Segments,
+            true,
+            true,
+            &speaker_colors,
+        );
+        let export_content = build_export_content(
+            &artifact.raw_transcript,
+            &segments,
+            ExportStyle::Segments,
+            true,
+            true,
+        );
+
+        let txt_path = temp.path().join("transcript.txt");
+        super::export_txt(&txt_path, &render_plain_text_document(&document)).expect("txt export");
+        assert!(std::fs::read_to_string(&txt_path)
+            .expect("txt contents")
+            .contains("[00:12] Alice: Alice opens the meeting."));
+
+        let md_path = temp.path().join("transcript.md");
+        super::export_md(&md_path, &render_markdown_document(&document)).expect("md export");
+        assert!(std::fs::read_to_string(&md_path)
+            .expect("md contents")
+            .contains("## Segments"));
+
+        let csv_path = temp.path().join("segments.csv");
+        super::export_csv(&csv_path, &segments, true).expect("csv export");
+        assert!(std::fs::read_to_string(&csv_path)
+            .expect("csv contents")
+            .contains("Transcript;Speaker"));
+
+        let html_path = temp.path().join("transcript.html");
+        super::export_html(&html_path, "en", &document).expect("html export");
+        assert!(std::fs::read_to_string(&html_path)
+            .expect("html contents")
+            .contains("<!doctype html>"));
+
+        let json_path = temp.path().join("transcript.json");
+        super::export_json(
+            &json_path,
+            &artifact,
+            &document,
+            ExportStyle::Segments,
+            super::ExportGrouping::None,
+            true,
+            true,
+            &segments,
+            &export_content,
+        )
+        .expect("json export");
+        let json_payload =
+            std::fs::read_to_string(&json_path).expect("json contents should be readable");
+        assert!(json_payload.contains("\"style\": \"segments\""));
+        assert!(json_payload.contains("\"speaker_label\": \"Alice\""));
+
+        let docx_path = temp.path().join("transcript.docx");
+        super::export_docx(&docx_path, &document).expect("docx export");
+        assert!(std::fs::metadata(&docx_path).expect("docx metadata").len() > 0);
+
+        let pdf_path = temp.path().join("transcript.pdf");
+        super::export_pdf(&pdf_path, &document).expect("pdf export");
+        assert!(std::fs::metadata(&pdf_path).expect("pdf metadata").len() > 0);
+
+        let srt_path = temp.path().join("subtitles.srt");
+        super::export_txt(
+            &srt_path,
+            &build_export_content(
+                &artifact.raw_transcript,
+                &segments,
+                ExportStyle::Subtitles,
+                true,
+                true,
+            ),
+        )
+        .expect("srt export");
+        assert!(std::fs::read_to_string(&srt_path)
+            .expect("srt contents")
+            .contains("00:00:12,000 --> 00:00:23,000"));
+
+        let vtt_path = temp.path().join("subtitles.vtt");
+        super::export_txt(
+            &vtt_path,
+            &super::build_vtt_content(&segments, &artifact.raw_transcript, true),
+        )
+        .expect("vtt export");
+        assert!(std::fs::read_to_string(&vtt_path)
+            .expect("vtt contents")
+            .starts_with("WEBVTT"));
     }
 
     #[test]
@@ -4136,5 +4735,33 @@ mod tests {
             validate_trimmed_audio_output(MIN_TRIMMED_AUDIO_DURATION_SECONDS - 0.1, 128)
                 .expect_err("too-short trimmed file should be rejected");
         assert!(short_error.message.contains("trimmed audio is too short"));
+    }
+
+    #[test]
+    fn diarization_timeline_segments_clear_existing_speakers_before_rerun() {
+        let artifact = sample_artifact_with_timeline("Alice opens. Bob confirms.");
+
+        let segments = timeline_segments_for_diarization(&artifact)
+            .expect("timeline should parse for diarization rerun");
+
+        assert_eq!(segments.len(), 2);
+        assert!(segments.iter().all(|segment| segment.speaker_id.is_none()));
+        assert!(segments
+            .iter()
+            .all(|segment| segment.speaker_label.is_none()));
+    }
+
+    #[tokio::test]
+    async fn run_cancellable_returns_cancelled_without_awaiting_pending_operation() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = run_cancellable(&token, async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok::<(), ApplicationError>(())
+        })
+        .await;
+
+        assert!(matches!(result, Err(ApplicationError::Cancelled)));
     }
 }

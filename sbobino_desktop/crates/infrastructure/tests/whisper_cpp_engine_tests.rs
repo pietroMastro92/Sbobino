@@ -253,7 +253,440 @@ exit 0
     let emitted_lines = emitted.lock().expect("emit lock poisoned");
     assert!(emitted_lines
         .iter()
-        .any(|line| line.contains("retrying in CPU-safe mode")));
+        .any(|line| line.contains("Whisper fallback CPU-safe mode")));
+}
+
+#[tokio::test]
+async fn transcribe_retries_in_cpu_safe_mode_after_repack_runtime_failure() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+out=""
+cpu_mode=0
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then
+    shift
+    out="$1"
+  elif [ "$1" = "-ng" ]; then
+    cpu_mode=1
+  fi
+  shift
+done
+
+if [ "$cpu_mode" -eq 0 ]; then
+  # Whisper prints noisy repack/runtime diagnostics on stderr before failing
+  # with a non-zero exit on long audio when the GPU backend can't initialize.
+  i=0
+  while [ "$i" -lt 5 ]; do
+    echo "repack tensor with q8_0_4x4" 1>&2
+    i=$((i + 1))
+  done
+  echo "REPACK = 1" 1>&2
+  echo "whisper_backend_init_gpu: no GPU found" 1>&2
+  echo "flash attention is not supported on this device" 1>&2
+  exit 1
+fi
+
+if [ -n "$out" ]; then
+  printf "cpu safe transcript\n" > "${out}.txt"
+fi
+echo "[00:00:00.000 --> 00:00:01.000] cpu safe transcript"
+exit 0
+"#,
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_clone = emitted.clone();
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            "en",
+            &WhisperOptions::default(),
+            None,
+            Arc::new(move |line: String| {
+                emitted_clone.lock().expect("emit lock poisoned").push(line);
+            }),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("transcription should succeed after cpu safe retry");
+
+    assert!(
+        transcript.text.contains("cpu safe transcript"),
+        "transcript should come from the cpu safe retry: {:?}",
+        transcript.text
+    );
+
+    let emitted_lines = emitted.lock().expect("emit lock poisoned");
+    assert!(
+        emitted_lines
+            .iter()
+            .any(|line| line.contains("Whisper fallback CPU-safe mode")),
+        "expected a CPU-safe fallback notice in the partial stream: {:?}",
+        emitted_lines
+    );
+}
+
+#[tokio::test]
+async fn cpu_safe_retry_forces_single_processor_and_no_gpu_flags() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+    let args_log = temp.path().join("args.log");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    let args_log_for_script = args_log.to_string_lossy().to_string();
+    write_executable_script(
+        &script_path,
+        &format!(
+            r#"#!/bin/sh
+# Record every invocation's args so the test can inspect the retry attempt.
+echo "INVOCATION $@ " >> "{args_log}"
+
+out=""
+cpu_mode=0
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then
+    shift
+    out="$1"
+  elif [ "$1" = "-ng" ]; then
+    cpu_mode=1
+  fi
+  shift
+done
+
+if [ "$cpu_mode" -eq 0 ]; then
+  echo "ggml_metal_buffer_init: error: failed to allocate buffer" 1>&2
+  exit 139
+fi
+
+if [ -n "$out" ]; then
+  printf "cpu single processor transcript\n" > "${{out}}.txt"
+fi
+exit 0
+"#,
+            args_log = args_log_for_script
+        ),
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let options = WhisperOptions {
+        processors: 4,
+        ..WhisperOptions::default()
+    };
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            "en",
+            &options,
+            None,
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("transcription should succeed after cpu safe retry");
+
+    assert!(
+        transcript.text.contains("cpu single processor transcript"),
+        "transcript should come from the cpu safe retry: {:?}",
+        transcript.text
+    );
+
+    // The retry invocation (the one carrying -ng) must also carry -p 1, i.e.
+    // processors overridden to single-thread even though the user asked for 4.
+    let logged = std::fs::read_to_string(&args_log).expect("failed to read args log");
+    let retry_invocations: Vec<&str> = logged.lines().filter(|line| line.contains("-ng")).collect();
+    assert!(
+        !retry_invocations.is_empty(),
+        "expected at least one cpu-safe retry invocation, got log: {logged}"
+    );
+    let retry_args = retry_invocations.last().expect("retry invocation present");
+    assert!(
+        retry_args
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair[0] == "-p" && pair[1] == "1"),
+        "cpu-safe retry must pass `-p 1` (processors overridden to 1), got: {retry_args}"
+    );
+}
+
+#[tokio::test]
+async fn no_gpu_found_with_successful_exit_stays_success_without_retry() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then
+    shift
+    out="$1"
+  fi
+  shift
+done
+
+# whisper.cpp prints "no GPU found" during init when no Metal device is
+# available, but on CPU it still completes successfully (exit 0). This must
+# NOT be treated as a retry-worthy failure.
+echo "whisper_backend_init_gpu: no GPU found" 1>&2
+echo "ggml_backend_init: CPU backend ready" 1>&2
+
+if [ -n "$out" ]; then
+  printf "successful cpu run\n" > "${out}.txt"
+fi
+exit 0
+"#,
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_clone = emitted.clone();
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            "en",
+            &WhisperOptions::default(),
+            None,
+            Arc::new(move |line: String| {
+                emitted_clone.lock().expect("emit lock poisoned").push(line);
+            }),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("successful cpu run must not trigger a retry");
+
+    assert!(
+        transcript.text.contains("successful cpu run"),
+        "transcript should be produced on the first attempt: {:?}",
+        transcript.text
+    );
+
+    let emitted_lines = emitted.lock().expect("emit lock poisoned");
+    assert!(
+        !emitted_lines
+            .iter()
+            .any(|line| line.contains("CPU-safe mode")),
+        "no CPU-safe fallback notice should be emitted for a successful run: {:?}",
+        emitted_lines
+    );
+}
+
+#[tokio::test]
+async fn cpu_safe_retry_resets_progress_to_zero_before_retrying() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+out=""
+cpu_mode=0
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then
+    shift
+    out="$1"
+  elif [ "$1" = "-ng" ]; then
+    cpu_mode=1
+  fi
+  shift
+done
+
+if [ "$cpu_mode" -eq 0 ]; then
+  # First (GPU) attempt: emit a few segments that advance progress, then crash.
+  echo "[00:00:10.000 --> 00:00:12.000] gpu segment one"
+  echo "[00:00:12.000 --> 00:00:14.000] gpu segment two"
+  echo "ggml_metal_buffer_init: error: failed to allocate buffer" 1>&2
+  exit 139
+fi
+
+# CPU-safe retry: segments restart from low timestamps.
+if [ -n "$out" ]; then
+  printf "cpu retry transcript\n" > "${out}.txt"
+fi
+echo "[00:00:00.000 --> 00:00:01.000] cpu retry transcript"
+exit 0
+"#,
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let progress: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let progress_clone = progress.clone();
+
+    engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            "en",
+            &WhisperOptions::default(),
+            None,
+            Arc::new(|_line: String| {}),
+            Arc::new(move |seconds: f32| {
+                progress_clone
+                    .lock()
+                    .expect("progress lock poisoned")
+                    .push(seconds);
+            }),
+        )
+        .await
+        .expect("transcription should succeed after cpu safe retry");
+
+    let progress_values = progress.lock().expect("progress lock poisoned").clone();
+    // The retry must reset progress to 0.0 before emitting the low-timestamp
+    // segment, so the UI is not stuck at the first attempt's last value.
+    assert!(
+        progress_values
+            .iter()
+            .any(|value| (*value - 0.0).abs() < 0.001),
+        "expected progress to be reset to 0.0 before the retry, got: {:?}",
+        progress_values
+    );
+    // And the 0.0 reset must come AFTER the first attempt advanced progress.
+    let first_nonzero = progress_values.iter().position(|value| *value > 0.0);
+    let reset_index = progress_values
+        .iter()
+        .position(|value| (*value - 0.0).abs() < 0.001);
+    if let (Some(first), Some(reset)) = (first_nonzero, reset_index) {
+        assert!(
+            reset > first,
+            "the 0.0 reset must come after the first attempt advanced progress, got: {:?}",
+            progress_values
+        );
+    }
+}
+
+#[tokio::test]
+async fn cpu_safe_retry_failure_wraps_error_and_dedups_repeated_stderr() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+cpu_mode=0
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-ng" ]; then
+    cpu_mode=1
+  fi
+  shift
+done
+
+if [ "$cpu_mode" -eq 0 ]; then
+  # First attempt crashes with a signal.
+  exit 139
+fi
+
+# CPU-safe retry also fails, after spamming 50 identical repack lines and a
+# final fatal line. The surfaced error must collapse the repetition.
+i=0
+while [ "$i" -lt 50 ]; do
+  echo "repack tensor with q8_0_4x4" 1>&2
+  i=$((i + 1))
+done
+echo "ggml_metal: fatal device error" 1>&2
+exit 1
+"#,
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let result = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            "en",
+            &WhisperOptions::default(),
+            None,
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await;
+
+    let error = result.expect_err("both attempts must fail");
+    let message = match error {
+        ApplicationError::SpeechToText(message) => message,
+        other => panic!("expected SpeechToText error, got {other:?}"),
+    };
+
+    assert!(
+        message.starts_with("Whisper retry in CPU-safe mode failed:"),
+        "final error must be wrapped with the CPU-safe retry prefix, got: {message}"
+    );
+
+    let repack_count = message.matches("repack tensor with q8_0_4x4").count();
+    assert!(
+        repack_count <= 3,
+        "repeated stderr lines must be collapsed in the surfaced error, found {repack_count} occurrences in: {message}"
+    );
+
+    assert!(
+        message.contains("ggml_metal: fatal device error"),
+        "the final fatal stderr line must survive dedup in the error, got: {message}"
+    );
 }
 
 #[tokio::test]

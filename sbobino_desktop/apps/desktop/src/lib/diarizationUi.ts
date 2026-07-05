@@ -2,6 +2,13 @@ import type { TranscriptArtifact } from "../types";
 
 export type ArtifactDiarizationUiState =
   | {
+      kind: "running";
+      speakerCount: 0;
+      speakerLabels: [];
+      error: null;
+      progress: number | null;
+    }
+  | {
       kind: "speakers_detected";
       speakerCount: number;
       speakerLabels: string[];
@@ -12,6 +19,12 @@ export type ArtifactDiarizationUiState =
       speakerCount: 0;
       speakerLabels: [];
       error: string | null;
+    }
+  | {
+      kind: "cancelled";
+      speakerCount: 0;
+      speakerLabels: [];
+      error: null;
     }
   | {
       kind: "no_speakers_detected";
@@ -50,6 +63,44 @@ export function getArtifactDiarizationUiState(
     return null;
   }
 
+  const diarizationStatus = normalizeText(
+    artifact.metadata?.speaker_diarization_status,
+  )?.toLowerCase();
+  const diarizationError = normalizeText(artifact.metadata?.speaker_diarization_error);
+  const diarizationProgress = Number(
+    normalizeText(artifact.metadata?.speaker_diarization_progress) ?? "",
+  );
+
+  if (diarizationStatus === "running") {
+    return {
+      kind: "running",
+      speakerCount: 0,
+      speakerLabels: [],
+      error: null,
+      progress: Number.isFinite(diarizationProgress)
+        ? Math.max(0, Math.min(100, diarizationProgress))
+        : null,
+    };
+  }
+
+  if (diarizationStatus === "cancelled") {
+    return {
+      kind: "cancelled",
+      speakerCount: 0,
+      speakerLabels: [],
+      error: null,
+    };
+  }
+
+  if (diarizationStatus === "failed") {
+    return {
+      kind: "failed",
+      speakerCount: 0,
+      speakerLabels: [],
+      error: diarizationError,
+    };
+  }
+
   const uniqueSpeakerLabels = Array.from(
     new Set(
       speakerLabels
@@ -64,20 +115,6 @@ export function getArtifactDiarizationUiState(
       speakerCount: uniqueSpeakerLabels.length,
       speakerLabels: uniqueSpeakerLabels,
       error: null,
-    };
-  }
-
-  const diarizationStatus = normalizeText(
-    artifact.metadata?.speaker_diarization_status,
-  )?.toLowerCase();
-  const diarizationError = normalizeText(artifact.metadata?.speaker_diarization_error);
-
-  if (diarizationStatus === "failed") {
-    return {
-      kind: "failed",
-      speakerCount: 0,
-      speakerLabels: [],
-      error: diarizationError,
     };
   }
 

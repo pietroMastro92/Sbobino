@@ -67,6 +67,7 @@ import {
 } from "lucide-react";
 import {
   analyzeArtifactEmotions,
+  cancelArtifactSpeakerDiarization,
   cancelTranscription,
   chatArtifact,
   checkUpdates,
@@ -104,6 +105,7 @@ import {
   resetPromptTemplates,
   resumeRealtime,
   restoreArtifacts,
+  runArtifactSpeakerDiarization,
   scanAutomaticImport,
   saveSettings,
   saveSettingsPartial,
@@ -112,6 +114,8 @@ import {
   startRealtime,
   startTranscription,
   stopRealtime,
+  subscribeArtifactSpeakerDiarizationProgress,
+  subscribeArtifactUpdated,
   subscribeJobCompleted,
   subscribeJobFailed,
   subscribeJobProgress,
@@ -208,6 +212,7 @@ import type {
   AiCapabilityStatus,
   AppearanceMode,
   AppSettings,
+  ArtifactSpeakerDiarizationProgress,
   AutomaticImportPostProcessingSettings,
   AutomaticImportPreset,
   AutomaticImportQueuedJob,
@@ -2156,26 +2161,43 @@ function RollingProgressValue({ value }: { value: string }): JSX.Element {
     };
   }, [settledValue, value]);
 
+  const currentChars = Array.from(settledValue);
+  const outgoingChars = outgoingValue ? Array.from(outgoingValue) : null;
+  const slotCount = Math.max(currentChars.length, outgoingChars?.length ?? 0);
+
   return (
     <span className="transcribing-cancel-pill-value" aria-hidden>
-      {outgoingValue ? (
-        <>
+      {Array.from({ length: slotCount }).map((_, index) => {
+        const currentChar = currentChars[index] ?? "";
+        const outgoingChar = outgoingChars?.[index] ?? currentChar;
+        const changed = Boolean(outgoingChars) && outgoingChar !== currentChar;
+
+        return (
           <span
-            className={`transcribing-cancel-pill-value-slot transcribing-cancel-pill-value-slot-out${isRolling ? " is-rolling" : ""}`}
+            key={`${index}-${currentChar}`}
+            className={`transcribing-cancel-pill-value-digit${changed ? " is-changing" : ""}`}
           >
-            {outgoingValue}
+            {changed ? (
+              <>
+                <span
+                  className={`transcribing-cancel-pill-value-slot transcribing-cancel-pill-value-slot-out${isRolling ? " is-rolling" : ""}`}
+                >
+                  {outgoingChar}
+                </span>
+                <span
+                  className={`transcribing-cancel-pill-value-slot transcribing-cancel-pill-value-slot-in${isRolling ? " is-rolling" : ""}`}
+                >
+                  {currentChar}
+                </span>
+              </>
+            ) : (
+              <span className="transcribing-cancel-pill-value-slot transcribing-cancel-pill-value-slot-stable">
+                {currentChar}
+              </span>
+            )}
           </span>
-          <span
-            className={`transcribing-cancel-pill-value-slot transcribing-cancel-pill-value-slot-in${isRolling ? " is-rolling" : ""}`}
-          >
-            {settledValue}
-          </span>
-        </>
-      ) : (
-        <span className="transcribing-cancel-pill-value-slot transcribing-cancel-pill-value-slot-stable">
-          {settledValue}
-        </span>
-      )}
+        );
+      })}
     </span>
   );
 }
@@ -2506,6 +2528,8 @@ type DetailToolbarProps = {
   hasArtifact: boolean;
   hasActiveJob: boolean;
   transcriptionProgress: number;
+  isSpeakerDiarizationRunning: boolean;
+  speakerDiarizationProgress: number;
   onToggleSidebar: () => void;
   onBack: () => void;
   onRenameTitle?: () => void;
@@ -2514,6 +2538,7 @@ type DetailToolbarProps = {
   onShowDetailsPanel: () => void;
   onHideDetailsPanel: () => void;
   onCancel: () => void;
+  onCancelSpeakerDiarization: () => void;
   isImprovingText?: boolean;
   onImproveText?: () => void;
   chatDisabled?: boolean;
@@ -2540,6 +2565,8 @@ function DetailToolbar({
   hasArtifact,
   hasActiveJob,
   transcriptionProgress,
+  isSpeakerDiarizationRunning,
+  speakerDiarizationProgress,
   onToggleSidebar,
   onBack,
   onRenameTitle,
@@ -2548,6 +2575,7 @@ function DetailToolbar({
   onShowDetailsPanel,
   onHideDetailsPanel,
   onCancel,
+  onCancelSpeakerDiarization,
   isImprovingText,
   onImproveText,
   chatDisabled,
@@ -2574,6 +2602,13 @@ function DetailToolbar({
     transcriptionProgress,
   );
   const cancelTranscriptionTitle = `${t("detail.cancelTranscription", "Cancel transcription")} (${roundedTranscriptionProgress}%)`;
+  const roundedSpeakerDiarizationProgress = Math.round(
+    makeProgressVisible(speakerDiarizationProgress),
+  );
+  const speakerDiarizationProgressText = formatProgressPercentageLabel(
+    speakerDiarizationProgress,
+  );
+  const cancelSpeakerDiarizationTitle = `${t("detail.stopSpeakerDetection", "Stop speaker detection")} (${roundedSpeakerDiarizationProgress}%)`;
   return (
     <header
       className={`detail-toolbar ${!leftSidebarOpen ? "sidebar-closed" : ""}`}
@@ -2738,6 +2773,30 @@ function DetailToolbar({
               <ChevronDown size={14} />
             </button>
           ) : null}
+          {hasArtifact && isSpeakerDiarizationRunning ? (
+            <button
+              className="transcribing-cancel-pill speaker-diarization-progress-pill"
+              onClick={onCancelSpeakerDiarization}
+              onMouseMove={(event: ReactMouseEvent<HTMLButtonElement>) =>
+                setCancelPillDangerProximity(event.currentTarget, event.clientX)
+              }
+              onMouseLeave={(event: ReactMouseEvent<HTMLButtonElement>) =>
+                resetCancelPillDangerProximity(event.currentTarget)
+              }
+              title={cancelSpeakerDiarizationTitle}
+              aria-label={cancelSpeakerDiarizationTitle}
+            >
+              <span className="transcribing-cancel-pill-compact" aria-hidden>
+                <ProgressRing percentage={speakerDiarizationProgress} size={20} />
+              </span>
+              <span className="transcribing-cancel-pill-expanded" aria-hidden>
+                <RollingProgressValue value={speakerDiarizationProgressText} />
+                <span className="transcribing-cancel-pill-cancel">
+                  <X size={14} />
+                </span>
+              </span>
+            </button>
+          ) : null}
           {!hasArtifact && hasActiveJob ? (
             <button
               className="transcribing-cancel-pill"
@@ -2840,7 +2899,9 @@ function TranscriptSegmentsTileSwitch({
         <span className="mode-tile-icon">
           <FileText size={18} />
         </span>
-        <span>{t("detail.transcript", "Transcript")}</span>
+        <span className="mode-tile-label">
+          {t("detail.transcript", "Transcript")}
+        </span>
       </button>
       <button
         className={detailMode === "segments" ? "mode-tile active" : "mode-tile"}
@@ -2850,7 +2911,9 @@ function TranscriptSegmentsTileSwitch({
         <span className="mode-tile-icon">
           <List size={18} />
         </span>
-        <span>{t("detail.segments", "Segments")}</span>
+        <span className="mode-tile-label">
+          {t("detail.segments", "Segments")}
+        </span>
       </button>
     </div>
   );
@@ -3052,6 +3115,8 @@ export function App({
 
   const [openArtifacts, setOpenArtifacts] = useState<TranscriptArtifact[]>([]);
   const [activeArtifactId, setActiveArtifactId] = useState<string | null>(null);
+  const [artifactDiarizationProgress, setArtifactDiarizationProgress] =
+    useState<Record<string, ArtifactSpeakerDiarizationProgress>>({});
 
   const activeArtifact = useMemo(
     () => openArtifacts.find((a) => a.id === activeArtifactId) || null,
@@ -4598,6 +4663,8 @@ export function App({
     let unsubRealtimeInput: (() => void) | undefined;
     let unsubRealtimeStatus: (() => void) | undefined;
     let unsubRealtimeSaved: (() => void) | undefined;
+    let unsubArtifactUpdated: (() => void) | undefined;
+    let unsubDiarizationProgress: (() => void) | undefined;
     let unsubProvisioningProgress: (() => void) | undefined;
     let unsubProvisioningStatus: (() => void) | undefined;
 
@@ -4768,6 +4835,49 @@ export function App({
         uCompleted();
       } else {
         unsubCompleted = uCompleted;
+      }
+
+      const uArtifactUpdated = await subscribeArtifactUpdated((artifact) => {
+        upsertArtifact(artifact);
+        setOpenArtifacts((previous) =>
+          previous.some((item) => item.id === artifact.id)
+            ? previous.map((item) => (item.id === artifact.id ? artifact : item))
+            : previous,
+        );
+        const status =
+          artifact.metadata?.speaker_diarization_status?.trim().toLowerCase() ??
+          "";
+        if (status !== "running") {
+          setArtifactDiarizationProgress((previous) => {
+            if (!previous[artifact.id]) {
+              return previous;
+            }
+            const next = { ...previous };
+            delete next[artifact.id];
+            return next;
+          });
+        }
+      });
+      if (unmounted) {
+        uArtifactUpdated();
+      } else {
+        unsubArtifactUpdated = uArtifactUpdated;
+      }
+
+      const uDiarizationProgress =
+        await subscribeArtifactSpeakerDiarizationProgress((event) => {
+          setArtifactDiarizationProgress((previous) => ({
+            ...previous,
+            [event.artifact_id]: {
+              ...event,
+              percentage: clampPercentage(event.percentage),
+            },
+          }));
+        });
+      if (unmounted) {
+        uDiarizationProgress();
+      } else {
+        unsubDiarizationProgress = uDiarizationProgress;
       }
 
       const uFailed = await subscribeJobFailed((payload) => {
@@ -5093,6 +5203,8 @@ export function App({
       unsubRealtimeInput?.();
       unsubRealtimeStatus?.();
       unsubRealtimeSaved?.();
+      unsubArtifactUpdated?.();
+      unsubDiarizationProgress?.();
       unsubProvisioningProgress?.();
       unsubProvisioningStatus?.();
       clearStartupWatchdog();
@@ -5103,6 +5215,7 @@ export function App({
     prependArtifact,
     setError,
     setProgress,
+    upsertArtifact,
   ]);
 
   useEffect(() => {
@@ -5532,6 +5645,18 @@ export function App({
   const artifactDiarizationUiState = useMemo(
     () => getArtifactDiarizationUiState(activeArtifact, knownSpeakerLabels),
     [activeArtifact, knownSpeakerLabels],
+  );
+  const activeArtifactDiarizationProgress = activeArtifact
+    ? (artifactDiarizationProgress[activeArtifact.id] ?? null)
+    : null;
+  const isArtifactDiarizationRunning =
+    artifactDiarizationUiState?.kind === "running" ||
+    activeArtifactDiarizationProgress?.state === "running";
+  const activeArtifactDiarizationPercentage = clampPercentage(
+    activeArtifactDiarizationProgress?.percentage ??
+      (artifactDiarizationUiState?.kind === "running"
+        ? (artifactDiarizationUiState.progress ?? 0)
+        : 0),
   );
   const selectedSegmentSpeakerLabel =
     selectedDetailSegment?.speakerLabel?.trim() ?? "";
@@ -8371,6 +8496,79 @@ export function App({
           "error.cancelTranscriptionFailed",
           "Failed to cancel transcription",
           cancelError,
+        ),
+      );
+    }
+  }
+
+  async function onRunSpeakerDiarization(): Promise<void> {
+    if (!activeArtifact || !activeArtifact.audio_available || isArtifactDiarizationRunning) {
+      return;
+    }
+
+    const artifactId = activeArtifact.id;
+    setArtifactDiarizationProgress((previous) => ({
+      ...previous,
+      [artifactId]: {
+        artifact_id: artifactId,
+        state: "running",
+        message: t(
+          "detail.speakerDetectionStarting",
+          "Starting speaker detection...",
+        ),
+        percentage: 0,
+      },
+    }));
+
+    try {
+      await runArtifactSpeakerDiarization(artifactId);
+      setError(null);
+    } catch (diarizationError) {
+      setArtifactDiarizationProgress((previous) => {
+        const next = { ...previous };
+        delete next[artifactId];
+        return next;
+      });
+      setError(
+        formatUiError(
+          "error.runSpeakerDiarizationFailed",
+          "Failed to start speaker detection",
+          diarizationError,
+        ),
+      );
+    }
+  }
+
+  async function onRequestCancelSpeakerDiarization(): Promise<void> {
+    if (!activeArtifact || !isArtifactDiarizationRunning) {
+      return;
+    }
+
+    const confirmed = await confirmDialog(
+      t(
+        "speakerDiarizationCancel.message",
+        "Interrompere la speaker diarization?",
+      ),
+      {
+        title: t("speakerDiarizationCancel.title", "Speaker diarization"),
+        kind: "warning",
+        okLabel: t("speakerDiarizationCancel.confirmButton", "Interrompi"),
+        cancelLabel: t("speakerDiarizationCancel.keepRunning", "Continua"),
+      },
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      await cancelArtifactSpeakerDiarization(activeArtifact.id);
+      setError(null);
+    } catch (diarizationError) {
+      setError(
+        formatUiError(
+          "error.cancelSpeakerDiarizationFailed",
+          "Failed to stop speaker detection",
+          diarizationError,
         ),
       );
     }
@@ -11762,6 +11960,86 @@ export function App({
         return null;
       }
 
+      if (artifactDiarizationUiState.kind === "running") {
+        return (
+          <div className="transcript-speaker-banner is-running">
+            <div className="transcript-speaker-banner-copy">
+              <strong>
+                {t(
+                  "detail.speakerDiarizationRunning",
+                  "Speaker diarization is running in the background.",
+                )}
+              </strong>
+              <span>
+                {t(
+                  "detail.speakerDiarizationRunningHint",
+                  "You can keep navigating and editing this transcript while speakers are assigned.",
+                )}
+              </span>
+            </div>
+            <div className="transcript-speaker-banner-actions">
+              <button
+                type="button"
+                className="secondary-button speaker-detection-progress-button"
+                onClick={() => void onRequestCancelSpeakerDiarization()}
+              >
+                <ProgressRing
+                  percentage={activeArtifactDiarizationPercentage}
+                  size={18}
+                />
+                <RollingProgressValue
+                  value={formatProgressPercentageLabel(
+                    activeArtifactDiarizationPercentage,
+                  )}
+                />
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void onRequestCancelSpeakerDiarization()}
+              >
+                {t("detail.stopSpeakerDetection", "Stop speaker detection")}
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      if (artifactDiarizationUiState.kind === "cancelled") {
+        return (
+          <div className="transcript-speaker-banner is-warning">
+            <div className="transcript-speaker-banner-copy">
+              <strong>
+                {t(
+                  "detail.speakerDiarizationCancelled",
+                  "Speaker diarization was stopped.",
+                )}
+              </strong>
+              <span>
+                {t(
+                  "detail.speakerDiarizationCancelledHint",
+                  "Run speaker detection again when you want to assign speakers to this transcript.",
+                )}
+              </span>
+            </div>
+            {activeArtifact.audio_available ? (
+              <div className="transcript-speaker-banner-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void onRunSpeakerDiarization()}
+                >
+                  {t(
+                    "detail.runSpeakerDetectionAgain",
+                    "Run speaker detection again",
+                  )}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        );
+      }
+
       if (artifactDiarizationUiState.kind === "speakers_detected") {
         return (
           <div className="transcript-speaker-banner">
@@ -11783,6 +12061,18 @@ export function App({
               >
                 {t("inspector.openSegments", "Open Segments")}
               </button>
+              {activeArtifact.audio_available ? (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void onRunSpeakerDiarization()}
+                >
+                  {t(
+                    "detail.runSpeakerDetectionAgain",
+                    "Run speaker detection again",
+                  )}
+                </button>
+              ) : null}
             </div>
           </div>
         );
@@ -11807,6 +12097,18 @@ export function App({
               <span>{diarizationError}</span>
             </div>
             <div className="transcript-speaker-banner-actions">
+              {activeArtifact.audio_available ? (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void onRunSpeakerDiarization()}
+                >
+                  {t(
+                    "detail.runSpeakerDetectionAgain",
+                    "Run speaker detection again",
+                  )}
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="secondary-button"
@@ -11855,6 +12157,18 @@ export function App({
               >
                 {t("inspector.openSegments", "Open Segments")}
               </button>
+              {activeArtifact.audio_available ? (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void onRunSpeakerDiarization()}
+                >
+                  {t(
+                    "detail.runSpeakerDetectionAgain",
+                    "Run speaker detection again",
+                  )}
+                </button>
+              ) : null}
             </div>
           </div>
         );
@@ -11940,12 +12254,19 @@ export function App({
       }
 
       switch (artifactDiarizationUiState.kind) {
+        case "running":
+          return t("detail.detectingSpeakers", "Detecting speakers");
         case "speakers_detected":
           return t("detail.speakersDetected", "{count} speakers detected", {
             count: artifactDiarizationUiState.speakerCount,
           });
         case "failed":
           return t("detail.diarizationFailedShort", "Diarization failed");
+        case "cancelled":
+          return t(
+            "detail.speakerDiarizationCancelledShort",
+            "Speaker detection stopped",
+          );
         case "no_speakers_detected":
           return t("detail.noSpeakersShort", "No speakers detected");
         case "not_requested":
@@ -11985,6 +12306,14 @@ export function App({
       }
 
       switch (artifactDiarizationUiState.kind) {
+        case "running":
+          return (
+            activeArtifactDiarizationProgress?.message ||
+            t(
+              "detail.speakerDiarizationRunningHint",
+              "You can keep navigating and editing this transcript while speakers are assigned.",
+            )
+          );
         case "speakers_detected":
           return formatSpeakerSummary(artifactDiarizationUiState.speakerLabels);
         case "failed":
@@ -11994,6 +12323,11 @@ export function App({
               "detail.diarizationFailedFallback",
               "Speaker diarization failed after transcription.",
             )
+          );
+        case "cancelled":
+          return t(
+            "detail.speakerDiarizationCancelledHint",
+            "Run speaker detection again when you want to assign speakers to this transcript.",
           );
         case "no_speakers_detected":
           return t(
@@ -12131,15 +12465,63 @@ export function App({
           <h4>{t("inspector.people")}</h4>
           <div
             className={`pill ${
-              artifactDiarizationUiState?.kind === "failed"
+              artifactDiarizationUiState?.kind === "failed" ||
+              artifactDiarizationUiState?.kind === "cancelled"
                 ? "pill-warning"
                 : artifactDiarizationUiState?.kind === "speakers_detected"
                   ? "pill-success"
-                  : ""
+                  : artifactDiarizationUiState?.kind === "running"
+                    ? "pill-progress"
+                    : ""
             }`}
           >
             {peoplePillText}
           </div>
+          {activeArtifact?.audio_available ? (
+            <div className="speaker-detection-actions">
+              {isArtifactDiarizationRunning ? (
+                <>
+                  <button
+                    type="button"
+                    className="secondary-button speaker-detection-progress-button"
+                    onClick={() => void onRequestCancelSpeakerDiarization()}
+                    title={t(
+                      "detail.stopSpeakerDetection",
+                      "Stop speaker detection",
+                    )}
+                  >
+                    <ProgressRing
+                      percentage={activeArtifactDiarizationPercentage}
+                      size={16}
+                    />
+                    <RollingProgressValue
+                      value={formatProgressPercentageLabel(
+                        activeArtifactDiarizationPercentage,
+                      )}
+                    />
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => void onRequestCancelSpeakerDiarization()}
+                  >
+                    {t("detail.stopSpeakerDetection", "Stop speaker detection")}
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void onRunSpeakerDiarization()}
+                >
+                  {t(
+                    "detail.runSpeakerDetectionAgain",
+                    "Run speaker detection again",
+                  )}
+                </button>
+              )}
+            </div>
+          ) : null}
           {showSpeakerManagement && knownSpeakerLabels.length > 0 ? (
             <div className="speaker-known-list">
               <span className="speaker-known-label">
@@ -13071,6 +13453,8 @@ export function App({
             hasArtifact={Boolean(activeArtifact)}
             hasActiveJob={Boolean(focusedJobId)}
             transcriptionProgress={displayedTranscriptionPercentage}
+            isSpeakerDiarizationRunning={isArtifactDiarizationRunning}
+            speakerDiarizationProgress={activeArtifactDiarizationPercentage}
             onToggleSidebar={() => setLeftSidebarOpen((open) => !open)}
             onBack={() => {
               if (!activeArtifact && focusedJobId) {
@@ -13098,6 +13482,9 @@ export function App({
             onShowDetailsPanel={() => setRightSidebarOpen(true)}
             onHideDetailsPanel={() => setRightSidebarOpen(false)}
             onCancel={() => void onCancel()}
+            onCancelSpeakerDiarization={() =>
+              void onRequestCancelSpeakerDiarization()
+            }
             isImprovingText={isImprovingText}
             onImproveText={onImproveText}
             chatDisabled={!aiFeaturesAvailable}

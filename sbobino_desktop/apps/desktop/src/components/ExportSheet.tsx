@@ -544,7 +544,7 @@ export function ExportSheet({
           includeSpeakerNames: showSpeakerNames,
         },
         segments: exportSegments,
-        contentOverride: transcriptText,
+        contentOverride: exportContent,
       });
       if (didExport) {
         onClose();

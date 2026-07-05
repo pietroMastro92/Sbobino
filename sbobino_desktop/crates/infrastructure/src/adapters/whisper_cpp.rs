@@ -533,6 +533,40 @@ impl WhisperCppEngine {
         normalized
     }
 
+    /// Summarize raw stderr for user-facing messages: collapse runs of identical
+    /// consecutive lines into a single `<N identical lines: "...">` marker, drop
+    /// pure-whitespace lines, and keep only a tail of the result so a verbose
+    /// backend log never floods the UI. The full stderr is still used internally
+    /// for retry classification — this only shapes what we show the user.
+    fn summarize_stderr_for_user(raw_stderr: &str) -> String {
+        const MAX_TAIL_LINES: usize = 8;
+
+        let mut collapsed: Vec<String> = Vec::new();
+        for line in raw_stderr.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match collapsed.last() {
+                Some(last) if last == trimmed => {
+                    // consecutive duplicate — skip, counted after the run ends
+                }
+                _ => collapsed.push(trimmed.to_string()),
+            }
+        }
+
+        let tail: Vec<&String> = collapsed
+            .iter()
+            .rev()
+            .take(MAX_TAIL_LINES)
+            .collect::<Vec<_>>();
+        tail.into_iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn should_retry_with_cpu_fallback(error: &WhisperCliAttemptError) -> bool {
         let haystack = format!(
             "{}\n{}",
@@ -540,7 +574,10 @@ impl WhisperCppEngine {
             error.stderr_output.to_ascii_lowercase()
         );
 
-        let metal_failure = haystack.contains("ggml_metal")
+        // Hard GPU failure patterns: these are unambiguous Metal/backend
+        // breakdowns, so they always justify a CPU-safe retry regardless of
+        // the exit code.
+        let gpu_failure = haystack.contains("ggml_metal")
             || haystack.contains("metal buffer")
             || haystack.contains("failed to allocate buffer")
             || haystack.contains("use gpu    = 1");
@@ -551,7 +588,21 @@ impl WhisperCppEngine {
             .unwrap_or(false)
             && status_signal_is_crash(error.status);
 
-        metal_failure || crashed
+        // Runtime-noise patterns that whisper.cpp also prints during normal
+        // GPU initialization (e.g. `repack tensor`, `flash attention`, backend
+        // buffer setup). On their own they are not failures, so they only
+        // qualify for a CPU-safe retry when the process exited non-zero or
+        // crashed — i.e. the noisy init did not actually succeed.
+        let exited_nonzero = error.status.map(|s| !s.success()).unwrap_or(false);
+        let runtime_failure = exited_nonzero
+            && (haystack.contains("repack tensor")
+                || haystack.contains("q8_0_4x4")
+                || haystack.contains("repack = 1")
+                || haystack.contains("flash attention")
+                || haystack.contains("backend init")
+                || haystack.contains("backend buffer"));
+
+        gpu_failure || crashed || runtime_failure
     }
 
     fn configure_command_environment(command: &mut Command, binary_path: &str) {
@@ -893,21 +944,34 @@ impl WhisperCppEngine {
         {
             Ok(output) => Ok(output),
             Err(error) if Self::should_retry_with_cpu_fallback(&error) => {
-                emit_partial(
-                    "Whisper GPU execution failed; retrying in CPU-safe mode.".to_string(),
-                );
+                emit_partial("Whisper fallback CPU-safe mode...".to_string());
+                // Reset progress before the retry so the UI does not stay stuck
+                // at the first attempt's last value while the CPU-safe run
+                // replays the audio from the beginning.
+                emit_progress_seconds(0.0);
+                // Force a single processor for the CPU-safe retry: multi-processor
+                // audio-chunk splitting relies on the GPU path that just failed,
+                // and on CPU it can trigger the same runtime failures we are
+                // recovering from.
+                let mut fallback_options = options.clone();
+                fallback_options.processors = 1;
                 self.run_whisper_cli_attempt(
                     input_wav,
                     model_path,
                     language_code,
-                    options,
+                    &fallback_options,
                     total_audio_seconds,
                     emit_partial,
                     emit_progress_seconds,
                     WhisperCliExecutionMode::CpuFallback,
                 )
                 .await
-                .map_err(|retry_error| ApplicationError::SpeechToText(retry_error.message))
+                .map_err(|retry_error| {
+                    let summary = Self::summarize_stderr_for_user(&retry_error.stderr_output);
+                    ApplicationError::SpeechToText(format!(
+                        "Whisper retry in CPU-safe mode failed: {summary}"
+                    ))
+                })
             }
             Err(error) => Err(ApplicationError::SpeechToText(error.message)),
         }
@@ -916,10 +980,22 @@ impl WhisperCppEngine {
 
 #[cfg(unix)]
 fn status_signal_is_crash(status: Option<ExitStatus>) -> bool {
-    matches!(
-        status.and_then(|value| value.signal()),
-        Some(11) | Some(6) | Some(10)
-    )
+    const CRASH_SIGNALS: [i32; 3] = [11, 6, 10]; // SIGSEGV, SIGABRT, SIGBUS
+    status
+        .and_then(|value| {
+            // A process killed by a signal reports it via `.signal()`. But when
+            // whisper-cli (or a wrapper script) is itself the child that exits
+            // with `128 + signal`, the shell surfaces it as an exit code rather
+            // than a signal — so we also recognize the `128 + n` form.
+            if let Some(signal) = value.signal() {
+                return Some(signal);
+            }
+            value
+                .code()
+                .filter(|code| *code >= 128)
+                .map(|code| code - 128)
+        })
+        .is_some_and(|value| CRASH_SIGNALS.contains(&value))
 }
 
 #[cfg(not(unix))]

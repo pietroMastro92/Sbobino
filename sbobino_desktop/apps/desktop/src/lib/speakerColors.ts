@@ -2,10 +2,11 @@ const SPEAKER_COLOR_PALETTE = [
   "#4F7CFF",
   "#EC6A5E",
   "#27A376",
-  "#B06BF2",
   "#D88B15",
   "#1293A5",
-  "#E255A1",
+  "#C85F39",
+  "#5F8D3D",
+  "#B04A64",
   "#6C7A2D",
 ];
 

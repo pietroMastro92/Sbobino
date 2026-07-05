@@ -30,6 +30,20 @@ asr_default_parakeet_fixture_dir() {
   printf '%s\n' "$HOME/Library/Application Support/$app_id/parakeet-fixtures/tests/fixtures"
 }
 
+asr_default_siu_audio() {
+  local candidate
+  for candidate in \
+    "$HOME/Desktop/Automatic_transc/SIU_19062026.m4a" \
+    "$HOME/Downloads/SIU_19062026.m4a" \
+    "$HOME/Documents/SIU_19062026.m4a"; do
+    if [[ -f "$candidate" ]]; then
+      cd "$(dirname "$candidate")" && printf '%s/%s\n' "$(pwd)" "$(basename "$candidate")"
+      return 0
+    fi
+  done
+  return 1
+}
+
 asr_resolve_source() {
   local root_dir=${1:-$(asr_repo_root)}
   local sample=${SBOBINO_ASR_SAMPLE:-artemis}
@@ -55,8 +69,16 @@ asr_resolve_source() {
         ASR_SOURCE_PATH="$fixture_dir/$fixture"
       fi
       ;;
+    siu)
+      if [[ -n "${SBOBINO_SIU_AUDIO:-}" ]]; then
+        ASR_SOURCE_PATH=$SBOBINO_SIU_AUDIO
+      else
+        ASR_SOURCE_PATH=$(asr_default_siu_audio) \
+          || asr_fail "SBOBINO_ASR_SAMPLE=siu requires SBOBINO_SIU_AUDIO when SIU_19062026.m4a is not in a default local path"
+      fi
+      ;;
     *)
-      asr_fail "unsupported SBOBINO_ASR_SAMPLE '$sample' (expected artemis or parakeet_fixture)"
+      asr_fail "unsupported SBOBINO_ASR_SAMPLE '$sample' (expected artemis, parakeet_fixture, or siu)"
       ;;
   esac
 
