@@ -176,7 +176,7 @@ if as_third_path.is_file():
         )
 PY
 
-gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease=false
+gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease=false --latest
 
 STABLE_RELEASE_RETENTION=${SBOBINO_STABLE_RELEASE_RETENTION:-2}
 if ! [[ "$STABLE_RELEASE_RETENTION" =~ ^[0-9]+$ ]] || [[ "$STABLE_RELEASE_RETENTION" -lt 1 ]]; then

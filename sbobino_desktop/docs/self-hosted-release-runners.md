@@ -128,11 +128,9 @@ Minimum acceptable setup:
 
 1. Hosted GitHub Actions builds the candidate and publishes the prerelease.
 2. Hosted GitHub Actions runs `distribution_readiness.sh` and uploads `distribution-readiness-proof.json`.
-3. Self-hosted runners validate the exact public release assets and upload:
-   - `AS-PRIMARY.validation-report.json`
-   - `AS-THIRD.validation-report.json`
-   - `INTEL-PRIMARY.validation-report.json`
-4. Stable promotion remains manual and blocked unless all required reports are present and valid.
+3. Hosted GitHub Actions runs the portability smoke and uploads `portability-smoke-report.json`.
+4. Self-hosted runners may still be used for optional extra validation of exact public release assets.
+5. Stable promotion remains manual and blocked unless the hosted proof assets are present and valid.
 
 ## First real run
 

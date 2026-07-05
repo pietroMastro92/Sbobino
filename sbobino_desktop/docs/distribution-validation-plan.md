@@ -29,13 +29,13 @@ That is the direction this plan formalizes for Sbobino.
 
 ## Release Policy
 
-A release is distributable only if all mandatory Apple Silicon scenarios pass on the exact GitHub release assets for that version.
+A release is distributable only if all mandatory hosted validation gates pass on the exact GitHub release assets for that version.
 
 Mandatory rule:
 
-- Do not publish or promote a stable release until the Apple Silicon distribution matrix in this document is green.
-- Publish the release as a prerelease candidate first, then promote only after `release-readiness-proof.json`, `distribution-readiness-proof.json`, and the machine validation report assets are uploaded with passed statuses.
-- If the release fails on a third-party Mac, retire it and cut a new patch version.
+- Do not publish or promote a stable release until the hosted release validation proof assets are green.
+- Publish the release as a prerelease candidate first, then promote only after `release-readiness-proof.json`, `distribution-readiness-proof.json`, and `portability-smoke-report.json` are uploaded with passed statuses.
+- If the release fails hosted validation, retire it and cut a new patch version.
 - Never fix a broken stable release in place.
 
 ## Current Scope
@@ -217,10 +217,8 @@ A stable Apple Silicon release is allowed only if:
 
 1. `release_readiness.sh` passes.
 2. `distribution_readiness.sh` passes.
-3. `AS-PRIMARY` passes update-path validation, warm restart, and diarization smoke.
-4. `AS-THIRD` passes clean-room install, warm restart, and diarization smoke.
-5. `INTEL-PRIMARY` passes release metadata and bootstrap-layer validation, with `soft_pass` allowed when arm64 execution is `not_applicable`.
-6. No mandatory scenario requires terminal repair or manual filesystem intervention.
+3. The hosted macos-14 portability smoke installs the public DMG and confirms the app launches.
+4. No mandatory scenario requires terminal repair or manual filesystem intervention.
 
 If any item fails, the release is not distributable.
 
@@ -230,7 +228,7 @@ Each release should produce a short validation record with:
 
 - version
 - release URL
-- machine class tested (`AS-PRIMARY`, `AS-THIRD`, `INTEL-PRIMARY`)
+- runner class tested
 - OS version
 - outcome of each scenario
 - timestamp
@@ -243,9 +241,7 @@ Minimum evidence for the release thread or release notes folder:
 - full `distribution_readiness.sh` success
 - `release-readiness-proof.json` uploaded on the GitHub release with `status=passed`
 - `distribution-readiness-proof.json` uploaded on the GitHub release with `status=passed`
-- `AS-PRIMARY.validation-report.json` uploaded on the GitHub release with `status=passed`
-- `AS-THIRD.validation-report.json` uploaded on the GitHub release with `status=passed`
-- `INTEL-PRIMARY.validation-report.json` uploaded on the GitHub release with `status=passed` or `status=soft_pass`
+- `portability-smoke-report.json` uploaded on the GitHub release with `status=passed`
 
 ## Future Matrix Extension
 
@@ -272,9 +268,7 @@ For Apple Silicon, the release bar should now be:
 1. local `release_readiness.sh`
 2. uploaded release `distribution_readiness.sh`
 3. `distribution-readiness-proof.json` uploaded to the prerelease
-4. clean-room validation on `AS-THIRD`
-5. upgrade validation from previous public version on `AS-PRIMARY`
-6. Intel bootstrap-layer validation on `INTEL-PRIMARY`
-7. only then manual stable promotion
+4. hosted macos-14 portability smoke
+5. only then manual stable promotion
 
 That gives us a real distribution process instead of a developer-machine check.

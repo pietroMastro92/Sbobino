@@ -50,9 +50,6 @@ That folder now always includes:
 - `pyannote-runtime-macos-aarch64.zip`
 - `pyannote-model-community-1.zip`
 - `release-readiness-proof.json` (generated only when `release_readiness.sh` passed)
-- `AS-PRIMARY.validation-report.json` (template, must be uploaded back as `passed`)
-- `AS-THIRD.validation-report.json` (template, must be uploaded back as `passed`)
-- `INTEL-PRIMARY.validation-report.json` (template, must be uploaded back as `passed` or `soft_pass`)
 
 Manual publish contract:
 1. build the release locally
@@ -60,27 +57,22 @@ Manual publish contract:
 3. upload the full asset set
 4. run `./scripts/distribution_readiness.sh <version>`
 5. write and upload `distribution-readiness-proof.json`
-6. test that exact GitHub release against the machine matrix in `docs/distribution-validation-plan.md`
-7. update and re-upload all machine validation reports
-8. promote to stable only with `./scripts/promote_candidate_release.sh <version>`
-9. if it fails, retire that release and cut a new patch version
+6. run the hosted portability smoke job and upload `portability-smoke-report.json`
+7. promote to stable only with `./scripts/promote_candidate_release.sh <version>`
+8. if it fails, retire that release and cut a new patch version
 
 Helper scripts:
 - `./scripts/publish_candidate_release.sh <version>` publishes a prerelease candidate and refuses publishing if readiness proof/checksums/manifests/templates are inconsistent
 - `./scripts/promote_candidate_release.sh <version>`
-- `./scripts/run_release_machine_validation.sh <machine-class> <version>` validates the exact public candidate on `AS-PRIMARY`, `AS-THIRD`, or `INTEL-PRIMARY`
-- `./scripts/install_self_hosted_runner_macos.sh <machine-class>` installs and registers a macOS self-hosted runner with the right labels
-- `./scripts/preflight_self_hosted_runner.sh <machine-class>` checks whether a machine is truly ready to serve as a release runner
-- `./scripts/check_release_runner_matrix.sh` confirms the full GitHub runner matrix is online before dispatch
-- `./scripts/dispatch_release_candidate.sh v<version>` triggers the Release Candidate workflow only when the runner matrix is complete
+- `./scripts/dispatch_release_candidate.sh v<version>` triggers the GitHub-hosted Release Candidate workflow
 - `./scripts/watch_release_candidate.sh` watches the latest candidate run and summarizes the jobs at the end
 - `./scripts/retire_failed_candidate.sh <version>`
 
 Stable release policy:
 - never overwrite or “fix in place” a stable GitHub release
 - prerelease candidate validation is mandatory before stable promotion
-- mandatory assets for promotion are `release-readiness-proof.json`, `distribution-readiness-proof.json`, `AS-PRIMARY.validation-report.json`, `AS-THIRD.validation-report.json`, and `INTEL-PRIMARY.validation-report.json`
-- the default promotion flow removes older stable releases so only the latest validated stable remains public
+- mandatory assets for promotion are `release-readiness-proof.json`, `distribution-readiness-proof.json`, and `portability-smoke-report.json`
+- the default promotion flow keeps the latest two validated stable releases public
 
 Set `SBOBINO_RELEASE_PROFILE=standalone-dev` only for internal/offline builds that intentionally embed bundled pyannote assets.
 

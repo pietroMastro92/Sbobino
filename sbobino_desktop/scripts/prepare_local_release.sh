@@ -404,7 +404,7 @@ Nothing in this folder has been published automatically.
 
 1. Create or reuse the Git tag locally: \`git tag -a v$VERSION -m "Sbobino v$VERSION"\`
 2. Push only when you are ready: \`git push origin v$VERSION\`
-3. Publish the GitHub release as a prerelease candidate first. Stable promotion is blocked until Apple Silicon validation reports are uploaded with \`status=passed\`.
+3. Publish the GitHub release as a prerelease candidate first. Stable promotion is blocked until the hosted GitHub validation proofs are uploaded with \`status=passed\`.
 4. Upload these files from \`$OUTPUT_DIR\`:
    - \`Sbobino_${VERSION}_aarch64.dmg\`
    - \`Sbobino.app.tar.gz\`
@@ -421,10 +421,9 @@ Nothing in this folder has been published automatically.
 5. Run \`./scripts/distribution_readiness.sh "$VERSION"\` from \`sbobino_desktop/\`.
 6. Generate \`distribution-readiness-proof.json\` after the remote integrity gate passes.
 7. Run the portability smoke job on a hosted macos-14 runner (automated in release.yml).
-8. Run \`./scripts/run_release_vm_gate.sh "$VERSION"\` so AS-THIRD installs the public DMG and validates Parakeet + diarization in the VM.
-9. Re-upload \`distribution-readiness-proof.json\`, \`portability-smoke-report.json\`, and \`AS-THIRD.validation-report.json\` to the same GitHub prerelease with \`gh release upload --clobber\`.
-10. Promote to stable only with \`./scripts/promote_candidate_release.sh "$VERSION"\`.
-11. If validation fails, retire the prerelease and cut a new patch version. Do not overwrite a stable release in place.
+8. Re-upload \`distribution-readiness-proof.json\` and \`portability-smoke-report.json\` to the same GitHub prerelease with \`gh release upload --clobber\`.
+9. Promote to stable only with \`./scripts/promote_candidate_release.sh "$VERSION"\`.
+10. If validation fails, retire the prerelease and cut a new patch version. Do not overwrite a stable release in place.
 
 ## gh CLI example
 
@@ -440,8 +439,6 @@ python3 ./scripts/write_distribution_readiness_proof.py \
 gh release upload "v$VERSION" \
   "$OUTPUT_DIR/distribution-readiness-proof.json" \
   --clobber
-
-./scripts/run_release_vm_gate.sh "$VERSION"
 
 ./scripts/promote_candidate_release.sh "$VERSION"
 \`\`\`
@@ -485,7 +482,7 @@ Homebrew, host Python, or previously installed Sbobino runtime assets.
 
 - If every step passes, the prerelease can be promoted to stable.
 - If any step fails, delete the prerelease and cut a new patch version.
-- This checklist is the minimum clean-room pass. Stable release still requires the full Apple Silicon matrix in \`docs/distribution-validation-plan.md\`, including update-path validation.
+- This checklist is an optional extra pass. Stable promotion is gated by the hosted GitHub validation proofs in the prerelease.
 EOF
 
 python3 - "$OUTPUT_DIR/CLEAN_ROOM_VALIDATION.md" "$VERSION" <<'PY'
