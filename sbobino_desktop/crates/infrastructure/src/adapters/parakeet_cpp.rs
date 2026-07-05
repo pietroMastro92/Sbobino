@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tempfile::TempDir;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
@@ -27,11 +27,13 @@ const PREVIEW_CHUNK_SECONDS: f32 = 8.0;
 const PREVIEW_MAX_CHUNKS: usize = 2;
 const PREVIEW_CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
 const LONG_FILE_THRESHOLD_SECONDS: f32 = 10.0 * 60.0;
-const LONG_FILE_TARGET_CHUNK_SECONDS: f32 = 5.0 * 60.0;
-const LONG_FILE_RETRY_CHUNK_SECONDS: [f32; 3] = [2.0 * 60.0, 60.0, 30.0];
-const LONG_FILE_BOUNDARY_SNAP_SECONDS: f32 = 15.0;
+const LONG_FILE_FAST_START_CHUNK_SECONDS: f32 = 2.0 * 60.0;
+const LONG_FILE_TARGET_CHUNK_SECONDS: f32 = 8.0 * 60.0;
+const LONG_FILE_RETRY_CHUNK_SECONDS: [f32; 3] = [5.0 * 60.0, 2.0 * 60.0, 60.0];
+const LONG_FILE_BOUNDARY_SNAP_SECONDS: f32 = 20.0;
 const LONG_FILE_BOUNDARY_RMS_WINDOW_SECONDS: f32 = 0.5;
-const LONG_FILE_OVERLAP_SECONDS: f32 = 2.0;
+const LONG_FILE_CONTEXT_SECONDS: f32 = 45.0;
+const LONG_FILE_TAIL_PAD_SECONDS: f32 = 2.0;
 const OVERLAP_DEDUPE_TOLERANCE_SECONDS: f32 = 0.05;
 
 #[derive(Debug, Clone)]
@@ -90,16 +92,30 @@ struct PreviewChunk {
 struct AudioChunk {
     index: usize,
     path: PathBuf,
-    start_seconds: f32,
-    end_seconds: f32,
+    decode_start_seconds: f32,
+    decode_end_seconds: f32,
+    commit_start_seconds: f32,
+    commit_end_seconds: f32,
 }
 
 #[derive(Debug, Deserialize)]
 struct WorkerChunkLine {
     index: usize,
-    start: f32,
-    end: f32,
+    decode_start: f32,
+    decode_end: f32,
+    commit_start: f32,
+    commit_end: f32,
     result: ParakeetJsonOutput,
+}
+
+/// Normalize a single word for overlap deduplication: lowercase, strip
+/// punctuation/whitespace. Words that normalize to the same key AND overlap in
+/// time are treated as the same word transcribed by two adjacent chunks.
+fn normalize_word_text(text: &str) -> String {
+    text.trim()
+        .to_lowercase()
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .to_string()
 }
 
 impl ParakeetCppEngine {
@@ -319,6 +335,7 @@ impl ParakeetCppEngine {
         Ok(TranscriptionOutput {
             text: text.clone(),
             segments: normalize_transcript_segments(&text, &raw_segments, total_audio_seconds),
+            effective_model: None,
         })
     }
 
@@ -1252,21 +1269,36 @@ impl ParakeetCppEngine {
         let total_frames = samples.len();
         let target_frames = ((target_seconds.max(30.0) * spec.sample_rate as f32).round() as usize)
             .max(sample_rate);
+        let fast_start_frames = ((LONG_FILE_FAST_START_CHUNK_SECONDS
+            .min(target_seconds)
+            .max(30.0)
+            * spec.sample_rate as f32)
+            .round() as usize)
+            .max(sample_rate)
+            .min(target_frames);
         let snap_radius = ((LONG_FILE_BOUNDARY_SNAP_SECONDS * spec.sample_rate as f32).round()
             as usize)
             .max(sample_rate);
         let rms_window = ((LONG_FILE_BOUNDARY_RMS_WINDOW_SECONDS * spec.sample_rate as f32).round()
             as usize)
             .max(1);
-        let overlap_frames = ((LONG_FILE_OVERLAP_SECONDS * spec.sample_rate as f32).round()
+        let context_frames = ((LONG_FILE_CONTEXT_SECONDS * spec.sample_rate as f32).round()
             as usize)
-            .min(sample_rate * 10);
+            .min(total_frames);
+        let tail_pad_frames = ((LONG_FILE_TAIL_PAD_SECONDS * spec.sample_rate as f32).round()
+            as usize)
+            .min(sample_rate * 5);
 
         let mut boundaries = vec![0usize];
         let mut cursor = 0usize;
         while cursor + target_frames < total_frames {
-            let ideal = cursor + target_frames;
-            let min_next = cursor + sample_rate.min(target_frames / 2);
+            let current_target_frames = if cursor == 0 {
+                fast_start_frames
+            } else {
+                target_frames
+            };
+            let ideal = cursor + current_target_frames;
+            let min_next = cursor + sample_rate.min(current_target_frames / 2);
             let boundary = Self::quietest_boundary(&samples, ideal, snap_radius, rms_window)
                 .clamp(min_next.min(total_frames), total_frames);
             if boundary <= cursor || total_frames.saturating_sub(boundary) < sample_rate {
@@ -1290,15 +1322,17 @@ impl ParakeetCppEngine {
         let mut chunks = Vec::new();
         for pair in boundaries.windows(2) {
             let index = chunks.len();
-            let logical_start = pair[0];
-            let logical_end = pair[1];
-            if logical_end <= logical_start {
+            let commit_start = pair[0];
+            let commit_end = pair[1];
+            if commit_end <= commit_start {
                 continue;
             }
-            let write_start = if index == 0 {
-                logical_start
+            let decode_start = commit_start.saturating_sub(context_frames);
+            let decode_end = (commit_end + context_frames).min(total_frames);
+            let pad_frames = if commit_end == total_frames {
+                tail_pad_frames
             } else {
-                logical_start.saturating_sub(overlap_frames)
+                0
             };
             let path = temp_dir.path().join(format!("chunk-{index:04}.wav"));
             let mut writer = hound::WavWriter::create(&path, spec).map_err(|error| {
@@ -1307,10 +1341,18 @@ impl ParakeetCppEngine {
                     path.display()
                 ))
             })?;
-            for sample in &samples[write_start..logical_end] {
+            for sample in &samples[decode_start..decode_end] {
                 writer.write_sample(*sample).map_err(|error| {
                     ApplicationError::SpeechToText(format!(
                         "failed to write Parakeet final chunk {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            }
+            for _ in 0..pad_frames {
+                writer.write_sample(0i16).map_err(|error| {
+                    ApplicationError::SpeechToText(format!(
+                        "failed to pad Parakeet final chunk {}: {error}",
                         path.display()
                     ))
                 })?;
@@ -1324,8 +1366,10 @@ impl ParakeetCppEngine {
             chunks.push(AudioChunk {
                 index,
                 path,
-                start_seconds: write_start as f32 / spec.sample_rate as f32,
-                end_seconds: logical_end as f32 / spec.sample_rate as f32,
+                decode_start_seconds: decode_start as f32 / spec.sample_rate as f32,
+                decode_end_seconds: (decode_end + pad_frames) as f32 / spec.sample_rate as f32,
+                commit_start_seconds: commit_start as f32 / spec.sample_rate as f32,
+                commit_end_seconds: commit_end as f32 / spec.sample_rate as f32,
             });
         }
 
@@ -1393,10 +1437,12 @@ impl ParakeetCppEngine {
         for chunk in chunks {
             writeln!(
                 manifest,
-                "{}\t{:.3}\t{:.3}\t{}",
+                "{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}",
                 chunk.index,
-                chunk.start_seconds,
-                chunk.end_seconds,
+                chunk.decode_start_seconds,
+                chunk.decode_end_seconds,
+                chunk.commit_start_seconds,
+                chunk.commit_end_seconds,
                 chunk.path.display()
             )
             .map_err(|error| {
@@ -1412,7 +1458,11 @@ impl ParakeetCppEngine {
         &self,
         worker_path: &Path,
         model_path: &Path,
+        language_code: &str,
         chunks: &[AudioChunk],
+        total_audio_seconds: Option<f32>,
+        emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<Vec<(AudioChunk, TranscriptionOutput)>, ApplicationError> {
         let manifest = Self::write_worker_manifest(chunks)?;
         let mut command = Command::new(worker_path);
@@ -1422,27 +1472,50 @@ impl ParakeetCppEngine {
             .arg(model_path)
             .arg("--manifest")
             .arg(manifest.path())
+            .arg("--lang")
+            .arg(Self::parakeet_target_lang(language_code))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         command.kill_on_drop(true);
-        let output = command.output().await.map_err(|error| {
+        let mut child = command.spawn().map_err(|error| {
             ApplicationError::SpeechToText(format!(
                 "parakeet-batch-json failed to start at '{}': {error}",
                 worker_path.display()
             ))
         })?;
-        if !output.status.success() {
-            return Err(Self::parakeet_command_failure(
-                "parakeet-batch-json failed",
-                &output.stderr,
-                Some(output.status.to_string()),
-            ));
-        }
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ApplicationError::SpeechToText("parakeet-batch-json stdout was unavailable".to_string())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ApplicationError::SpeechToText("parakeet-batch-json stderr was unavailable".to_string())
+        })?;
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            let mut tail = Vec::<String>::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                if tail.len() >= 120 {
+                    tail.remove(0);
+                }
+                tail.push(line);
+            }
+            tail.join("\n")
+        });
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let mut results = Vec::new();
-        for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-            let parsed: WorkerChunkLine = serde_json::from_str(line).map_err(|error| {
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        while let Some(line) = stdout_lines.next_line().await.map_err(|error| {
+            ApplicationError::SpeechToText(format!(
+                "failed to read parakeet-batch-json output: {error}"
+            ))
+        })? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parsed: WorkerChunkLine = serde_json::from_str(&line).map_err(|error| {
                 ApplicationError::SpeechToText(format!(
                     "failed to parse parakeet-batch-json output: {error}"
                 ))
@@ -1459,10 +1532,43 @@ impl ParakeetCppEngine {
             };
             let mut output = Self::transcription_from_parakeet_json(
                 parsed.result,
-                Some((parsed.end - parsed.start).max(0.0)),
+                Some((parsed.decode_end - parsed.decode_start).max(0.0)),
             )?;
-            Self::offset_transcription_output(&mut output, parsed.start);
+            Self::offset_transcription_output(&mut output, parsed.decode_start);
+            Self::filter_transcription_to_commit_window(
+                &mut output,
+                parsed.commit_start,
+                parsed.commit_end,
+            );
             results.push((chunk, output));
+            results.sort_by_key(|(chunk, _)| chunk.index);
+            if let Some(snapshot) =
+                Self::merge_chunk_transcriptions_snapshot(&results, total_audio_seconds)?
+            {
+                emit_partial(format!("{DELTA_REPLACE_PREFIX}{}", snapshot.text));
+                if let Some((latest_chunk, _)) = results.iter().max_by_key(|(chunk, _)| chunk.index)
+                {
+                    emit_progress_seconds(latest_chunk.commit_end_seconds);
+                }
+            }
+        }
+
+        let status = child.wait().await.map_err(|error| {
+            ApplicationError::SpeechToText(format!(
+                "failed to wait for parakeet-batch-json: {error}"
+            ))
+        })?;
+        let stderr = stderr_task.await.map_err(|error| {
+            ApplicationError::SpeechToText(format!(
+                "failed to join parakeet-batch-json stderr reader: {error}"
+            ))
+        })?;
+        if !status.success() {
+            return Err(Self::parakeet_command_failure(
+                "parakeet-batch-json failed",
+                stderr.as_bytes(),
+                Some(status.to_string()),
+            ));
         }
         if results.len() != chunks.len() {
             return Err(ApplicationError::SpeechToText(format!(
@@ -1515,9 +1621,14 @@ impl ParakeetCppEngine {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut parsed = Self::parse_json_output(
             &stdout,
-            Some((chunk.end_seconds - chunk.start_seconds).max(0.0)),
+            Some((chunk.decode_end_seconds - chunk.decode_start_seconds).max(0.0)),
         )?;
-        Self::offset_transcription_output(&mut parsed, chunk.start_seconds);
+        Self::offset_transcription_output(&mut parsed, chunk.decode_start_seconds);
+        Self::filter_transcription_to_commit_window(
+            &mut parsed,
+            chunk.commit_start_seconds,
+            chunk.commit_end_seconds,
+        );
         Ok(parsed)
     }
 
@@ -1559,10 +1670,19 @@ impl ParakeetCppEngine {
             }
             let attempt = if let Some(worker_path) = self.parakeet_worker_path() {
                 match self
-                    .run_worker_for_chunks(&worker_path, model_path, &chunks)
+                    .run_worker_for_chunks(
+                        &worker_path,
+                        model_path,
+                        language_code,
+                        &chunks,
+                        total_audio_seconds,
+                        emit_partial.clone(),
+                        emit_progress_seconds.clone(),
+                    )
                     .await
                 {
                     Ok(results) => Ok(results),
+                    Err(error) if Self::is_metal_oom_error(&error.to_string()) => Err(error),
                     Err(error) => {
                         eprintln!(
                             "Parakeet worker unavailable or failed, falling back to chunk CLI: {error}"
@@ -1607,20 +1727,73 @@ impl ParakeetCppEngine {
         emit_partial: &(dyn Fn(String) + Send + Sync),
         emit_progress_seconds: &(dyn Fn(f32) + Send + Sync),
     ) -> Result<TranscriptionOutput, ApplicationError> {
-        let mut committed_until = 0.0_f32;
-        let mut merged_segments = Vec::new();
-        let mut cumulative_text = String::new();
+        let mut cumulative = Vec::new();
+        for item in chunks {
+            cumulative.push(item);
+            if let Some(snapshot) =
+                Self::merge_chunk_transcriptions_snapshot(&cumulative, total_audio_seconds)?
+            {
+                emit_partial(format!("{DELTA_REPLACE_PREFIX}{}", snapshot.text));
+            }
+            if let Some((chunk, _)) = cumulative.last() {
+                emit_progress_seconds(chunk.commit_end_seconds);
+            }
+        }
+        Self::merge_chunk_transcriptions_snapshot(&cumulative, total_audio_seconds)?.ok_or_else(
+            || {
+                ApplicationError::SpeechToText(
+                    "Parakeet long-file transcription produced empty output".to_string(),
+                )
+            },
+        )
+    }
 
-        for (chunk, mut output) in chunks {
+    fn merge_chunk_transcriptions_snapshot(
+        chunks: &[(AudioChunk, TranscriptionOutput)],
+        total_audio_seconds: Option<f32>,
+    ) -> Result<Option<TranscriptionOutput>, ApplicationError> {
+        // Lossless merge. Chunks overlap by a few seconds, so the same audio is
+        // transcribed by two adjacent chunks. Dropping *every* word whose
+        // timestamp falls before the previous chunk's end (the old
+        // `committed_until` cutoff) loses speech whenever a chunk under-
+        // transcribes its tail — the boundary word then exists only in the next
+        // chunk and is silently discarded. That is exactly the bug that made
+        // whole sentences vanish near every ~5min chunk boundary.
+        //
+        // Instead we suppress a word only when it is a genuine duplicate of one
+        // already committed: same (normalized) text AND a timestamp that overlaps
+        // an already-committed word within tolerance. A word in the overlap zone
+        // that the previous chunk never produced always survives.
+        let mut committed_word_keys: Vec<(String, f32, f32)> = Vec::new();
+        let mut merged_segments = Vec::new();
+
+        let mut sorted = chunks.to_vec();
+        sorted.sort_by_key(|(chunk, _)| chunk.index);
+        for (_chunk, output) in sorted {
+            let mut output = output;
             let mut kept_segments = Vec::new();
             for mut segment in output.segments.drain(..) {
                 if !segment.words.is_empty() {
                     segment.words.retain(|word| {
-                        word.end_seconds
-                            .or(word.start_seconds)
-                            .is_none_or(|seconds| {
-                                seconds > committed_until + OVERLAP_DEDUPE_TOLERANCE_SECONDS
-                            })
+                        let Some(seconds) = word.end_seconds.or(word.start_seconds) else {
+                            // No timestamp at all: keep it (rare, never a dup).
+                            return true;
+                        };
+                        let key = normalize_word_text(&word.text);
+                        let start = word.start_seconds.unwrap_or(seconds);
+                        let end = word.end_seconds.unwrap_or(seconds);
+                        let is_duplicate = committed_word_keys.iter().any(
+                            |(existing_key, existing_start, existing_end)| {
+                                existing_key == &key
+                                    && start <= existing_end + OVERLAP_DEDUPE_TOLERANCE_SECONDS
+                                    && end >= existing_start - OVERLAP_DEDUPE_TOLERANCE_SECONDS
+                            },
+                        );
+                        if is_duplicate {
+                            return false;
+                        }
+                        committed_word_keys.push((key, start, end));
+                        true
                     });
                     if segment.words.is_empty() {
                         continue;
@@ -1636,27 +1809,13 @@ impl ParakeetCppEngine {
                         .filter(|text| !text.is_empty())
                         .collect::<Vec<_>>()
                         .join(" ");
-                } else if segment
-                    .end_seconds
-                    .or(segment.start_seconds)
-                    .is_some_and(|seconds| {
-                        seconds <= committed_until + OVERLAP_DEDUPE_TOLERANCE_SECONDS
-                    })
-                {
-                    continue;
                 }
                 let text = segment.text.trim();
                 if !text.is_empty() {
-                    cumulative_text = Self::join_text_parts(&cumulative_text, text);
                     kept_segments.push(segment);
                 }
             }
             merged_segments.extend(kept_segments);
-            committed_until = committed_until.max(chunk.end_seconds);
-            if !cumulative_text.trim().is_empty() {
-                emit_partial(format!("{DELTA_REPLACE_PREFIX}{cumulative_text}"));
-            }
-            emit_progress_seconds(chunk.end_seconds);
         }
 
         let text = merged_segments
@@ -1666,14 +1825,13 @@ impl ParakeetCppEngine {
             .collect::<Vec<_>>()
             .join(" ");
         if text.trim().is_empty() {
-            return Err(ApplicationError::SpeechToText(
-                "Parakeet long-file transcription produced empty output".to_string(),
-            ));
+            return Ok(None);
         }
-        Ok(TranscriptionOutput {
+        Ok(Some(TranscriptionOutput {
             text: text.clone(),
             segments: normalize_transcript_segments(&text, &merged_segments, total_audio_seconds),
-        })
+            effective_model: None,
+        }))
     }
 
     fn offset_transcription_output(output: &mut TranscriptionOutput, offset_seconds: f32) {
@@ -1685,6 +1843,75 @@ impl ParakeetCppEngine {
                 word.end_seconds = word.end_seconds.map(|value| value + offset_seconds);
             }
         }
+    }
+
+    fn filter_transcription_to_commit_window(
+        output: &mut TranscriptionOutput,
+        commit_start_seconds: f32,
+        commit_end_seconds: f32,
+    ) {
+        let tolerance = OVERLAP_DEDUPE_TOLERANCE_SECONDS;
+        let mut filtered_segments = Vec::new();
+
+        for mut segment in output.segments.drain(..) {
+            if !segment.words.is_empty() {
+                segment.words.retain(|word| {
+                    let anchor = match (word.start_seconds, word.end_seconds) {
+                        (Some(start), Some(end)) => (start + end) * 0.5,
+                        (Some(start), None) => start,
+                        (None, Some(end)) => end,
+                        (None, None) => return true,
+                    };
+                    anchor >= commit_start_seconds - tolerance
+                        && anchor <= commit_end_seconds + tolerance
+                });
+
+                if segment.words.is_empty() {
+                    continue;
+                }
+
+                segment.start_seconds = segment.words.iter().find_map(|word| word.start_seconds);
+                segment.end_seconds = segment.words.iter().rev().find_map(|word| word.end_seconds);
+                segment.text = segment
+                    .words
+                    .iter()
+                    .map(|word| word.text.trim())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            } else {
+                let overlaps_commit = match (segment.start_seconds, segment.end_seconds) {
+                    (Some(start), Some(end)) => {
+                        end >= commit_start_seconds - tolerance
+                            && start <= commit_end_seconds + tolerance
+                    }
+                    (Some(start), None) => {
+                        start >= commit_start_seconds - tolerance
+                            && start <= commit_end_seconds + tolerance
+                    }
+                    (None, Some(end)) => {
+                        end >= commit_start_seconds - tolerance
+                            && end <= commit_end_seconds + tolerance
+                    }
+                    (None, None) => true,
+                };
+                if !overlaps_commit {
+                    continue;
+                }
+            }
+
+            if !segment.text.trim().is_empty() {
+                filtered_segments.push(segment);
+            }
+        }
+
+        output.text = filtered_segments
+            .iter()
+            .map(|segment| segment.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        output.segments = filtered_segments;
     }
 
     fn is_metal_oom_error(message: &str) -> bool {
@@ -1745,6 +1972,27 @@ impl SpeechToTextEngine for ParakeetCppEngine {
         }
 
         let model_path = self.validate_model_exists(model_filename)?;
+        let use_long_file_chunking =
+            Self::should_use_long_file_chunking(input_wav, total_audio_seconds);
+        if use_long_file_chunking {
+            let result = self
+                .run_long_file_transcription(
+                    input_wav,
+                    &model_path,
+                    model_filename,
+                    language_code,
+                    total_audio_seconds,
+                    emit_partial.clone(),
+                    emit_progress_seconds.clone(),
+                )
+                .await?;
+            emit_partial(result.text.clone());
+            if let Some(total) = total_audio_seconds {
+                emit_progress_seconds(total);
+            }
+            return Ok(result);
+        }
+
         let preview_model_path =
             self.validate_preview_model_exists(model_filename, language_code)?;
         let preview_state = Arc::new(Mutex::new(PreviewStreamState::default()));
@@ -1768,25 +2016,6 @@ impl SpeechToTextEngine for ParakeetCppEngine {
             Err(_) => {
                 eprintln!("Parakeet progressive preview timed out after {PREVIEW_TIMEOUT:?}");
             }
-        }
-
-        if Self::should_use_long_file_chunking(input_wav, total_audio_seconds) {
-            let result = self
-                .run_long_file_transcription(
-                    input_wav,
-                    &model_path,
-                    model_filename,
-                    language_code,
-                    total_audio_seconds,
-                    emit_partial.clone(),
-                    emit_progress_seconds.clone(),
-                )
-                .await?;
-            emit_partial(result.text.clone());
-            if let Some(total) = total_audio_seconds {
-                emit_progress_seconds(total);
-            }
-            return Ok(result);
         }
 
         let mut command = Command::new(&self.binary_path);

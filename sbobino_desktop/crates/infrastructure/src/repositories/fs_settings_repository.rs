@@ -73,6 +73,17 @@ impl FsSettingsRepository {
                 ))
             })?;
 
+        let has_parakeet_live_model = raw_json
+            .pointer("/transcription/parakeet_live_model")
+            .is_some();
+        if !has_parakeet_live_model {
+            let legacy_model = settings.transcription.parakeet_model.clone();
+            if legacy_model.is_streaming() {
+                settings.transcription.parakeet_live_model = legacy_model;
+                settings.transcription.parakeet_model = sbobino_domain::ParakeetModel::Tdt06bV3F16;
+            }
+        }
+
         // Migrate legacy defaults from Python bundle assumptions to runtime-friendly defaults.
         if settings.ffmpeg_path == "resources/ffmpeg_bin/ffmpeg" {
             settings.ffmpeg_path = "ffmpeg".to_string();

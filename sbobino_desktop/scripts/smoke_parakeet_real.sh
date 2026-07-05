@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$ROOT_DIR/scripts/lib/asr_samples.sh"
 
-MODEL_FILENAME=${SBOBINO_PARAKEET_MODEL:-tdt-0.6b-v3-q4_k.gguf}
+MODEL_FILENAME=${SBOBINO_PARAKEET_MODEL:-tdt-0.6b-v3-f16.gguf}
 MODEL_URL="https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/$MODEL_FILENAME"
 NEMOTRON_STREAMING_Q4_MODEL="nemotron-3.5-asr-streaming-0.6b-q4_k.gguf"
 NEMOTRON_STREAMING_Q4_URL="https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/$NEMOTRON_STREAMING_Q4_MODEL"

@@ -57,6 +57,127 @@ async fn save_then_get_by_id_returns_persisted_artifact() {
 }
 
 #[tokio::test]
+async fn diarization_result_updates_status_and_timeline_in_one_revision() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let repo = SqliteArtifactRepository::new(temp.path().join("artifacts.db"))
+        .expect("repo should initialize");
+    let mut artifact = artifact_with_job("live-job", "live.wav", "hello live transcript");
+    artifact.kind = ArtifactKind::Realtime;
+    artifact
+        .metadata
+        .insert("speaker_diarization_status".into(), "queued".into());
+    repo.save(&artifact).await.expect("save should succeed");
+
+    let timeline = r#"{"version":2,"segments":[]}"#;
+    let updated = repo
+        .update_diarization_result(&artifact.id, Some(timeline), "completed", None)
+        .await
+        .expect("diarization update")
+        .expect("artifact exists");
+    assert_eq!(updated.revision, artifact.revision + 1);
+    assert_eq!(
+        updated
+            .metadata
+            .get("speaker_diarization_status")
+            .map(String::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        updated.metadata.get("timeline_v2").map(String::as_str),
+        Some(timeline)
+    );
+    assert!(!updated.metadata.contains_key("speaker_diarization_error"));
+}
+
+#[tokio::test]
+async fn startup_marks_unfinished_audio_and_diarization_jobs_as_interrupted() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let repo = SqliteArtifactRepository::new(temp.path().join("artifacts.db"))
+        .expect("repo should initialize");
+    let mut queued = artifact_with_job("queued", "queued.wav", "queued transcript");
+    queued
+        .metadata
+        .insert("speaker_diarization_status".into(), "queued".into());
+    let mut running = artifact_with_job("running", "running.wav", "running transcript");
+    running
+        .metadata
+        .insert("speaker_diarization_status".into(), "running".into());
+    let mut completed = artifact_with_job("completed", "completed.wav", "done transcript");
+    completed
+        .metadata
+        .insert("speaker_diarization_status".into(), "completed".into());
+    let mut audio_queued = artifact_with_job("audio-queued", "audio.wav", "audio transcript");
+    audio_queued
+        .metadata
+        .insert("audio_import_status".into(), "queued".into());
+    for artifact in [&queued, &running, &completed, &audio_queued] {
+        repo.save(artifact).await.expect("save should succeed");
+    }
+
+    assert_eq!(
+        repo.interrupt_pending_postprocessing_jobs()
+            .await
+            .expect("interrupt"),
+        3
+    );
+    for artifact in [&queued, &running] {
+        let updated = repo.get_by_id(&artifact.id).await.unwrap().unwrap();
+        assert_eq!(
+            updated
+                .metadata
+                .get("speaker_diarization_status")
+                .map(String::as_str),
+            Some("interrupted")
+        );
+        assert_eq!(updated.revision, artifact.revision + 1);
+    }
+    let audio_interrupted = repo.get_by_id(&audio_queued.id).await.unwrap().unwrap();
+    assert_eq!(
+        audio_interrupted
+            .metadata
+            .get("audio_import_status")
+            .map(String::as_str),
+        Some("interrupted")
+    );
+    let untouched = repo.get_by_id(&completed.id).await.unwrap().unwrap();
+    assert_eq!(untouched.revision, completed.revision);
+}
+
+#[tokio::test]
+async fn attach_audio_updates_audio_row_and_import_status_in_one_revision() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let repo = SqliteArtifactRepository::new(temp.path().join("artifacts.db"))
+        .expect("repo should initialize");
+    let audio_path = temp.path().join("live.wav");
+    std::fs::write(&audio_path, b"test audio bytes").expect("write audio fixture");
+    let mut artifact = artifact_with_job("live-audio", "live.wav", "live transcript");
+    artifact.audio_backfill_status = sbobino_domain::ArtifactAudioBackfillStatus::PendingBackfill;
+    artifact
+        .metadata
+        .insert("audio_import_status".into(), "queued".into());
+    repo.save(&artifact).await.expect("save transcript first");
+
+    let updated = repo
+        .attach_audio_file(&artifact.id, &audio_path)
+        .await
+        .expect("attach audio")
+        .expect("artifact exists");
+    assert!(updated.audio_available);
+    assert_eq!(updated.revision, artifact.revision + 1);
+    assert_eq!(updated.audio_byte_size, Some(16));
+    assert_eq!(
+        updated
+            .metadata
+            .get("audio_import_status")
+            .map(String::as_str),
+        Some("completed")
+    );
+}
+
+#[tokio::test]
 async fn list_recent_returns_newest_first_with_limit() {
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");

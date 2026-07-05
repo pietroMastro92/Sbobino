@@ -82,4 +82,18 @@ describe("getArtifactDiarizationUiState", () => {
       error: null,
     });
   });
+
+  it("reports queued and running diarization as processing", () => {
+    for (const status of ["queued", "running", "diarizing"]) {
+      expect(getArtifactDiarizationUiState(artifact({ speaker_diarization_status: status }), [])).toEqual({
+        kind: "processing", speakerCount: 0, speakerLabels: [], error: null,
+      });
+    }
+  });
+
+  it("reports interrupted background diarization", () => {
+    expect(getArtifactDiarizationUiState(artifact({ speaker_diarization_status: "interrupted" }), [])).toEqual({
+      kind: "interrupted", speakerCount: 0, speakerLabels: [], error: null,
+    });
+  });
 });

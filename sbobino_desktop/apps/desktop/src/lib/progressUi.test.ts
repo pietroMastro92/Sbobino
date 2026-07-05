@@ -3,6 +3,7 @@ import {
   clampPercentage,
   formatProgressPercentageLabel,
   makeProgressVisible,
+  percentageFromJobProgress,
 } from "./progressUi";
 
 describe("progressUi", () => {
@@ -24,5 +25,20 @@ describe("progressUi", () => {
     expect(formatProgressPercentageLabel(0.2)).toBe("01%");
     expect(formatProgressPercentageLabel(7.2)).toBe("07%");
     expect(formatProgressPercentageLabel(100)).toBe("100%");
+    expect(formatProgressPercentageLabel(42, true)).toBe("~42%");
+    expect(formatProgressPercentageLabel(100, true)).toBe("100%");
+  });
+
+  it("trusts backend percentage over phase-local current seconds", () => {
+    expect(
+      percentageFromJobProgress({
+        job_id: "job",
+        stage: "preparing_audio",
+        message: "Preparing audio",
+        percentage: 10,
+        current_seconds: 7814,
+        total_seconds: 7814,
+      }),
+    ).toBe(10);
   });
 });

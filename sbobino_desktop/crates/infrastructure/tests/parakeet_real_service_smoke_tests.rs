@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     path::Path,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -21,7 +22,7 @@ use sbobino_infrastructure::adapters::{
     ffmpeg::FfmpegAdapter, noop_enhancer::NoopEnhancer, parakeet_cpp::ParakeetCppEngine,
 };
 
-const DEFAULT_REAL_SMOKE_MODEL: &str = "tdt-0.6b-v3-q4_k.gguf";
+const DEFAULT_REAL_SMOKE_MODEL: &str = "tdt-0.6b-v3-f16.gguf";
 
 #[derive(Default)]
 struct SmokeArtifactRepository {
@@ -97,6 +98,28 @@ impl ArtifactRepository for SmokeArtifactRepository {
         &self,
         _id: &str,
         _timeline_v2_json: &str,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        Ok(None)
+    }
+
+    async fn update_diarization_result(
+        &self,
+        _id: &str,
+        _timeline_v2_json: Option<&str>,
+        _status: &str,
+        _error: Option<&str>,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        Ok(None)
+    }
+
+    async fn interrupt_pending_postprocessing_jobs(&self) -> Result<usize, ApplicationError> {
+        Ok(0)
+    }
+
+    async fn attach_audio_file(
+        &self,
+        _id: &str,
+        _source_path: &Path,
     ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
         Ok(None)
     }
@@ -239,6 +262,7 @@ async fn parakeet_service_real_smoke_persists_metadata() {
         repo.clone(),
     );
     let emitted_ref = emitted.clone();
+    let smoke_started = Instant::now();
 
     let artifact = service
         .run_file_transcription(
@@ -266,7 +290,10 @@ async fn parakeet_service_real_smoke_persists_metadata() {
             Arc::new(move |delta| {
                 let mut emitted = emitted_ref.lock().expect("emit lock poisoned");
                 if emitted.len() < 5 {
-                    eprintln!("service_delta={delta}");
+                    eprintln!(
+                        "service_delta_after={:.2}s:{delta}",
+                        smoke_started.elapsed().as_secs_f32()
+                    );
                 }
                 emitted.push(delta);
             }),

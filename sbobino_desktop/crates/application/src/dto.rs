@@ -3,9 +3,39 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use sbobino_domain::{
-    ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel,
+    ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, ProgressKind, SpeechModel,
     TranscriptionEngine, WhisperOptions,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiarizationProgress {
+    pub phase: String,
+    pub percentage: u8,
+    pub completed: Option<u64>,
+    pub total: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptionProgress {
+    pub current_seconds: f32,
+    pub phase: String,
+    pub progress_kind: ProgressKind,
+    pub attempt: u32,
+    pub effective_model: Option<String>,
+}
+
+impl TranscriptionProgress {
+    pub fn actual(current_seconds: f32) -> Self {
+        Self {
+            current_seconds,
+            phase: "transcribing".to_string(),
+            progress_kind: ProgressKind::Actual,
+            attempt: 1,
+            effective_model: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunTranscriptionRequest {

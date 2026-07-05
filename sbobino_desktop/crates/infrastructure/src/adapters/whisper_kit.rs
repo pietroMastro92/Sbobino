@@ -329,6 +329,7 @@ impl WhisperKitEngine {
         TranscriptionOutput {
             text: normalized_text,
             segments,
+            effective_model: None,
         }
     }
 

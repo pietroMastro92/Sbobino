@@ -1,7 +1,10 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use regex::Regex;
 use tempfile::tempdir;
@@ -395,6 +398,82 @@ exit 0
 }
 
 #[tokio::test]
+async fn long_file_merge_keeps_boundary_word_only_present_in_next_chunk() {
+    // Regression: the chunked merge used to drop a word whose timestamp fell in
+    // the overlap zone even when the previous chunk never transcribed it
+    // (Parakeet routinely under-transcribes the tail of a clip). The result was
+    // whole words — sometimes whole sentences near the ~5min chunk boundary —
+    // silently disappearing from the transcript. The merge must never lose a
+    // word that only one chunk produced, regardless of where its timestamp lands.
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let worker_path = temp.path().join("parakeet-batch-json");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
+        .expect("failed to create model");
+    write_test_wav(&input_wav, 605);
+
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\necho 'chunk CLI must not run when worker succeeds' >&2\nexit 45\n",
+    );
+    // Each chunk emits a word at its very start (the overlap region). For the
+    // first chunk that is genuine audio near t=0. For every later chunk the word
+    // lands inside the 2s overlap with the previous chunk. The previous chunk
+    // did NOT transcribe this word (it under-transcribed its tail), so the only
+    // copy is the one the next chunk produces — and the positional dedup drops
+    // it because its timestamp is <= committed_until.
+    write_executable_script(
+        &worker_path,
+        r#"#!/bin/sh
+manifest=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+while IFS='	' read -r idx decode_start decode_end commit_start commit_end path; do
+  # Word sits exactly at the chunk's commit start. For every later chunk that is
+  # inside the pre-context decoded by the previous chunk, but the previous chunk
+  # did not emit it. It must survive because it is unique.
+  local_start=$(awk -v c="$commit_start" -v d="$decode_start" 'BEGIN { printf "%.3f", c - d }')
+  local_end=$(awk -v s="$local_start" 'BEGIN { printf "%.3f", s + 0.4 }')
+  echo "{\"index\":$idx,\"decode_start\":$decode_start,\"decode_end\":$decode_end,\"commit_start\":$commit_start,\"commit_end\":$commit_end,\"result\":{\"text\":\"parola$idx\",\"words\":[{\"w\":\"parola$idx\",\"start\":$local_start,\"end\":$local_end}]}}"
+done < "$manifest"
+exit 0
+"#,
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-q4_k.gguf",
+            "it",
+            &WhisperOptions::default(),
+            Some(605.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("chunked transcription should merge worker output");
+
+    assert!(
+        transcript.text.contains("parola1"),
+        "the boundary word only present in the second chunk must survive the merge, got: {:?}",
+        transcript.text
+    );
+}
+
+#[tokio::test]
 async fn long_file_transcription_uses_worker_chunks_and_progressive_deltas() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");
@@ -434,8 +513,12 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
-while IFS='	' read -r idx start end path; do
-  echo "{\"index\":$idx,\"start\":$start,\"end\":$end,\"result\":{\"text\":\"worker chunk $idx\",\"words\":[{\"w\":\"worker\",\"start\":3.10,\"end\":3.30},{\"w\":\"chunk\",\"start\":3.30,\"end\":3.50},{\"w\":\"$idx\",\"start\":3.50,\"end\":3.70}]}}"
+while IFS='	' read -r idx decode_start decode_end commit_start commit_end path; do
+  word_start=$(awk -v c="$commit_start" -v d="$decode_start" 'BEGIN { printf "%.3f", c - d + 3.1 }')
+  word_mid=$(awk -v s="$word_start" 'BEGIN { printf "%.3f", s + 0.2 }')
+  word_last=$(awk -v s="$word_start" 'BEGIN { printf "%.3f", s + 0.4 }')
+  word_end=$(awk -v s="$word_start" 'BEGIN { printf "%.3f", s + 0.6 }')
+  echo "{\"index\":$idx,\"decode_start\":$decode_start,\"decode_end\":$decode_end,\"commit_start\":$commit_start,\"commit_end\":$commit_end,\"result\":{\"text\":\"worker chunk $idx\",\"words\":[{\"w\":\"worker\",\"start\":$word_start,\"end\":$word_mid},{\"w\":\"chunk\",\"start\":$word_mid,\"end\":$word_last},{\"w\":\"$idx\",\"start\":$word_last,\"end\":$word_end}]}}"
 done < "$manifest"
 exit 0
 "#,
@@ -483,6 +566,324 @@ exit 0
     );
     let progress = progress.lock().expect("progress lock poisoned");
     assert!(progress.iter().any(|seconds| *seconds > 300.0));
+}
+
+#[tokio::test]
+async fn long_file_manifest_uses_contiguous_commit_windows_with_decode_context() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let worker_path = temp.path().join("parakeet-batch-json");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+    let manifest_copy = temp.path().join("manifest-copy.tsv");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
+        .expect("failed to create model");
+    write_test_wav(&input_wav, 1000);
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+case "$*" in
+  *chunk-*)
+    echo '{"text":"preview","words":[{"w":"preview","start":0.1,"end":0.3}]}'
+    exit 0
+    ;;
+esac
+echo 'full input must not be used for long Parakeet files' 1>&2
+exit 44
+"#,
+    );
+    write_executable_script(
+        &worker_path,
+        &format!(
+            r#"#!/bin/sh
+manifest=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cp "$manifest" "{manifest_copy}"
+while IFS='	' read -r idx decode_start decode_end commit_start commit_end path; do
+  word_start=$(awk -v c="$commit_start" -v d="$decode_start" 'BEGIN {{ printf "%.3f", c - d + 1.0 }}')
+  word_end=$(awk -v s="$word_start" 'BEGIN {{ printf "%.3f", s + 0.4 }}')
+  echo "{{\"index\":$idx,\"decode_start\":$decode_start,\"decode_end\":$decode_end,\"commit_start\":$commit_start,\"commit_end\":$commit_end,\"result\":{{\"text\":\"chunk$idx\",\"words\":[{{\"w\":\"chunk$idx\",\"start\":$word_start,\"end\":$word_end}}]}}}}"
+done < "$manifest"
+exit 0
+"#,
+            manifest_copy = manifest_copy.display()
+        ),
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-q4_k.gguf",
+            "it",
+            &WhisperOptions::default(),
+            Some(1000.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("long Parakeet transcription should use worker manifest");
+
+    assert!(transcript.text.contains("chunk0"));
+    assert!(
+        manifest_copy.exists(),
+        "fake worker should copy the generated manifest"
+    );
+
+    let manifest = std::fs::read_to_string(&manifest_copy).expect("failed to read manifest copy");
+    let mut previous_commit_end = 0.0_f32;
+    let rows = manifest
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert!(
+        rows.len() >= 3,
+        "expected multiple long-audio windows: {rows:?}"
+    );
+
+    for (index, row) in rows.iter().enumerate() {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        assert_eq!(
+            fields.len(),
+            6,
+            "manifest row should have 6 TSV fields: {row}"
+        );
+        let decode_start = fields[1].parse::<f32>().expect("decode_start");
+        let decode_end = fields[2].parse::<f32>().expect("decode_end");
+        let commit_start = fields[3].parse::<f32>().expect("commit_start");
+        let commit_end = fields[4].parse::<f32>().expect("commit_end");
+
+        if index == 0 {
+            assert!(
+                commit_end - commit_start <= 145.0,
+                "first long-file chunk should be fast-start sized: {row}"
+            );
+        }
+        assert!(
+            (commit_start - previous_commit_end).abs() <= 0.02,
+            "commit windows must be contiguous: previous={previous_commit_end}, row={row}"
+        );
+        assert!(decode_start <= commit_start + 0.02, "row={row}");
+        assert!(decode_end >= commit_end - 0.02, "row={row}");
+        if index > 0 {
+            assert!(
+                decode_start < commit_start - 1.0,
+                "non-first windows need pre-context: {row}"
+            );
+        }
+        if index + 1 < rows.len() {
+            assert!(
+                decode_end > commit_end + 1.0,
+                "non-final windows need post-context: {row}"
+            );
+        }
+        previous_commit_end = commit_end;
+    }
+    assert!(
+        (previous_commit_end - 1000.0).abs() <= 0.02,
+        "final commit should reach the full audio duration, got {previous_commit_end}"
+    );
+}
+
+#[tokio::test]
+async fn long_file_worker_streams_first_chunk_before_process_exit() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let worker_path = temp.path().join("parakeet-batch-json");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+    let first_chunk_sleep_marker = temp.path().join("first-chunk-sleep-complete");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
+        .expect("failed to create model");
+    write_test_wav(&input_wav, 700);
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+echo 'full input must not be used for long Parakeet files' 1>&2
+exit 44
+"#,
+    );
+    write_executable_script(
+        &worker_path,
+        &format!(
+            r#"#!/bin/sh
+manifest=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+count=0
+while IFS='	' read -r idx decode_start decode_end commit_start commit_end path; do
+  word_start=$(awk -v c="$commit_start" -v d="$decode_start" 'BEGIN {{ printf "%.3f", c - d + 1.0 }}')
+  word_end=$(awk -v s="$word_start" 'BEGIN {{ printf "%.3f", s + 0.4 }}')
+  echo "{{\"index\":$idx,\"decode_start\":$decode_start,\"decode_end\":$decode_end,\"commit_start\":$commit_start,\"commit_end\":$commit_end,\"result\":{{\"text\":\"stream$idx\",\"words\":[{{\"w\":\"stream$idx\",\"start\":$word_start,\"end\":$word_end}}]}}}}"
+  if [ "$count" -eq 0 ]; then
+    sleep 1
+    touch "{first_chunk_sleep_marker}"
+  fi
+  count=$((count + 1))
+done < "$manifest"
+exit 0
+"#,
+            first_chunk_sleep_marker = first_chunk_sleep_marker.display()
+        ),
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let saw_first_chunk_before_worker_finished = Arc::new(AtomicBool::new(false));
+    let saw_first_chunk_before_worker_finished_ref = saw_first_chunk_before_worker_finished.clone();
+    let marker_ref = first_chunk_sleep_marker.clone();
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-q4_k.gguf",
+            "it",
+            &WhisperOptions::default(),
+            Some(700.0),
+            Arc::new(move |line: String| {
+                if line.contains("stream0") && !marker_ref.exists() {
+                    saw_first_chunk_before_worker_finished_ref.store(true, Ordering::SeqCst);
+                }
+            }),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("long Parakeet transcription should stream worker chunks");
+
+    assert!(transcript.text.contains("stream0"));
+    assert!(transcript.text.contains("stream1"));
+    assert!(
+        saw_first_chunk_before_worker_finished.load(Ordering::SeqCst),
+        "first worker chunk should be emitted while the worker is still running"
+    );
+}
+
+#[tokio::test]
+async fn long_file_worker_oom_retries_with_smaller_coverage_windows() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let worker_path = temp.path().join("parakeet-batch-json");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+    let attempt_file = temp.path().join("attempt-count");
+    let first_manifest = temp.path().join("manifest-attempt-1.tsv");
+    let second_manifest = temp.path().join("manifest-attempt-2.tsv");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
+        .expect("failed to create model");
+    write_test_wav(&input_wav, 1000);
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+case "$*" in
+  *chunk-*)
+    echo '{"text":"preview","words":[{"w":"preview","start":0.1,"end":0.3}]}'
+    exit 0
+    ;;
+esac
+echo 'chunk CLI must not run after worker OOM retry' 1>&2
+exit 45
+"#,
+    );
+    write_executable_script(
+        &worker_path,
+        &format!(
+            r#"#!/bin/sh
+manifest=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+attempt=0
+if [ -f "{attempt_file}" ]; then
+  attempt=$(cat "{attempt_file}")
+fi
+attempt=$((attempt + 1))
+echo "$attempt" > "{attempt_file}"
+cp "$manifest" "{temp}/manifest-attempt-$attempt.tsv"
+if [ "$attempt" -eq 1 ]; then
+  echo 'ggml_backend_graph_compute failed: kIOGPUCommandBufferCallbackErrorOutOfMemory' 1>&2
+  exit 86
+fi
+while IFS='	' read -r idx decode_start decode_end commit_start commit_end path; do
+  word_start=$(awk -v c="$commit_start" -v d="$decode_start" 'BEGIN {{ printf "%.3f", c - d + 1.0 }}')
+  word_end=$(awk -v s="$word_start" 'BEGIN {{ printf "%.3f", s + 0.4 }}')
+  echo "{{\"index\":$idx,\"decode_start\":$decode_start,\"decode_end\":$decode_end,\"commit_start\":$commit_start,\"commit_end\":$commit_end,\"result\":{{\"text\":\"retry$idx\",\"words\":[{{\"w\":\"retry$idx\",\"start\":$word_start,\"end\":$word_end}}]}}}}"
+done < "$manifest"
+exit 0
+"#,
+            attempt_file = attempt_file.display(),
+            temp = temp.path().display()
+        ),
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-q4_k.gguf",
+            "it",
+            &WhisperOptions::default(),
+            Some(1000.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("OOM should retry with smaller worker windows");
+
+    assert!(transcript.text.contains("retry0"));
+    assert!(first_manifest.exists(), "first worker attempt should run");
+    assert!(second_manifest.exists(), "second worker attempt should run");
+
+    let first_manifest =
+        std::fs::read_to_string(first_manifest).expect("failed to read first manifest");
+    let second_manifest =
+        std::fs::read_to_string(second_manifest).expect("failed to read second manifest");
+    let max_commit_seconds = |manifest: &str| {
+        manifest
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|row| {
+                let fields = row.split('\t').collect::<Vec<_>>();
+                fields[4].parse::<f32>().unwrap() - fields[3].parse::<f32>().unwrap()
+            })
+            .fold(0.0_f32, f32::max)
+    };
+    let first_commit_seconds = max_commit_seconds(&first_manifest);
+    let second_commit_seconds = max_commit_seconds(&second_manifest);
+    assert!(
+        second_commit_seconds < first_commit_seconds,
+        "retry should regenerate a smaller commit plan: first max={first_commit_seconds}, second max={second_commit_seconds}"
+    );
 }
 
 #[tokio::test]

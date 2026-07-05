@@ -200,6 +200,7 @@ pub struct StopRealtimePayload {
 pub struct StopRealtimeResponse {
     pub saved: bool,
     pub artifact: Option<TranscriptArtifact>,
+    pub post_processing_started: bool,
 }
 
 struct RealtimeStopResult {
@@ -212,6 +213,18 @@ struct RealtimeStopResult {
 pub struct RealtimeStatusEvent {
     pub state: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RealtimePostProcessingEvent {
+    pub artifact_id: String,
+    pub stage: String,
+    pub message: String,
+    pub phase: Option<String>,
+    pub percentage: Option<u8>,
+    pub completed: Option<u64>,
+    pub total: Option<u64>,
+    pub artifact: Option<TranscriptArtifact>,
 }
 
 async fn stop_realtime_preview(
@@ -236,65 +249,182 @@ async fn start_realtime_preview(
     Ok(())
 }
 
-async fn apply_realtime_speaker_diarization(
-    state: &AppState,
-    settings: &AppSettings,
-    audio_path: Option<&Path>,
-    segments: &mut Vec<TimedSegment>,
-    metadata: &mut BTreeMap<String, String>,
+fn emit_realtime_postprocess(
+    app: &tauri::AppHandle,
+    artifact_id: &str,
+    stage: &str,
+    message: &str,
+    artifact: Option<TranscriptArtifact>,
 ) {
-    if !settings.transcription.speaker_diarization.enabled {
-        return;
-    }
+    let _ = app.emit(
+        "realtime://postprocess",
+        RealtimePostProcessingEvent {
+            artifact_id: artifact_id.to_string(),
+            stage: stage.to_string(),
+            message: message.to_string(),
+            phase: None,
+            percentage: match stage {
+                "saving_audio" => Some(0),
+                "completed" => Some(100),
+                _ => None,
+            },
+            completed: None,
+            total: None,
+            artifact,
+        },
+    );
+}
 
-    let Some(audio_path) = audio_path else {
-        metadata.insert(
-            "speaker_diarization_status".to_string(),
-            "skipped_no_audio".to_string(),
-        );
+fn emit_realtime_diarization_progress(
+    app: &tauri::AppHandle,
+    artifact_id: &str,
+    progress: sbobino_application::DiarizationProgress,
+) {
+    let _ = app.emit(
+        "realtime://postprocess",
+        RealtimePostProcessingEvent {
+            artifact_id: artifact_id.to_string(),
+            stage: "diarizing".to_string(),
+            message: progress.message,
+            phase: Some(progress.phase),
+            percentage: Some(progress.percentage),
+            completed: progress.completed,
+            total: progress.total,
+            artifact: None,
+        },
+    );
+}
+
+async fn run_realtime_postprocessing_background(
+    app: tauri::AppHandle,
+    state: AppState,
+    settings: AppSettings,
+    artifact_id: String,
+    audio_path: std::path::PathBuf,
+    segments: Vec<TimedSegment>,
+    diarization_requested: bool,
+) {
+    emit_realtime_postprocess(
+        &app,
+        &artifact_id,
+        "saving_audio",
+        "Saving the live audio in the background.",
+        None,
+    );
+    let Ok(_permit) = state.transcription_gate.acquire().await else {
         return;
     };
-
-    if segments.is_empty() {
-        metadata.insert(
-            "speaker_diarization_status".to_string(),
-            "skipped_no_segments".to_string(),
-        );
-        return;
-    }
-
-    let diarizer = match state.runtime_factory.build_speaker_diarizer(settings) {
-        Ok(Some(diarizer)) => diarizer,
-        Ok(None) => return,
+    let imported = match state
+        .artifact_service
+        .attach_audio_file(&artifact_id, &audio_path)
+        .await
+    {
+        Ok(Some(updated)) => updated,
+        Ok(None) => {
+            warn!("realtime artifact disappeared during background audio import");
+            return;
+        }
         Err(error) => {
-            metadata.insert(
-                "speaker_diarization_status".to_string(),
-                "failed".to_string(),
+            let updated = state
+                .artifact_service
+                .update_metadata_entry(&artifact_id, "audio_import_status", Some("failed"))
+                .await
+                .ok()
+                .flatten();
+            emit_realtime_postprocess(
+                &app,
+                &artifact_id,
+                "failed",
+                "Audio import failed; the live transcript remains available.",
+                updated,
             );
-            metadata.insert("speaker_diarization_error".to_string(), error.clone());
-            warn!("speaker diarization skipped for realtime session: {error}");
+            warn!("failed to import realtime audio in background: {error}");
             return;
         }
     };
-
-    match diarizer.diarize(audio_path).await {
+    if !diarization_requested {
+        emit_realtime_postprocess(
+            &app,
+            &artifact_id,
+            "completed",
+            "Live audio saved.",
+            Some(imported),
+        );
+        return;
+    }
+    emit_realtime_postprocess(
+        &app,
+        &artifact_id,
+        "diarizing",
+        "Assigning speakers in the background.",
+        Some(imported),
+    );
+    let progress_app = app.clone();
+    let progress_artifact_id = artifact_id.clone();
+    let result = match state.runtime_factory.build_speaker_diarizer(&settings) {
+        Ok(Some(diarizer)) => {
+            diarizer
+                .diarize(
+                    &audio_path,
+                    Arc::new(move |progress| {
+                        emit_realtime_diarization_progress(
+                            &progress_app,
+                            &progress_artifact_id,
+                            progress,
+                        );
+                    }),
+                )
+                .await
+        }
+        Ok(None) => Err(ApplicationError::SpeakerDiarization(
+            "speaker diarization runtime is unavailable".to_string(),
+        )),
+        Err(error) => Err(ApplicationError::SpeakerDiarization(error)),
+    };
+    let (timeline, status, error, stage, message) = match result {
         Ok(turns) => {
-            metadata.insert(
-                "speaker_diarization_status".to_string(),
-                "completed".to_string(),
-            );
-            if !turns.is_empty() {
-                *segments = TranscriptionService::assign_speakers_to_segments(segments, &turns);
+            let assigned = if turns.is_empty() {
+                segments
+            } else {
+                TranscriptionService::assign_speakers_to_segments(&segments, &turns)
+            };
+            let timeline = TranscriptionOutput {
+                text: assigned
+                    .iter()
+                    .map(|segment| segment.text.trim())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                segments: assigned,
+                effective_model: None,
             }
+            .timeline_v2_metadata_json();
+            (
+                Some(timeline),
+                "completed",
+                None,
+                "completed",
+                "Speaker diarization completed.",
+            )
         }
-        Err(error) => {
-            metadata.insert(
-                "speaker_diarization_status".to_string(),
-                "failed".to_string(),
-            );
-            metadata.insert("speaker_diarization_error".to_string(), error.to_string());
-            warn!("speaker diarization failed for realtime session: {error}");
+        Err(error) => (
+            None,
+            "failed",
+            Some(error.to_string()),
+            "failed",
+            "Speaker diarization failed; the live transcript remains available.",
+        ),
+    };
+    match state
+        .artifact_service
+        .update_diarization_result(&artifact_id, timeline.as_deref(), status, error.as_deref())
+        .await
+    {
+        Ok(Some(updated)) => {
+            emit_realtime_postprocess(&app, &artifact_id, stage, message, Some(updated))
         }
+        Ok(None) => warn!("realtime artifact disappeared during background diarization"),
+        Err(update_error) => warn!("failed to persist realtime diarization result: {update_error}"),
     }
 }
 
@@ -399,7 +529,7 @@ pub async fn start_realtime(
                 .resolve_models_dir(&settings.transcription.parakeet_models_dir);
             let requested_model = payload
                 .parakeet_model
-                .unwrap_or(settings.transcription.parakeet_model);
+                .unwrap_or(settings.transcription.parakeet_live_model);
             let live_model = select_parakeet_live_model(
                 std::path::Path::new(&models_dir),
                 requested_model.clone(),
@@ -577,7 +707,7 @@ pub async fn stop_realtime(
     let save = payload.save.unwrap_or(true);
 
     let active_engine = state.realtime.active_engine.lock().await.clone();
-    let mut stop_result = match active_engine {
+    let stop_result = match active_engine {
         TranscriptionEngine::WhisperCpp => {
             let engine = state.realtime.engine.lock().await.clone();
             let result = engine.stop().await.map_err(CommandError::from)?;
@@ -619,6 +749,7 @@ pub async fn stop_realtime(
         return Ok(StopRealtimeResponse {
             saved: false,
             artifact: None,
+            post_processing_started: false,
         });
     }
 
@@ -670,14 +801,29 @@ pub async fn stop_realtime(
         },
     );
 
-    apply_realtime_speaker_diarization(
-        &state,
-        &settings,
-        stop_result.saved_audio_path.as_deref(),
-        &mut stop_result.segments,
-        &mut metadata,
-    )
-    .await;
+    let diarization_requested = settings.transcription.speaker_diarization.enabled
+        && stop_result.saved_audio_path.is_some()
+        && !stop_result.segments.is_empty();
+    let post_processing_started = stop_result.saved_audio_path.is_some();
+    if post_processing_started {
+        metadata.insert("audio_import_status".to_string(), "queued".to_string());
+    }
+    if diarization_requested {
+        metadata.insert(
+            "speaker_diarization_status".to_string(),
+            "queued".to_string(),
+        );
+    } else if settings.transcription.speaker_diarization.enabled {
+        metadata.insert(
+            "speaker_diarization_status".to_string(),
+            if stop_result.saved_audio_path.is_none() {
+                "skipped_no_audio"
+            } else {
+                "skipped_no_segments"
+            }
+            .to_string(),
+        );
+    }
 
     if !stop_result.segments.is_empty() {
         metadata.insert(
@@ -685,6 +831,7 @@ pub async fn stop_realtime(
             TranscriptionOutput {
                 text: stop_result.transcript.clone(),
                 segments: stop_result.segments.clone(),
+                effective_model: None,
             }
             .timeline_v2_metadata_json(),
         );
@@ -713,7 +860,11 @@ pub async fn stop_realtime(
         metadata,
     )
     .map_err(|e| CommandError::new("validation", e.to_string()))?;
-    artifact.audio_available = stop_result.saved_audio_path.is_some();
+    artifact.audio_available = false;
+    if post_processing_started {
+        artifact.audio_backfill_status =
+            sbobino_domain::ArtifactAudioBackfillStatus::PendingBackfill;
+    }
     artifact.audio_duration_seconds = payload.elapsed_seconds.map(|value| value as f32);
     artifact.processing_engine = Some(match active_engine {
         TranscriptionEngine::WhisperCpp => "whisper_stream".to_string(),
@@ -721,10 +872,6 @@ pub async fn stop_realtime(
     });
     artifact.processing_model = Some(model_filename.clone());
     artifact.processing_language = Some(state.realtime.language_code.lock().await.clone());
-    if let Some(path) = stop_result.saved_audio_path.as_ref() {
-        artifact.set_source_external_path(path.to_string_lossy().to_string());
-    }
-
     state
         .artifact_service
         .save(&artifact)
@@ -733,9 +880,30 @@ pub async fn stop_realtime(
 
     let _ = app.emit("realtime://saved", artifact.clone());
 
+    if let Some(audio_path) = stop_result.saved_audio_path.clone() {
+        let app_handle = app.clone();
+        let state_for_task = state.inner().clone();
+        let settings_for_task = settings.clone();
+        let artifact_id = artifact.id.clone();
+        let segments = stop_result.segments.clone();
+        tokio::spawn(async move {
+            run_realtime_postprocessing_background(
+                app_handle,
+                state_for_task,
+                settings_for_task,
+                artifact_id,
+                audio_path,
+                segments,
+                diarization_requested,
+            )
+            .await;
+        });
+    }
+
     Ok(StopRealtimeResponse {
         saved: true,
         artifact: Some(artifact),
+        post_processing_started,
     })
 }
 

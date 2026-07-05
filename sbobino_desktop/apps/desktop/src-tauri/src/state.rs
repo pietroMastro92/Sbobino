@@ -15,6 +15,10 @@ pub struct TranscriptionTask {
     pub cancel_token: CancellationToken,
 }
 
+pub struct ArtifactPostProcessingTask {
+    pub cancel_token: CancellationToken,
+}
+
 #[derive(Clone)]
 pub struct RealtimeRuntime {
     pub engine: Arc<Mutex<WhisperStreamEngine>>,
@@ -37,6 +41,7 @@ pub struct AppState {
     pub settings_service: Arc<SettingsService>,
     pub runtime_factory: Arc<RuntimeTranscriptionFactory>,
     pub transcription_tasks: Arc<Mutex<HashMap<String, TranscriptionTask>>>,
+    pub postprocessing_tasks: Arc<Mutex<HashMap<String, ArtifactPostProcessingTask>>>,
     // Serializes heavy transcription work. Multiple start_transcription
     // invocations return immediately with a job id, but only one job at a
     // time acquires this permit and runs whisper-cli + pyannote. Prevents

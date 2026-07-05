@@ -66,6 +66,7 @@ describe("close and cancel confirmations", () => {
     expect(onCancel).toContain("transcriptionCancel.title");
     expect(onCancel).toContain("transcriptionCancel.confirmButton");
     expect(onCancel).toContain("transcriptionCancel.keepRunning");
-    expect(onCancel).toContain("await cancelTranscription(activeJobId)");
+    expect(onCancel).toContain("activeJobId ?? focusedJobId");
+    expect(onCancel).toContain("await cancelTranscription(jobIdToCancel)");
   });
 });

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -7,11 +8,16 @@ use tauri::{Emitter, State};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use sbobino_application::{ApplicationError, RunTranscriptionRequest};
-use sbobino_domain::{
-    ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel, SpeechModel,
-    TranscriptionEngine, WhisperOptions,
+use sbobino_application::{
+    ApplicationError, AudioTranscoder, DiarizationProgress, RunTranscriptionRequest,
+    TranscriptionService,
 };
+use sbobino_domain::{
+    AppSettings, ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel,
+    SpeechModel, TimedSegment, TimedWord, TranscriptArtifact, TranscriptionEngine,
+    TranscriptionOutput, WhisperOptions,
+};
+use sbobino_infrastructure::adapters::ffmpeg::FfmpegAdapter;
 
 use crate::{
     commands::automatic_import::{
@@ -19,8 +25,9 @@ use crate::{
         IMPORT_FOLDER_METADATA_KEY, IMPORT_PRESET_METADATA_KEY, IMPORT_SOURCE_LABEL_METADATA_KEY,
         IMPORT_WORKSPACE_METADATA_KEY,
     },
+    commands::prepared_transcript::parse_timeline_document,
     error::CommandError,
-    state::{AppState, TranscriptionTask},
+    state::{AppState, ArtifactPostProcessingTask, TranscriptionTask},
 };
 
 const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
@@ -87,6 +94,25 @@ pub struct CancelTranscriptionPayload {
     pub job_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CancelArtifactPostProcessingPayload {
+    pub artifact_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactPostProcessingEvent {
+    pub artifact_id: String,
+    pub kind: String,
+    pub status: String,
+    pub stage: String,
+    pub message: String,
+    pub phase: Option<String>,
+    pub percentage: Option<u8>,
+    pub completed: Option<u64>,
+    pub total: Option<u64>,
+    pub artifact: Option<TranscriptArtifact>,
+}
+
 #[tauri::command]
 pub async fn start_transcription(
     app: tauri::AppHandle,
@@ -103,7 +129,13 @@ pub(crate) async fn spawn_transcription_job(
 ) -> Result<StartTranscriptionResponse, CommandError> {
     let job_id = Uuid::new_v4().to_string();
 
-    let request = RunTranscriptionRequest {
+    let postprocessing_settings = state.runtime_factory.load_settings().ok();
+    let diarization_requested = postprocessing_settings
+        .as_ref()
+        .map(|settings| settings.transcription.speaker_diarization.enabled)
+        .unwrap_or(false);
+
+    let mut request = RunTranscriptionRequest {
         job_id: job_id.clone(),
         input_path: payload.input_path,
         engine: payload.engine,
@@ -120,6 +152,20 @@ pub(crate) async fn spawn_transcription_job(
         metadata: payload.metadata,
         source_fingerprint_json: payload.source_fingerprint_json,
     };
+    if diarization_requested {
+        request
+            .metadata
+            .entry("speaker_diarization_status".to_string())
+            .or_insert_with(|| "queued".to_string());
+        request
+            .metadata
+            .entry("speaker_diarization_progress".to_string())
+            .or_insert_with(|| "0".to_string());
+        request
+            .metadata
+            .entry("speaker_diarization_phase".to_string())
+            .or_insert_with(|| "queued".to_string());
+    }
 
     let runtime_factory = state.runtime_factory.clone();
     let app_handle = app.clone();
@@ -134,6 +180,8 @@ pub(crate) async fn spawn_transcription_job(
     let transcription_gate = state.transcription_gate.clone();
     let automatic_import_metadata = request.metadata.clone();
     let automatic_import_state = state.clone();
+    let postprocessing_state = state.clone();
+    let postprocessing_input_path = request.input_path.clone();
     let progress_input_path = request.input_path.clone();
     let progress_title = request.title.clone();
     let progress_source_origin = request.source_origin.clone();
@@ -174,6 +222,25 @@ pub(crate) async fn spawn_transcription_job(
                 },
             );
         });
+
+        // Emit an immediate PreparingAudio event so the job appears in the
+        // transcription queue without waiting for the runtime gate or the
+        // service's own first emit (which only fires after build_service() and
+        // the transcode setup). This covers every entry point — manual start,
+        // queued promotion and automatic import — so non-WAV inputs are no
+        // longer invisible until their ffmpeg conversion completes.
+        emit_progress(JobProgress {
+            job_id: task_job_id.clone(),
+            stage: JobStage::PreparingAudio,
+            message: "Preparing transcription".to_string(),
+            percentage: 0,
+            current_seconds: None,
+            total_seconds: None,
+            phase: None,
+            progress_kind: sbobino_domain::ProgressKind::Actual,
+            attempt: 1,
+            effective_model: None,
+        });
         let delta_sequence = delta_sequence.clone();
         let emit_delta = Arc::new(move |text: String| {
             let (mode, normalized_text) =
@@ -208,10 +275,21 @@ pub(crate) async fn spawn_transcription_job(
                     percentage: 0,
                     current_seconds: None,
                     total_seconds: None,
+                    phase: None,
+                    progress_kind: sbobino_domain::ProgressKind::Actual,
+                    attempt: 1,
+                    effective_model: None,
                 });
                 tokio::select! {
                     biased;
                     _ = task_cancellation_token.cancelled() => {
+                        let _ = app.emit(
+                            "transcription://failed",
+                            JobFailedEvent {
+                                job_id: task_job_id.clone(),
+                                message: "Transcription cancelled".to_string(),
+                            },
+                        );
                         let mut registry = tasks.lock().await;
                         registry.remove(&cleanup_job_id);
                         return;
@@ -236,6 +314,13 @@ pub(crate) async fn spawn_transcription_job(
         };
 
         if task_cancellation_token.is_cancelled() {
+            let _ = app.emit(
+                "transcription://failed",
+                JobFailedEvent {
+                    job_id: task_job_id.clone(),
+                    message: "Transcription cancelled".to_string(),
+                },
+            );
             let mut registry = tasks.lock().await;
             registry.remove(&cleanup_job_id);
             return;
@@ -267,9 +352,29 @@ pub(crate) async fn spawn_transcription_job(
                     &automatic_import_metadata,
                 )
                 .await;
+                let postprocess_artifact = artifact.clone();
                 let _ = app.emit("transcription://completed", artifact);
+                if diarization_requested {
+                    if let Some(settings) = postprocessing_settings.clone() {
+                        tauri::async_runtime::spawn(run_file_diarization_background(
+                            app.clone(),
+                            postprocessing_state.clone(),
+                            settings,
+                            postprocess_artifact,
+                            PathBuf::from(postprocessing_input_path.clone()),
+                        ));
+                    }
+                }
             }
-            Err(ApplicationError::Cancelled) => {}
+            Err(ApplicationError::Cancelled) => {
+                let _ = app.emit(
+                    "transcription://failed",
+                    JobFailedEvent {
+                        job_id: task_job_id.clone(),
+                        message: "Transcription cancelled".to_string(),
+                    },
+                );
+            }
             Err(error) => {
                 let _ = record_automatic_import_failure(
                     &automatic_import_state,
@@ -317,4 +422,354 @@ pub async fn cancel_transcription(
     }
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_artifact_postprocessing(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    payload: CancelArtifactPostProcessingPayload,
+) -> Result<(), CommandError> {
+    let task = {
+        let mut registry = state.postprocessing_tasks.lock().await;
+        registry.remove(&payload.artifact_id)
+    };
+
+    if let Some(task) = task {
+        task.cancel_token.cancel();
+    }
+
+    let updated = state
+        .artifact_service
+        .update_diarization_result(&payload.artifact_id, None, "interrupted", None)
+        .await
+        .map_err(|error| CommandError::new("artifact_postprocess", error.to_string()))?;
+    emit_artifact_postprocess(
+        &app,
+        &payload.artifact_id,
+        "diarization",
+        "interrupted",
+        "interrupted",
+        "Speaker detection stopped.",
+        None,
+        Some(0),
+        updated,
+    );
+
+    Ok(())
+}
+
+fn emit_artifact_postprocess(
+    app: &tauri::AppHandle,
+    artifact_id: &str,
+    kind: &str,
+    status: &str,
+    stage: &str,
+    message: &str,
+    progress: Option<DiarizationProgress>,
+    percentage_override: Option<u8>,
+    artifact: Option<TranscriptArtifact>,
+) {
+    let (phase, percentage, completed, total) = if let Some(progress) = progress {
+        (
+            Some(progress.phase),
+            Some(progress.percentage),
+            progress.completed,
+            progress.total,
+        )
+    } else {
+        (
+            Some(stage.to_string()),
+            percentage_override,
+            None::<u64>,
+            None::<u64>,
+        )
+    };
+    let _ = app.emit(
+        "artifact://postprocess",
+        ArtifactPostProcessingEvent {
+            artifact_id: artifact_id.to_string(),
+            kind: kind.to_string(),
+            status: status.to_string(),
+            stage: stage.to_string(),
+            message: message.to_string(),
+            phase,
+            percentage,
+            completed,
+            total,
+            artifact,
+        },
+    );
+}
+
+async fn run_file_diarization_background(
+    app: tauri::AppHandle,
+    state: AppState,
+    settings: AppSettings,
+    artifact: TranscriptArtifact,
+    input_path: PathBuf,
+) {
+    let artifact_id = artifact.id.clone();
+    let cancel_token = CancellationToken::new();
+    {
+        let mut registry = state.postprocessing_tasks.lock().await;
+        registry.insert(
+            artifact_id.clone(),
+            ArtifactPostProcessingTask {
+                cancel_token: cancel_token.clone(),
+            },
+        );
+    }
+
+    let result = run_file_diarization_background_inner(
+        &app,
+        &state,
+        &settings,
+        artifact,
+        &input_path,
+        &cancel_token,
+    )
+    .await;
+
+    {
+        let mut registry = state.postprocessing_tasks.lock().await;
+        registry.remove(&artifact_id);
+    }
+
+    if let Err(error) = result {
+        let (status, stage, message, error_message) = match error {
+            ApplicationError::Cancelled => (
+                "interrupted",
+                "interrupted",
+                "Speaker detection stopped.",
+                None,
+            ),
+            other => (
+                "failed",
+                "failed",
+                "Speaker detection failed; the transcript remains available.",
+                Some(other.to_string()),
+            ),
+        };
+        let updated = state
+            .artifact_service
+            .update_diarization_result(&artifact_id, None, status, error_message.as_deref())
+            .await
+            .ok()
+            .flatten();
+        emit_artifact_postprocess(
+            &app,
+            &artifact_id,
+            "diarization",
+            status,
+            stage,
+            message,
+            None,
+            Some(0),
+            updated,
+        );
+    }
+}
+
+async fn run_file_diarization_background_inner(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    settings: &AppSettings,
+    artifact: TranscriptArtifact,
+    input_path: &Path,
+    cancel_token: &CancellationToken,
+) -> Result<(), ApplicationError> {
+    let artifact_id = artifact.id.clone();
+    emit_artifact_postprocess(
+        app,
+        &artifact_id,
+        "diarization",
+        "queued",
+        "queued",
+        "Speaker detection is queued.",
+        None,
+        Some(0),
+        None,
+    );
+
+    let permit = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return Err(ApplicationError::Cancelled),
+        permit = state.transcription_gate.clone().acquire_owned() => permit.map_err(|_| {
+            ApplicationError::SpeakerDiarization("post-processing gate closed unexpectedly".to_string())
+        })?,
+    };
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        return Err(ApplicationError::Cancelled);
+    }
+
+    let _ = state
+        .artifact_service
+        .update_metadata_entry(&artifact_id, "speaker_diarization_status", Some("running"))
+        .await?;
+    let _ = state
+        .artifact_service
+        .update_metadata_entry(&artifact_id, "speaker_diarization_progress", Some("0"))
+        .await?;
+    let _ = state
+        .artifact_service
+        .update_metadata_entry(&artifact_id, "speaker_diarization_phase", Some("preparing"))
+        .await?;
+    emit_artifact_postprocess(
+        app,
+        &artifact_id,
+        "diarization",
+        "running",
+        "preparing",
+        "Preparing speaker detection.",
+        None,
+        Some(0),
+        None,
+    );
+
+    let wav_path = std::env::temp_dir().join(format!(
+        "sbobino-diarization-{}-{}.wav",
+        artifact_id,
+        Uuid::new_v4()
+    ));
+    let ffmpeg_path = state
+        .runtime_factory
+        .resolve_binary_path(&settings.transcription.ffmpeg_path, "ffmpeg");
+    let transcoder = FfmpegAdapter::new(ffmpeg_path);
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            drop(permit);
+            return Err(ApplicationError::Cancelled);
+        }
+        result = transcoder.to_wav_mono_16k(input_path, &wav_path) => {
+            result?;
+        }
+    }
+
+    let segments = segments_from_artifact_timeline(&artifact);
+    if segments.is_empty() {
+        let updated = state
+            .artifact_service
+            .update_diarization_result(&artifact_id, None, "completed", None)
+            .await?;
+        emit_artifact_postprocess(
+            app,
+            &artifact_id,
+            "diarization",
+            "completed",
+            "completed",
+            "Speaker detection completed.",
+            None,
+            Some(100),
+            updated,
+        );
+        let _ = tokio::fs::remove_file(&wav_path).await;
+        drop(permit);
+        return Ok(());
+    }
+
+    let diarizer = state
+        .runtime_factory
+        .build_speaker_diarizer(settings)
+        .map_err(ApplicationError::SpeakerDiarization)?
+        .ok_or_else(|| {
+            ApplicationError::SpeakerDiarization(
+                "speaker diarization runtime is unavailable".to_string(),
+            )
+        })?;
+
+    let progress_app = app.clone();
+    let progress_artifact_id = artifact_id.clone();
+    let progress = Arc::new(move |progress: DiarizationProgress| {
+        let message = progress.message.clone();
+        emit_artifact_postprocess(
+            &progress_app,
+            &progress_artifact_id,
+            "diarization",
+            "running",
+            "diarizing",
+            &message,
+            Some(progress),
+            None,
+            None,
+        );
+    });
+
+    let turns = tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            let _ = tokio::fs::remove_file(&wav_path).await;
+            drop(permit);
+            return Err(ApplicationError::Cancelled);
+        }
+        result = diarizer.diarize(&wav_path, progress) => result?,
+    };
+
+    let assigned = if turns.is_empty() {
+        segments
+    } else {
+        TranscriptionService::assign_speakers_to_segments(&segments, &turns)
+    };
+    let timeline = TranscriptionOutput {
+        text: assigned
+            .iter()
+            .map(|segment| segment.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        segments: assigned,
+        effective_model: None,
+    }
+    .timeline_v2_metadata_json();
+
+    let updated = state
+        .artifact_service
+        .update_diarization_result(&artifact_id, Some(&timeline), "completed", None)
+        .await?;
+    emit_artifact_postprocess(
+        app,
+        &artifact_id,
+        "diarization",
+        "completed",
+        "completed",
+        "Speaker detection completed.",
+        None,
+        Some(100),
+        updated,
+    );
+
+    let _ = tokio::fs::remove_file(&wav_path).await;
+    drop(permit);
+    Ok(())
+}
+
+fn segments_from_artifact_timeline(artifact: &TranscriptArtifact) -> Vec<TimedSegment> {
+    parse_timeline_document(artifact)
+        .map(|document| {
+            document
+                .segments
+                .into_iter()
+                .map(|segment| TimedSegment {
+                    text: segment.text,
+                    start_seconds: segment.start_seconds,
+                    end_seconds: segment.end_seconds,
+                    speaker_id: segment.speaker_id,
+                    speaker_label: segment.speaker_label,
+                    words: segment
+                        .words
+                        .into_iter()
+                        .map(|word| TimedWord {
+                            text: word.text,
+                            start_seconds: word.start_seconds,
+                            end_seconds: word.end_seconds,
+                            confidence: word.confidence,
+                        })
+                        .collect(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }

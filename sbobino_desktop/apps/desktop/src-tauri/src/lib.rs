@@ -51,7 +51,9 @@ use crate::commands::settings::{
     list_gemini_models, list_prompts, reset_prompts, save_prompt, test_prompt, update_ai_providers,
     update_settings, update_settings_partial,
 };
-use crate::commands::transcription::{cancel_transcription, start_transcription};
+use crate::commands::transcription::{
+    cancel_artifact_postprocessing, cancel_transcription, start_transcription,
+};
 use crate::commands::updates::check_updates;
 use crate::commands::window::open_settings_window;
 use crate::state::{ProvisioningRuntime, RealtimeRuntime};
@@ -176,6 +178,24 @@ pub fn run() {
                 });
             }
 
+            {
+                let artifact_service = bundle.artifact_service.clone();
+                tauri::async_runtime::spawn(async move {
+                    match artifact_service
+                        .interrupt_pending_postprocessing_jobs()
+                        .await
+                    {
+                        Ok(count) if count > 0 => {
+                            warn!("marked {count} unfinished post-processing job(s) as interrupted")
+                        }
+                        Ok(_) => {}
+                        Err(error) => warn!(
+                            "failed to recover unfinished post-processing jobs at startup: {error}"
+                        ),
+                    }
+                });
+            }
+
             let realtime_engine = bundle
                 .runtime_factory
                 .build_whisper_stream_engine()
@@ -192,6 +212,7 @@ pub fn run() {
                 settings_service: bundle.settings_service,
                 runtime_factory: bundle.runtime_factory,
                 transcription_tasks: Arc::new(Mutex::new(HashMap::new())),
+                postprocessing_tasks: Arc::new(Mutex::new(HashMap::new())),
                 transcription_gate: Arc::new(Semaphore::new(1)),
                 realtime: RealtimeRuntime {
                     engine: Arc::new(Mutex::new(realtime_engine)),
@@ -230,6 +251,7 @@ pub fn run() {
             test_prompt,
             start_transcription,
             cancel_transcription,
+            cancel_artifact_postprocessing,
             list_artifacts,
             list_deleted_artifacts,
             list_recent_artifacts,

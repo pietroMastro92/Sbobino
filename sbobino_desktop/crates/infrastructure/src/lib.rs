@@ -67,10 +67,13 @@ const REQUIRED_MODEL_FILES: [&str; 5] = [
 ];
 
 const PARAKEET_MODEL_CATALOG: [(&str, &str); 2] = [
-    ("tdt-0.6b-v3-q4_k.gguf", "Parakeet TDT 0.6B Q4 — file only"),
+    (
+        "tdt-0.6b-v3-f16.gguf",
+        "Parakeet TDT 0.6B F16 — file only (high accuracy)",
+    ),
     (
         "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
-        "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual",
+        "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual (compact)",
     ),
 ];
 const REQUIRED_COREML_ENCODERS: [(&str, &str); 5] = [
@@ -488,8 +491,6 @@ impl RuntimeTranscriptionFactory {
                     parakeet_models_dir,
                 )),
             };
-        let speaker_diarizer = self.build_speaker_diarizer(&settings)?;
-
         let enhancer_candidates = self
             .build_enhancer_candidates()
             .map_err(|error| format!("failed to build AI enhancer chain: {error}"))?;
@@ -503,16 +504,13 @@ impl RuntimeTranscriptionFactory {
             .map(|candidate| candidate.enhancer.clone())
             .collect::<Vec<_>>();
 
-        let mut service = TranscriptionService::new(
+        let service = TranscriptionService::new(
             transcoder,
             speech_engine,
             enhancer,
             self.artifacts_repo.clone(),
         )
         .with_fallback_enhancers(fallback_enhancers);
-        if let Some(diarizer) = speaker_diarizer {
-            service = service.with_speaker_diarizer(diarizer);
-        }
 
         Ok(Arc::new(service))
     }

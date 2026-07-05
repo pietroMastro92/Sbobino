@@ -3,7 +3,7 @@ use std::fs;
 use tempfile::tempdir;
 
 use sbobino_application::SettingsRepository;
-use sbobino_domain::{LanguageCode, SpeechModel};
+use sbobino_domain::{LanguageCode, ParakeetModel, SpeechModel};
 use sbobino_infrastructure::repositories::fs_settings_repository::FsSettingsRepository;
 
 fn enable_local_secure_storage_for_tests() {
@@ -92,6 +92,40 @@ async fn save_then_load_preserves_structured_transcription_settings() {
             .get("speaker_1")
             .map(String::as_str),
         Some("#4F7CFF")
+    );
+}
+
+#[tokio::test]
+async fn load_splits_legacy_streaming_parakeet_model_into_file_and_live_defaults() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let settings_path = temp.path().join("settings.json");
+    let mut settings = sbobino_domain::AppSettings::default();
+    settings.transcription.parakeet_model = ParakeetModel::Nemotron35AsrStreaming06bQ4;
+    settings.sync_legacy_from_sections();
+    let mut raw = serde_json::to_value(&settings).expect("settings should serialize");
+    raw["transcription"]
+        .as_object_mut()
+        .expect("transcription should be an object")
+        .remove("parakeet_live_model");
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&raw).expect("settings JSON"),
+    )
+    .expect("write legacy settings");
+
+    let loaded = FsSettingsRepository::new(settings_path)
+        .load()
+        .await
+        .expect("legacy settings should migrate");
+
+    assert_eq!(
+        loaded.transcription.parakeet_model,
+        ParakeetModel::Tdt06bV3F16
+    );
+    assert_eq!(
+        loaded.transcription.parakeet_live_model,
+        ParakeetModel::Nemotron35AsrStreaming06bQ4
     );
 }
 

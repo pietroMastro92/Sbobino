@@ -77,9 +77,9 @@ pub enum ParakeetModel {
     Nemotron35AsrStreaming06bQ4,
     #[serde(rename = "nemotron35_asr_streaming_06b_q8")]
     Nemotron35AsrStreaming06bQ8,
+    #[default]
     Tdt06bV3F16,
     Tdt06bV3Q8,
-    #[default]
     Tdt06bV3Q4,
 }
 
@@ -109,6 +109,14 @@ impl ParakeetModel {
                 | Self::Nemotron35AsrStreaming06bQ8
         )
     }
+
+    pub fn is_streaming(&self) -> bool {
+        self.is_english_realtime_eou() || self.is_multilingual_streaming()
+    }
+}
+
+fn default_parakeet_live_model() -> ParakeetModel {
+    ParakeetModel::Nemotron35AsrStreaming06bQ4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -319,6 +327,8 @@ pub struct TranscriptionSettings {
     pub engine: TranscriptionEngine,
     pub model: SpeechModel,
     pub parakeet_model: ParakeetModel,
+    #[serde(default = "default_parakeet_live_model")]
+    pub parakeet_live_model: ParakeetModel,
     pub language: LanguageCode,
     pub whisper_cli_path: String,
     #[serde(alias = "whisper_stream_path")]
@@ -338,6 +348,7 @@ impl Default for TranscriptionSettings {
             engine: TranscriptionEngine::default(),
             model: SpeechModel::Base,
             parakeet_model: ParakeetModel::default(),
+            parakeet_live_model: default_parakeet_live_model(),
             language: LanguageCode::Auto,
             whisper_cli_path: "whisper-cli".to_string(),
             whisperkit_cli_path: "whisper-stream".to_string(),

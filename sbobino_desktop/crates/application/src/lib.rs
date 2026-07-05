@@ -5,7 +5,8 @@ pub mod services;
 pub mod summary_pipeline;
 
 pub use dto::{
-    ArtifactQuery, RealtimeDelta, RealtimeDeltaKind, RunTranscriptionRequest, SummaryFaq,
+    ArtifactQuery, DiarizationProgress, RealtimeDelta, RealtimeDeltaKind, RunTranscriptionRequest,
+    SummaryFaq, TranscriptionProgress,
 };
 pub use error::{is_retryable_ai_provider_error, ApplicationError};
 pub use ports::{
@@ -13,7 +14,7 @@ pub use ports::{
     SpeechToTextEngine, TranscriptEnhancer,
 };
 pub use sbobino_domain::{
-    EmotionAnalysisResult, SpeakerTurn, TimedSegment, TimedWord, TranscriptionOutput,
+    EmotionAnalysisResult, ProgressKind, SpeakerTurn, TimedSegment, TimedWord, TranscriptionOutput,
 };
 pub use services::{ArtifactService, SettingsService, TranscriptionService};
 pub use summary_pipeline::{

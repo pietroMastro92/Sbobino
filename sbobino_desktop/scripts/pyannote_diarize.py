@@ -2,9 +2,48 @@
 
 import argparse
 import json
+import os
 import sys
 import wave
 from typing import Dict, List
+
+
+PROGRESS_PREFIX = "SBOBINO_DIARIZATION_PROGRESS "
+_last_progress = 0
+
+
+def emit_progress(phase, percentage, message, completed=None, total=None):
+    global _last_progress
+    percentage = max(_last_progress, min(100, int(round(percentage))))
+    _last_progress = percentage
+    payload = {
+        "phase": phase,
+        "percentage": percentage,
+        "completed": None if completed is None else int(completed),
+        "total": None if total is None else int(total),
+        "message": message,
+    }
+    sys.stderr.write(PROGRESS_PREFIX + json.dumps(payload) + "\n")
+    sys.stderr.flush()
+
+
+class SbobinoProgressHook:
+    RANGES = {
+        "segmentation": (5, 55, "Segmenting speech"),
+        "speaker_counting": (55, 60, "Counting active speakers"),
+        "embeddings": (60, 92, "Detecting speakers"),
+        "discrete_diarization": (92, 98, "Clustering speaker turns"),
+    }
+
+    def __call__(self, step_name, _artifact, file=None, total=None, completed=None):
+        if step_name not in self.RANGES:
+            return
+        start, end, message = self.RANGES[step_name]
+        if completed is None or total in (None, 0):
+            percentage = end
+        else:
+            percentage = start + (end - start) * min(1.0, completed / total)
+        emit_progress(step_name, percentage, message, completed, total)
 
 
 def resolve_device_candidates(requested: str):
@@ -89,7 +128,13 @@ def main() -> int:
     parser.add_argument("--audio-path", required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--batch-size", type=int, default=16)
     args = parser.parse_args()
+
+    try:
+        os.nice(5)
+    except OSError:
+        pass
 
     try:
         import torch  # noqa: F401 - explicit dependency preflight check
@@ -101,15 +146,27 @@ def main() -> int:
         sys.stderr.write(f"{error}\n")
         return 1
 
+    worker_threads = max(1, int(os.environ.get("OMP_NUM_THREADS", "2")))
+    torch.set_num_threads(worker_threads)
+    torch.set_num_interop_threads(1)
+    emit_progress("loading_model", 0, "Loading speaker diarization model")
+
     input_payload = None
     last_error = None
     for device in resolve_device_candidates(args.device):
         try:
             if input_payload is None:
                 input_payload = load_wav_input(args.audio_path)
+            emit_progress("loading_model", 2, f"Loading diarization model for {device}")
             pipeline = Pipeline.from_pretrained(args.model_path)
             pipeline.to(device)
-            diarization = pipeline(input_payload)
+            batch_size = max(1, int(args.batch_size))
+            if str(device) == "cpu":
+                batch_size = min(batch_size, 8)
+            pipeline.segmentation_batch_size = batch_size
+            pipeline.embedding_batch_size = batch_size
+            emit_progress("loading_model", 5, f"Diarization model ready on {device}")
+            diarization = pipeline(input_payload, hook=SbobinoProgressHook())
             break
         except Exception as error:
             last_error = error
@@ -117,6 +174,7 @@ def main() -> int:
                 sys.stderr.write(
                     f"pyannote inference on {device} failed; retrying on cpu: {error}\n"
                 )
+                emit_progress("retrying_cpu", _last_progress, "Retrying diarization on CPU")
                 continue
             sys.stderr.write(f"pyannote inference failed: {error}\n")
             return 1
@@ -149,6 +207,7 @@ def main() -> int:
         )
 
     turns.sort(key=lambda item: (item["start_seconds"], item["end_seconds"]))
+    emit_progress("finalizing", 100, "Speaker diarization completed")
     sys.stdout.write(json.dumps({"speakers": turns}))
     return 0
 

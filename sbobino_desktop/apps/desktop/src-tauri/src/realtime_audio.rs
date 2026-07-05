@@ -13,9 +13,16 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RealtimeWaveformBin {
+    pub min: f32,
+    pub max: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct RealtimeInputLevelEvent {
     pub state: String,
     pub level: f32,
+    pub envelope: Vec<RealtimeWaveformBin>,
     pub message: String,
 }
 
@@ -48,6 +55,30 @@ fn mean_abs_level(samples: impl Iterator<Item = f32>) -> f32 {
 
     let normalized = (sum / count as f32) * 3.2;
     clamp_level(normalized)
+}
+
+pub(crate) fn waveform_envelope(samples: &[f32], bin_count: usize) -> Vec<RealtimeWaveformBin> {
+    if samples.is_empty() || bin_count == 0 {
+        return Vec::new();
+    }
+    let bin_count = bin_count.min(samples.len());
+    let mut output = Vec::with_capacity(bin_count);
+    for index in 0..bin_count {
+        let start = index * samples.len() / bin_count;
+        let end = ((index + 1) * samples.len() / bin_count).max(start + 1);
+        let mut minimum = 0.0_f32;
+        let mut maximum = 0.0_f32;
+        for sample in &samples[start..end.min(samples.len())] {
+            let value = if sample.abs() < 0.003 { 0.0 } else { *sample };
+            minimum = minimum.min(value);
+            maximum = maximum.max(value);
+        }
+        output.push(RealtimeWaveformBin {
+            min: (minimum * 6.0).clamp(-1.0, 1.0),
+            max: (maximum * 6.0).clamp(-1.0, 1.0),
+        });
+    }
+    output
 }
 
 fn map_input_error(reason_code: &str, detail: impl Into<String>) -> RealtimeInputError {
@@ -110,6 +141,24 @@ pub(crate) fn emit_level_event(
         RealtimeInputLevelEvent {
             state: state.to_string(),
             level: clamp_level(level),
+            envelope: Vec::new(),
+            message: message.into(),
+        },
+    );
+}
+
+fn emit_waveform_event(
+    app: &AppHandle,
+    level: f32,
+    envelope: Vec<RealtimeWaveformBin>,
+    message: impl Into<String>,
+) {
+    let _ = app.emit(
+        "realtime://input_level",
+        RealtimeInputLevelEvent {
+            state: "running".to_string(),
+            level: clamp_level(level),
+            envelope,
             message: message.into(),
         },
     );
@@ -120,17 +169,22 @@ fn build_stream_from_config(
     config: &StreamConfig,
     sample_format: SampleFormat,
     level_bits: Arc<AtomicU32>,
+    envelope_slot: Arc<Mutex<Vec<RealtimeWaveformBin>>>,
     last_error: Arc<Mutex<Option<String>>>,
 ) -> Result<Stream, BuildStreamError> {
     match sample_format {
         SampleFormat::F32 => {
             let level_slot = level_bits.clone();
+            let waveform_slot = envelope_slot.clone();
             let error_slot = last_error.clone();
             device.build_input_stream(
                 config,
                 move |data: &[f32], _| {
                     let level = mean_abs_level(data.iter().copied());
                     level_slot.store(level.to_bits(), Ordering::Relaxed);
+                    if let Ok(mut slot) = waveform_slot.try_lock() {
+                        *slot = waveform_envelope(data, 4);
+                    }
                 },
                 move |error| {
                     if let Ok(mut slot) = error_slot.lock() {
@@ -142,13 +196,20 @@ fn build_stream_from_config(
         }
         SampleFormat::I16 => {
             let level_slot = level_bits.clone();
+            let waveform_slot = envelope_slot.clone();
             let error_slot = last_error.clone();
             device.build_input_stream(
                 config,
                 move |data: &[i16], _| {
-                    let level =
-                        mean_abs_level(data.iter().map(|sample| *sample as f32 / i16::MAX as f32));
+                    let samples = data
+                        .iter()
+                        .map(|sample| *sample as f32 / i16::MAX as f32)
+                        .collect::<Vec<_>>();
+                    let level = mean_abs_level(samples.iter().copied());
                     level_slot.store(level.to_bits(), Ordering::Relaxed);
+                    if let Ok(mut slot) = waveform_slot.try_lock() {
+                        *slot = waveform_envelope(&samples, 4);
+                    }
                 },
                 move |error| {
                     if let Ok(mut slot) = error_slot.lock() {
@@ -160,15 +221,20 @@ fn build_stream_from_config(
         }
         SampleFormat::U16 => {
             let level_slot = level_bits.clone();
+            let waveform_slot = envelope_slot.clone();
             let error_slot = last_error.clone();
             device.build_input_stream(
                 config,
                 move |data: &[u16], _| {
-                    let level = mean_abs_level(
-                        data.iter()
-                            .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0),
-                    );
+                    let samples = data
+                        .iter()
+                        .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
+                        .collect::<Vec<_>>();
+                    let level = mean_abs_level(samples.iter().copied());
                     level_slot.store(level.to_bits(), Ordering::Relaxed);
+                    if let Ok(mut slot) = waveform_slot.try_lock() {
+                        *slot = waveform_envelope(&samples, 4);
+                    }
                 },
                 move |error| {
                     if let Ok(mut slot) = error_slot.lock() {
@@ -220,12 +286,14 @@ pub fn start_input_preview(
             }
         };
         let level_bits = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let envelope_slot = Arc::new(Mutex::new(Vec::<RealtimeWaveformBin>::new()));
         let last_error = Arc::new(Mutex::new(None::<String>));
         let stream = match build_stream_from_config(
             &device,
             &supported_config.config(),
             supported_config.sample_format(),
             level_bits.clone(),
+            envelope_slot.clone(),
             last_error.clone(),
         ) {
             Ok(value) => value,
@@ -243,7 +311,7 @@ pub fn start_input_preview(
         emit_level_event(&app_handle, "running", 0.0, format!("Using {device_name}"));
 
         loop {
-            match shutdown_rx.recv_timeout(Duration::from_millis(45)) {
+            match shutdown_rx.recv_timeout(Duration::from_millis(33)) {
                 Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     emit_level_event(&app_handle, "idle", 0.0, "Microphone preview stopped.");
                     break;
@@ -261,10 +329,14 @@ pub fn start_input_preview(
                     }
 
                     let level = f32::from_bits(level_bits.load(Ordering::Relaxed));
-                    emit_level_event(
+                    let envelope = envelope_slot
+                        .lock()
+                        .map(|mut slot| std::mem::take(&mut *slot))
+                        .unwrap_or_default();
+                    emit_waveform_event(
                         &app_handle,
-                        "running",
                         level,
+                        envelope,
                         format!("Using {device_name}"),
                     );
                 }
@@ -286,5 +358,20 @@ impl RealtimeInputPreviewHandle {
     pub fn stop(self, app: &AppHandle, final_state: &str, message: &str) {
         let _ = self.shutdown_tx.send(());
         emit_level_event(app, final_state, 0.0, message.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::waveform_envelope;
+
+    #[test]
+    fn waveform_envelope_preserves_distinct_microphone_transients() {
+        let samples = [0.0, 0.01, -0.02, 0.03, -0.4, 0.7, -0.2, 0.1];
+        let envelope = waveform_envelope(&samples, 4);
+        assert_eq!(envelope.len(), 4);
+        assert!(envelope[0].max.abs() < envelope[2].max.abs());
+        assert!(envelope[2].min < -0.5);
+        assert!(envelope[2].max > 0.9);
     }
 }

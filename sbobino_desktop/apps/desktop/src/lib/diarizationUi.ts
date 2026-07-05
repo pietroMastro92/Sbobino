@@ -25,6 +25,12 @@ export type ArtifactDiarizationUiState =
       speakerLabels: [];
       error: null;
     }
+  | {
+      kind: "processing" | "interrupted";
+      speakerCount: 0;
+      speakerLabels: [];
+      error: null;
+    }
   | null;
 
 function normalizeText(value: string | null | undefined): string | null {
@@ -88,6 +94,14 @@ export function getArtifactDiarizationUiState(
       speakerLabels: [],
       error: null,
     };
+  }
+
+  if (["queued", "running", "diarizing"].includes(diarizationStatus ?? "")) {
+    return { kind: "processing", speakerCount: 0, speakerLabels: [], error: null };
+  }
+
+  if (diarizationStatus === "interrupted") {
+    return { kind: "interrupted", speakerCount: 0, speakerLabels: [], error: null };
   }
 
   return {

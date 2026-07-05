@@ -14,7 +14,7 @@ pub use emotion_analysis::{
     EmotionSemanticEdge, EmotionSemanticMap, EmotionSemanticNode, EmotionTimelineEntry,
 };
 pub use error::DomainError;
-pub use job::{JobProgress, JobStage, JobStatus, TranscriptionJob};
+pub use job::{JobProgress, JobStage, JobStatus, ProgressKind, TranscriptionJob};
 pub use settings::{
     default_prompt_templates, AiProvider, AiSettings, AppLanguage, AppSettings, AppearanceMode,
     AutomaticImportActivityEntry, AutomaticImportActivityLevel,

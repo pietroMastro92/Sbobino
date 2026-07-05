@@ -37,6 +37,26 @@ pub struct JobProgress {
     pub percentage: u8,
     pub current_seconds: Option<f32>,
     pub total_seconds: Option<f32>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub progress_kind: ProgressKind,
+    #[serde(default = "default_progress_attempt")]
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+}
+
+fn default_progress_attempt() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressKind {
+    #[default]
+    Actual,
+    Estimated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

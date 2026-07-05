@@ -448,7 +448,7 @@ pub async fn get_realtime_start_readiness(
         let requested_parakeet_model = payload
             .as_ref()
             .and_then(|value| value.parakeet_model.clone())
-            .unwrap_or_else(|| settings.transcription.parakeet_model.clone());
+            .unwrap_or_else(|| settings.transcription.parakeet_live_model.clone());
         let health = state
             .runtime_factory
             .runtime_health_preflight()

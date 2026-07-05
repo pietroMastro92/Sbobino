@@ -7,7 +7,7 @@ source "$ROOT_DIR/scripts/lib/asr_samples.sh"
 APP_ID=${SBOBINO_APP_ID:-com.sbobino.desktop}
 APP_SUPPORT_DIR=${SBOBINO_APP_SUPPORT_DIR:-"$HOME/Library/Application Support/$APP_ID"}
 PARAKEET_MODELS_DIR=${SBOBINO_PARAKEET_MODELS_DIR:-"$APP_SUPPORT_DIR/parakeet-models"}
-PARAKEET_MODEL=${SBOBINO_PARAKEET_MODEL:-tdt-0.6b-v3-q4_k.gguf}
+PARAKEET_MODEL=${SBOBINO_PARAKEET_MODEL:-tdt-0.6b-v3-f16.gguf}
 WHISPER_MODELS_DIR=${SBOBINO_WHISPER_MODELS_DIR:-"$APP_SUPPORT_DIR/models"}
 WHISPER_MODEL=${SBOBINO_WHISPER_MODEL:-ggml-base.bin}
 WHISPER_LANGUAGE=${SBOBINO_WHISPER_LANGUAGE:-en}
@@ -94,6 +94,35 @@ rtfx_for() {
   }'
 }
 
+print_speedup_summary() {
+  local baseline_label=$1
+  local candidate_label=$2
+  local baseline_real=$3
+  local candidate_real=$4
+  local baseline_status=$5
+  local candidate_status=$6
+
+  if [[ "$baseline_status" != "0" || "$candidate_status" != "0" ]]; then
+    echo "${candidate_label}_vs_${baseline_label}_summary=unavailable"
+    return 0
+  fi
+  awk \
+    -v baseline_label="$baseline_label" \
+    -v candidate_label="$candidate_label" \
+    -v baseline="$baseline_real" \
+    -v candidate="$candidate_real" \
+    'BEGIN {
+      if (baseline <= 0 || candidate <= 0) {
+        printf "%s_vs_%s_summary=unavailable\n", candidate_label, baseline_label
+        exit
+      }
+      speedup = baseline / candidate
+      percent = (speedup - 1.0) * 100.0
+      printf "%s_vs_%s_speedup=%.2fx\n", candidate_label, baseline_label, speedup
+      printf "%s_vs_%s_percent_faster=%.0f%%\n", candidate_label, baseline_label, percent
+    }'
+}
+
 preview_file() {
   local path=$1
   if [[ ! -s "$path" ]]; then
@@ -146,6 +175,10 @@ run_timed() {
     echo "${label}_preview=$preview"
   fi
   echo
+
+  eval "${label}_status_value=\$status"
+  eval "${label}_real_seconds_value=\$real"
+  eval "${label}_rtfx_value=\$rtfx"
 
   return "$status"
 }
@@ -266,17 +299,39 @@ elif [[ -n "${WHISPER_CLI:-}" && -x "$WHISPER_CLI" && -f "$WHISPER_MODEL_PATH" ]
       -np || true
   fi
 
-  run_timed whisper_cpu \
-    env DYLD_LIBRARY_PATH="$BIN_DIR:${DYLD_LIBRARY_PATH:-}" "$WHISPER_CLI" \
-    --no-gpu \
-    -m "$WHISPER_MODEL_PATH" \
-    -f "$ASR_NORMALIZED_WAV" \
-    -l "$WHISPER_LANGUAGE" \
-    -oj -ojf \
-    -of "$RUN_DIR/whisper_cpu" \
-    -np || true
+  if [[ "${SBOBINO_COMPARE_SKIP_WHISPER_CPU:-0}" != "1" ]]; then
+    run_timed whisper_cpu \
+      env DYLD_LIBRARY_PATH="$BIN_DIR:${DYLD_LIBRARY_PATH:-}" "$WHISPER_CLI" \
+      --no-gpu \
+      -m "$WHISPER_MODEL_PATH" \
+      -f "$ASR_NORMALIZED_WAV" \
+      -l "$WHISPER_LANGUAGE" \
+      -oj -ojf \
+      -of "$RUN_DIR/whisper_cpu" \
+      -np || true
+  else
+    echo "whisper_cpu_status=skipped"
+  fi
 else
   echo "whisper_status=missing"
 fi
+
+echo
+echo "benchmark_summary=begin"
+print_speedup_summary \
+  whisper_default \
+  parakeet_default \
+  "${whisper_default_real_seconds_value:-0}" \
+  "${parakeet_default_real_seconds_value:-0}" \
+  "${whisper_default_status_value:-missing}" \
+  "${parakeet_default_status_value:-missing}"
+print_speedup_summary \
+  whisper_cpu \
+  parakeet_default \
+  "${whisper_cpu_real_seconds_value:-0}" \
+  "${parakeet_default_real_seconds_value:-0}" \
+  "${whisper_cpu_status_value:-missing}" \
+  "${parakeet_default_status_value:-missing}"
+echo "benchmark_summary=end"
 
 exit "$PARAKEET_STATUS"

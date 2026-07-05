@@ -6,11 +6,24 @@ use sbobino_domain::{
     AppSettings, ArtifactKind, SpeakerTurn, TranscriptArtifact, TranscriptionOutput, WhisperOptions,
 };
 
-use crate::{dto::SummaryFaq, ApplicationError};
+use crate::{
+    dto::{DiarizationProgress, SummaryFaq, TranscriptionProgress},
+    ApplicationError,
+};
 
 #[async_trait]
 pub trait AudioTranscoder: Send + Sync {
     async fn to_wav_mono_16k(&self, input: &Path, output: &Path) -> Result<(), ApplicationError>;
+
+    async fn to_wav_mono_16k_with_progress(
+        &self,
+        input: &Path,
+        output: &Path,
+        emit_progress: std::sync::Arc<dyn Fn(f32, Option<f32>) + Send + Sync>,
+    ) -> Result<(), ApplicationError> {
+        let _ = emit_progress;
+        self.to_wav_mono_16k(input, output).await
+    }
 }
 
 #[async_trait]
@@ -26,11 +39,40 @@ pub trait SpeechToTextEngine: Send + Sync {
         emit_partial: std::sync::Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: std::sync::Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<TranscriptionOutput, ApplicationError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transcribe_with_progress(
+        &self,
+        input_wav: &Path,
+        model_filename: &str,
+        language_code: &str,
+        options: &WhisperOptions,
+        total_audio_seconds: Option<f32>,
+        emit_partial: std::sync::Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress: std::sync::Arc<dyn Fn(TranscriptionProgress) + Send + Sync>,
+    ) -> Result<TranscriptionOutput, ApplicationError> {
+        self.transcribe(
+            input_wav,
+            model_filename,
+            language_code,
+            options,
+            total_audio_seconds,
+            emit_partial,
+            std::sync::Arc::new(move |seconds| {
+                emit_progress(TranscriptionProgress::actual(seconds));
+            }),
+        )
+        .await
+    }
 }
 
 #[async_trait]
 pub trait SpeakerDiarizationEngine: Send + Sync {
-    async fn diarize(&self, input_wav: &Path) -> Result<Vec<SpeakerTurn>, ApplicationError>;
+    async fn diarize(
+        &self,
+        input_wav: &Path,
+        emit_progress: std::sync::Arc<dyn Fn(DiarizationProgress) + Send + Sync>,
+    ) -> Result<Vec<SpeakerTurn>, ApplicationError>;
 }
 
 #[async_trait]
@@ -102,6 +144,19 @@ pub trait ArtifactRepository: Send + Sync {
         &self,
         id: &str,
         timeline_v2_json: &str,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError>;
+    async fn update_diarization_result(
+        &self,
+        id: &str,
+        timeline_v2_json: Option<&str>,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError>;
+    async fn interrupt_pending_postprocessing_jobs(&self) -> Result<usize, ApplicationError>;
+    async fn attach_audio_file(
+        &self,
+        id: &str,
+        source_path: &std::path::Path,
     ) -> Result<Option<TranscriptArtifact>, ApplicationError>;
     async fn update_emotion_analysis(
         &self,

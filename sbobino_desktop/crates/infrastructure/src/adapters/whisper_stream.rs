@@ -122,11 +122,12 @@ impl WhisperStreamEngine {
         None
     }
 
-    fn process_is_alive(pid: u32) -> bool {
-        std::process::Command::new("kill")
+    async fn process_is_alive(pid: u32) -> bool {
+        Command::new("kill")
             .arg("-0")
             .arg(pid.to_string())
             .status()
+            .await
             .map(|status| status.success())
             .unwrap_or(false)
     }
@@ -450,10 +451,11 @@ impl WhisperStreamEngine {
 
         if let Some(child) = &mut child {
             if let Some(pid) = child.id() {
-                let _ = std::process::Command::new("kill")
+                let _ = Command::new("kill")
                     .arg("-INT")
                     .arg(pid.to_string())
-                    .status();
+                    .status()
+                    .await;
             }
 
             if timeout(Duration::from_millis(900), child.wait())
@@ -461,10 +463,11 @@ impl WhisperStreamEngine {
                 .is_err()
             {
                 if let Some(pid) = child.id() {
-                    let _ = std::process::Command::new("kill")
+                    let _ = Command::new("kill")
                         .arg("-TERM")
                         .arg(pid.to_string())
-                        .status();
+                        .status()
+                        .await;
                 }
                 if timeout(Duration::from_millis(500), child.wait())
                     .await
@@ -507,7 +510,7 @@ impl WhisperStreamEngine {
                 state.running = false;
                 state.paused = false;
             } else if let Some(pid) = child.id() {
-                if !Self::process_is_alive(pid) {
+                if !Self::process_is_alive(pid).await {
                     state.running = false;
                     state.paused = false;
                 }

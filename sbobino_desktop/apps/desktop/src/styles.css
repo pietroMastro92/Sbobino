@@ -1484,10 +1484,22 @@ summary,
 }
 
 .progress-ring-core {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 100%;
   height: 100%;
   border-radius: 999px;
   background: var(--progress-ring-core-bg, var(--detail-main-bg));
+}
+
+.progress-ring-label {
+  font-size: 6.5px;
+  line-height: 1;
+  font-weight: 800;
+  letter-spacing: -0.06em;
+  color: var(--progress-ring-label, var(--detail-active-text));
+  transform: translateY(0.2px);
 }
 
 .history-item {
@@ -2185,6 +2197,27 @@ summary,
   transform: scale(0.97);
 }
 
+.transcribing-cancel-pill--readonly {
+  cursor: default;
+  pointer-events: auto;
+}
+
+.transcribing-cancel-pill--readonly:hover,
+.transcribing-cancel-pill--readonly:focus-visible {
+  width: 70px;
+  background: var(--transcribing-pill-surface);
+}
+
+.transcribing-cancel-pill--readonly:active {
+  transform: none;
+}
+
+.transcribing-cancel-pill--diarization {
+  --progress-ring-fill: #7c3aed;
+  --progress-ring-track: color-mix(in srgb, #7c3aed 18%, var(--line-soft));
+  --progress-ring-label: color-mix(in srgb, #7c3aed 78%, var(--detail-active-text));
+}
+
 .optimize-hover-button {
   display: flex;
   align-items: center;
@@ -2567,6 +2600,38 @@ summary,
   color: var(--muted);
   font-size: 0.84rem;
   line-height: 1.4;
+}
+
+.diarization-progress-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: min(420px, 100%);
+  margin-top: 4px;
+}
+
+.diarization-progress-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, var(--line-soft));
+}
+
+.diarization-progress-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), var(--accent-strong));
+  transition: width 180ms ease-out;
+}
+
+.diarization-progress-row > span {
+  min-width: 3ch;
+  color: var(--text);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .transcript-speaker-banner-actions {
@@ -3246,9 +3311,16 @@ summary,
   color: var(--muted);
 }
 
+.inspector-inline-action {
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px;
+  font-size: 0.82rem;
+}
+
 .speaker-chip-list {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 8px;
 }
 
@@ -3272,10 +3344,11 @@ summary,
 }
 
 .speaker-chip-row {
-  display: inline-flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px 28px;
   align-items: center;
   gap: 8px;
-  position: relative;
+  min-width: 0;
 }
 
 .speaker-chip-button {
@@ -3291,11 +3364,10 @@ summary,
   transition:
     border-color 140ms ease,
     background-color 140ms ease,
-    color 140ms ease,
-    transform 140ms ease,
-    padding-right 180ms ease;
+    color 140ms ease;
   position: relative;
-  padding-right: 14px;
+  width: 100%;
+  min-width: 0;
 }
 
 .speaker-chip-button:hover,
@@ -3314,10 +3386,10 @@ summary,
 .speaker-chip-button-label {
   display: inline-flex;
   align-items: center;
-  transition:
-    transform 180ms ease,
-    opacity 180ms ease,
-    letter-spacing 180ms ease;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .speaker-color-control {
@@ -3352,20 +3424,16 @@ summary,
 }
 
 .speaker-chip-inline-remove {
-  position: absolute;
-  top: 50%;
-  right: 44px;
   width: 24px;
   min-width: 24px;
   height: 24px;
   min-height: 24px;
   border-radius: 999px;
-  opacity: 0;
-  transform: translateY(-50%) scale(0.72);
-  pointer-events: none;
+  opacity: 0.72;
+  transform: none;
+  pointer-events: auto;
   transition:
     opacity 180ms ease,
-    transform 180ms ease,
     background-color 180ms ease,
     border-color 180ms ease,
     color 180ms ease;
@@ -3374,20 +3442,6 @@ summary,
 .speaker-chip-row:hover .speaker-chip-inline-remove,
 .speaker-chip-row:focus-within .speaker-chip-inline-remove {
   opacity: 1;
-  transform: translateY(-50%) scale(1);
-  pointer-events: auto;
-}
-
-.speaker-chip-row:hover .speaker-chip-button,
-.speaker-chip-row:focus-within .speaker-chip-button {
-  padding-right: 38px;
-}
-
-.speaker-chip-row:hover .speaker-chip-button-label,
-.speaker-chip-row:focus-within .speaker-chip-button-label {
-  opacity: 0.9;
-  transform: translateX(-4px) scale(0.97);
-  letter-spacing: 0.01em;
 }
 
 @media (max-width: 980px) {

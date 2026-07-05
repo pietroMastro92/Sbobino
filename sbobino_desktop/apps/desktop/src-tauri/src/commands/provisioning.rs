@@ -97,15 +97,35 @@ const MODEL_CATALOG: [(&str, &str, &str, &str, &str); 5] = [
 const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/";
 const PARAKEET_MODEL_BASE_URL: &str =
     "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/";
-const PARAKEET_MODEL_CATALOG: [(&str, &str, &str); 2] = [
+const PARAKEET_MODEL_CATALOG: [(&str, &str, &str); 6] = [
+    (
+        "tdt06b_v3_f16",
+        "Parakeet TDT 0.6B F16 — file only (high accuracy)",
+        "tdt-0.6b-v3-f16.gguf",
+    ),
+    (
+        "tdt06b_v3_q8",
+        "Parakeet TDT 0.6B Q8 — file only (balanced)",
+        "tdt-0.6b-v3-q8_0.gguf",
+    ),
     (
         "tdt06b_v3_q4",
-        "Parakeet TDT 0.6B Q4 — file only",
+        "Parakeet TDT 0.6B Q4 — file only (compact)",
         "tdt-0.6b-v3-q4_k.gguf",
     ),
     (
+        "nemotron35_asr_streaming_06b_f16",
+        "NVIDIA Nemotron 3.5 ASR 0.6B F16 — live + multilingual (high accuracy)",
+        "nemotron-3.5-asr-streaming-0.6b-f16.gguf",
+    ),
+    (
+        "nemotron35_asr_streaming_06b_q8",
+        "NVIDIA Nemotron 3.5 ASR 0.6B Q8 — live + multilingual (balanced)",
+        "nemotron-3.5-asr-streaming-0.6b-q8_0.gguf",
+    ),
+    (
         "nemotron35_asr_streaming_06b_q4",
-        "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual",
+        "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual (compact)",
         "nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
     ),
 ];

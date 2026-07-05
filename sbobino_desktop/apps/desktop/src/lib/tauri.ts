@@ -25,6 +25,7 @@ import type {
   PyannoteBackgroundActionTrigger,
   RealtimeDelta,
   RealtimeInputLevelEvent,
+  RealtimePostProcessingEvent,
   RealtimeStartReadiness,
   RealtimeStatusEvent,
   RuntimeHealth,
@@ -152,6 +153,10 @@ export async function startTranscription(
 
 export async function cancelTranscription(job_id: string): Promise<void> {
   return invoke<void>("cancel_transcription", { payload: { job_id } });
+}
+
+export async function cancelArtifactPostProcessing(artifact_id: string): Promise<void> {
+  return invoke<void>("cancel_artifact_postprocessing", { payload: { artifact_id } });
 }
 
 export async function listRecentArtifacts(limit = 40): Promise<TranscriptArtifact[]> {
@@ -309,6 +314,7 @@ export async function resumeRealtime(): Promise<void> {
 export async function stopRealtime(save = true, title?: string, elapsedSeconds?: number): Promise<{
   saved: boolean;
   artifact: TranscriptArtifact | null;
+  post_processing_started: boolean;
 }> {
   return invoke("stop_realtime", {
     payload: {
@@ -545,6 +551,21 @@ export async function subscribeRealtimeSaved(
     onSaved(event.payload);
   });
   return unlisten;
+}
+
+export async function subscribeRealtimePostProcessing(
+  onProgress: (event: RealtimePostProcessingEvent) => void,
+): Promise<() => void> {
+  const unlistenRealtime = await listen<RealtimePostProcessingEvent>("realtime://postprocess", (event) => {
+    onProgress(event.payload);
+  });
+  const unlistenArtifact = await listen<RealtimePostProcessingEvent>("artifact://postprocess", (event) => {
+    onProgress(event.payload);
+  });
+  return () => {
+    unlistenRealtime();
+    unlistenArtifact();
+  };
 }
 
 export async function subscribeProvisioningProgress(

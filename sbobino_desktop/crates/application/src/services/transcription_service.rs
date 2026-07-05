@@ -110,7 +110,7 @@ impl TranscriptionService {
             &request.job_id,
             JobStage::PreparingAudio,
             "Preparing audio",
-            10,
+            0,
             None,
             None,
         );
@@ -123,9 +123,46 @@ impl TranscriptionService {
             // deterministic PCM-16 mono 16 kHz stream. The skip-ffmpeg fast path
             // shipped in v0.1.36 caused field reports of "transcription does not
             // start"; reverted until we can repro and root-cause.
+            let transcode_progress = {
+                let emit_progress = emit_progress.clone();
+                let job_id = request.job_id.clone();
+                let last_percentage = Arc::new(Mutex::new(0_u8));
+                let last_percentage_ref = last_percentage.clone();
+                Arc::new(move |current_seconds: f32, total_seconds: Option<f32>| {
+                    let percentage = match total_seconds {
+                        Some(total) if total > 0.0 => {
+                            ((current_seconds / total).clamp(0.0, 1.0) * 10.0).round() as u8
+                        }
+                        _ => 1,
+                    };
+                    let percentage = percentage.clamp(1, 10);
+                    if let Ok(mut last) = last_percentage_ref.lock() {
+                        if percentage <= *last {
+                            return;
+                        }
+                        *last = percentage;
+                    }
+                    emit_progress(JobProgress {
+                        job_id: job_id.clone(),
+                        stage: JobStage::PreparingAudio,
+                        message: "Preparing audio".to_string(),
+                        percentage,
+                        current_seconds: Some(current_seconds.max(0.0)),
+                        total_seconds,
+                        phase: Some("preparing_audio".to_string()),
+                        progress_kind: sbobino_domain::ProgressKind::Actual,
+                        attempt: 1,
+                        effective_model: None,
+                    });
+                }) as Arc<dyn Fn(f32, Option<f32>) + Send + Sync>
+            };
             self.run_cancellable(
                 &cancellation_token,
-                self.transcoder.to_wav_mono_16k(&input_path, &wav_path),
+                self.transcoder.to_wav_mono_16k_with_progress(
+                    &input_path,
+                    &wav_path,
+                    transcode_progress,
+                ),
             )
             .await?;
 
@@ -147,16 +184,32 @@ impl TranscriptionService {
                 let emit_progress = emit_progress.clone();
                 let job_id = request.job_id.clone();
                 let transcription_progress_message = transcription_progress_message.clone();
-                let last_emitted_seconds = Arc::new(Mutex::new(0_f32));
-                let last_emitted_seconds_ref = last_emitted_seconds.clone();
+                let last_emitted = Arc::new(Mutex::new((0_u32, 0_f32, String::new())));
+                let last_emitted_ref = last_emitted.clone();
 
-                Arc::new(move |current_seconds: f32| {
-                    let sanitized_seconds = current_seconds.max(0.0);
-                    if let Ok(mut last) = last_emitted_seconds_ref.lock() {
-                        if sanitized_seconds <= *last + 0.05 {
+                Arc::new(move |progress: crate::TranscriptionProgress| {
+                    let sanitized_seconds = progress.current_seconds.max(0.0);
+                    if let Ok(mut last) = last_emitted_ref.lock() {
+                        // An engine may reset progress to zero before a CPU-safe
+                        // retry. Detect that backward jump (same attempt/phase but
+                        // seconds dropping well below the last high-water mark) and
+                        // re-anchor the monotonic baseline so the retry's early
+                        // progress is not suppressed, which would leave the UI
+                        // stuck at the first attempt's last value.
+                        if progress.attempt == last.0
+                            && progress.phase == last.2
+                            && sanitized_seconds + 1.0 < last.1
+                        {
+                            *last = (progress.attempt, 0.0, progress.phase.clone());
+                        }
+                        if progress.attempt < last.0
+                            || (progress.attempt == last.0
+                                && sanitized_seconds <= last.1 + 0.05
+                                && progress.phase == last.2)
+                        {
                             return;
                         }
-                        *last = sanitized_seconds;
+                        *last = (progress.attempt, sanitized_seconds, progress.phase.clone());
                     }
 
                     let percentage = match total_audio_seconds {
@@ -173,14 +226,18 @@ impl TranscriptionService {
                         percentage,
                         current_seconds: Some(sanitized_seconds),
                         total_seconds: total_audio_seconds,
+                        phase: Some(progress.phase),
+                        progress_kind: progress.progress_kind,
+                        attempt: progress.attempt,
+                        effective_model: progress.effective_model,
                     });
-                }) as Arc<dyn Fn(f32) + Send + Sync>
+                }) as Arc<dyn Fn(crate::TranscriptionProgress) + Send + Sync>
             };
 
-            let mut transcription_output = self
+            let transcription_output = self
                 .run_cancellable(
                     &cancellation_token,
-                    self.speech_engine.transcribe(
+                    self.speech_engine.transcribe_with_progress(
                         &wav_path,
                         request.speech_model_filename(),
                         request.language.as_whisper_code(),
@@ -212,40 +269,6 @@ impl TranscriptionService {
                     Some(total),
                     Some(total),
                 );
-            }
-
-            let mut diarization_status: Option<String> = None;
-            let mut diarization_error: Option<String> = None;
-            if let Some(speaker_diarizer) = &self.speaker_diarizer {
-                self.emit(
-                    &emit_progress,
-                    &request.job_id,
-                    JobStage::Diarizing,
-                    "Assigning speakers with pyannote",
-                    60,
-                    None,
-                    None,
-                );
-                match self
-                    .run_cancellable(&cancellation_token, speaker_diarizer.diarize(&wav_path))
-                    .await
-                {
-                    Ok(turns) => {
-                        diarization_status = Some("completed".to_string());
-                        if !turns.is_empty() && !transcription_output.segments.is_empty() {
-                            transcription_output.segments = Self::assign_speakers_to_segments(
-                                &transcription_output.segments,
-                                &turns,
-                            );
-                        }
-                    }
-                    Err(ApplicationError::Cancelled) => return Err(ApplicationError::Cancelled),
-                    Err(error) => {
-                        diarization_status = Some("failed".to_string());
-                        diarization_error = Some(error.to_string());
-                        warn!("speaker diarization skipped after transcription: {error}");
-                    }
-                }
             }
 
             let (optimized, summary_faq, has_optimized_transcript, generated_outputs) = if request
@@ -319,10 +342,11 @@ impl TranscriptionService {
             );
 
             let mut metadata = request.metadata.clone();
-            metadata.insert(
-                "model".to_string(),
-                request.speech_model_filename().to_string(),
-            );
+            let effective_model = transcription_output
+                .effective_model
+                .clone()
+                .unwrap_or_else(|| request.speech_model_filename().to_string());
+            metadata.insert("model".to_string(), effective_model.clone());
             metadata.insert(
                 "language".to_string(),
                 request.language.as_whisper_code().to_string(),
@@ -331,13 +355,6 @@ impl TranscriptionService {
                 "timeline_v2".to_string(),
                 transcription_output.timeline_v2_metadata_json(),
             );
-            if let Some(status) = diarization_status {
-                metadata.insert("speaker_diarization_status".to_string(), status);
-            }
-            if let Some(error) = diarization_error {
-                metadata.insert("speaker_diarization_error".to_string(), error);
-            }
-
             if let Some(pid) = &request.parent_id {
                 metadata.insert("parent_id".to_string(), pid.clone());
             }
@@ -391,7 +408,7 @@ impl TranscriptionService {
             artifact.audio_duration_seconds = total_audio_seconds;
             artifact.parent_artifact_id = request.parent_id.clone();
             artifact.processing_engine = Some(request.engine.as_str().to_string());
-            artifact.processing_model = Some(request.speech_model_filename().to_string());
+            artifact.processing_model = Some(effective_model);
             artifact.processing_language = Some(request.language.as_whisper_code().to_string());
             artifact.whisper_options_json = serde_json::to_string(&request.whisper_options).ok();
             artifact.ai_provider_snapshot_json = Some(
@@ -751,6 +768,10 @@ impl TranscriptionService {
             percentage,
             current_seconds,
             total_seconds,
+            phase: None,
+            progress_kind: sbobino_domain::ProgressKind::Actual,
+            attempt: 1,
+            effective_model: None,
         });
     }
 

@@ -7,6 +7,7 @@ import React, {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import {
   confirm as confirmDialog,
@@ -67,6 +68,7 @@ import {
 } from "lucide-react";
 import {
   analyzeArtifactEmotions,
+  cancelArtifactPostProcessing,
   cancelTranscription,
   chatArtifact,
   checkUpdates,
@@ -120,6 +122,7 @@ import {
   subscribeProvisioningStatus,
   subscribeRealtimeDelta,
   subscribeRealtimeInputLevel,
+  subscribeRealtimePostProcessing,
   subscribeMenuCheckUpdates,
   subscribeRealtimeSaved,
   subscribeRealtimeStatus,
@@ -186,6 +189,7 @@ import {
   clampPercentage,
   formatProgressPercentageLabel,
   makeProgressVisible,
+  percentageFromJobProgress,
 } from "./lib/progressUi";
 import {
   buildQueuedTranscriptionJob,
@@ -230,6 +234,7 @@ import type {
   PyannoteBackgroundActionTrigger,
   RealtimeDelta,
   RealtimeInputLevelEvent,
+  RealtimePostProcessingEvent,
   RealtimeStartReadiness,
   RemoteServiceConfig,
   RemoteServiceKind,
@@ -261,7 +266,9 @@ import type {
 import { buildChatClipboardText } from "./components/chat/chatUtils";
 import { ConfidenceTranscript } from "./components/ConfidenceTranscript";
 import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
-import { LiveMicrophoneWaveform } from "./components/LiveMicrophoneWaveform";
+import { LiveElapsedTimer, LiveMicrophoneWaveform } from "./components/LiveMicrophoneWaveform";
+import { RealtimeLevelBuffer } from "./lib/realtimeLevelBuffer";
+import { RealtimeSessionStore } from "./lib/realtimeSessionStore";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 import { LoadingAnimation } from "./components/LoadingAnimation";
 import { SetupMatrixIndicator } from "./components/SetupMatrixIndicator";
@@ -605,10 +612,20 @@ const modelOptions: Array<{ value: SpeechModel; label: string }> = [
 ];
 
 const parakeetModelOptions: Array<{ value: ParakeetModel; label: string }> = [
-  { value: "tdt06b_v3_q4", label: "Parakeet TDT 0.6B Q4 — file only" },
+  { value: "tdt06b_v3_f16", label: "Parakeet TDT 0.6B F16 — file only (high accuracy)" },
+  { value: "tdt06b_v3_q8", label: "Parakeet TDT 0.6B Q8 — file only (balanced)" },
+  { value: "tdt06b_v3_q4", label: "Parakeet TDT 0.6B Q4 — file only (compact)" },
+  {
+    value: "nemotron35_asr_streaming_06b_f16",
+    label: "NVIDIA Nemotron 3.5 ASR 0.6B F16 — live + multilingual (high accuracy)",
+  },
+  {
+    value: "nemotron35_asr_streaming_06b_q8",
+    label: "NVIDIA Nemotron 3.5 ASR 0.6B Q8 — live + multilingual (balanced)",
+  },
   {
     value: "nemotron35_asr_streaming_06b_q4",
-    label: "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual",
+    label: "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual (compact)",
   },
 ];
 
@@ -1703,18 +1720,6 @@ function InlineInfoHint({
   );
 }
 
-function percentageFromJobProgress(
-  progress: JobProgress | null | undefined,
-): number {
-  if (!progress) return 0;
-  const currentSeconds = progress.current_seconds ?? null;
-  const totalSeconds = progress.total_seconds ?? null;
-  if (currentSeconds !== null && totalSeconds !== null && totalSeconds > 0) {
-    return clampPercentage((currentSeconds / totalSeconds) * 100);
-  }
-  return clampPercentage(progress.percentage);
-}
-
 function activeJobPercentage(
   activeJobId: string | null,
   activeQueueJob: JobProgress | null,
@@ -1727,6 +1732,10 @@ function activeJobPercentage(
       : 0;
   const livePercentage =
     progress?.job_id === activeJobId ? percentageFromJobProgress(progress) : 0;
+  const queueAttempt = activeQueueJob?.attempt ?? 1;
+  const liveAttempt = progress?.job_id === activeJobId ? (progress.attempt ?? 1) : 0;
+  if (liveAttempt > queueAttempt) return clampPercentage(livePercentage);
+  if (queueAttempt > liveAttempt) return clampPercentage(queuePercentage);
   return clampPercentage(Math.max(queuePercentage, livePercentage));
 }
 
@@ -2110,9 +2119,11 @@ function formatTranscriptionPreflightMessage(
 function ProgressRing({
   percentage,
   size = 18,
+  label,
 }: {
   percentage: number;
   size?: number;
+  label?: string | null;
 }): JSX.Element {
   const clamped = makeProgressVisible(percentage);
   const ringStyle = {
@@ -2122,10 +2133,69 @@ function ProgressRing({
   } satisfies CSSProperties;
 
   return (
-    <span className="progress-ring" style={ringStyle} aria-hidden>
-      <span className="progress-ring-core" />
+    <span
+      className={`progress-ring ${label ? "progress-ring--labeled" : ""}`}
+      style={ringStyle}
+      aria-hidden
+    >
+      <span className="progress-ring-core">
+        {label ? <span className="progress-ring-label">{label}</span> : null}
+      </span>
     </span>
   );
+}
+
+function compactProgressRingLabel(percentage: number): string {
+  return String(Math.round(clampPercentage(percentage)));
+}
+
+function parseProgressPercentageValue(
+  value: number | string | null | undefined,
+): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return clampPercentage(value);
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? clampPercentage(parsed) : null;
+}
+
+function metadataPatchForRealtimePostProcessing(
+  event: RealtimePostProcessingEvent,
+): Record<string, string> {
+  const metadata: Record<string, string> = {};
+  const percentage = parseProgressPercentageValue(event.percentage);
+
+  if (event.stage === "saving_audio") {
+    metadata.audio_import_status = "running";
+  }
+  const status = event.status?.trim() || event.stage;
+
+  if (event.stage === "diarizing" || status === "running") {
+    metadata.speaker_diarization_status = "running";
+  }
+  if (event.stage === "queued" || status === "queued") {
+    metadata.speaker_diarization_status = "queued";
+  }
+  if (event.stage === "completed" || status === "completed") {
+    metadata.speaker_diarization_status = "completed";
+    metadata.speaker_diarization_progress = "100";
+  }
+  if (event.stage === "failed" || status === "failed") {
+    metadata.speaker_diarization_status = "failed";
+  }
+  if (event.stage === "interrupted" || status === "interrupted") {
+    metadata.speaker_diarization_status = "interrupted";
+  }
+  if (percentage !== null) {
+    metadata.speaker_diarization_progress = String(percentage);
+  }
+  if (event.phase?.trim()) {
+    metadata.speaker_diarization_phase = event.phase.trim();
+  }
+  return metadata;
 }
 
 function RollingProgressValue({ value }: { value: string }): JSX.Element {
@@ -2315,7 +2385,13 @@ function normalizeSettings(settings: AppSettings): AppSettings {
     transcription: {
       ...settings.transcription,
       parakeet_model:
-        settings.transcription.parakeet_model ?? "tdt06b_v3_q4",
+        settings.transcription.parakeet_model ?? "tdt06b_v3_f16",
+      parakeet_live_model:
+        settings.transcription.parakeet_live_model ??
+        (settings.transcription.parakeet_model?.startsWith("nemotron") ||
+        settings.transcription.parakeet_model?.startsWith("realtime")
+          ? settings.transcription.parakeet_model
+          : "nemotron35_asr_streaming_06b_q4"),
       parakeet_cli_path:
         settings.transcription.parakeet_cli_path?.trim() || "parakeet-cli",
       parakeet_models_dir:
@@ -2506,6 +2582,13 @@ type DetailToolbarProps = {
   hasArtifact: boolean;
   hasActiveJob: boolean;
   transcriptionProgress: number;
+  transcriptionProgressEstimated?: boolean;
+  activeProgressKind?: "transcription" | "diarization";
+  postProcessingProgress?: {
+    percentage: number;
+    text: string;
+    title: string;
+  } | null;
   onToggleSidebar: () => void;
   onBack: () => void;
   onRenameTitle?: () => void;
@@ -2540,6 +2623,9 @@ function DetailToolbar({
   hasArtifact,
   hasActiveJob,
   transcriptionProgress,
+  transcriptionProgressEstimated = false,
+  activeProgressKind = "transcription",
+  postProcessingProgress = null,
   onToggleSidebar,
   onBack,
   onRenameTitle,
@@ -2572,8 +2658,12 @@ function DetailToolbar({
   );
   const transcriptionProgressText = formatProgressPercentageLabel(
     transcriptionProgress,
+    transcriptionProgressEstimated,
   );
   const cancelTranscriptionTitle = `${t("detail.cancelTranscription", "Cancel transcription")} (${roundedTranscriptionProgress}%)`;
+  const postProcessingProgressLabel = postProcessingProgress
+    ? compactProgressRingLabel(postProcessingProgress.percentage)
+    : null;
   return (
     <header
       className={`detail-toolbar ${!leftSidebarOpen ? "sidebar-closed" : ""}`}
@@ -2677,7 +2767,8 @@ function DetailToolbar({
           ) : null}
           {detailMode === "transcript" &&
             !showRetranscribe &&
-            onImproveText && (
+            onImproveText &&
+            !postProcessingProgress && (
               <button
                 className="optimize-hover-button"
                 onClick={() => void onImproveText()}
@@ -2740,7 +2831,11 @@ function DetailToolbar({
           ) : null}
           {!hasArtifact && hasActiveJob ? (
             <button
-              className="transcribing-cancel-pill"
+              className={`transcribing-cancel-pill ${
+                activeProgressKind === "diarization"
+                  ? "transcribing-cancel-pill--diarization"
+                  : ""
+              }`}
               onClick={onCancel}
               onMouseMove={(event: ReactMouseEvent<HTMLButtonElement>) =>
                 setCancelPillDangerProximity(event.currentTarget, event.clientX)
@@ -2752,7 +2847,11 @@ function DetailToolbar({
               aria-label={cancelTranscriptionTitle}
             >
               <span className="transcribing-cancel-pill-compact" aria-hidden>
-                <ProgressRing percentage={transcriptionProgress} size={20} />
+                <ProgressRing
+                  percentage={transcriptionProgress}
+                  size={20}
+                  label={compactProgressRingLabel(transcriptionProgress)}
+                />
               </span>
               <span className="transcribing-cancel-pill-expanded" aria-hidden>
                 <RollingProgressValue value={transcriptionProgressText} />
@@ -2761,6 +2860,25 @@ function DetailToolbar({
                 </span>
               </span>
             </button>
+          ) : null}
+          {hasArtifact && postProcessingProgress ? (
+            <span
+              className="transcribing-cancel-pill transcribing-cancel-pill--readonly transcribing-cancel-pill--diarization"
+              role="status"
+              aria-label={postProcessingProgress.title}
+              title={postProcessingProgress.text}
+            >
+              <span className="transcribing-cancel-pill-compact" aria-hidden>
+                <ProgressRing
+                  percentage={postProcessingProgress.percentage}
+                  size={20}
+                  label={postProcessingProgressLabel}
+                />
+              </span>
+              <span className="transcribing-cancel-pill-expanded" aria-hidden>
+                <RollingProgressValue value={postProcessingProgress.text} />
+              </span>
+            </span>
           ) : null}
         </div>
       </div>
@@ -2903,6 +3021,88 @@ function createProvisioningUiState(
     progress: null,
     statusMessage: "",
   };
+}
+
+function RealtimeTranscriptDocument({
+  store,
+  fontSize,
+  emptyTitle,
+  emptyDescription,
+}: {
+  store: RealtimeSessionStore;
+  fontSize: number;
+  emptyTitle: string;
+  emptyDescription: string;
+}): JSX.Element {
+  const snapshot = useSyncExternalStore(
+    store.subscribe,
+    store.getSnapshot,
+    store.getSnapshot,
+  );
+  const text = [...snapshot.finalLines, snapshot.preview.trim()]
+    .filter((line) => line.trim())
+    .join("\n");
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      editor.scrollTop = editor.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [snapshot.version]);
+
+  return (
+    <>
+      <textarea
+        ref={editorRef}
+        className="detail-editor realtime-detail-editor"
+        value={text}
+        readOnly
+        style={{ fontSize: `${fontSize}px`, width: "100%", height: "100%" }}
+      />
+      {!text ? (
+        <div className="center-empty compact realtime-detail-empty">
+          <h3>{emptyTitle}</h3>
+          <p>{emptyDescription}</p>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function RealtimeTranscriptPanelContent({
+  store,
+  emptyTitle,
+  emptyDescription,
+}: {
+  store: RealtimeSessionStore;
+  emptyTitle: string;
+  emptyDescription: string;
+}): JSX.Element {
+  const snapshot = useSyncExternalStore(
+    store.subscribe,
+    store.getSnapshot,
+    store.getSnapshot,
+  );
+  const combinedText = snapshot.finalLines.join("\n");
+  const preview = snapshot.preview.trim();
+  if (!combinedText && !preview) {
+    return (
+      <div className="center-empty compact">
+        <h3>{emptyTitle}</h3>
+        <p>{emptyDescription}</p>
+      </div>
+    );
+  }
+  return (
+    <>
+      {combinedText ? <pre>{combinedText}</pre> : null}
+      {preview ? <p className="preview-line">{preview}</p> : null}
+    </>
+  );
 }
 
 export function App({
@@ -3189,22 +3389,21 @@ export function App({
   const [realtimeMessage, setRealtimeMessage] = useState(
     t("realtime.idle", "Realtime idle"),
   );
-  const [realtimeFinalLines, setRealtimeFinalLines] = useState<string[]>([]);
-  const [realtimePreview, setRealtimePreview] = useState("");
-  const [realtimeSegments, setRealtimeSegments] = useState<TimelineV2Segment[]>([]);
-  const [realtimePreviewSegment, setRealtimePreviewSegment] =
-    useState<TimelineV2Segment | null>(null);
-  const [realtimeInputLevels, setRealtimeInputLevels] = useState<number[]>([]);
+  const realtimeSessionStoreRef = useRef(new RealtimeSessionStore());
+  const realtimeLevelBufferRef = useRef(new RealtimeLevelBuffer(512));
   const [realtimePreviewState, setRealtimePreviewState] = useState<
+    "idle" | "connecting" | "running" | "paused" | "blocked" | "unavailable"
+  >("idle");
+  const realtimePreviewStateRef = useRef<
     "idle" | "connecting" | "running" | "paused" | "blocked" | "unavailable"
   >("idle");
   const [realtimeSessionOpen, setRealtimeSessionOpen] = useState(false);
   const [realtimeStartedAtMs, setRealtimeStartedAtMs] = useState<number | null>(
     null,
   );
-  const [realtimeElapsedSeconds, setRealtimeElapsedSeconds] = useState(0);
   const [isStoppingRealtime, setIsStoppingRealtime] = useState(false);
-
+  const [realtimePostProcessingByArtifact, setRealtimePostProcessingByArtifact] =
+    useState<Record<string, RealtimePostProcessingEvent>>({});
   const [provisioning, setProvisioning] = useState<{
     ready: boolean;
     modelsDir: string;
@@ -3526,7 +3725,6 @@ export function App({
   const focusedJobIdRef = useRef<string | null>(focusedJobId);
   const activeJobDeltaSequenceRef = useRef<number>(-1);
   const activeJobPreviewTextareaRef = useRef<HTMLDivElement>(null);
-  const realtimeTranscriptTextareaRef = useRef<HTMLTextAreaElement>(null);
   const detailMainRef = useRef<HTMLElement | null>(null);
   const mainAreaRef = useRef<HTMLElement | null>(null);
   const leftSidebarRef = useRef<HTMLElement | null>(null);
@@ -4597,6 +4795,7 @@ export function App({
     let unsubRealtimeDelta: (() => void) | undefined;
     let unsubRealtimeInput: (() => void) | undefined;
     let unsubRealtimeStatus: (() => void) | undefined;
+    let unsubRealtimePostProcessing: (() => void) | undefined;
     let unsubRealtimeSaved: (() => void) | undefined;
     let unsubProvisioningProgress: (() => void) | undefined;
     let unsubProvisioningStatus: (() => void) | undefined;
@@ -4872,42 +5071,10 @@ export function App({
 
       const uRealtimeDelta = await subscribeRealtimeDelta(
         (delta: RealtimeDelta) => {
-          if (delta.kind === "append_final") {
-            setRealtimeFinalLines((previous) => [...previous, delta.text]);
-            setRealtimePreview("");
-            const segment = realtimeSegmentFromDelta(delta);
-            if (segment) {
-              setRealtimeSegments((previous) => [...previous, segment]);
-              setRealtimePreviewSegment(null);
-            }
-          }
-
-          if (delta.kind === "replace_final") {
-            setRealtimeFinalLines((previous) => {
-              if (previous.length === 0) {
-                return [delta.text];
-              }
-              const next = [...previous];
-              next[next.length - 1] = delta.text;
-              return next;
-            });
-            setRealtimePreview("");
-            const segment = realtimeSegmentFromDelta(delta);
-            if (segment) {
-              setRealtimeSegments((previous) => {
-                if (previous.length === 0) {
-                  return [segment];
-                }
-                return [...previous.slice(0, -1), segment];
-              });
-              setRealtimePreviewSegment(null);
-            }
-          }
-
-          if (delta.kind === "update_preview") {
-            setRealtimePreview(delta.text);
-            setRealtimePreviewSegment(realtimeSegmentFromDelta(delta));
-          }
+          realtimeSessionStoreRef.current.applyDelta(
+            delta,
+            realtimeSegmentFromDelta(delta),
+          );
         },
       );
       if (unmounted) {
@@ -4919,32 +5086,38 @@ export function App({
       const uRealtimeInput = await subscribeRealtimeInputLevel(
         (event: RealtimeInputLevelEvent) => {
           if (event.state === "running") {
-            setRealtimePreviewState("running");
-            setRealtimeInputLevels((previous) => {
-              const next = [...previous, Math.max(0, Math.min(1, event.level ?? 0))];
-              return next.length > 160 ? next.slice(next.length - 160) : next;
-            });
+            if (realtimePreviewStateRef.current !== "running") {
+              realtimePreviewStateRef.current = "running";
+              setRealtimePreviewState("running");
+            }
+            if (event.envelope && event.envelope.length > 0) {
+              realtimeLevelBufferRef.current.pushEnvelope(event.envelope);
+            }
             return;
           }
 
           if (event.state === "paused") {
+            realtimePreviewStateRef.current = "paused";
             setRealtimePreviewState("paused");
             return;
           }
 
           if (event.state === "connecting") {
+            realtimePreviewStateRef.current = "connecting";
             setRealtimePreviewState("connecting");
             return;
           }
 
           if (event.state === "blocked" || event.state === "unavailable") {
+            realtimePreviewStateRef.current = event.state;
             setRealtimePreviewState(event.state);
-            setRealtimeInputLevels([]);
+            realtimeLevelBufferRef.current.clear();
             return;
           }
 
+          realtimePreviewStateRef.current = "idle";
           setRealtimePreviewState("idle");
-          setRealtimeInputLevels([]);
+          realtimeLevelBufferRef.current.clear();
         },
       );
       if (unmounted) {
@@ -4983,6 +5156,38 @@ export function App({
         uRealtimeSaved();
       } else {
         unsubRealtimeSaved = uRealtimeSaved;
+      }
+
+      const uRealtimePostProcessing = await subscribeRealtimePostProcessing((event) => {
+        if (event.artifact) upsertArtifact(event.artifact);
+        mergeRealtimePostProcessingIntoOpenArtifact(event);
+        setRealtimePostProcessingByArtifact((previous) => ({
+          ...previous,
+          [event.artifact_id]: event,
+        }));
+        if (
+          event.stage === "completed" ||
+          event.stage === "failed" ||
+          event.stage === "interrupted" ||
+          event.status === "completed" ||
+          event.status === "failed" ||
+          event.status === "interrupted"
+        ) {
+          window.setTimeout(() => {
+            setRealtimePostProcessingByArtifact((previous) => {
+              const next = { ...previous };
+              if (next[event.artifact_id]?.stage === event.stage) {
+                delete next[event.artifact_id];
+              }
+              return next;
+            });
+          }, 4_000);
+        }
+      });
+      if (unmounted) {
+        uRealtimePostProcessing();
+      } else {
+        unsubRealtimePostProcessing = uRealtimePostProcessing;
       }
 
       const uProvisioningProgress = await subscribeProvisioningProgress(
@@ -5092,6 +5297,7 @@ export function App({
       unsubRealtimeDelta?.();
       unsubRealtimeInput?.();
       unsubRealtimeStatus?.();
+      unsubRealtimePostProcessing?.();
       unsubRealtimeSaved?.();
       unsubProvisioningProgress?.();
       unsubProvisioningStatus?.();
@@ -5103,6 +5309,7 @@ export function App({
     prependArtifact,
     setError,
     setProgress,
+    upsertArtifact,
   ]);
 
   useEffect(() => {
@@ -5370,20 +5577,8 @@ export function App({
     if (!realtimeSessionOpen || activeArtifact || focusedJobId) {
       return null;
     }
-    const segments = realtimePreviewSegment
-      ? [...realtimeSegments, realtimePreviewSegment]
-      : realtimeSegments;
-    if (segments.length === 0) {
-      return null;
-    }
-    return JSON.stringify({ version: 2, segments });
-  }, [
-    activeArtifact,
-    focusedJobId,
-    realtimePreviewSegment,
-    realtimeSegments,
-    realtimeSessionOpen,
-  ]);
+    return realtimeSessionStoreRef.current.timelineJson();
+  }, [activeArtifact, focusedJobId, realtimeSessionOpen]);
   const detailSegments = useMemo(
     () =>
       parseTimelineV2Segments(
@@ -5533,6 +5728,39 @@ export function App({
     () => getArtifactDiarizationUiState(activeArtifact, knownSpeakerLabels),
     [activeArtifact, knownSpeakerLabels],
   );
+  const activeDiarizationProgress = useMemo(() => {
+    if (
+      !activeArtifact ||
+      artifactDiarizationUiState?.kind !== "processing"
+    ) {
+      return null;
+    }
+
+    const liveEvent = realtimePostProcessingByArtifact[activeArtifact.id];
+    const percentage =
+      parseProgressPercentageValue(liveEvent?.percentage) ??
+      parseProgressPercentageValue(
+        activeArtifact.metadata?.speaker_diarization_progress,
+      ) ??
+      0;
+    const rounded = Math.round(clampPercentage(percentage));
+    const text = formatProgressPercentageLabel(rounded);
+
+    return {
+      percentage,
+      text,
+      title: t(
+        "detail.speakerDetectionProgressTitle",
+        "Speaker detection {percent}%",
+        { percent: rounded },
+      ),
+    };
+  }, [
+    activeArtifact,
+    artifactDiarizationUiState,
+    realtimePostProcessingByArtifact,
+    t,
+  ]);
   const selectedSegmentSpeakerLabel =
     selectedDetailSegment?.speakerLabel?.trim() ?? "";
   const canRenameSelectedSpeaker =
@@ -5719,37 +5947,8 @@ export function App({
       null,
     [activeTrimmedAudioDraft, effectiveDetailContext],
   );
-  const realtimeTranscriptText = useMemo(
-    () =>
-      realtimeFinalLines.filter((line) => line.trim().length > 0).join("\n"),
-    [realtimeFinalLines],
-  );
-  const realtimePreviewText = realtimePreview.trim();
-  const realtimeTranscriptDisplayText = useMemo(
-    () =>
-      [...realtimeFinalLines, realtimePreviewText]
-        .filter((line) => line.trim().length > 0)
-        .join("\n"),
-    [realtimeFinalLines, realtimePreviewText],
-  );
-  const realtimeHasAnyText =
-    realtimeTranscriptText.trim().length > 0 || realtimePreviewText.length > 0;
   const isRealtimeDetailActive =
     realtimeSessionOpen && !activeArtifact && !focusedJobId;
-
-  useEffect(() => {
-    if (!isRealtimeDetailActive) {
-      return;
-    }
-    const transcriptEditor = realtimeTranscriptTextareaRef.current;
-    if (!transcriptEditor) {
-      return;
-    }
-    const frame = window.requestAnimationFrame(() => {
-      transcriptEditor.scrollTop = transcriptEditor.scrollHeight;
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [isRealtimeDetailActive, realtimeTranscriptDisplayText]);
 
   const detailAudioInputPath = useMemo(() => {
     if (effectiveDetailContext?.inputPath) {
@@ -5919,6 +6118,7 @@ export function App({
     setDisplayedTranscriptionPercentage,
   ] = useState(0);
   const displayedTranscriptionJobIdRef = useRef<string | null>(null);
+  const displayedTranscriptionAttemptRef = useRef(1);
 
   useEffect(() => {
     if (!hasOptimizedTranscript && transcriptViewMode !== "original") {
@@ -5941,18 +6141,26 @@ export function App({
   useEffect(() => {
     if (!focusedJobId) {
       displayedTranscriptionJobIdRef.current = null;
+      displayedTranscriptionAttemptRef.current = 1;
       setDisplayedTranscriptionPercentage(0);
       return;
     }
     if (displayedTranscriptionJobIdRef.current !== focusedJobId) {
       displayedTranscriptionJobIdRef.current = focusedJobId;
+      displayedTranscriptionAttemptRef.current = progress?.attempt ?? focusedQueueJob?.attempt ?? 1;
       setDisplayedTranscriptionPercentage(rawActiveTranscriptionPercentage);
       return;
     }
-    setDisplayedTranscriptionPercentage((previous) =>
-      Math.max(previous, rawActiveTranscriptionPercentage),
-    );
-  }, [focusedJobId, rawActiveTranscriptionPercentage]);
+    const nextAttempt = progress?.job_id === focusedJobId
+      ? (progress.attempt ?? 1)
+      : (focusedQueueJob?.attempt ?? 1);
+    if (nextAttempt > displayedTranscriptionAttemptRef.current) {
+      displayedTranscriptionAttemptRef.current = nextAttempt;
+      setDisplayedTranscriptionPercentage(rawActiveTranscriptionPercentage);
+      return;
+    }
+    setDisplayedTranscriptionPercentage((previous) => Math.max(previous, rawActiveTranscriptionPercentage));
+  }, [focusedJobId, focusedQueueJob, progress, rawActiveTranscriptionPercentage]);
 
   const queueActiveItems = useMemo(
     () => queueItems,
@@ -6115,25 +6323,6 @@ export function App({
   }, [activeArtifact, detailAudioArtifactId, detailAudioInputPath]);
 
   useEffect(() => {
-    if (!realtimeSessionOpen || realtimeStartedAtMs === null) {
-      setRealtimeElapsedSeconds(0);
-      return;
-    }
-
-    const updateElapsed = (): void => {
-      setRealtimeElapsedSeconds(
-        Math.max(0, (Date.now() - realtimeStartedAtMs) / 1000),
-      );
-    };
-
-    updateElapsed();
-    const timer = window.setInterval(updateElapsed, 500);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [realtimeSessionOpen, realtimeStartedAtMs]);
-
-  useEffect(() => {
     if (visibleSettingsPanes.length === 0) return;
     if (!visibleSettingsPanes.some((pane) => pane.key === settingsPane)) {
       setSettingsPane(visibleSettingsPanes[0].key);
@@ -6226,6 +6415,38 @@ export function App({
       resetDetailMode: true,
       clearDetailContext: true,
     });
+  }
+
+  function mergeRealtimePostProcessingIntoOpenArtifact(
+    event: RealtimePostProcessingEvent,
+  ): void {
+    if (event.artifact) {
+      setOpenArtifacts((previous) =>
+        previous.map((artifact) =>
+          artifact.id === event.artifact_id ? event.artifact! : artifact,
+        ),
+      );
+      return;
+    }
+
+    const metadataPatch = metadataPatchForRealtimePostProcessing(event);
+    if (Object.keys(metadataPatch).length === 0) {
+      return;
+    }
+
+    setOpenArtifacts((previous) =>
+      previous.map((artifact) =>
+        artifact.id === event.artifact_id
+          ? {
+              ...artifact,
+              metadata: {
+                ...artifact.metadata,
+                ...metadataPatch,
+              },
+            }
+          : artifact,
+      ),
+    );
   }
 
   function updateTranscriptionJobSnapshot(
@@ -7647,6 +7868,16 @@ export function App({
     }));
   }
 
+  async function onChangeParakeetLiveModel(model: ParakeetModel): Promise<void> {
+    await patchSettings((current) => ({
+      ...current,
+      transcription: {
+        ...current.transcription,
+        parakeet_live_model: model,
+      },
+    }));
+  }
+
   async function onChangeTranscriptionEngine(
     engine: TranscriptionEngine,
   ): Promise<void> {
@@ -8336,7 +8567,12 @@ export function App({
   ]);
 
   async function onCancel(): Promise<void> {
-    if (!activeJobId) return;
+    // `activeJobId` is set for manually-started jobs, but a job focused from
+    // the queue (e.g. automatic import) only sets `focusedJobId`. Resolve the
+    // job to cancel from whichever is active so the cancel pill/button works
+    // in both contexts.
+    const jobIdToCancel = activeJobId ?? focusedJobId;
+    if (!jobIdToCancel) return;
 
     const confirmed = await confirmDialog(
       activeJobTitle
@@ -8364,12 +8600,48 @@ export function App({
     }
 
     try {
-      await cancelTranscription(activeJobId);
+      await cancelTranscription(jobIdToCancel);
     } catch (cancelError) {
       setError(
         formatUiError(
           "error.cancelTranscriptionFailed",
           "Failed to cancel transcription",
+          cancelError,
+        ),
+      );
+    }
+  }
+
+  async function onCancelArtifactDiarization(artifactId?: string): Promise<void> {
+    const targetArtifactId = artifactId ?? activeArtifact?.id;
+    if (!targetArtifactId) {
+      return;
+    }
+
+    try {
+      await cancelArtifactPostProcessing(targetArtifactId);
+      const event: RealtimePostProcessingEvent = {
+        artifact_id: targetArtifactId,
+        kind: "diarization",
+        status: "interrupted",
+        stage: "interrupted",
+        message: t("detail.diarizationStopped", "Speaker detection stopped."),
+        phase: "interrupted",
+        percentage: null,
+        completed: null,
+        total: null,
+        artifact: null,
+      };
+      mergeRealtimePostProcessingIntoOpenArtifact(event);
+      setRealtimePostProcessingByArtifact((previous) => ({
+        ...previous,
+        [targetArtifactId]: event,
+      }));
+    } catch (cancelError) {
+      setError(
+        formatUiError(
+          "error.cancelSpeakerDetectionFailed",
+          "Failed to stop speaker detection",
           cancelError,
         ),
       );
@@ -9469,43 +9741,11 @@ export function App({
     }
 
     try {
-      setRealtimePreviewState("connecting");
-      setRealtimeInputLevels([]);
-
-      const readiness = await withTimeout(
-        fetchRealtimeStartReadiness({
-          engine: settings.transcription.engine,
-          model: settings.transcription.model,
-          parakeet_model: settings.transcription.parakeet_model,
-          language: settings.transcription.language,
-        }),
-        8_000,
-        t("error.preflightTimedOut", "Preflight timed out."),
-      );
-      if (!readiness.allowed) {
-        const message =
-          readiness.message || formatRuntimeNotReadyMessage(runtimeHealth);
-        setRealtimeMessage(message);
-        setRealtimePreviewState(realtimePreviewStateForReadinessFailure(readiness));
-        setRealtimeInputLevels([]);
-        setError(
-          message,
-        );
-        return;
-      }
-
       const sessionTitle = buildLiveSessionTitle();
-      setRealtimeFinalLines([]);
-      setRealtimePreview("");
-      setRealtimeSegments([]);
-      setRealtimePreviewSegment(null);
-      setRealtimeSessionOpen(false);
-      await startRealtime({
-        engine: settings.transcription.engine,
-        model: settings.transcription.model,
-        parakeet_model: settings.transcription.parakeet_model,
-        language: settings.transcription.language,
-      });
+      setRealtimePreviewState("connecting");
+      setRealtimeMessage(t("realtime.connecting", "Connecting live transcription..."));
+      realtimeLevelBufferRef.current.clear();
+      realtimeSessionStoreRef.current.reset();
       setDraftTitle(sessionTitle);
       setDraftTranscript("");
       setDraftSummary("");
@@ -9526,14 +9766,45 @@ export function App({
       setRealtimeSessionOpen(true);
       setRealtimeStartedAtMs(Date.now());
       setSection("detail");
+
+      const readiness = await withTimeout(
+        fetchRealtimeStartReadiness({
+          engine: settings.transcription.engine,
+          model: settings.transcription.model,
+          parakeet_model: settings.transcription.parakeet_live_model,
+          language: settings.transcription.language,
+        }),
+        8_000,
+        t("error.preflightTimedOut", "Preflight timed out."),
+      );
+      if (!readiness.allowed) {
+        const message =
+          readiness.message || formatRuntimeNotReadyMessage(runtimeHealth);
+        setRealtimeMessage(message);
+        setRealtimePreviewState(realtimePreviewStateForReadinessFailure(readiness));
+        setRealtimeSessionOpen(false);
+        setRealtimeStartedAtMs(null);
+        realtimeLevelBufferRef.current.clear();
+        setError(
+          message,
+        );
+        return;
+      }
+
+      await startRealtime({
+        engine: settings.transcription.engine,
+        model: settings.transcription.model,
+        parakeet_model: settings.transcription.parakeet_live_model,
+        language: settings.transcription.language,
+      });
+      setRealtimeSessionOpen(true);
       setError(null);
     } catch (startError) {
       setRealtimeSessionOpen(false);
       setRealtimeStartedAtMs(null);
       setRealtimePreviewState("idle");
-      setRealtimeInputLevels([]);
-      setRealtimeSegments([]);
-      setRealtimePreviewSegment(null);
+      realtimeLevelBufferRef.current.clear();
+      realtimeSessionStoreRef.current.reset();
       setError(
         formatUiError(
           "error.realtimeStartFailed",
@@ -9575,14 +9846,15 @@ export function App({
   async function onStopRealtime(saveResult: boolean): Promise<void> {
     setIsStoppingRealtime(true);
     try {
-      const currentLiveTranscript = [...realtimeFinalLines, realtimePreviewText]
-        .filter((line) => line.trim().length > 0)
-        .join("\n")
+      const currentLiveTranscript = realtimeSessionStoreRef.current
+        .transcript()
         .trim();
       const result = await stopRealtime(
         saveResult,
         draftTitle,
-        Math.max(0, Math.round(realtimeElapsedSeconds)),
+        realtimeStartedAtMs === null
+          ? 0
+          : Math.max(0, Math.round((Date.now() - realtimeStartedAtMs) / 1000)),
       );
       if (result.artifact) {
         prependArtifact(result.artifact);
@@ -9601,10 +9873,7 @@ export function App({
         setActiveDetailContext(null);
         setSection("home");
       }
-      setRealtimePreview("");
-      setRealtimeFinalLines([]);
-      setRealtimeSegments([]);
-      setRealtimePreviewSegment(null);
+      realtimeSessionStoreRef.current.reset();
       setRealtimeSessionOpen(false);
       setRealtimeStartedAtMs(null);
       setError(null);
@@ -10743,7 +11012,7 @@ export function App({
             <button
               className="secondary-button"
               onClick={() => void onCancel()}
-              disabled={!activeJobId}
+              disabled={!activeJobId && !focusedJobId}
             >
               {t("queue.cancelActiveJob", "Cancel Active Job")}
             </button>
@@ -11206,23 +11475,12 @@ export function App({
             className="transcript-container realtime-transcript-container"
             style={{ position: "relative", height: "100%" }}
           >
-            <textarea
-              ref={realtimeTranscriptTextareaRef}
-              className="detail-editor realtime-detail-editor"
-              value={realtimeTranscriptDisplayText}
-              readOnly
-              style={{
-                fontSize: `${fontSize}px`,
-                width: "100%",
-                height: "100%",
-              }}
+            <RealtimeTranscriptDocument
+              store={realtimeSessionStoreRef.current}
+              fontSize={fontSize}
+              emptyTitle={t("realtime.noTranscript")}
+              emptyDescription={t("realtime.noTranscriptDesc")}
             />
-            {!realtimeTranscriptDisplayText ? (
-              <div className="center-empty compact realtime-detail-empty">
-                <h3>{t("realtime.noTranscript")}</h3>
-                <p>{t("realtime.noTranscriptDesc")}</p>
-              </div>
-            ) : null}
           </div>
         </div>
       );
@@ -11251,7 +11509,10 @@ export function App({
             );
           const statusDescription =
             percentage > 0
-              ? `${statusMessage} (${formatProgressPercentageLabel(percentage)})`
+              ? `${statusMessage} (${formatProgressPercentageLabel(
+                  percentage,
+                  jobProgress?.progress_kind === "estimated",
+                )})`
               : statusMessage;
           return (
             <LoadingAnimation
@@ -11830,6 +12091,37 @@ export function App({
         );
       }
 
+      if (artifactDiarizationUiState.kind === "processing") {
+        return (
+          <div className="transcript-speaker-banner">
+            <div className="transcript-speaker-banner-copy">
+              <strong>{t("detail.diarizationProcessing", "Speaker detection is running in the background.")}</strong>
+              <span>{t("detail.diarizationProcessingHint", "You can keep navigating and editing this transcript while speakers are assigned.")}</span>
+            </div>
+            <div className="transcript-speaker-banner-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => void onCancelArtifactDiarization(activeArtifact.id)}
+              >
+                {t("detail.stopSpeakerDetection", "Stop speaker detection")}
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      if (artifactDiarizationUiState.kind === "interrupted") {
+        return (
+          <div className="transcript-speaker-banner is-warning">
+            <div className="transcript-speaker-banner-copy">
+              <strong>{t("detail.diarizationInterrupted", "Speaker diarization was interrupted when the app closed.")}</strong>
+              <span>{t("detail.diarizationInterruptedHint", "The transcript and any imported audio remain available.")}</span>
+            </div>
+          </div>
+        );
+      }
+
       if (artifactDiarizationUiState.kind === "no_speakers_detected") {
         return (
           <div className="transcript-speaker-banner">
@@ -11948,6 +12240,10 @@ export function App({
           return t("detail.diarizationFailedShort", "Diarization failed");
         case "no_speakers_detected":
           return t("detail.noSpeakersShort", "No speakers detected");
+        case "processing":
+          return t("detail.diarizationProcessingShort", "Detecting speakers");
+        case "interrupted":
+          return t("detail.diarizationInterruptedShort", "Diarization interrupted");
         case "not_requested":
         default:
           return t("detail.noSpeakerLabels", "No speaker labels");
@@ -12000,6 +12296,10 @@ export function App({
             "detail.noSpeakersDetectedHint",
             "Open Segments to inspect the timeline or assign speakers manually.",
           );
+        case "processing":
+          return t("detail.diarizationProcessingHint", "You can keep navigating and editing this transcript while speakers are assigned.");
+        case "interrupted":
+          return t("detail.diarizationInterruptedHint", "The transcript and any imported audio remain available.");
         case "not_requested":
         default:
           return t(
@@ -12140,6 +12440,15 @@ export function App({
           >
             {peoplePillText}
           </div>
+          {artifactDiarizationUiState?.kind === "processing" && activeArtifact ? (
+            <button
+              type="button"
+              className="secondary-button inspector-inline-action"
+              onClick={() => void onCancelArtifactDiarization(activeArtifact.id)}
+            >
+              {t("detail.stopSpeakerDetection", "Stop speaker detection")}
+            </button>
+          ) : null}
           {showSpeakerManagement && knownSpeakerLabels.length > 0 ? (
             <div className="speaker-known-list">
               <span className="speaker-known-label">
@@ -12931,9 +13240,11 @@ export function App({
           <button
             className="secondary-button"
             onClick={() =>
-              void navigator.clipboard.writeText(realtimeTranscriptText)
+              void navigator.clipboard.writeText(
+                realtimeSessionStoreRef.current.transcript(false),
+              )
             }
-            disabled={!realtimeTranscriptText.trim()}
+            disabled={!realtimeSessionOpen}
           >
             {t("inspector.copy", "Copy")}
           </button>
@@ -12950,7 +13261,7 @@ export function App({
             </div>
             <div className="property-line">
               <span>{t("inspector.duration")}</span>
-              <strong>{formatShortDuration(realtimeElapsedSeconds)}</strong>
+              <LiveElapsedTimer startedAtMs={realtimeStartedAtMs} active={realtimeSessionOpen} />
             </div>
           </div>
 
@@ -12980,7 +13291,7 @@ export function App({
             <div className="property-line">
               <span>{t("detail.transcript", "Transcript")}</span>
               <strong>
-                {realtimeHasAnyText
+                {realtimeSessionOpen
                   ? t("realtime.transcriptUpdating", "Updating live")
                   : t("realtime.waitingForSpeech", "Waiting for speech")}
               </strong>
@@ -12999,6 +13310,14 @@ export function App({
           (progress?.job_id === focusedJobId ? progress : null) ??
           snapshot?.progress ??
           null;
+        const focusedJobMessage =
+          focusedJobProgress?.stage === "diarizing"
+            ? t("detail.diarizationProcessingShort", "Detecting speakers")
+            : (focusedJobProgress?.message ??
+              t(
+                "inspector.whisperRunning",
+                "Running Whisper transcription...",
+              ));
         return (
           <div className="inspector-body">
             <button
@@ -13014,13 +13333,7 @@ export function App({
             </button>
             <div className="inspector-block">
               <h4>{t("inspector.transcribingTitle")}</h4>
-              <p className="muted">
-                {focusedJobProgress?.message ??
-                  t(
-                    "inspector.whisperRunning",
-                    "Running Whisper transcription...",
-                  )}
-              </p>
+              <p className="muted">{focusedJobMessage}</p>
             </div>
           </div>
         );
@@ -13042,6 +13355,17 @@ export function App({
   function renderDetail(): JSX.Element {
     const isTrimRetranscriptionStarting =
       isStarting && Boolean(effectiveTrimmedAudioDraft);
+    const toolbarFocusedProgress =
+      focusedQueueJob ??
+      (progress?.job_id === focusedJobId ? progress : null) ??
+      (focusedJobId
+        ? (transcriptionJobSnapshotsRef.current.get(focusedJobId)?.progress ??
+          null)
+        : null);
+    const toolbarProgressKind =
+      toolbarFocusedProgress?.stage === "diarizing"
+        ? "diarization"
+        : "transcription";
 
     return (
       <div
@@ -13071,6 +13395,11 @@ export function App({
             hasArtifact={Boolean(activeArtifact)}
             hasActiveJob={Boolean(focusedJobId)}
             transcriptionProgress={displayedTranscriptionPercentage}
+            transcriptionProgressEstimated={
+              progress?.job_id === focusedJobId && progress.progress_kind === "estimated"
+            }
+            activeProgressKind={toolbarProgressKind}
+            postProcessingProgress={activeDiarizationProgress}
             onToggleSidebar={() => setLeftSidebarOpen((open) => !open)}
             onBack={() => {
               if (!activeArtifact && focusedJobId) {
@@ -13237,8 +13566,8 @@ export function App({
                   )}
                   mode={realtimeState}
                   previewState={realtimePreviewState}
-                  levels={realtimeInputLevels}
-                  elapsedSeconds={realtimeElapsedSeconds}
+                  levelBuffer={realtimeLevelBufferRef.current}
+                  startedAtMs={realtimeStartedAtMs}
                   runningLabel={t("realtime.waveformRunning", "Mic live")}
                   pausedLabel={t("realtime.waveformPaused", "Preview paused")}
                   idleStatusLabel={t("realtime.waveformIdleShort", "Mic idle")}
@@ -13327,8 +13656,6 @@ export function App({
   }
 
   function renderRealtime(): JSX.Element {
-    const combinedText = realtimeFinalLines.join("\n");
-
     return (
       <div className="view-body">
         <div className="view-toolbar">
@@ -13404,8 +13731,8 @@ export function App({
               )}
               mode={realtimeState}
               previewState={realtimePreviewState}
-              levels={realtimeInputLevels}
-              elapsedSeconds={realtimeElapsedSeconds}
+              levelBuffer={realtimeLevelBufferRef.current}
+              startedAtMs={realtimeStartedAtMs}
               runningLabel={t("realtime.waveformRunning", "Mic live")}
               pausedLabel={t("realtime.waveformPaused", "Preview paused")}
               idleStatusLabel={t("realtime.waveformIdleShort", "Mic idle")}
@@ -13433,19 +13760,11 @@ export function App({
               </div>
 
               <div className="live-transcript-copy">
-                {combinedText || realtimePreviewText ? (
-                  <>
-                    {combinedText ? <pre>{combinedText}</pre> : null}
-                    {realtimePreviewText ? (
-                      <p className="preview-line">{realtimePreviewText}</p>
-                    ) : null}
-                  </>
-                ) : (
-                  <div className="center-empty compact">
-                    <h3>{t("realtime.noTranscript")}</h3>
-                    <p>{t("realtime.noTranscriptDesc")}</p>
-                  </div>
-                )}
+                <RealtimeTranscriptPanelContent
+                  store={realtimeSessionStoreRef.current}
+                  emptyTitle={t("realtime.noTranscript")}
+                  emptyDescription={t("realtime.noTranscriptDesc")}
+                />
               </div>
             </div>
           </div>
@@ -14771,11 +15090,13 @@ export function App({
                   }));
                 }}
               >
-                {parakeetModelOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {formatParakeetModelLabel(option.value, option.label)}
-                  </option>
-                ))}
+                {parakeetModelOptions
+                  .filter((option) => option.value.startsWith("tdt"))
+                  .map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {formatParakeetModelLabel(option.value, option.label)}
+                    </option>
+                  ))}
               </select>
             ) : (
               <select
@@ -14792,6 +15113,35 @@ export function App({
               </select>
             )}
           </div>
+
+          {settings.transcription.engine === "parakeet_cpp" ? (
+            <div className="settings-row settings-row-block">
+              <div>
+                <strong>
+                  {t(
+                    "settings.transcription.parakeetLiveModel",
+                    "Live Parakeet model",
+                  )}
+                </strong>
+              </div>
+              <select
+                value={settings.transcription.parakeet_live_model}
+                onChange={(event) =>
+                  void onChangeParakeetLiveModel(
+                    event.target.value as ParakeetModel,
+                  )
+                }
+              >
+                {parakeetModelOptions
+                  .filter((option) => !option.value.startsWith("tdt"))
+                  .map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {formatParakeetModelLabel(option.value, option.label)}
+                    </option>
+                  ))}
+              </select>
+            </div>
+          ) : null}
 
           <div className="settings-row settings-row-block">
             <div>

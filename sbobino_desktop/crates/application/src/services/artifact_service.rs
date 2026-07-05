@@ -75,6 +75,30 @@ impl ArtifactService {
             .await
     }
 
+    pub async fn update_diarization_result(
+        &self,
+        id: &str,
+        timeline_v2_json: Option<&str>,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        self.artifacts
+            .update_diarization_result(id, timeline_v2_json, status, error)
+            .await
+    }
+
+    pub async fn interrupt_pending_postprocessing_jobs(&self) -> Result<usize, ApplicationError> {
+        self.artifacts.interrupt_pending_postprocessing_jobs().await
+    }
+
+    pub async fn attach_audio_file(
+        &self,
+        id: &str,
+        source_path: &std::path::Path,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        self.artifacts.attach_audio_file(id, source_path).await
+    }
+
     pub async fn update_emotion_analysis(
         &self,
         id: &str,

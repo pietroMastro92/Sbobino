@@ -104,6 +104,8 @@ pub struct TranscriptionOutput {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub segments: Vec<TimedSegment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
 }
 
 impl TranscriptionOutput {
@@ -111,6 +113,7 @@ impl TranscriptionOutput {
         Self {
             text: text.into(),
             segments: Vec::new(),
+            effective_model: None,
         }
     }
 

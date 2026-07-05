@@ -175,7 +175,10 @@ assert_binary_portable() {
   minos=$(read_binary_minos "$binary")
   if ! assert_version_not_newer_than "$MACOS_DEPLOYMENT_TARGET" "$minos"; then
     echo "$label was built for macOS $minos, newer than the supported $MACOS_DEPLOYMENT_TARGET target." >&2
-    exit 1
+    if [[ "${SBOBINO_RUNTIME_ALLOW_NONPORTABLE:-0}" != "1" ]]; then
+      exit 1
+    fi
+    echo "SBOBINO_RUNTIME_ALLOW_NONPORTABLE=1: continuing anyway (local build)." >&2
   fi
 
   local bad_refs
@@ -249,7 +252,11 @@ build_whisper_binaries() {
     -DWHISPER_SDL2=ON \
     -DGGML_BLAS=OFF \
     -DGGML_ACCELERATE=OFF \
-    -DWHISPER_USE_SYSTEM_GGML=OFF
+    -DWHISPER_USE_SYSTEM_GGML=OFF \
+    -DGGML_METAL=ON \
+    -DGGML_METAL_EMBED_LIBRARY=ON \
+    -DWHISPER_COREML=ON \
+    -DWHISPER_COREML_ALLOW_FALLBACK=ON
   cmake --build "$build_root" -j"$BUILD_JOBS" --target whisper-cli whisper-stream
 
   cp "$build_root/bin/whisper-cli" "$TARGET_BIN/whisper-cli"

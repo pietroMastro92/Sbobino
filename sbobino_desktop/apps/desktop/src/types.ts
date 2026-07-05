@@ -104,6 +104,7 @@ export type TranscriptionSettings = {
   engine: TranscriptionEngine;
   model: SpeechModel;
   parakeet_model: ParakeetModel;
+  parakeet_live_model: ParakeetModel;
   language: LanguageCode;
   whisper_cli_path: string;
   whisperkit_cli_path: string;
@@ -314,6 +315,10 @@ export type JobProgress = {
   percentage: number;
   current_seconds?: number | null;
   total_seconds?: number | null;
+  phase?: string | null;
+  progress_kind?: "actual" | "estimated";
+  attempt?: number;
+  effective_model?: string | null;
   input_path?: string | null;
   title?: string | null;
   source_origin?: ArtifactSourceOrigin | null;
@@ -526,9 +531,23 @@ export type RealtimeStatusEvent = {
   message: string;
 };
 
+export type RealtimePostProcessingEvent = {
+  artifact_id: string;
+  kind?: string | null;
+  status?: string | null;
+  stage: string;
+  message: string;
+  phase?: string | null;
+  percentage?: number | null;
+  completed?: number | null;
+  total?: number | null;
+  artifact?: TranscriptArtifact | null;
+};
+
 export type RealtimeInputLevelEvent = {
   state: string;
   level: number;
+  envelope?: Array<{ min: number; max: number }>;
   message: string;
 };
 

@@ -1048,7 +1048,7 @@ impl ArtifactRepository for SqliteArtifactRepository {
                 },
                 None => AudioImportResult {
                     available: false,
-                    backfill_status: ArtifactAudioBackfillStatus::Missing,
+                    backfill_status: artifact.audio_backfill_status.clone(),
                     encrypted_rel_path: None,
                     extension: None,
                     mime_type: None,
@@ -1313,6 +1313,133 @@ impl ArtifactRepository for SqliteArtifactRepository {
                 params![current.id, repo.encrypt_text(&current.id, "timeline_v2_json", &timeline_v2_json)?],
             ).map_err(|e| ApplicationError::Persistence(format!("failed to update timeline analysis row: {e}")))?;
             tx.commit().map_err(|e| ApplicationError::Persistence(format!("failed to commit timeline update transaction: {e}")))?;
+            repo.load_one(&repo.open_connection()?, &id, false)
+        }).await.map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn update_diarization_result(
+        &self,
+        id: &str,
+        timeline_v2_json: Option<&str>,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        let repo = self.clone();
+        let id = id.to_string();
+        let timeline_v2_json = timeline_v2_json.map(str::trim).map(str::to_string);
+        let status = status.trim().to_string();
+        let error = error
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            if let Some(timeline) = timeline_v2_json.as_deref() {
+                let _: serde_json::Value = serde_json::from_str(timeline).map_err(|e| {
+                    ApplicationError::Validation(format!("invalid timeline_v2 JSON: {e}"))
+                })?;
+            }
+            let mut conn = repo.open_connection()?;
+            let Some(current) = repo.load_one(&conn, &id, false)? else { return Ok(None); };
+            let mut metadata = current.metadata.clone();
+            metadata.remove("timeline_v2");
+            metadata.insert("speaker_diarization_status".to_string(), status);
+            match error {
+                Some(error) => { metadata.insert("speaker_diarization_error".to_string(), error); }
+                None => { metadata.remove("speaker_diarization_error"); }
+            }
+            let metadata_json = serde_json::to_string(&metadata).map_err(|e| {
+                ApplicationError::Persistence(format!("failed to serialize metadata: {e}"))
+            })?;
+            let tx = conn.transaction().map_err(|e| ApplicationError::Persistence(format!("failed to start diarization update transaction: {e}")))?;
+            let changed = tx.execute(
+                "UPDATE transcript_artifacts SET metadata_json_enc = ?2, updated_at = ?3, revision = revision + 1 WHERE id = ?1 AND is_deleted = 0 AND revision = ?4",
+                params![id, repo.encrypt_text(&current.id, "metadata_json", &metadata_json)?, Utc::now().to_rfc3339(), current.revision],
+            ).map_err(|e| ApplicationError::Persistence(format!("failed to update diarization metadata: {e}")))?;
+            if changed == 0 {
+                return Err(ApplicationError::Persistence("artifact diarization update rejected because a newer revision already exists".to_string()));
+            }
+            if let Some(timeline) = timeline_v2_json.as_deref() {
+                tx.execute(
+                    "INSERT INTO artifact_analysis (artifact_id, timeline_v2_json_enc) VALUES (?1, ?2) ON CONFLICT(artifact_id) DO UPDATE SET timeline_v2_json_enc = excluded.timeline_v2_json_enc",
+                    params![current.id, repo.encrypt_text(&current.id, "timeline_v2_json", timeline)?],
+                ).map_err(|e| ApplicationError::Persistence(format!("failed to update diarization timeline: {e}")))?;
+            }
+            tx.commit().map_err(|e| ApplicationError::Persistence(format!("failed to commit diarization update transaction: {e}")))?;
+            repo.load_one(&repo.open_connection()?, &id, false)
+        }).await.map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn interrupt_pending_postprocessing_jobs(&self) -> Result<usize, ApplicationError> {
+        let repo = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = repo.open_connection()?;
+            let pending = repo.fetch_artifacts(&conn, false, None)?.into_iter().filter(|artifact| {
+                matches!(artifact.metadata.get("speaker_diarization_status").map(String::as_str), Some("queued" | "running" | "diarizing"))
+                    || matches!(artifact.metadata.get("audio_import_status").map(String::as_str), Some("queued" | "running" | "saving_audio"))
+            }).collect::<Vec<_>>();
+            if pending.is_empty() { return Ok(0); }
+            let tx = conn.transaction().map_err(|e| ApplicationError::Persistence(format!("failed to start interrupted-job transaction: {e}")))?;
+            for artifact in &pending {
+                let mut metadata = artifact.metadata.clone();
+                metadata.remove("timeline_v2");
+                if matches!(metadata.get("speaker_diarization_status").map(String::as_str), Some("queued" | "running" | "diarizing")) {
+                    metadata.insert("speaker_diarization_status".to_string(), "interrupted".to_string());
+                }
+                if matches!(metadata.get("audio_import_status").map(String::as_str), Some("queued" | "running" | "saving_audio")) {
+                    metadata.insert("audio_import_status".to_string(), "interrupted".to_string());
+                }
+                let metadata_json = serde_json::to_string(&metadata).map_err(|e| ApplicationError::Persistence(format!("failed to serialize metadata: {e}")))?;
+                tx.execute(
+                    "UPDATE transcript_artifacts SET metadata_json_enc = ?2, updated_at = ?3, revision = revision + 1 WHERE id = ?1 AND is_deleted = 0 AND revision = ?4",
+                    params![artifact.id, repo.encrypt_text(&artifact.id, "metadata_json", &metadata_json)?, Utc::now().to_rfc3339(), artifact.revision],
+                ).map_err(|e| ApplicationError::Persistence(format!("failed to mark post-processing job interrupted: {e}")))?;
+            }
+            tx.commit().map_err(|e| ApplicationError::Persistence(format!("failed to commit interrupted-job transaction: {e}")))?;
+            Ok(pending.len())
+        }).await.map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn attach_audio_file(
+        &self,
+        id: &str,
+        source_path: &Path,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        let repo = self.clone();
+        let id = id.to_string();
+        let source_path = source_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = repo.open_connection()?;
+            let Some(current) = repo.load_one(&conn, &id, false)? else { return Ok(None); };
+            let audio = repo.import_audio_file(&id, &source_path, false)?;
+            let mut metadata = current.metadata.clone();
+            metadata.remove("timeline_v2");
+            metadata.insert("audio_import_status".to_string(), "completed".to_string());
+            let metadata_json = serde_json::to_string(&metadata).map_err(|e| ApplicationError::Persistence(format!("failed to serialize metadata: {e}")))?;
+            let tx = conn.transaction().map_err(|e| ApplicationError::Persistence(format!("failed to start audio attach transaction: {e}")))?;
+            let changed = tx.execute(
+                "UPDATE transcript_artifacts SET metadata_json_enc = ?2, audio_available = 1, audio_backfill_status = ?3, updated_at = ?4, revision = revision + 1 WHERE id = ?1 AND is_deleted = 0 AND revision = ?5",
+                params![id, repo.encrypt_text(&current.id, "metadata_json", &metadata_json)?, audio.backfill_status.as_str(), Utc::now().to_rfc3339(), current.revision],
+            ).map_err(|e| ApplicationError::Persistence(format!("failed to attach artifact audio: {e}")))?;
+            if changed == 0 { return Err(ApplicationError::Persistence("artifact audio attach rejected because a newer revision already exists".to_string())); }
+            tx.execute(
+                r#"INSERT INTO artifact_audio (
+                    artifact_id, encrypted_rel_path, mime_type, file_extension, sha256, byte_size,
+                    duration_seconds, imported_at, backfill_status, source_fingerprint_json_enc
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)
+                ON CONFLICT(artifact_id) DO UPDATE SET
+                    encrypted_rel_path = excluded.encrypted_rel_path,
+                    mime_type = excluded.mime_type,
+                    file_extension = excluded.file_extension,
+                    sha256 = excluded.sha256,
+                    byte_size = excluded.byte_size,
+                    duration_seconds = excluded.duration_seconds,
+                    imported_at = excluded.imported_at,
+                    backfill_status = excluded.backfill_status"#,
+                params![current.id, audio.encrypted_rel_path, audio.mime_type, audio.extension, audio.sha256,
+                    audio.byte_size.map(|value| value as i64), current.audio_duration_seconds,
+                    Utc::now().to_rfc3339(), audio.backfill_status.as_str()],
+            ).map_err(|e| ApplicationError::Persistence(format!("failed to save artifact audio row: {e}")))?;
+            tx.commit().map_err(|e| ApplicationError::Persistence(format!("failed to commit audio attach transaction: {e}")))?;
             repo.load_one(&repo.open_connection()?, &id, false)
         }).await.map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
     }

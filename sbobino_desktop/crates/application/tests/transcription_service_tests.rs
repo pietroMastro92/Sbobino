@@ -35,6 +35,33 @@ impl AudioTranscoder for MockTranscoder {
     }
 }
 
+#[derive(Default)]
+struct ProgressingTranscoder {
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl AudioTranscoder for ProgressingTranscoder {
+    async fn to_wav_mono_16k(&self, _input: &Path, _output: &Path) -> Result<(), ApplicationError> {
+        let mut calls = self.calls.lock().expect("transcoder calls lock poisoned");
+        *calls += 1;
+        Ok(())
+    }
+
+    async fn to_wav_mono_16k_with_progress(
+        &self,
+        _input: &Path,
+        _output: &Path,
+        emit_progress: Arc<dyn Fn(f32, Option<f32>) + Send + Sync>,
+    ) -> Result<(), ApplicationError> {
+        let mut calls = self.calls.lock().expect("transcoder calls lock poisoned");
+        *calls += 1;
+        emit_progress(5.0, Some(10.0));
+        emit_progress(10.0, Some(10.0));
+        Ok(())
+    }
+}
+
 struct MockSpeechEngine {
     transcript: String,
     segments: Vec<TimedSegment>,
@@ -55,6 +82,7 @@ impl SpeechToTextEngine for MockSpeechEngine {
         Ok(TranscriptionOutput {
             text: self.transcript.clone(),
             segments: self.segments.clone(),
+            effective_model: None,
         })
     }
 }
@@ -100,6 +128,7 @@ impl SpeechToTextEngine for RecordingSpeechEngine {
                 speaker_label: None,
                 words: Vec::new(),
             }],
+            effective_model: None,
         })
     }
 }
@@ -112,7 +141,11 @@ struct MockSpeakerDiarizer {
 
 #[async_trait]
 impl SpeakerDiarizationEngine for MockSpeakerDiarizer {
-    async fn diarize(&self, _input_wav: &Path) -> Result<Vec<SpeakerTurn>, ApplicationError> {
+    async fn diarize(
+        &self,
+        _input_wav: &Path,
+        _emit_progress: Arc<dyn Fn(sbobino_application::DiarizationProgress) + Send + Sync>,
+    ) -> Result<Vec<SpeakerTurn>, ApplicationError> {
         if let Some(message) = &self.fail_with {
             return Err(ApplicationError::SpeakerDiarization(message.clone()));
         }
@@ -411,6 +444,51 @@ impl ArtifactRepository for InMemoryArtifactRepository {
             .insert("timeline_v2".to_string(), timeline_v2_json.to_string());
         artifact.touch();
         Ok(Some(artifact.clone()))
+    }
+
+    async fn update_diarization_result(
+        &self,
+        id: &str,
+        timeline_v2_json: Option<&str>,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        let mut artifacts = self.artifacts.lock().expect("artifact repo lock poisoned");
+        let Some(artifact) = artifacts.iter_mut().find(|artifact| artifact.id == id) else {
+            return Ok(None);
+        };
+        artifact
+            .metadata
+            .insert("speaker_diarization_status".into(), status.into());
+        if let Some(timeline) = timeline_v2_json {
+            artifact
+                .metadata
+                .insert("timeline_v2".into(), timeline.into());
+        }
+        match error {
+            Some(message) => {
+                artifact
+                    .metadata
+                    .insert("speaker_diarization_error".into(), message.into());
+            }
+            None => {
+                artifact.metadata.remove("speaker_diarization_error");
+            }
+        }
+        artifact.touch();
+        Ok(Some(artifact.clone()))
+    }
+
+    async fn interrupt_pending_postprocessing_jobs(&self) -> Result<usize, ApplicationError> {
+        Ok(0)
+    }
+
+    async fn attach_audio_file(
+        &self,
+        _id: &str,
+        _source_path: &Path,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        Ok(None)
     }
 
     async fn update_emotion_analysis(
@@ -795,6 +873,72 @@ async fn run_file_transcription_emits_final_transcript_snapshot_before_post_proc
 }
 
 #[tokio::test]
+async fn run_file_transcription_emits_transcode_progress_during_preparing_audio() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("meeting.m4a");
+    tokio::fs::write(&input_path, b"fake audio")
+        .await
+        .expect("failed to create input");
+
+    let transcoder = Arc::new(ProgressingTranscoder::default());
+    let speech = Arc::new(MockSpeechEngine {
+        transcript: "raw transcript".to_string(),
+        segments: vec![TimedSegment {
+            text: "raw transcript".to_string(),
+            start_seconds: Some(0.0),
+            end_seconds: Some(1.0),
+            ..TimedSegment::default()
+        }],
+    });
+    let enhancer = Arc::new(MockEnhancer::default());
+    let repo = Arc::new(InMemoryArtifactRepository::default());
+    let service = TranscriptionService::new(transcoder, speech, enhancer, repo);
+    let emitted: Arc<Mutex<Vec<JobProgress>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_ref = emitted.clone();
+
+    service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-transcode-progress".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Base,
+                engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+            },
+            Arc::new(move |event| {
+                emitted_ref
+                    .lock()
+                    .expect("emitted lock poisoned")
+                    .push(event);
+            }),
+            Arc::new(|_text: String| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("transcription should succeed");
+
+    let preparing_audio_progress = emitted
+        .lock()
+        .expect("emitted lock poisoned")
+        .iter()
+        .filter(|event| {
+            event.stage == JobStage::PreparingAudio
+                && event.phase.as_deref() == Some("preparing_audio")
+        })
+        .map(|event| event.percentage)
+        .collect::<Vec<_>>();
+    assert_eq!(preparing_audio_progress, vec![5, 10]);
+}
+
+#[tokio::test]
 async fn run_file_transcription_with_ai_runs_enhancer_steps() {
     let temp = tempdir().expect("failed to create temp dir");
     let input_path = temp.path().join("meeting.wav");
@@ -933,7 +1077,8 @@ async fn run_file_transcription_rejects_missing_input_path() {
 }
 
 #[tokio::test]
-async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
+async fn run_file_transcription_preserves_queued_diarization_metadata_without_blocking_on_pyannote()
+{
     let temp = tempdir().expect("failed to create temp dir");
     let input_path = temp.path().join("interview.wav");
     tokio::fs::write(&input_path, b"fake wav content")
@@ -981,6 +1126,13 @@ async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
     let service = TranscriptionService::new(transcoder, speech, enhancer, repo)
         .with_speaker_diarizer(diarizer);
 
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "speaker_diarization_status".to_string(),
+        "queued".to_string(),
+    );
+    metadata.insert("speaker_diarization_progress".to_string(), "0".to_string());
+
     let artifact = service
         .run_file_transcription(
             RunTranscriptionRequest {
@@ -995,7 +1147,7 @@ async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
                 whisper_options: WhisperOptions::default(),
                 title: None,
                 parent_id: None,
-                metadata: BTreeMap::new(),
+                metadata,
                 source_fingerprint_json: None,
             },
             Arc::new(|_| {}),
@@ -1003,26 +1155,26 @@ async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
             CancellationToken::new(),
         )
         .await
-        .expect("transcription with diarization should succeed");
+        .expect("transcription should save before background diarization");
 
     let timeline = artifact
         .metadata
         .get("timeline_v2")
         .expect("timeline metadata should be present");
-    assert!(timeline.contains("\"speaker_id\":\"speaker_1\""));
-    assert!(timeline.contains("\"speaker_label\":\"Speaker 1\""));
-    assert!(timeline.contains("\"speaker_id\":\"speaker_2\""));
+    assert!(!timeline.contains("\"speaker_id\":\"speaker_1\""));
+    assert!(!timeline.contains("\"speaker_label\":\"Speaker 1\""));
+    assert!(!timeline.contains("\"speaker_id\":\"speaker_2\""));
     assert_eq!(
         artifact
             .metadata
             .get("speaker_diarization_status")
             .map(String::as_str),
-        Some("completed")
+        Some("queued")
     );
 }
 
 #[tokio::test]
-async fn run_file_transcription_persists_diarization_failure_metadata() {
+async fn run_file_transcription_does_not_fail_when_background_diarizer_would_fail() {
     let temp = tempdir().expect("failed to create temp dir");
     let input_path = temp.path().join("meeting.wav");
     tokio::fs::write(&input_path, b"fake wav content")
@@ -1049,6 +1201,13 @@ async fn run_file_transcription_persists_diarization_failure_metadata() {
     let service = TranscriptionService::new(transcoder, speech, enhancer, repo)
         .with_speaker_diarizer(diarizer);
 
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        "speaker_diarization_status".to_string(),
+        "queued".to_string(),
+    );
+    metadata.insert("speaker_diarization_progress".to_string(), "0".to_string());
+
     let artifact = service
         .run_file_transcription(
             RunTranscriptionRequest {
@@ -1063,7 +1222,7 @@ async fn run_file_transcription_persists_diarization_failure_metadata() {
                 whisper_options: WhisperOptions::default(),
                 title: None,
                 parent_id: None,
-                metadata: BTreeMap::new(),
+                metadata,
                 source_fingerprint_json: None,
             },
             Arc::new(|_| {}),
@@ -1071,22 +1230,16 @@ async fn run_file_transcription_persists_diarization_failure_metadata() {
             CancellationToken::new(),
         )
         .await
-        .expect("transcription should still succeed when diarization fails");
+        .expect("transcription should finish before background diarization");
 
     assert_eq!(
         artifact
             .metadata
             .get("speaker_diarization_status")
             .map(String::as_str),
-        Some("failed")
+        Some("queued")
     );
-    assert_eq!(
-        artifact
-            .metadata
-            .get("speaker_diarization_error")
-            .map(String::as_str),
-        Some("speaker diarization failed: pyannote crashed")
-    );
+    assert!(artifact.metadata.get("speaker_diarization_error").is_none());
 }
 
 #[tokio::test]
@@ -1362,5 +1515,109 @@ async fn run_file_transcription_transcodes_wav_inputs_unconditionally() {
             .expect("transcoder calls lock poisoned"),
         1,
         "ffmpeg transcoder must be invoked for every input"
+    );
+}
+
+/// Engine that replays a fixed sequence of progress values (in seconds) to its
+/// `emit_progress_seconds` callback, simulating the non-monotonic sequence an
+/// engine emits when it resets progress before a CPU-safe retry.
+struct ProgressReplayEngine {
+    progress_seconds: Vec<f32>,
+}
+
+#[async_trait]
+impl SpeechToTextEngine for ProgressReplayEngine {
+    async fn transcribe(
+        &self,
+        _input_wav: &Path,
+        _model_filename: &str,
+        _language_code: &str,
+        _options: &WhisperOptions,
+        _total_audio_seconds: Option<f32>,
+        _emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+    ) -> Result<TranscriptionOutput, ApplicationError> {
+        for seconds in &self.progress_seconds {
+            emit_progress_seconds(*seconds);
+        }
+        Ok(TranscriptionOutput {
+            text: "replayed transcript".to_string(),
+            segments: Vec::new(),
+            effective_model: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn progress_callback_lets_through_reset_after_retry_progress() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("lecture.mp3");
+    tokio::fs::write(&input_path, b"fake mp3 content")
+        .await
+        .expect("failed to create test input file");
+
+    let transcoder = Arc::new(MockTranscoder::default());
+    // Sequence simulating: first attempt advances to 10s, then a CPU-safe retry
+    // resets to 0.0 and re-advances through 1.0s -> 2.0s -> 3.0s. Without a
+    // reset-aware throttle, every value after 10.0 would be suppressed.
+    let speech = Arc::new(ProgressReplayEngine {
+        progress_seconds: vec![10.0, 0.0, 1.0, 2.0, 3.0],
+    });
+    let enhancer = Arc::new(MockEnhancer::default());
+    let repo = Arc::new(InMemoryArtifactRepository::default());
+
+    let service =
+        TranscriptionService::new(transcoder.clone(), speech, enhancer.clone(), repo.clone());
+
+    let emitted: Arc<Mutex<Vec<JobProgress>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_clone = emitted.clone();
+
+    service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-progress".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Base,
+                engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+            },
+            Arc::new(move |event| {
+                emitted_clone
+                    .lock()
+                    .expect("emitted lock poisoned")
+                    .push(event);
+            }),
+            Arc::new(|_text: String| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("transcription service should succeed");
+
+    // Collect only the Transcribing progress events driven by the engine's
+    // seconds callback (those carry current_seconds).
+    let progress_seconds: Vec<f32> = emitted
+        .lock()
+        .expect("emitted lock poisoned")
+        .iter()
+        .filter(|event| event.stage == JobStage::Transcribing)
+        .filter_map(|event| event.current_seconds)
+        .collect();
+
+    // The reset value (1.0, first value after the 0.0 reset) must survive the
+    // throttle and reach the UI instead of being suppressed as non-monotonic.
+    assert!(
+        progress_seconds
+            .iter()
+            .any(|value| (*value - 1.0).abs() < 0.001),
+        "expected the post-reset progress value 1.0 to reach the UI, got: {:?}",
+        progress_seconds
     );
 }

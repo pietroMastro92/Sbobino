@@ -67,9 +67,9 @@ function createRuntimeHealthFixture(): RuntimeHealth {
     parakeet_models_dir_resolved: "/tmp/parakeet-models",
     model_filename: "ggml-base.bin",
     model_present: true,
-    parakeet_model_filename: "tdt-0.6b-v3-q4_k.gguf",
+    parakeet_model_filename: "tdt-0.6b-v3-f16.gguf",
     parakeet_model_present: false,
-    missing_parakeet_models: ["tdt-0.6b-v3-q4_k.gguf"],
+    missing_parakeet_models: ["tdt-0.6b-v3-f16.gguf"],
     coreml_encoder_present: true,
     missing_models: [],
     missing_encoders: [],
@@ -110,9 +110,9 @@ function createModelCatalogFixture(): ProvisioningModelCatalogEntry[] {
       experimental: false,
     },
     {
-      key: "tdt06b_v3_q4",
-      label: "Parakeet TDT 0.6B Q4 — file only",
-      model_file: "tdt-0.6b-v3-q4_k.gguf",
+      key: "tdt06b_v3_f16",
+      label: "Parakeet TDT 0.6B F16 — file only (high accuracy)",
+      model_file: "tdt-0.6b-v3-f16.gguf",
       installed: true,
       coreml_installed: true,
       engine: "parakeet_cpp",
@@ -194,7 +194,7 @@ describe("initialSetup helpers", () => {
     };
     expect(getInitialSetupMissingModels(catalog, true)).toEqual([
       "large_turbo",
-      "tdt06b_v3_q4",
+      "tdt06b_v3_f16",
       "nemotron35_asr_streaming_06b_q4",
     ]);
   });

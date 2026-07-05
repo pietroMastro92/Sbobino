@@ -18,7 +18,7 @@ use libloading::Library;
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
 use sbobino_domain::TimedSegment;
 
-use crate::realtime_audio::{classify_input_error, RealtimeInputLevelEvent};
+use crate::realtime_audio::{classify_input_error, waveform_envelope, RealtimeInputLevelEvent};
 
 type ParakeetCtx = std::ffi::c_void;
 type ParakeetStream = std::ffi::c_void;
@@ -94,11 +94,13 @@ impl ParakeetRealtimeEngine {
         emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
         emit_input_level: Arc<dyn Fn(RealtimeInputLevelEvent) + Send + Sync>,
     ) -> Result<(), ApplicationError> {
-        let mut state = self.state.lock().map_err(lock_error)?;
-        if state.running {
-            return Err(ApplicationError::Validation(
-                "realtime transcription is already running".to_string(),
-            ));
+        {
+            let state = self.state.lock().map_err(lock_error)?;
+            if state.running {
+                return Err(ApplicationError::Validation(
+                    "realtime transcription is already running".to_string(),
+                ));
+            }
         }
 
         eprintln!(
@@ -204,8 +206,18 @@ impl ParakeetRealtimeEngine {
                 ))
             })?;
 
-        match startup_rx.recv_timeout(Duration::from_secs(90)) {
+        let startup_result =
+            tokio::task::spawn_blocking(move || startup_rx.recv_timeout(Duration::from_secs(90)))
+                .await
+                .map_err(|error| {
+                    ApplicationError::SpeechToText(format!(
+                        "Parakeet realtime startup waiter failed: {error}"
+                    ))
+                })?;
+
+        match startup_result {
             Ok(Ok(())) => {
+                let mut state = self.state.lock().map_err(lock_error)?;
                 state.running = true;
                 state.paused = paused;
                 state.shutdown_tx = Some(shutdown_tx);
@@ -218,12 +230,12 @@ impl ParakeetRealtimeEngine {
             }
             Ok(Err(error)) => {
                 let _ = shutdown_tx.send(());
-                let _ = worker.join();
+                let _ = tokio::task::spawn_blocking(move || worker.join()).await;
                 Err(error)
             }
             Err(_) => {
                 let _ = shutdown_tx.send(());
-                let _ = worker.join();
+                let _ = tokio::task::spawn_blocking(move || worker.join()).await;
                 Err(ApplicationError::SpeechToText(
                     "Parakeet realtime startup timed out while waiting for microphone capture."
                         .to_string(),
@@ -264,7 +276,7 @@ impl ParakeetRealtimeEngine {
         };
 
         if let Some(worker) = worker {
-            let _ = worker.join();
+            let _ = tokio::task::spawn_blocking(move || worker.join()).await;
         }
 
         let mut state = self.state.lock().map_err(lock_error)?;
@@ -627,6 +639,7 @@ fn emit_parakeet_input_level(
     emit_input_level(RealtimeInputLevelEvent {
         state: state.to_string(),
         level: level.clamp(0.0, 1.0),
+        envelope: Vec::new(),
         message: message.into(),
     });
 }
@@ -747,6 +760,7 @@ fn run_capture_loop(
     let mut assembler = ParakeetLiveAssembler::new(transcript, segments, emit_delta);
     let mut last_input_level_emit = Instant::now();
     let mut pending_input_level = 0.0_f32;
+    let mut pending_waveform_samples = Vec::<f32>::new();
     let _stream_guard = input_stream;
     emit_parakeet_input_level(
         emit_input_level.as_ref(),
@@ -785,14 +799,16 @@ fn run_capture_loop(
         }
 
         pending_input_level = pending_input_level.max(mean_abs_input_level(chunk.iter().copied()));
-        if last_input_level_emit.elapsed() >= Duration::from_millis(45) {
-            emit_parakeet_input_level(
-                emit_input_level.as_ref(),
-                "running",
-                pending_input_level,
-                format!("Using {device_name}"),
-            );
+        pending_waveform_samples.extend_from_slice(&chunk);
+        if last_input_level_emit.elapsed() >= Duration::from_millis(33) {
+            emit_input_level(RealtimeInputLevelEvent {
+                state: "running".to_string(),
+                level: pending_input_level,
+                envelope: waveform_envelope(&pending_waveform_samples, 4),
+                message: format!("Using {device_name}"),
+            });
             pending_input_level = 0.0;
+            pending_waveform_samples.clear();
             last_input_level_emit = Instant::now();
         }
 
@@ -1290,6 +1306,43 @@ impl LinearResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_keeps_async_runtime_responsive_while_capture_worker_exits() {
+        let engine = ParakeetRealtimeEngine::new(PathBuf::new(), PathBuf::new());
+        {
+            let mut state = engine.state.lock().expect("state lock");
+            state.running = true;
+            state.worker = Some(std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+            }));
+        }
+
+        let heartbeat = Arc::new(AtomicBool::new(false));
+        let heartbeat_ref = heartbeat.clone();
+        let heartbeat_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            heartbeat_ref.store(true, Ordering::SeqCst);
+        });
+
+        let stop_engine = engine.clone();
+        let stop_task = tokio::spawn(async move { stop_engine.stop().await });
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "worker.join delayed the async timer"
+        );
+        assert!(
+            heartbeat.load(Ordering::SeqCst),
+            "worker.join blocked the async runtime"
+        );
+        stop_task
+            .await
+            .expect("stop task completes")
+            .expect("stop succeeds");
+        heartbeat_task.await.expect("heartbeat completes");
+    }
 
     #[test]
     fn parakeet_realtime_metal_safety_env_keeps_metal_enabled() {

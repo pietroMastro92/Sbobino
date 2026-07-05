@@ -26,6 +26,9 @@ const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
 const PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const PROCESS_IDLE_TIMEOUT_MIN: Duration = Duration::from_secs(900);
 const PROCESS_IDLE_TIMEOUT_MAX: Duration = Duration::from_secs(3600);
+const STDERR_FAILURE_TAIL_LINES: usize = 48;
+const STDERR_FAILURE_TAIL_CHARS: usize = 8_000;
+const LONG_AUDIO_CPU_SAFE_THRESHOLD_SECONDS: f32 = 30.0 * 60.0;
 
 #[derive(Debug, Clone)]
 pub struct WhisperCppEngine {
@@ -220,6 +223,61 @@ impl WhisperCppEngine {
             .map(|parsed| parsed.clamp(0.0, 100.0))
     }
 
+    fn stderr_failure_tail(stderr_output: &str) -> String {
+        let mut deduplicated_tail = Vec::new();
+        let mut repeated_line: Option<String> = None;
+        let mut repeat_count = 0usize;
+        for line in stderr_output.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if repeated_line.as_deref() == Some(trimmed) {
+                repeat_count += 1;
+                continue;
+            }
+            if let Some(previous) = repeated_line.take() {
+                if repeat_count > 1 {
+                    deduplicated_tail.push(format!("{previous} (repeated {repeat_count}x)"));
+                } else {
+                    deduplicated_tail.push(previous);
+                }
+            }
+            repeated_line = Some(trimmed.to_string());
+            repeat_count = 1;
+        }
+        if let Some(previous) = repeated_line.take() {
+            if repeat_count > 1 {
+                deduplicated_tail.push(format!("{previous} (repeated {repeat_count}x)"));
+            } else {
+                deduplicated_tail.push(previous);
+            }
+        }
+
+        let tail_lines = deduplicated_tail
+            .into_iter()
+            .rev()
+            .take(STDERR_FAILURE_TAIL_LINES)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let trimmed = tail_lines.trim();
+        if trimmed.chars().count() <= STDERR_FAILURE_TAIL_CHARS {
+            return trimmed.to_string();
+        }
+
+        let mut chars = trimmed
+            .chars()
+            .rev()
+            .take(STDERR_FAILURE_TAIL_CHARS)
+            .collect::<Vec<_>>();
+        chars.reverse();
+        format!("…{}", chars.into_iter().collect::<String>())
+    }
+
     fn clean_cli_display_line(raw_line: &str) -> String {
         raw_line
             .replace("\u{001b}[2K", "")
@@ -329,6 +387,34 @@ impl WhisperCppEngine {
             segment,
             preview_text,
         })
+    }
+
+    fn parse_cli_events(raw_line: &str) -> Vec<ParsedCliEvent> {
+        let mut events = Vec::new();
+        for chunk in raw_line.split('\r') {
+            if let Some(event) = Self::parse_cli_line(chunk) {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    fn emit_monotonic_progress_seconds(
+        candidate_seconds: f32,
+        emit_progress_seconds: &(dyn Fn(f32) + Send + Sync),
+        last_progress_seconds: &Arc<Mutex<f32>>,
+    ) {
+        if !candidate_seconds.is_finite() || candidate_seconds < 0.0 {
+            return;
+        }
+        let Ok(mut last) = last_progress_seconds.lock() else {
+            return;
+        };
+        if candidate_seconds <= *last + 0.05 {
+            return;
+        }
+        *last = candidate_seconds;
+        emit_progress_seconds(candidate_seconds);
     }
 
     fn build_word_candidates(
@@ -477,8 +563,9 @@ impl WhisperCppEngine {
         collector: Arc<Mutex<TranscriptCollector>>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
-        _total_audio_seconds: Option<f32>,
+        total_audio_seconds: Option<f32>,
         last_activity_at_ms: Arc<AtomicU64>,
+        last_progress_seconds: Arc<Mutex<f32>>,
     ) -> Result<Vec<String>, ApplicationError>
     where
         R: AsyncRead + Unpin,
@@ -491,23 +578,32 @@ impl WhisperCppEngine {
         while let Ok(Some(raw)) = lines.next_line().await {
             Self::mark_activity(last_activity_at_ms.as_ref());
             raw_lines.push(raw.clone());
-            if let Some(parsed_line) = Self::parse_cli_line(&raw) {
+            for parsed_line in Self::parse_cli_events(&raw) {
                 match parsed_line {
                     ParsedCliEvent::Segment {
                         segment,
                         preview_text,
                     } => {
                         if let Some(end_seconds) = segment.end_seconds {
-                            emit_progress_seconds(end_seconds);
+                            Self::emit_monotonic_progress_seconds(
+                                end_seconds,
+                                emit_progress_seconds.as_ref(),
+                                &last_progress_seconds,
+                            );
                         }
                         Self::collect_segment(&collector, &emit_partial, segment, preview_text);
                     }
-                    // The CLI prints internal progress updates that can run
-                    // well ahead of the finalized segments we have actually
-                    // received. Driving the UI from those percentages makes the
-                    // progress pill look "ahead" of the live transcript, so
-                    // we only advance progress from segment end times.
-                    ParsedCliEvent::ProgressPercent(_progress_percent) => {}
+                    ParsedCliEvent::ProgressPercent(progress_percent) => {
+                        if let Some(total_seconds) =
+                            total_audio_seconds.filter(|seconds| *seconds > 0.0)
+                        {
+                            Self::emit_monotonic_progress_seconds(
+                                total_seconds * (progress_percent / 100.0),
+                                emit_progress_seconds.as_ref(),
+                                &last_progress_seconds,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -545,13 +641,36 @@ impl WhisperCppEngine {
             || haystack.contains("failed to allocate buffer")
             || haystack.contains("use gpu    = 1");
 
+        let backend_runtime_failure = haystack.contains("repack tensor")
+            || haystack.contains("q8_0_4x4")
+            || haystack.contains("repack = 1")
+            || haystack.contains("flash attention")
+            || haystack.contains("flash-attn")
+            || haystack.contains("failed to compute")
+            || haystack.contains("backend");
+
         let crashed = error
             .status
             .map(|status| !status.success())
             .unwrap_or(false)
             && status_signal_is_crash(error.status);
 
-        metal_failure || crashed
+        metal_failure || backend_runtime_failure || crashed
+    }
+
+    fn should_start_in_cpu_safe_mode(
+        model_filename: &str,
+        total_audio_seconds: Option<f32>,
+    ) -> bool {
+        let is_long_audio = total_audio_seconds.is_some_and(|seconds| {
+            seconds.is_finite() && seconds >= LONG_AUDIO_CPU_SAFE_THRESHOLD_SECONDS
+        });
+        if !is_long_audio {
+            return false;
+        }
+
+        let normalized_model = model_filename.to_ascii_lowercase();
+        normalized_model.contains("large-v3-turbo") && normalized_model.contains("q8")
     }
 
     fn configure_command_environment(command: &mut Command, binary_path: &str) {
@@ -601,7 +720,10 @@ impl WhisperCppEngine {
             .arg("-f")
             .arg(input_wav);
 
-        let options = Self::normalized_options(options);
+        let mut options = Self::normalized_options(options);
+        if mode == WhisperCliExecutionMode::CpuFallback {
+            options.processors = 1;
+        }
 
         command
             .arg("-t")
@@ -730,12 +852,14 @@ impl WhisperCppEngine {
 
         let collected = Arc::new(Mutex::new(TranscriptCollector::default()));
         let last_activity_at_ms = Arc::new(AtomicU64::new(Self::clock_now_millis()));
+        let last_progress_seconds = Arc::new(Mutex::new(0.0_f32));
 
         let stdout_emit = emit_partial.clone();
         let stdout_progress = emit_progress_seconds.clone();
         let stdout_collector = collected.clone();
         let stdout_total_seconds = total_audio_seconds;
         let stdout_last_activity = last_activity_at_ms.clone();
+        let stdout_last_progress = last_progress_seconds.clone();
         let stdout_task = tokio::spawn(async move {
             Self::consume_stream(
                 stdout,
@@ -744,6 +868,7 @@ impl WhisperCppEngine {
                 stdout_progress,
                 stdout_total_seconds,
                 stdout_last_activity,
+                stdout_last_progress,
             )
             .await
         });
@@ -753,6 +878,7 @@ impl WhisperCppEngine {
         let stderr_collector = collected.clone();
         let stderr_total_seconds = total_audio_seconds;
         let stderr_last_activity = last_activity_at_ms.clone();
+        let stderr_last_progress = last_progress_seconds.clone();
         let stderr_task = tokio::spawn(async move {
             Self::consume_stream(
                 stderr,
@@ -761,6 +887,7 @@ impl WhisperCppEngine {
                 stderr_progress,
                 stderr_total_seconds,
                 stderr_last_activity,
+                stderr_last_progress,
             )
             .await
         });
@@ -805,8 +932,9 @@ impl WhisperCppEngine {
         let stderr_output = stderr_lines.join("\n");
 
         if !status.success() {
+            let stderr_tail = Self::stderr_failure_tail(&stderr_output);
             return Err(WhisperCliAttemptError {
-                message: format!("whisper-cli failed: {}", stderr_output.trim()),
+                message: format!("whisper-cli failed: {stderr_tail}"),
                 stderr_output,
                 status: Some(status),
             });
@@ -864,6 +992,7 @@ impl WhisperCppEngine {
         Ok(TranscriptionOutput {
             text: transcript,
             segments,
+            effective_model: None,
         })
     }
 
@@ -872,12 +1001,35 @@ impl WhisperCppEngine {
         &self,
         input_wav: &Path,
         model_path: &Path,
+        model_filename: &str,
         language_code: &str,
         options: &WhisperOptions,
         total_audio_seconds: Option<f32>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<TranscriptionOutput, ApplicationError> {
+        if Self::should_start_in_cpu_safe_mode(model_filename, total_audio_seconds) {
+            emit_partial("Whisper CPU-safe mode for long audio...".to_string());
+            return self
+                .run_whisper_cli_attempt(
+                    input_wav,
+                    model_path,
+                    language_code,
+                    options,
+                    total_audio_seconds,
+                    emit_partial,
+                    emit_progress_seconds,
+                    WhisperCliExecutionMode::CpuFallback,
+                )
+                .await
+                .map_err(|error| {
+                    ApplicationError::SpeechToText(format!(
+                        "Whisper CPU-safe mode failed: {}",
+                        error.message
+                    ))
+                });
+        }
+
         match self
             .run_whisper_cli_attempt(
                 input_wav,
@@ -893,9 +1045,8 @@ impl WhisperCppEngine {
         {
             Ok(output) => Ok(output),
             Err(error) if Self::should_retry_with_cpu_fallback(&error) => {
-                emit_partial(
-                    "Whisper GPU execution failed; retrying in CPU-safe mode.".to_string(),
-                );
+                emit_partial("Whisper fallback CPU-safe mode...".to_string());
+                emit_progress_seconds(0.0);
                 self.run_whisper_cli_attempt(
                     input_wav,
                     model_path,
@@ -907,7 +1058,12 @@ impl WhisperCppEngine {
                     WhisperCliExecutionMode::CpuFallback,
                 )
                 .await
-                .map_err(|retry_error| ApplicationError::SpeechToText(retry_error.message))
+                .map_err(|retry_error| {
+                    ApplicationError::SpeechToText(format!(
+                        "Whisper retry in CPU-safe mode failed: {}",
+                        retry_error.message
+                    ))
+                })
             }
             Err(error) => Err(ApplicationError::SpeechToText(error.message)),
         }
@@ -1031,6 +1187,7 @@ impl SpeechToTextEngine for WhisperCppEngine {
         self.transcribe_with_cli(
             input_wav,
             &model_path,
+            model_filename,
             language_code,
             options,
             total_audio_seconds,
