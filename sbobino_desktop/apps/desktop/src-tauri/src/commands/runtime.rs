@@ -825,21 +825,6 @@ pub async fn get_transcription_start_preflight(
         });
     }
 
-    if health.pyannote.enabled && !health.pyannote.ready {
-        return Ok(StartPreflightResponse {
-            allowed: false,
-            reason_code: health.pyannote.reason_code.clone(),
-            message: health.pyannote.message.clone(),
-            engine: engine_wire,
-            model_filename,
-            model_path,
-            whisper_cli_resolved: health.whisper_cli_resolved,
-            whisper_stream_resolved: health.whisper_stream_resolved,
-            parakeet_cli_resolved: health.parakeet_cli_resolved,
-            pyannote: health.pyannote,
-        });
-    }
-
     Ok(StartPreflightResponse {
         allowed: true,
         reason_code: "ok".to_string(),

@@ -1086,9 +1086,7 @@ impl RuntimeTranscriptionFactory {
             return Ok(None);
         }
 
-        self.install_bundled_pyannote_override_if_available()?;
-        self.ensure_managed_pyannote_runtime_layout();
-        let pyannote_health = self.pyannote_health(settings, RuntimeHealthMode::Full);
+        let pyannote_health = self.pyannote_health(settings, RuntimeHealthMode::Preflight);
         if !pyannote_health.ready {
             return Err(pyannote_health.message);
         }
@@ -1107,7 +1105,16 @@ impl RuntimeTranscriptionFactory {
             ));
         }
 
-        let model_path = self.ensure_managed_pyannote_model_dir()?.ok_or_else(|| {
+        let model_path = if is_pyannote_model_dir(&self.managed_pyannote_model_dir()) {
+            Some(
+                self.managed_pyannote_model_dir()
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        } else {
+            None
+        }
+        .ok_or_else(|| {
             "Pyannote diarization is enabled, but the managed offline model is unavailable."
                 .to_string()
         })?;
@@ -1233,16 +1240,8 @@ impl RuntimeTranscriptionFactory {
         self.runtime_health_with_mode(RuntimeHealthMode::Preflight)
     }
 
-    pub fn warmup_managed_pyannote_runtime(&self) {
-        self.ensure_managed_pyannote_runtime_layout();
-    }
-
     fn runtime_health_with_mode(&self, mode: RuntimeHealthMode) -> Result<RuntimeHealth, String> {
         let settings = self.load_settings()?;
-        if mode == RuntimeHealthMode::Full {
-            self.install_bundled_pyannote_override_if_available()?;
-            self.ensure_managed_pyannote_runtime_layout();
-        }
         let configured_models_dir = if settings.transcription.models_dir.trim().is_empty() {
             settings.models_dir.clone()
         } else {
@@ -1682,34 +1681,23 @@ impl RuntimeTranscriptionFactory {
         validate_pyannote_python_runtime(&python_root, Path::new(&python_path)).err()
     }
 
-    fn ensure_managed_pyannote_runtime_layout(&self) {
-        let runtime_root = self.managed_pyannote_python_dir();
-        let _ = ensure_embedded_libpython_is_present(&runtime_root);
-        let _ = ensure_embedded_pyannote_stdlib_is_present(&runtime_root);
-    }
-
-    fn ensure_managed_pyannote_model_dir(&self) -> Result<Option<String>, String> {
-        let runtime_dir = self.managed_pyannote_runtime_dir();
-        std::fs::create_dir_all(&runtime_dir)
-            .map_err(|e| format!("failed to create pyannote runtime directory: {e}"))?;
-
-        let destination = self.managed_pyannote_model_dir();
-        if is_pyannote_model_dir(&destination) {
-            return Ok(Some(destination.to_string_lossy().to_string()));
+    pub fn validate_managed_pyannote_runtime(&self) -> Result<(), String> {
+        if self.managed_pyannote_python_path().is_none() {
+            return Err(
+                "Pyannote diarization runtime is not installed. Install it from Settings > Local Models."
+                    .to_string(),
+            );
         }
-
-        if let Some(source) = self.find_bundled_pyannote_model_source() {
-            copy_directory_recursive(&source, &destination).map_err(|e| {
-                format!(
-                    "failed to install bundled pyannote model from '{}' to '{}': {e}",
-                    source.display(),
-                    destination.display()
-                )
-            })?;
-            return Ok(Some(destination.to_string_lossy().to_string()));
+        if let Some(error) = self.pyannote_runtime_validation_error() {
+            return Err(error);
         }
-
-        Ok(None)
+        if !is_pyannote_model_dir(&self.managed_pyannote_model_dir()) {
+            return Err(
+                "Pyannote diarization model is not installed. Install it from Settings > Local Models."
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     fn managed_pyannote_python_candidates(&self) -> Vec<PathBuf> {
@@ -1856,7 +1844,7 @@ impl RuntimeTranscriptionFactory {
     fn pyannote_health(
         &self,
         settings: &AppSettings,
-        mode: RuntimeHealthMode,
+        _mode: RuntimeHealthMode,
     ) -> PyannoteRuntimeHealth {
         let diarization = &settings.transcription.speaker_diarization;
         let managed_python_root = self.managed_pyannote_python_dir();
@@ -1883,11 +1871,6 @@ impl RuntimeTranscriptionFactory {
             .as_ref()
             .map(|value| value.reason_code.trim().to_string())
             .unwrap_or_default();
-        let status_validated_ready = status
-            .as_ref()
-            .and_then(|value| value.validated_at.as_deref())
-            .is_some_and(|value| !value.trim().is_empty());
-
         let status_override = status.as_ref().and_then(|value| {
             let code = value.reason_code.trim();
             if code.is_empty() || code == "ok" {
@@ -1896,10 +1879,6 @@ impl RuntimeTranscriptionFactory {
                 Some((code.to_string(), value.message.trim().to_string()))
             }
         });
-        let can_self_heal_status_override = status_override
-            .as_ref()
-            .map(|(code, _)| !matches!(code.as_str(), "pyannote_arch_mismatch"))
-            .unwrap_or(false);
         let manifest_matches_host = manifest.as_ref().is_some_and(|value| {
             pyannote_runtime_arch_matches_host(value.runtime_arch.trim())
                 && (value.source == PYANNOTE_BUNDLED_OVERRIDE_SOURCE
@@ -1910,51 +1889,9 @@ impl RuntimeTranscriptionFactory {
             && model_installed
             && cached_runtime_layout_ready
             && manifest_matches_host
-            && status_reason_code == "ok"
-            && status_validated_ready;
-        let runtime_validation_error = if mode == RuntimeHealthMode::Full
-            && runtime_installed
-            && !should_trust_cached_ready_status
-        {
-            self.pyannote_runtime_validation_error()
-        } else {
-            None
-        };
+            && status_reason_code == "ok";
 
         if should_trust_cached_ready_status {
-            if let Some(existing_manifest) = manifest.as_ref() {
-                if existing_manifest.source != PYANNOTE_BUNDLED_OVERRIDE_SOURCE
-                    && existing_manifest.compat_level == 0
-                {
-                    let mut updated_manifest = existing_manifest.clone();
-                    updated_manifest.compat_level = PYANNOTE_COMPAT_LEVEL;
-                    let _ = self.write_managed_pyannote_manifest(&updated_manifest);
-                }
-            }
-            return PyannoteRuntimeHealth {
-                enabled: diarization.enabled,
-                ready: true,
-                runtime_installed,
-                model_installed,
-                runtime_dir,
-                arch,
-                device,
-                source,
-                reason_code: "ok".to_string(),
-                message: "Pyannote diarization runtime is installed.".to_string(),
-            };
-        }
-
-        if status_override.is_some()
-            && mode == RuntimeHealthMode::Full
-            && runtime_installed
-            && model_installed
-            && runtime_validation_error.is_none()
-            && manifest_matches_host
-            && can_self_heal_status_override
-        {
-            let _ =
-                self.write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.");
             if let Some(existing_manifest) = manifest.as_ref() {
                 if existing_manifest.source != PYANNOTE_BUNDLED_OVERRIDE_SOURCE
                     && existing_manifest.compat_level == 0
@@ -2013,26 +1950,13 @@ impl RuntimeTranscriptionFactory {
                 "pyannote_model_missing".to_string(),
                 "Pyannote diarization model is not installed. Install it from Settings > Local Models.".to_string(),
             )
-        } else if let Some(error) = runtime_validation_error {
-            (false, "pyannote_repair_required".to_string(), error)
-        } else if mode == RuntimeHealthMode::Preflight
-            && runtime_installed
-            && model_installed
-            && cached_runtime_layout_ready
-            && manifest_matches_host
-        {
-            let (reason_code, message) = if status_reason_code == "ok" {
-                (
-                    "pyannote_validation_required",
-                    "Pyannote runtime needs validation before speaker diarization can be used.",
-                )
-            } else {
-                (
-                    "pyannote_repair_required",
-                    "Pyannote installation status is incomplete. Validate or repair it from Settings > Local Models.",
-                )
-            };
-            (false, reason_code.to_string(), message.to_string())
+        } else if !cached_runtime_layout_ready {
+            (
+                false,
+                "pyannote_repair_required".to_string(),
+                "Pyannote installation is incomplete. Repair the diarization runtime from Settings > Local Models."
+                    .to_string(),
+            )
         } else if let Some(manifest) = manifest.as_ref() {
             if !pyannote_runtime_arch_matches_host(manifest.runtime_arch.trim()) {
                 (
@@ -2057,15 +1981,6 @@ impl RuntimeTranscriptionFactory {
                     ),
                 )
             } else {
-                if mode == RuntimeHealthMode::Full
-                    && status_reason_code == "ok"
-                    && !status_validated_ready
-                {
-                    let _ = self.write_managed_pyannote_status(
-                        "ok",
-                        "Pyannote diarization runtime is ready.",
-                    );
-                }
                 (
                     true,
                     "ok".to_string(),
@@ -3249,114 +3164,6 @@ fn copy_directory_recursive(source: &Path, destination: &Path) -> Result<(), std
     Ok(())
 }
 
-fn ensure_embedded_libpython_is_present(runtime_root: &Path) -> Result<(), String> {
-    let lib_dir = runtime_root.join("lib");
-    if !lib_dir.is_dir() {
-        return Ok(());
-    }
-
-    let already_embedded = std::fs::read_dir(&lib_dir)
-        .ok()
-        .into_iter()
-        .flat_map(|entries| entries.filter_map(Result::ok))
-        .map(|entry| entry.path())
-        .any(|path| {
-            path.is_file()
-                && path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .map(|value| value.starts_with("libpython") && value.ends_with(".dylib"))
-                    .unwrap_or(false)
-        });
-    if already_embedded {
-        return Ok(());
-    }
-
-    let Some(source) = find_file_recursive(runtime_root, &|path| {
-        path.is_file()
-            && path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(|value| value.starts_with("libpython") && value.ends_with(".dylib"))
-                .unwrap_or(false)
-    }) else {
-        return Ok(());
-    };
-
-    std::fs::create_dir_all(&lib_dir)
-        .map_err(|e| format!("failed to create embedded libpython directory: {e}"))?;
-    let target = lib_dir.join(
-        source
-            .file_name()
-            .ok_or_else(|| "embedded libpython candidate is missing a file name".to_string())?,
-    );
-    std::fs::copy(&source, &target).map_err(|e| {
-        format!(
-            "failed to copy embedded libpython from '{}' to '{}': {e}",
-            source.display(),
-            target.display()
-        )
-    })?;
-    Ok(())
-}
-
-fn ensure_embedded_pyannote_stdlib_is_present(runtime_root: &Path) -> Result<(), String> {
-    let Some(version_dir_name) = pyannote_python_version_dir_name(runtime_root) else {
-        return Ok(());
-    };
-    let stdlib_dir = runtime_root.join("lib").join(&version_dir_name);
-    let has_local_stdlib = pyannote_stdlib_looks_complete(&stdlib_dir);
-    if has_local_stdlib {
-        return Ok(());
-    }
-
-    let Some(source_stdlib_dir) = find_pyannote_source_stdlib_dir(runtime_root, &version_dir_name)
-    else {
-        return Ok(());
-    };
-
-    std::fs::create_dir_all(&stdlib_dir)
-        .map_err(|e| format!("failed to create bundled stdlib directory: {e}"))?;
-
-    for entry in std::fs::read_dir(&source_stdlib_dir).map_err(|e| {
-        format!(
-            "failed to read source stdlib '{}': {e}",
-            source_stdlib_dir.display()
-        )
-    })? {
-        let entry = entry.map_err(|e| format!("failed to inspect source stdlib entry: {e}"))?;
-        let name = entry.file_name();
-        if name.to_string_lossy() == "site-packages" {
-            continue;
-        }
-        let source_path = entry.path();
-        let target_path = stdlib_dir.join(&name);
-        if entry
-            .file_type()
-            .map_err(|e| format!("failed to inspect stdlib entry type: {e}"))?
-            .is_dir()
-        {
-            copy_directory_recursive(&source_path, &target_path).map_err(|e| {
-                format!(
-                    "failed to copy stdlib directory '{}' to '{}': {e}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
-        } else if source_path.is_file() {
-            std::fs::copy(&source_path, &target_path).map_err(|e| {
-                format!(
-                    "failed to copy stdlib file '{}' to '{}': {e}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
 fn pyannote_python_version_dir_name(runtime_root: &Path) -> Option<String> {
     let lib_root = runtime_root.join("lib");
     let entries = std::fs::read_dir(&lib_root).ok()?;
@@ -3895,33 +3702,6 @@ fn pyannote_external_framework_reference(runtime_root: &Path) -> Option<String> 
     parse_external_python_framework_reference(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn find_pyannote_source_stdlib_dir(runtime_root: &Path, version_dir_name: &str) -> Option<PathBuf> {
-    let pyvenv_cfg = runtime_root.join("pyvenv.cfg");
-    let body = std::fs::read_to_string(pyvenv_cfg).ok()?;
-    let home = body
-        .lines()
-        .find_map(|line| line.strip_prefix("home = "))
-        .map(str::trim)?;
-    let home_path = PathBuf::from(home);
-    let prefix = if home_path.file_name().and_then(|value| value.to_str()) == Some("bin") {
-        home_path.parent().map(PathBuf::from)?
-    } else {
-        home_path
-    };
-
-    let candidates = [
-        prefix.join("lib").join(version_dir_name),
-        prefix
-            .parent()
-            .map(|parent| parent.join("lib").join(version_dir_name))
-            .unwrap_or_default(),
-    ];
-
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.join("encodings").is_dir())
-}
-
 fn validate_pyannote_python_runtime(
     runtime_root: &Path,
     python_binary: &Path,
@@ -4028,25 +3808,6 @@ fn pyannote_runtime_validation_script() -> &'static str {
         "    print('sys.path=' + repr(sys.path), file=sys.stderr)\n",
         "    raise\n"
     )
-}
-
-fn find_file_recursive<F>(root: &Path, predicate: &F) -> Option<PathBuf>
-where
-    F: Fn(&Path) -> bool,
-{
-    let entries = std::fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if predicate(&path) {
-            return Some(path);
-        }
-        if path.is_dir() {
-            if let Some(found) = find_file_recursive(&path, predicate) {
-                return Some(found);
-            }
-        }
-    }
-    None
 }
 
 fn is_pyannote_model_dir(path: &Path) -> bool {
@@ -4460,7 +4221,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_health_does_not_trust_legacy_unvalidated_pyannote_ok_status() {
+    fn runtime_health_trusts_legacy_pyannote_ok_status_without_validation() {
         let (_temp, factory) = build_factory();
         persist_enabled_diarization(&factory);
 
@@ -4497,8 +4258,8 @@ mod tests {
         let health = factory
             .runtime_health()
             .expect("runtime health should load");
-        assert!(!health.pyannote.ready);
-        assert_eq!(health.pyannote.reason_code, "pyannote_repair_required");
+        assert!(health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "ok");
     }
 
     #[test]
@@ -4656,7 +4417,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_pyannote_override_replaces_stale_invalid_python_tree() {
+    fn explicit_bundled_pyannote_override_replaces_stale_invalid_python_tree() {
         let (_temp, factory, resources_dir) = build_dev_factory_with_bundle_resources();
         persist_enabled_diarization(&factory);
 
@@ -4693,6 +4454,11 @@ mod tests {
             .join("_tkinter.cpython-311-darwin.so");
         std::fs::write(&stale_native, b"stale host-linked native module")
             .expect("stale native module should write");
+
+        let installed = factory
+            .reinstall_managed_pyannote_from_bundled_override()
+            .expect("bundled pyannote override should install");
+        assert!(installed);
 
         let health = factory
             .runtime_health()
@@ -4835,50 +4601,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_managed_pyannote_runtime_layout_repairs_missing_embedded_libpython() {
-        let (_temp, factory) = build_factory();
-        persist_enabled_diarization(&factory);
-
-        write_executable_file(
-            &factory
-                .managed_pyannote_python_dir()
-                .join("bin")
-                .join("python3"),
-            "#!/bin/sh\nexit 0\n",
-        );
-        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
-        let nested_libpython = factory
-            .managed_pyannote_python_dir()
-            .join("lib")
-            .join("python3.11")
-            .join("site-packages")
-            .join("torchcodec")
-            .join(".dylibs")
-            .join("libpython3.11.dylib");
-        std::fs::create_dir_all(
-            nested_libpython
-                .parent()
-                .expect("libpython should have a parent directory"),
-        )
-        .expect("nested libpython parent should exist");
-        std::fs::write(&nested_libpython, "fake-libpython").expect("nested libpython should write");
-
-        assert!(!factory
-            .managed_pyannote_python_dir()
-            .join("lib")
-            .join("libpython3.11.dylib")
-            .exists());
-
-        factory.ensure_managed_pyannote_runtime_layout();
-
-        assert!(factory
-            .managed_pyannote_python_dir()
-            .join("lib")
-            .join("libpython3.11.dylib")
-            .is_file());
-    }
-
-    #[test]
     fn runtime_health_reports_install_incomplete_when_python_stdlib_is_missing() {
         let (_temp, factory) = build_factory();
         persist_enabled_diarization(&factory);
@@ -4915,7 +4637,7 @@ mod tests {
             .expect("runtime health should load");
         assert!(!health.pyannote.ready);
         assert_eq!(health.pyannote.reason_code, "pyannote_repair_required");
-        assert!(health.pyannote.message.contains("standard library"));
+        assert!(health.pyannote.message.contains("incomplete"));
     }
 
     #[test]

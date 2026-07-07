@@ -2557,6 +2557,9 @@ type DetailToolbarProps = {
   onStartSpeakerDetection?: () => void;
   showRetranscribe?: boolean;
   isStartingTrimmedAudioRetranscription?: boolean;
+  retranscribeActionLabel?: string;
+  retranscribeActionTitle?: string;
+  retranscribeActionIcon?: "trim" | "speakers";
   onRetranscribeTrimmedAudio?: () => void;
   realtimeControls?: {
     state: "idle" | "running" | "paused";
@@ -2602,6 +2605,9 @@ function DetailToolbar({
   onStartSpeakerDetection,
   showRetranscribe,
   isStartingTrimmedAudioRetranscription,
+  retranscribeActionLabel,
+  retranscribeActionTitle,
+  retranscribeActionIcon = "trim",
   onRetranscribeTrimmedAudio,
   realtimeControls,
 }: DetailToolbarProps): JSX.Element {
@@ -2760,8 +2766,7 @@ function DetailToolbar({
                 title={
                   isStartingSpeakerDetection
                     ? t("home.starting", "Starting...")
-                    : (speakerDetectionDescription ??
-                      speakerDetectionActionTitle)
+                    : (speakerDetectionDescription ?? speakerDetectionActionTitle)
                 }
                 aria-label={speakerDetectionActionTitle}
                 aria-describedby={speakerDetectionDescriptionId}
@@ -2802,23 +2807,27 @@ function DetailToolbar({
                         "detail.startingTrimmedRetranscription",
                         "Starting trimmed transcription...",
                       )
-                    : t(
+                    : (retranscribeActionTitle ??
+                      t(
                         "detail.retranscribeTrimmed",
                         "Retranscribe Trimmed Audio",
-                      )
+                      ))
                 }
                 disabled={isStartingTrimmedAudioRetranscription}
               >
                 <div className="button-content">
                   {isStartingTrimmedAudioRetranscription ? (
                     <Clock3 size={14} />
+                  ) : retranscribeActionIcon === "speakers" ? (
+                    <Users size={14} />
                   ) : (
                     <Scissors size={14} />
                   )}
                   <span className="detail-action-label">
                     {isStartingTrimmedAudioRetranscription
                       ? t("home.starting", "Starting...")
-                      : t("detail.retranscribe", "Retranscribe")}
+                      : (retranscribeActionLabel ??
+                        t("detail.retranscribe", "Retranscribe"))}
                   </span>
                 </div>
               </button>
@@ -4146,13 +4155,13 @@ export function App({
           initialRuntimeHealthResult.value
             ? initialRuntimeHealthResult.value.app_version
             : currentBuildVersion;
-        if (resolvedBuildVersion) {
-          const pyannoteTrigger: PyannoteBackgroundActionTrigger =
-            previousSeenVersion && previousSeenVersion !== resolvedBuildVersion
-              ? "post_update"
-              : "startup";
+        if (
+          resolvedBuildVersion &&
+          previousSeenVersion &&
+          previousSeenVersion !== resolvedBuildVersion
+        ) {
           void maybeStartPyannoteBackgroundAction(
-            pyannoteTrigger,
+            "post_update",
             resolvedBuildVersion,
           );
         }
@@ -7383,38 +7392,6 @@ export function App({
     }
   }
 
-  async function ensurePyannoteReadyForDiarizedJob(): Promise<void> {
-    const action = await planPyannoteBackgroundAction("job_requires_diarization");
-    if (action.status === "migrate_manifest") {
-      await refreshRuntimeHealth();
-      return;
-    }
-    if (!action.should_start) {
-      return;
-    }
-
-    setProvisioning((previous) => ({
-      ...previous,
-      running: true,
-      progress: null,
-      statusMessage: getPyannoteBackgroundActionStatusMessage(action),
-    }));
-
-    if (pyannoteProvisioningActiveRef.current) {
-      await waitForProvisioningRun(
-        async () => ({ started: false }),
-        { waitForExistingRun: true },
-      );
-      return;
-    }
-
-    pyannoteProvisioningActiveRef.current = true;
-    await waitForProvisioningRun(
-      () => provisioningInstallPyannote(action.force_reinstall),
-      { waitForExistingRun: false },
-    );
-  }
-
   async function acceptPrivacyPolicy(): Promise<void> {
     if (!settings) {
       return;
@@ -7906,12 +7883,11 @@ export function App({
       return;
     }
 
-    const previousDiarization = sanitizeSpeakerDiarizationSettings(
-      settings.transcription.speaker_diarization ??
-        getDefaultSpeakerDiarizationSettings(),
-    );
     const nextDiarization = sanitizeSpeakerDiarizationSettings(
-      mutator(previousDiarization),
+      mutator(
+        settings.transcription.speaker_diarization ??
+          getDefaultSpeakerDiarizationSettings(),
+      ),
     );
 
     await patchSettings((current) => ({
@@ -7922,13 +7898,6 @@ export function App({
       },
     }));
 
-    if (
-      !previousDiarization.enabled &&
-      nextDiarization.enabled &&
-      !pyannoteProvisioningActiveRef.current
-    ) {
-      void maybeStartPyannoteBackgroundAction("enable_diarization");
-    }
     void refreshRuntimeHealth();
   }
 
@@ -8159,24 +8128,6 @@ export function App({
         }
         if (runtimeStatus.did_setup) {
           void refreshRuntimeHealth();
-        }
-
-        if (
-          settings.transcription.speaker_diarization?.enabled &&
-          settings.transcription.engine !== "parakeet_cpp"
-        ) {
-          try {
-            await ensurePyannoteReadyForDiarizedJob();
-          } catch (pyannoteError) {
-            const failureMessage = formatUiError(
-              "error.pyannoteInstallFailed",
-              "Pyannote install failed",
-              pyannoteError,
-            );
-            reportStartFailure(failureMessage);
-            markQueuedStartFailed(failureMessage);
-            return;
-          }
         }
 
         let preflight: TranscriptionStartPreflight | null = null;
@@ -8564,11 +8515,19 @@ export function App({
       }
 
       let inputPath = effectiveTrimmedAudioDraft?.path ?? detailAudioInputPath;
-      const title = effectiveTrimmedAudioDraft?.title ?? activeArtifact.title;
+      let title = effectiveTrimmedAudioDraft?.title ?? activeArtifact.title;
 
-      if (!inputPath && activeArtifact.audio_available) {
-        const durationSeconds =
-          activeArtifact.audio_duration_seconds ?? audioDurationSeconds;
+      if (!inputPath) {
+        if (!activeArtifact.audio_available) {
+          throw new Error(
+            t(
+              "detail.speakerDetectionAudioUnavailable",
+              "Saved audio is required before speaker detection can run for this transcript.",
+            ),
+          );
+        }
+
+        const durationSeconds = transcriptSeconds;
         if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
           throw new Error(
             t(
@@ -8583,15 +8542,7 @@ export function App({
           [{ start: 0, end: durationSeconds }],
         );
         inputPath = preparedAudio.path;
-      }
-
-      if (!inputPath) {
-        throw new Error(
-          t(
-            "detail.speakerDetectionAudioUnavailable",
-            "Saved audio is required before speaker detection can run for this transcript.",
-          ),
-        );
+        title = activeArtifact.title;
       }
 
       await onStartTranscription(inputPath, {
@@ -11318,8 +11269,14 @@ export function App({
                       {queuePath ? <small>{queuePath}</small> : null}
                     </div>
                     <span className="queue-stage">
-                      <ProgressRing percentage={displayPercentage} size={18} />
-                      <small>{formatJobStageLabel(item.stage)}</small>
+                      {item.stage === "diarizing" ? null : (
+                        <ProgressRing percentage={displayPercentage} size={18} />
+                      )}
+                      <small>
+                        {item.stage === "diarizing"
+                          ? t("queue.stage.finalizing", "Finalizing")
+                          : formatJobStageLabel(item.stage)}
+                      </small>
                     </span>
                   </div>
                   <div className="queue-meta-row">
@@ -11352,10 +11309,12 @@ export function App({
                     ) : null}
                     {progressTime ? <span>{progressTime}</span> : null}
                   </div>
-                  <p>{item.message}</p>
-                  <div className="queue-progress">
-                    <div style={{ width: `${displayPercentage}%` }} />
-                  </div>
+                  {item.stage === "diarizing" ? null : <p>{item.message}</p>}
+                  {item.stage === "diarizing" ? null : (
+                    <div className="queue-progress">
+                      <div style={{ width: `${displayPercentage}%` }} />
+                    </div>
+                  )}
                 </article>
               );
             })}
@@ -11704,13 +11663,19 @@ export function App({
               "Preparing transcription...",
             );
           const statusDescription =
-            percentage > 0
-              ? `${statusMessage} (${formatProgressPercentageLabel(percentage)})`
-              : statusMessage;
+            jobProgress?.stage === "diarizing"
+              ? t("detail.finalizingTranscription", "Finalizing transcription...")
+              : percentage > 0
+                ? `${statusMessage} (${formatProgressPercentageLabel(percentage)})`
+                : statusMessage;
           return (
             <LoadingAnimation
               icon={AudioLines}
-              title={formatJobStageLabel(jobProgress?.stage ?? "preparing_audio")}
+              title={
+                jobProgress?.stage === "diarizing"
+                  ? t("detail.transcribing", "Transcribing")
+                  : formatJobStageLabel(jobProgress?.stage ?? "preparing_audio")
+              }
               description={statusDescription}
               variant="transcribing"
             />
@@ -12211,231 +12176,8 @@ export function App({
       );
     }
 
-    const transcriptSpeakerBanner = (() => {
-      if (!activeArtifact || !artifactDiarizationUiState) {
-        return null;
-      }
-
-      if (artifactDiarizationUiState.kind === "running") {
-        return (
-          <div className="transcript-speaker-banner is-running">
-            <div className="transcript-speaker-banner-copy">
-              <strong>
-                {t(
-                  "detail.speakerDiarizationRunning",
-                  "Speaker diarization is running in the background.",
-                )}
-              </strong>
-              <span>
-                {t(
-                  "detail.speakerDiarizationRunningHint",
-                  "You can keep navigating and editing this transcript while speakers are assigned.",
-                )}
-              </span>
-            </div>
-            <div className="transcript-speaker-banner-actions">
-              <button
-                type="button"
-                className="secondary-button speaker-detection-progress-button"
-                onClick={() => void onRequestCancelSpeakerDiarization()}
-              >
-                <ProgressRing
-                  percentage={activeArtifactDiarizationPercentage}
-                  size={18}
-                />
-                <RollingProgressValue
-                  value={formatProgressPercentageLabel(
-                    activeArtifactDiarizationPercentage,
-                  )}
-                />
-              </button>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => void onRequestCancelSpeakerDiarization()}
-              >
-                {t("detail.stopSpeakerDetection", "Stop speaker detection")}
-              </button>
-            </div>
-          </div>
-        );
-      }
-
-      if (artifactDiarizationUiState.kind === "cancelled") {
-        return (
-          <div className="transcript-speaker-banner is-warning">
-            <div className="transcript-speaker-banner-copy">
-              <strong>
-                {t(
-                  "detail.speakerDiarizationCancelled",
-                  "Speaker diarization was stopped.",
-                )}
-              </strong>
-              <span>
-                {t(
-                  "detail.speakerDiarizationCancelledHint",
-                  "Run speaker detection again when you want to assign speakers to this transcript.",
-                )}
-              </span>
-            </div>
-            {activeArtifact.audio_available ? (
-              <div className="transcript-speaker-banner-actions">
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => void onRunSpeakerDiarization()}
-                >
-                  {t(
-                    "detail.runSpeakerDetectionAgain",
-                    "Run speaker detection again",
-                  )}
-                </button>
-              </div>
-            ) : null}
-          </div>
-        );
-      }
-
-      if (artifactDiarizationUiState.kind === "speakers_detected") {
-        return (
-          <div className="transcript-speaker-banner">
-            <div className="transcript-speaker-banner-copy">
-              <strong>
-                {t("detail.speakersDetected", "{count} speakers detected", {
-                  count: artifactDiarizationUiState.speakerCount,
-                })}
-              </strong>
-              <span>
-                {formatSpeakerSummary(artifactDiarizationUiState.speakerLabels)}
-              </span>
-            </div>
-            <div className="transcript-speaker-banner-actions">
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => setDetailMode("segments")}
-              >
-                {t("inspector.openSegments", "Open Segments")}
-              </button>
-              {activeArtifact.audio_available ? (
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => void onRunSpeakerDiarization()}
-                >
-                  {t(
-                    "detail.runSpeakerDetectionAgain",
-                    "Run speaker detection again",
-                  )}
-                </button>
-              ) : null}
-            </div>
-          </div>
-        );
-      }
-
-      if (artifactDiarizationUiState.kind === "failed") {
-        const diarizationError =
-          artifactDiarizationUiState.error ??
-          t(
-            "detail.diarizationFailedFallback",
-            "Speaker diarization failed after transcription.",
-          );
-        return (
-          <div className="transcript-speaker-banner is-warning">
-            <div className="transcript-speaker-banner-copy">
-              <strong>
-                {t(
-                  "detail.diarizationFailed",
-                  "Speaker diarization failed for this transcript.",
-                )}
-              </strong>
-              <span>{diarizationError}</span>
-            </div>
-            <div className="transcript-speaker-banner-actions">
-              {activeArtifact.audio_available ? (
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => void onRunSpeakerDiarization()}
-                >
-                  {t(
-                    "detail.runSpeakerDetectionAgain",
-                    "Run speaker detection again",
-                  )}
-                </button>
-              ) : null}
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() =>
-                  void onOpenStandaloneSettingsWindow(
-                    shouldOfferLocalModelsCta(diarizationError)
-                      ? "local_models"
-                      : "transcription",
-                  )
-                }
-              >
-                {shouldOfferLocalModelsCta(diarizationError)
-                  ? t("action.openLocalModels", "Open Local Models")
-                  : t(
-                      "action.openTranscriptionDefaults",
-                      "Open Transcription Defaults",
-                    )}
-              </button>
-            </div>
-          </div>
-        );
-      }
-
-      if (artifactDiarizationUiState.kind === "no_speakers_detected") {
-        return (
-          <div className="transcript-speaker-banner">
-            <div className="transcript-speaker-banner-copy">
-              <strong>
-                {t(
-                  "detail.noSpeakersDetected",
-                  "Speaker diarization completed, but no speaker labels were assigned.",
-                )}
-              </strong>
-              <span>
-                {t(
-                  "detail.noSpeakersDetectedHint",
-                  "Open Segments to inspect the timeline or assign speakers manually.",
-                )}
-              </span>
-            </div>
-            <div className="transcript-speaker-banner-actions">
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => setDetailMode("segments")}
-              >
-                {t("inspector.openSegments", "Open Segments")}
-              </button>
-              {activeArtifact.audio_available ? (
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => void onRunSpeakerDiarization()}
-                >
-                  {t(
-                    "detail.runSpeakerDetectionAgain",
-                    "Run speaker detection again",
-                  )}
-                </button>
-              ) : null}
-            </div>
-          </div>
-        );
-      }
-
-      return null;
-    })();
-
     return (
       <div className="transcript-shell">
-        {transcriptSpeakerBanner}
         <div
           className="transcript-container"
           style={{ position: "relative", height: "100%" }}
@@ -12505,30 +12247,11 @@ export function App({
         );
       }
 
-      if (!artifactDiarizationUiState) {
-        return t("inspector.unknown", "Unknown");
-      }
-
-      switch (artifactDiarizationUiState.kind) {
-        case "running":
-          return t("detail.detectingSpeakers", "Detecting speakers");
-        case "speakers_detected":
-          return t("detail.speakersDetected", "{count} speakers detected", {
-            count: artifactDiarizationUiState.speakerCount,
-          });
-        case "failed":
-          return t("detail.diarizationFailedShort", "Diarization failed");
-        case "cancelled":
-          return t(
-            "detail.speakerDiarizationCancelledShort",
-            "Speaker detection stopped",
-          );
-        case "no_speakers_detected":
-          return t("detail.noSpeakersShort", "No speakers detected");
-        case "not_requested":
-        default:
-          return t("detail.noSpeakerLabels", "No speaker labels");
-      }
+      return knownSpeakerLabels.length > 0
+        ? t("inspector.speakerLabelsCount", "{count} speaker labels", {
+            count: knownSpeakerLabels.length,
+          })
+        : t("detail.noSpeakerLabels", "No speaker labels");
     })();
 
     const peopleSummaryText = (() => {
@@ -12554,49 +12277,9 @@ export function App({
             );
       }
 
-      if (!artifactDiarizationUiState) {
-        return t(
-          "detail.manualSpeakerHint",
-          "Assign speakers manually in Segments. You can decide later whether to run speaker diarization.",
-        );
-      }
-
-      switch (artifactDiarizationUiState.kind) {
-        case "running":
-          return (
-            activeArtifactDiarizationProgress?.message ||
-            t(
-              "detail.speakerDiarizationRunningHint",
-              "You can keep navigating and editing this transcript while speakers are assigned.",
-            )
-          );
-        case "speakers_detected":
-          return formatSpeakerSummary(artifactDiarizationUiState.speakerLabels);
-        case "failed":
-          return (
-            artifactDiarizationUiState.error ??
-            t(
-              "detail.diarizationFailedFallback",
-              "Speaker diarization failed after transcription.",
-            )
-          );
-        case "cancelled":
-          return t(
-            "detail.speakerDiarizationCancelledHint",
-            "Run speaker detection again when you want to assign speakers to this transcript.",
-          );
-        case "no_speakers_detected":
-          return t(
-            "detail.noSpeakersDetectedHint",
-            "Open Segments to inspect the timeline or assign speakers manually.",
-          );
-        case "not_requested":
-        default:
-          return t(
-            "detail.manualSpeakerHint",
-            "Assign speakers manually in Segments. You can decide later whether to run speaker diarization.",
-          );
-      }
+      return knownSpeakerLabels.length > 0
+        ? formatSpeakerSummary(knownSpeakerLabels)
+        : t("detail.manualSpeakerHint", "Assign speakers manually in Segments.");
     })();
 
     return (
@@ -12719,65 +12402,7 @@ export function App({
 
         <div className="inspector-block">
           <h4>{t("inspector.people")}</h4>
-          <div
-            className={`pill ${
-              artifactDiarizationUiState?.kind === "failed" ||
-              artifactDiarizationUiState?.kind === "cancelled"
-                ? "pill-warning"
-                : artifactDiarizationUiState?.kind === "speakers_detected"
-                  ? "pill-success"
-                  : artifactDiarizationUiState?.kind === "running"
-                    ? "pill-progress"
-                    : ""
-            }`}
-          >
-            {peoplePillText}
-          </div>
-          {activeArtifact?.audio_available ? (
-            <div className="speaker-detection-actions">
-              {isArtifactDiarizationRunning ? (
-                <>
-                  <button
-                    type="button"
-                    className="secondary-button speaker-detection-progress-button"
-                    onClick={() => void onRequestCancelSpeakerDiarization()}
-                    title={t(
-                      "detail.stopSpeakerDetection",
-                      "Stop speaker detection",
-                    )}
-                  >
-                    <ProgressRing
-                      percentage={activeArtifactDiarizationPercentage}
-                      size={16}
-                    />
-                    <RollingProgressValue
-                      value={formatProgressPercentageLabel(
-                        activeArtifactDiarizationPercentage,
-                      )}
-                    />
-                  </button>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    onClick={() => void onRequestCancelSpeakerDiarization()}
-                  >
-                    {t("detail.stopSpeakerDetection", "Stop speaker detection")}
-                  </button>
-                </>
-              ) : (
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => void onRunSpeakerDiarization()}
-                >
-                  {t(
-                    "detail.runSpeakerDetectionAgain",
-                    "Run speaker detection again",
-                  )}
-                </button>
-              )}
-            </div>
-          ) : null}
+          <div className="pill">{peoplePillText}</div>
           {showSpeakerManagement && knownSpeakerLabels.length > 0 ? (
             <div className="speaker-known-list">
               <span className="speaker-known-label">

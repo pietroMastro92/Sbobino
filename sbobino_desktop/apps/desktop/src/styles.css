@@ -1338,6 +1338,12 @@ summary,
   color: var(--detail-active-text);
 }
 
+.realtime-toolbar-button--speaker {
+  background: color-mix(in srgb, var(--sidebar-active) 84%, var(--surface));
+  border-color: var(--detail-control-border);
+  color: var(--detail-active-text);
+}
+
 .realtime-toolbar-button:disabled {
   opacity: 0.48;
   cursor: not-allowed;
@@ -2358,6 +2364,57 @@ summary,
   animation: none;
 }
 
+.speaker-detection-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 12px;
+  background: var(--sidebar-active);
+  border: 1px solid var(--detail-control-border);
+  border-radius: 16px;
+  color: var(--detail-active-text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    transform 160ms ease;
+}
+
+.speaker-detection-button .button-content {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.speaker-detection-button:hover:not(:disabled) {
+  transform: translateY(-0.5px);
+  border-color: color-mix(in srgb, var(--accent) 44%, var(--detail-control-border));
+}
+
+.speaker-detection-button:focus-visible,
+.realtime-toolbar-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 72%, #ffffff);
+  outline-offset: 2px;
+}
+
+.speaker-detection-button:disabled {
+  opacity: 0.52;
+  cursor: not-allowed;
+  background: color-mix(in srgb, var(--surface) 78%, var(--line));
+  color: var(--muted);
+}
+
+.speaker-detection-button.is-busy {
+  cursor: progress;
+  opacity: 1;
+}
+
 .retranscribe-hover-button.is-busy {
   width: 154px;
   height: 32px;
@@ -2403,6 +2460,46 @@ summary,
   opacity: 1;
   transform: scale(1);
   transition-delay: 0.1s; /* wait for expansion */
+}
+
+.speaker-detection-button[data-tooltip],
+.realtime-toolbar-button[data-tooltip] {
+  position: relative;
+}
+
+.speaker-detection-button[data-tooltip]::after,
+.realtime-toolbar-button[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 8px);
+  right: 0;
+  width: max-content;
+  max-width: min(320px, 72vw);
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #111827;
+  color: #ffffff;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.24);
+  font-size: 0.78rem;
+  font-weight: 560;
+  line-height: 1.35;
+  white-space: normal;
+  text-align: left;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.speaker-detection-button[data-tooltip]:hover::after,
+.speaker-detection-button[data-tooltip]:focus-visible::after,
+.realtime-toolbar-button[data-tooltip]:hover::after,
+.realtime-toolbar-button[data-tooltip]:focus-visible::after {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .transcribing-cancel-pill-compact,

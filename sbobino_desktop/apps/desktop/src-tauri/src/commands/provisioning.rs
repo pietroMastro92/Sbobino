@@ -765,6 +765,16 @@ async fn plan_pyannote_background_action_inner(
     let manifest_before = runtime_factory.read_managed_pyannote_manifest();
     let status_before = runtime_factory.read_managed_pyannote_status();
 
+    if !matches!(trigger, PyannoteBackgroundActionTrigger::PostUpdate) {
+        return Ok(pyannote_background_action_response(
+            "none",
+            false,
+            false,
+            "pyannote_auto_check_disabled",
+            "Pyannote is validated only during installation, repair, and app updates.",
+        ));
+    }
+
     if matches!(trigger, PyannoteBackgroundActionTrigger::PostUpdate)
         && should_attempt_post_update_pyannote_reconcile(manifest_before.as_ref())
     {
@@ -1516,19 +1526,26 @@ fn spawn_pyannote_bundled_install(
             },
         );
 
-        match runtime_factory.runtime_health() {
-            Ok(health) if health.pyannote.ready => emit_provisioning_status(
-                &app,
-                "completed",
-                "Pyannote diarization runtime installed successfully.",
-                None,
-            ),
-            Ok(health) => emit_provisioning_status(
-                &app,
-                "error",
-                &health.pyannote.message,
-                Some(health.pyannote.reason_code.as_str()),
-            ),
+        match runtime_factory.validate_managed_pyannote_runtime() {
+            Ok(()) => {
+                if let Err(error) = runtime_factory
+                    .write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")
+                {
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_install_incomplete"),
+                    );
+                    return;
+                }
+                emit_provisioning_status(
+                    &app,
+                    "completed",
+                    "Pyannote diarization runtime installed successfully.",
+                    None,
+                );
+            }
             Err(error) => {
                 emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"))
             }
@@ -1855,8 +1872,8 @@ fn spawn_pyannote_provisioning_download(
             }
         };
 
-        match runtime_factory.runtime_health() {
-            Ok(health) if health.pyannote.ready => {
+        match runtime_factory.validate_managed_pyannote_runtime() {
+            Ok(()) => {
                 if let Err(error) = runtime_factory
                     .write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")
                 {
@@ -1888,30 +1905,6 @@ fn spawn_pyannote_provisioning_download(
                 if let Err(cleanup_error) = cleanup_pyannote_runtime_backup(backup_runtime_dir) {
                     tracing::warn!("failed to clean up pyannote runtime backup: {cleanup_error}");
                 }
-            }
-            Ok(health) => {
-                let reason_code = if health.pyannote.reason_code.trim().is_empty() {
-                    "pyannote_install_incomplete"
-                } else {
-                    health.pyannote.reason_code.as_str()
-                };
-                let message = if health.pyannote.message.trim().is_empty() {
-                    "Pyannote diarization runtime could not be validated after installation."
-                } else {
-                    health.pyannote.message.as_str()
-                };
-                emit_provisioning_status(&app, "error", message, Some(reason_code));
-                if let Err(restore_error) =
-                    rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
-                {
-                    tracing::warn!("failed to rollback pyannote runtime after health validation error: {restore_error}");
-                }
-                persist_pyannote_install_failure(
-                    runtime_factory.as_ref(),
-                    had_ready_install,
-                    reason_code,
-                    message,
-                );
             }
             Err(error) => {
                 emit_provisioning_status(
@@ -3006,7 +2999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_pyannote_background_action_skips_missing_install_when_diarization_disabled() {
+    async fn plan_pyannote_background_action_skips_startup_when_diarization_disabled() {
         let (_temp, factory) = build_runtime_factory();
         persist_settings(&factory, false);
 
@@ -3019,11 +3012,11 @@ mod tests {
 
         assert_eq!(action.status, "none");
         assert!(!action.should_start);
-        assert_eq!(action.reason_code, "pyannote_disabled");
+        assert_eq!(action.reason_code, "pyannote_auto_check_disabled");
     }
 
     #[tokio::test]
-    async fn plan_pyannote_background_action_installs_missing_runtime_when_diarization_enabled() {
+    async fn plan_pyannote_background_action_skips_startup_when_diarization_enabled() {
         let (_temp, factory) = build_runtime_factory();
         persist_settings(&factory, true);
 
@@ -3034,14 +3027,14 @@ mod tests {
         .await
         .expect("planner should succeed");
 
-        assert_eq!(action.status, "install_missing");
-        assert!(action.should_start);
+        assert_eq!(action.status, "none");
+        assert!(!action.should_start);
         assert!(!action.force_reinstall);
-        assert_eq!(action.reason_code, "pyannote_runtime_missing");
+        assert_eq!(action.reason_code, "pyannote_auto_check_disabled");
     }
 
     #[tokio::test]
-    async fn plan_pyannote_background_action_reports_real_compat_mismatch_as_asset_migration() {
+    async fn plan_pyannote_background_action_skips_startup_compat_mismatch() {
         let (_temp, factory) = build_runtime_factory();
         persist_settings(&factory, true);
         prepare_ready_pyannote_install(
@@ -3067,14 +3060,14 @@ mod tests {
         .await
         .expect("planner should succeed");
 
-        assert_eq!(action.status, "migrate_assets");
-        assert!(action.should_start);
-        assert!(action.force_reinstall);
-        assert_eq!(action.reason_code, "pyannote_version_mismatch");
+        assert_eq!(action.status, "none");
+        assert!(!action.should_start);
+        assert!(!action.force_reinstall);
+        assert_eq!(action.reason_code, "pyannote_auto_check_disabled");
     }
 
     #[tokio::test]
-    async fn plan_pyannote_background_action_self_heals_stale_incomplete_status() {
+    async fn plan_pyannote_background_action_skips_startup_stale_incomplete_status() {
         let (_temp, factory) = build_runtime_factory();
         persist_settings(&factory, true);
         prepare_ready_pyannote_install(
@@ -3102,7 +3095,7 @@ mod tests {
 
         assert_eq!(action.status, "none");
         assert!(!action.should_start);
-        assert_eq!(action.reason_code, "ok");
+        assert_eq!(action.reason_code, "pyannote_auto_check_disabled");
     }
 
     #[tokio::test]
