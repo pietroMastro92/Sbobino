@@ -4310,7 +4310,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_health_self_heals_stale_install_incomplete_status_when_runtime_is_ready() {
+    fn runtime_health_reports_stale_install_incomplete_status_without_self_healing() {
         let (_temp, factory) = build_factory();
         persist_enabled_diarization(&factory);
 
@@ -4348,17 +4348,17 @@ mod tests {
         let health = factory
             .runtime_health()
             .expect("runtime health should load");
-        assert!(health.pyannote.ready);
-        assert_eq!(health.pyannote.reason_code, "ok");
+        assert!(!health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "pyannote_repair_required");
 
         let status = factory
             .read_managed_pyannote_status()
             .expect("status should still be present");
-        assert_eq!(status.reason_code, "ok");
+        assert_eq!(status.reason_code, "pyannote_install_incomplete");
     }
 
     #[test]
-    fn runtime_health_self_heals_missing_manifest_and_status_from_bundled_override() {
+    fn runtime_health_reports_missing_manifest_and_status_without_bundled_override_self_heal() {
         let (_temp, factory, resources_dir) = build_dev_factory_with_bundle_resources();
         persist_enabled_diarization(&factory);
 
@@ -4392,25 +4392,17 @@ mod tests {
         let health = factory
             .runtime_health()
             .expect("runtime health should load");
-        assert!(health.pyannote.ready);
-        assert_eq!(health.pyannote.reason_code, "ok");
+        assert!(!health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "pyannote_runtime_missing");
 
-        let manifest = factory
-            .read_managed_pyannote_manifest()
-            .expect("manifest should be written");
-        assert_eq!(manifest.source, "bundled_override");
-
-        let status = factory
-            .read_managed_pyannote_status()
-            .expect("status should be written");
-        assert_eq!(status.reason_code, "ok");
-
-        assert!(factory
+        assert!(factory.read_managed_pyannote_manifest().is_none());
+        assert!(factory.read_managed_pyannote_status().is_none());
+        assert!(!factory
             .managed_pyannote_python_dir()
             .join("bin")
             .join("python3")
             .is_file());
-        assert!(factory
+        assert!(!factory
             .managed_pyannote_model_dir()
             .join("config.yaml")
             .is_file());
