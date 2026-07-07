@@ -17,9 +17,12 @@ pub struct TranscriptionTask {
 pub struct RealtimeRuntime {
     pub engine: Arc<Mutex<WhisperStreamEngine>>,
     pub preview: Arc<Mutex<Option<RealtimeInputPreviewHandle>>>,
+    pub active_job_id: Arc<Mutex<Option<String>>>,
     pub session_name: Arc<Mutex<Option<String>>>,
     pub model_filename: Arc<Mutex<Option<String>>>,
     pub language_code: Arc<Mutex<String>>,
+    pub model: Arc<Mutex<Option<sbobino_domain::SpeechModel>>>,
+    pub language: Arc<Mutex<Option<sbobino_domain::LanguageCode>>>,
 }
 
 #[derive(Clone)]

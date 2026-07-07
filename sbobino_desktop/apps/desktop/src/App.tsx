@@ -62,6 +62,7 @@ import {
   Scissors,
   Trash2,
   Upload,
+  Users,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -128,6 +129,7 @@ import {
   testPromptTemplate,
   updateArtifact,
   updateArtifactTimeline,
+  writeTrimmedAudio,
   writeSetupReport,
 } from "./lib/tauri";
 import {
@@ -560,6 +562,7 @@ type TranscriptionJobSnapshot = {
   context: ActiveDetailContext | null;
   previewText: string;
   deltaSequence: number;
+  artifactId: string | null;
   title: string;
   progress: JobProgress | null;
   inputPath: string | null;
@@ -2462,6 +2465,14 @@ type DetailToolbarProps = {
   chatDisabled?: boolean;
   optimizeDisabled?: boolean;
   optimizeDisabledTitle?: string;
+  showSpeakerDetection?: boolean;
+  isStartingSpeakerDetection?: boolean;
+  speakerDetectionDisabled?: boolean;
+  speakerDetectionActionLabel?: string;
+  speakerDetectionActionTitle?: string;
+  speakerDetectionDescription?: string;
+  speakerDetectionDescriptionId?: string;
+  onStartSpeakerDetection?: () => void;
   showRetranscribe?: boolean;
   isStartingTrimmedAudioRetranscription?: boolean;
   onRetranscribeTrimmedAudio?: () => void;
@@ -2496,6 +2507,14 @@ function DetailToolbar({
   chatDisabled,
   optimizeDisabled,
   optimizeDisabledTitle,
+  showSpeakerDetection,
+  isStartingSpeakerDetection,
+  speakerDetectionDisabled,
+  speakerDetectionActionLabel,
+  speakerDetectionActionTitle,
+  speakerDetectionDescription,
+  speakerDetectionDescriptionId = "detail-speaker-detection-description",
+  onStartSpeakerDetection,
   showRetranscribe,
   isStartingTrimmedAudioRetranscription,
   onRetranscribeTrimmedAudio,
@@ -2637,6 +2656,46 @@ function DetailToolbar({
                     {t("detail.optimize", "Optimize")}
                   </span>
                 </div>
+              </button>
+            )}
+          {detailMode === "transcript" &&
+            showSpeakerDetection &&
+            onStartSpeakerDetection && (
+              <button
+                className={`speaker-detection-button ${isStartingSpeakerDetection ? "is-busy" : ""}`}
+                data-tooltip={speakerDetectionDescription}
+                onClick={() => void onStartSpeakerDetection()}
+                title={
+                  isStartingSpeakerDetection
+                    ? t("home.starting", "Starting...")
+                    : (speakerDetectionDescription ??
+                      speakerDetectionActionTitle)
+                }
+                aria-label={speakerDetectionActionTitle}
+                aria-describedby={speakerDetectionDescriptionId}
+                disabled={
+                  isStartingSpeakerDetection ||
+                  hasActiveJob ||
+                  speakerDetectionDisabled
+                }
+              >
+                <div className="button-content">
+                  {isStartingSpeakerDetection ? (
+                    <Clock3 size={14} aria-hidden="true" />
+                  ) : (
+                    <Users size={14} aria-hidden="true" />
+                  )}
+                  <span className="detail-action-label">
+                    {isStartingSpeakerDetection
+                      ? t("home.starting", "Starting...")
+                      : speakerDetectionActionLabel}
+                  </span>
+                </div>
+                {speakerDetectionDescription ? (
+                  <span id={speakerDetectionDescriptionId} className="sr-only">
+                    {speakerDetectionDescription}
+                  </span>
+                ) : null}
               </button>
             )}
           {detailMode === "transcript" &&
@@ -3138,6 +3197,9 @@ export function App({
   const [realtimePreviewState, setRealtimePreviewState] = useState<
     "idle" | "connecting" | "running" | "paused" | "blocked" | "unavailable"
   >("idle");
+  const [activeRealtimeJobId, setActiveRealtimeJobId] = useState<string | null>(
+    null,
+  );
   const [realtimeSessionOpen, setRealtimeSessionOpen] = useState(false);
   const [realtimeStartedAtMs, setRealtimeStartedAtMs] = useState<number | null>(
     null,
@@ -3289,6 +3351,8 @@ export function App({
   const [trimRegions, setTrimRegions] = useState<TrimRegion[]>([]);
   const [trimmedAudioDraft, setTrimmedAudioDraft] =
     useState<TrimmedAudioDraft | null>(null);
+  const [isStartingSpeakerDetection, setIsStartingSpeakerDetection] =
+    useState(false);
   const [trimRetranscriptionError, setTrimRetranscriptionError] = useState<
     string | null
   >(null);
@@ -3464,6 +3528,7 @@ export function App({
     ],
   );
   const focusedJobIdRef = useRef<string | null>(focusedJobId);
+  const activeRealtimeJobIdRef = useRef<string | null>(activeRealtimeJobId);
   const activeJobDeltaSequenceRef = useRef<number>(-1);
   const activeJobPreviewTextareaRef = useRef<HTMLDivElement>(null);
   const detailMainRef = useRef<HTMLElement | null>(null);
@@ -3492,6 +3557,10 @@ export function App({
   useEffect(() => {
     activeJobIdRef.current = activeJobId;
   }, [activeJobId]);
+
+  useEffect(() => {
+    activeRealtimeJobIdRef.current = activeRealtimeJobId;
+  }, [activeRealtimeJobId]);
 
   useEffect(() => {
     if (standaloneSettingsWindow) {
@@ -4656,8 +4725,11 @@ export function App({
 
           prependArtifact(hydratedArtifact);
           updateTranscriptionJobSnapshot(artifact.job_id, {
+            artifactId: hydratedArtifact.id,
             title: hydratedArtifact.title,
             context: pendingContext?.detailContext ?? null,
+            sourceOrigin: hydratedArtifact.source_origin,
+            sourceLabel: hydratedArtifact.source_label,
             progress: {
               job_id: artifact.job_id,
               stage: "completed",
@@ -4681,6 +4753,11 @@ export function App({
             clearActiveJob();
             activeJobIdRef.current = null;
             setActiveJobTitle("");
+          }
+
+          if (activeRealtimeJobIdRef.current === artifact.job_id) {
+            activeRealtimeJobIdRef.current = null;
+            setActiveRealtimeJobId(null);
           }
 
           if (wasFocused) {
@@ -6032,6 +6109,40 @@ export function App({
   }, [realtimeSessionOpen, realtimeStartedAtMs]);
 
   useEffect(() => {
+    if (!activeRealtimeJobId || !realtimeSessionOpen || !settings) {
+      return;
+    }
+
+    const snapshot =
+      transcriptionJobSnapshotsRef.current.get(activeRealtimeJobId) ?? null;
+    const realtimeProgress: JobProgress = {
+      job_id: activeRealtimeJobId,
+      stage: "transcribing",
+      message: formatRealtimeStatusMessage(realtimeState),
+      percentage: 0,
+      current_seconds: Math.max(0, realtimeElapsedSeconds),
+      total_seconds: null,
+    };
+    updateTranscriptionJobSnapshot(activeRealtimeJobId, {
+      title: draftTitle || snapshot?.title || t("topbar.live", "Live"),
+      inputPath: "realtime://microphone",
+      sourceOrigin: "realtime",
+      sourceLabel: t("realtime.liveMicrophone", "Live microphone"),
+      model: snapshot?.model ?? settings.transcription.model,
+      language: snapshot?.language ?? settings.transcription.language,
+      progress: realtimeProgress,
+    });
+    setQueueItems((previous) => upsertQueueItem(previous, realtimeProgress));
+  }, [
+    activeRealtimeJobId,
+    draftTitle,
+    realtimeElapsedSeconds,
+    realtimeSessionOpen,
+    realtimeState,
+    settings,
+  ]);
+
+  useEffect(() => {
     if (visibleSettingsPanes.length === 0) return;
     if (!visibleSettingsPanes.some((pane) => pane.key === settingsPane)) {
       setSettingsPane(visibleSettingsPanes[0].key);
@@ -6135,6 +6246,7 @@ export function App({
       context: patch.context ?? previous?.context ?? null,
       previewText: patch.previewText ?? previous?.previewText ?? "",
       deltaSequence: patch.deltaSequence ?? previous?.deltaSequence ?? -1,
+      artifactId: patch.artifactId ?? previous?.artifactId ?? null,
       title: patch.title ?? previous?.title ?? "",
       progress: patch.progress ?? previous?.progress ?? null,
       inputPath: patch.inputPath ?? previous?.inputPath ?? null,
@@ -8159,6 +8271,71 @@ export function App({
     await launchTranscriptionStart(request);
   }
 
+  async function onStartSpeakerDetectionForActiveArtifact(): Promise<void> {
+    if (!activeArtifact || isStartingSpeakerDetection) {
+      return;
+    }
+
+    setIsStartingSpeakerDetection(true);
+    setTrimRetranscriptionError(null);
+    try {
+      if (!settings?.transcription.speaker_diarization?.enabled) {
+        throw new Error(
+          t(
+            "detail.speakerDetectionDisabledHelp",
+            "Enable speaker diarization in Settings > Transcription before using speaker detection.",
+          ),
+        );
+      }
+
+      let inputPath = effectiveTrimmedAudioDraft?.path ?? detailAudioInputPath;
+      const title = effectiveTrimmedAudioDraft?.title ?? activeArtifact.title;
+
+      if (!inputPath && activeArtifact.audio_available) {
+        const durationSeconds =
+          activeArtifact.audio_duration_seconds ?? audioDurationSeconds;
+        if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+          throw new Error(
+            t(
+              "detail.trimInvalidDuration",
+              "Trimmed audio duration is invalid. Apply the trim again before retranscribing.",
+            ),
+          );
+        }
+
+        const preparedAudio = await writeTrimmedAudio(
+          { artifactId: activeArtifact.id },
+          [{ start: 0, end: durationSeconds }],
+        );
+        inputPath = preparedAudio.path;
+      }
+
+      if (!inputPath) {
+        throw new Error(
+          t(
+            "detail.speakerDetectionAudioUnavailable",
+            "Saved audio is required before speaker detection can run for this transcript.",
+          ),
+        );
+      }
+
+      await onStartTranscription(inputPath, {
+        parentId: activeArtifact.id,
+        title,
+      });
+    } catch (speakerDetectionError) {
+      setTrimRetranscriptionError(
+        formatUiError(
+          "error.speakerDetectionStartFailed",
+          "Could not start speaker detection",
+          speakerDetectionError,
+        ),
+      );
+    } finally {
+      setIsStartingSpeakerDetection(false);
+    }
+  }
+
   useEffect(() => {
     if (
       shouldQueueTranscriptionStart({
@@ -8266,6 +8443,23 @@ export function App({
 
   function onFocusQueueJob(item: JobProgress): void {
     if (isQueuedTranscriptionJobId(item.job_id)) {
+      return;
+    }
+    const snapshot = transcriptionJobSnapshotsRef.current.get(item.job_id);
+    if (snapshot?.artifactId) {
+      void onOpenArtifact(snapshot.artifactId);
+      return;
+    }
+    if (
+      snapshot?.sourceOrigin === "realtime" &&
+      activeRealtimeJobIdRef.current === item.job_id &&
+      realtimeSessionOpen
+    ) {
+      setFocusedJobId(null);
+      setActiveArtifact(null);
+      setActiveDetailContext(snapshot.context ?? null);
+      setSection("detail");
+      setError(null);
       return;
     }
     const pendingContext = pendingTranscriptionContextRef.current.get(
@@ -9337,11 +9531,33 @@ export function App({
       setRealtimeFinalLines([]);
       setRealtimePreview("");
       setRealtimeSessionOpen(false);
-      await startRealtime({
+      const startResult = await startRealtime({
         engine: settings.transcription.engine,
         model: settings.transcription.model,
         parakeet_model: settings.transcription.parakeet_model,
         language: settings.transcription.language,
+        title: sessionTitle,
+      });
+      const realtimeJobId = startResult.job_id;
+      const realtimeProgress: JobProgress = {
+        job_id: realtimeJobId,
+        stage: "transcribing",
+        message: formatRealtimeStatusMessage("running"),
+        percentage: 0,
+        current_seconds: 0,
+        total_seconds: null,
+      };
+      setActiveRealtimeJobId(realtimeJobId);
+      activeRealtimeJobIdRef.current = realtimeJobId;
+      setQueueItems((previous) => upsertQueueItem(previous, realtimeProgress));
+      updateTranscriptionJobSnapshot(realtimeJobId, {
+        title: sessionTitle,
+        inputPath: "realtime://microphone",
+        sourceOrigin: "realtime",
+        sourceLabel: t("realtime.liveMicrophone", "Live microphone"),
+        model: settings.transcription.model,
+        language: settings.transcription.language,
+        progress: realtimeProgress,
       });
       setDraftTitle(sessionTitle);
       setDraftTranscript("");
@@ -9365,6 +9581,8 @@ export function App({
       setSection("detail");
       setError(null);
     } catch (startError) {
+      activeRealtimeJobIdRef.current = null;
+      setActiveRealtimeJobId(null);
       setRealtimeSessionOpen(false);
       setRealtimeStartedAtMs(null);
       setRealtimePreviewState("idle");
@@ -9414,17 +9632,49 @@ export function App({
         .filter((line) => line.trim().length > 0)
         .join("\n")
         .trim();
+      const stoppingJobId = activeRealtimeJobIdRef.current;
+      const elapsedSeconds = Math.max(0, Math.round(realtimeElapsedSeconds));
       const result = await stopRealtime(
         saveResult,
         draftTitle,
-        Math.max(0, Math.round(realtimeElapsedSeconds)),
+        elapsedSeconds,
       );
-      if (result.artifact) {
-        prependArtifact(result.artifact);
-        hydrateDetail(result.artifact);
+      const realtimeJobId = result.job_id ?? stoppingJobId;
+      if (result.queued && realtimeJobId) {
+        const nextProgress: JobProgress = {
+          job_id: realtimeJobId,
+          stage: saveResult ? "persisting" : "cancelled",
+          message: saveResult
+            ? formatJobMessage("persisting")
+            : formatJobMessage("cancelled"),
+          percentage: saveResult ? 90 : 100,
+          current_seconds: elapsedSeconds,
+          total_seconds: null,
+        };
+        updateTranscriptionJobSnapshot(realtimeJobId, {
+          title: draftTitle || t("topbar.live", "Live"),
+          inputPath: "realtime://microphone",
+          sourceOrigin: "realtime",
+          sourceLabel: t("realtime.liveMicrophone", "Live microphone"),
+          model: settings?.transcription.model ?? null,
+          language: settings?.transcription.language ?? null,
+          progress: nextProgress,
+        });
+        setQueueItems((previous) => upsertQueueItem(previous, nextProgress));
+        activeRealtimeJobIdRef.current = null;
+        setActiveRealtimeJobId(null);
+        setRealtimePreview("");
+        setRealtimeFinalLines([]);
+        setRealtimeSessionOpen(false);
+        setRealtimeStartedAtMs(null);
+        setActiveDetailContext(null);
         setTranscriptViewMode("original");
-        setSection("detail");
-      } else if (saveResult && currentLiveTranscript) {
+        setSection("queue");
+        setError(null);
+        return;
+      }
+
+      if (saveResult && currentLiveTranscript) {
         setError(
           t(
             "error.realtimeSaveIncomplete",
@@ -9440,6 +9690,8 @@ export function App({
       setRealtimeFinalLines([]);
       setRealtimeSessionOpen(false);
       setRealtimeStartedAtMs(null);
+      activeRealtimeJobIdRef.current = null;
+      setActiveRealtimeJobId(null);
       setError(null);
     } catch (stopError) {
       setError(
@@ -10596,8 +10848,6 @@ export function App({
                 item.job_id,
               );
               const isTerminalQueueItem = isTerminalJobStage(item.stage);
-              const isInteractiveQueueItem =
-                !isQueuedPlaceholder && !isTerminalQueueItem;
               const queuedStart = queuedTranscriptionStarts.find(
                 (entry) => entry.queueId === item.job_id,
               );
@@ -10607,6 +10857,10 @@ export function App({
               const snapshot = transcriptionJobSnapshotsRef.current.get(
                 item.job_id,
               );
+              const queueArtifactId = snapshot?.artifactId ?? null;
+              const isInteractiveQueueItem =
+                !isQueuedPlaceholder &&
+                (!isTerminalQueueItem || Boolean(queueArtifactId));
               const queueItemTitle =
                 queuedStart?.title ??
                 (queuedStart?.inputPath
@@ -10664,6 +10918,8 @@ export function App({
               const progressTime =
                 item.current_seconds != null && item.total_seconds != null
                   ? `${formatShortDuration(item.current_seconds)} / ${formatShortDuration(item.total_seconds)}`
+                  : item.current_seconds != null
+                    ? formatShortDuration(item.current_seconds)
                   : null;
               const translateToEnglish =
                 settings?.transcription.whisper_options?.translate_to_english ??
@@ -12872,6 +13128,30 @@ export function App({
   function renderDetail(): JSX.Element {
     const isTrimRetranscriptionStarting =
       isStarting && Boolean(effectiveTrimmedAudioDraft);
+    const speakerDetectionWasRun =
+      Boolean(artifactDiarizationUiState) &&
+      artifactDiarizationUiState?.kind !== "not_requested";
+    const speakerDetectionActionLabel = speakerDetectionWasRun
+      ? t("detail.rerunSpeakerDetection", "Rerun speaker detection")
+      : t("detail.runSpeakerDetection", "Run speaker detection");
+    const speakerDiarizationEnabled = Boolean(
+      settings?.transcription.speaker_diarization?.enabled,
+    );
+    const speakerDetectionDescription = speakerDiarizationEnabled
+      ? t(
+          "detail.speakerDetectionEnabledHelp",
+          "Runs speaker detection with the configured pyannote runtime and assigns speaker labels to this transcript.",
+        )
+      : t(
+          "detail.speakerDetectionDisabledHelp",
+          "Enable speaker diarization in Settings > Transcription before using speaker detection.",
+        );
+    const speakerDetectionHasAudio = Boolean(
+      activeArtifact &&
+        (activeArtifact.audio_available ||
+          effectiveTrimmedAudioDraft ||
+          detailAudioInputPath),
+    );
 
     return (
       <div
@@ -12933,6 +13213,24 @@ export function App({
             chatDisabled={!aiFeaturesAvailable}
             optimizeDisabled={!aiFeaturesAvailable}
             optimizeDisabledTitle={aiUnavailableReason}
+            showSpeakerDetection={Boolean(
+              activeArtifact &&
+                !activeJobId &&
+                !isRealtimeDetailActive &&
+                speakerDetectionHasAudio,
+            )}
+            isStartingSpeakerDetection={isStartingSpeakerDetection}
+            speakerDetectionDisabled={
+              !speakerDiarizationEnabled ||
+              isStartingSpeakerDetection ||
+              Boolean(activeJobId)
+            }
+            speakerDetectionActionLabel={speakerDetectionActionLabel}
+            speakerDetectionActionTitle={speakerDetectionActionLabel}
+            speakerDetectionDescription={speakerDetectionDescription}
+            onStartSpeakerDetection={() =>
+              void onStartSpeakerDetectionForActiveArtifact()
+            }
             showRetranscribe={Boolean(
               effectiveTrimmedAudioDraft && !activeJobId,
             )}
@@ -13045,17 +13343,23 @@ export function App({
                   ) : null}
                 </div>
               ) : null}
-              {isTrimRetranscriptionStarting && !trimRetranscriptionError ? (
+              {(isTrimRetranscriptionStarting || isStartingSpeakerDetection) &&
+              !trimRetranscriptionError ? (
                 <div
                   className="detail-inline-status"
                   role="status"
                   aria-live="polite"
                 >
                   <span>
-                    {t(
-                      "detail.preparingTrimmedRetranscription",
-                      "Preparing trimmed audio transcription...",
-                    )}
+                    {isStartingSpeakerDetection
+                      ? t(
+                          "detail.preparingSpeakerDetection",
+                          "Preparing speaker detection...",
+                        )
+                      : t(
+                          "detail.preparingTrimmedRetranscription",
+                          "Preparing trimmed audio transcription...",
+                        )}
                   </span>
                 </div>
               ) : null}

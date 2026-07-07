@@ -294,8 +294,9 @@ export async function startRealtime(payload?: {
   parakeet_model?: StartTranscriptionPayload["parakeet_model"];
   language?: AppSettings["language"];
   resume_artifact_id?: string;
-}): Promise<{ started: boolean }> {
-  return invoke<{ started: boolean }>("start_realtime", { payload });
+  title?: string;
+}): Promise<{ started: boolean; job_id: string }> {
+  return invoke<{ started: boolean; job_id: string }>("start_realtime", { payload });
 }
 
 export async function pauseRealtime(): Promise<void> {
@@ -308,6 +309,8 @@ export async function resumeRealtime(): Promise<void> {
 
 export async function stopRealtime(save = true, title?: string, elapsedSeconds?: number): Promise<{
   saved: boolean;
+  queued: boolean;
+  job_id?: string | null;
   artifact: TranscriptArtifact | null;
 }> {
   return invoke("stop_realtime", {

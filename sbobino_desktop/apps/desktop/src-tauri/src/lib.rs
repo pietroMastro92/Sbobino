@@ -178,9 +178,12 @@ pub fn run() {
                 realtime: RealtimeRuntime {
                     engine: Arc::new(Mutex::new(realtime_engine)),
                     preview: Arc::new(Mutex::new(None)),
+                    active_job_id: Arc::new(Mutex::new(None)),
                     session_name: Arc::new(Mutex::new(None)),
                     model_filename: Arc::new(Mutex::new(None)),
                     language_code: Arc::new(Mutex::new("auto".to_string())),
+                    model: Arc::new(Mutex::new(None)),
+                    language: Arc::new(Mutex::new(None)),
                 },
                 provisioning: ProvisioningRuntime {
                     cancel_token: Arc::new(Mutex::new(None)),

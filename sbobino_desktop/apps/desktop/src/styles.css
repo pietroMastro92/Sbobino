@@ -2250,6 +2250,56 @@ code {
   animation: none;
 }
 
+.speaker-detection-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 12px;
+  background: var(--topbar-control-bg);
+  border: 1px solid var(--detail-control-border);
+  border-radius: 16px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  outline: none;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    transform 160ms ease;
+}
+
+.speaker-detection-button .button-content {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.speaker-detection-button:hover:not(:disabled) {
+  transform: translateY(-0.5px);
+  background: var(--sidebar-active);
+  border-color: var(--detail-control-border);
+  color: var(--detail-active-text);
+}
+
+.speaker-detection-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 72%, #ffffff);
+  outline-offset: 2px;
+}
+
+.speaker-detection-button:disabled {
+  opacity: 0.52;
+  cursor: not-allowed;
+}
+
+.speaker-detection-button.is-busy {
+  cursor: progress;
+  opacity: 1;
+}
+
 .optimize-hover-button:hover:not(:disabled) {
   /* Expand into a full button */
   width: 140px;
