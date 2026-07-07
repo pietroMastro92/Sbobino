@@ -8,16 +8,19 @@ use tauri::{Emitter, State};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
-use sbobino_application::{ApplicationError, RealtimeDelta, TranscriptionService};
+use sbobino_application::{ApplicationError, RealtimeDelta};
 use sbobino_domain::{
-    AppSettings, ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel,
-    TimedSegment, TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
+    ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel,
+    SpeechModel, TimedSegment, TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
 };
-use tracing::warn;
 
-use crate::parakeet_realtime::{ParakeetRealtimeEngine, ParakeetRealtimeStopResult};
+use crate::commands::transcription::{JobFailedEvent, JobProgressEvent};
+use crate::parakeet_realtime::ParakeetRealtimeEngine;
 use crate::realtime_audio::{emit_level_event, start_input_preview, RealtimeInputLevelEvent};
 use crate::{error::CommandError, state::AppState};
+
+const REALTIME_INPUT_PATH: &str = "realtime://microphone";
+const REALTIME_SOURCE_LABEL: &str = "Live microphone";
 
 fn resolve_realtime_engine(
     state: &AppState,
@@ -182,11 +185,13 @@ pub struct StartRealtimePayload {
     pub parakeet_model: Option<ParakeetModel>,
     pub language: Option<LanguageCode>,
     pub resume_artifact_id: Option<String>,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct StartRealtimeResponse {
     pub started: bool,
+    pub job_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,6 +204,8 @@ pub struct StopRealtimePayload {
 #[derive(Debug, Serialize)]
 pub struct StopRealtimeResponse {
     pub saved: bool,
+    pub queued: bool,
+    pub job_id: Option<String>,
     pub artifact: Option<TranscriptArtifact>,
 }
 
@@ -212,6 +219,242 @@ struct RealtimeStopResult {
 pub struct RealtimeStatusEvent {
     pub state: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone)]
+struct RealtimeArtifactInput {
+    job_id: String,
+    session_title: String,
+    language_code: String,
+    model_filename: String,
+    processing_engine: String,
+    elapsed_seconds: Option<u64>,
+    transcript: String,
+    segments: Vec<TimedSegment>,
+    saved_audio_path: Option<PathBuf>,
+}
+
+fn clean_optional_title(title: Option<String>) -> Option<String> {
+    title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn fallback_live_title() -> String {
+    format!("live_{}", Utc::now().format("%d%m%Y_%H%M%S"))
+}
+
+fn realtime_job_progress(
+    job_id: &str,
+    stage: JobStage,
+    message: impl Into<String>,
+    percentage: u8,
+    current_seconds: Option<f32>,
+    total_seconds: Option<f32>,
+) -> JobProgress {
+    JobProgress {
+        job_id: job_id.to_string(),
+        stage,
+        message: message.into(),
+        percentage,
+        current_seconds,
+        total_seconds,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn realtime_progress_event(
+    progress: JobProgress,
+    title: Option<String>,
+    model: SpeechModel,
+    language: LanguageCode,
+) -> JobProgressEvent {
+    JobProgressEvent {
+        progress,
+        input_path: REALTIME_INPUT_PATH.to_string(),
+        title,
+        source_origin: ArtifactSourceOrigin::Realtime,
+        source_label: Some(REALTIME_SOURCE_LABEL.to_string()),
+        source_folder: None,
+        model,
+        language,
+        preset: None,
+        workspace_id: None,
+    }
+}
+
+fn emit_realtime_progress(
+    app: &tauri::AppHandle,
+    progress: JobProgress,
+    title: Option<String>,
+    model: SpeechModel,
+    language: LanguageCode,
+) {
+    let _ = app.emit(
+        "transcription://progress",
+        realtime_progress_event(progress, title, model, language),
+    );
+}
+
+fn build_realtime_artifact(
+    input: RealtimeArtifactInput,
+) -> Result<TranscriptArtifact, ApplicationError> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("kind".to_string(), "realtime".to_string());
+    metadata.insert("language".to_string(), input.language_code.clone());
+    metadata.insert("model".to_string(), input.model_filename.clone());
+    if let Some(elapsed_seconds) = input.elapsed_seconds {
+        metadata.insert("duration_seconds".to_string(), elapsed_seconds.to_string());
+    }
+    metadata.insert(
+        "audio_saved".to_string(),
+        if input.saved_audio_path.is_some() {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        },
+    );
+    if !input.segments.is_empty() {
+        metadata.insert(
+            "timeline_v2".to_string(),
+            TranscriptionOutput {
+                text: input.transcript.clone(),
+                segments: input.segments.clone(),
+            }
+            .timeline_v2_metadata_json(),
+        );
+    }
+
+    let source_label = input
+        .saved_audio_path
+        .as_ref()
+        .and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("{}.wav", input.session_title));
+
+    let mut artifact = TranscriptArtifact::new(
+        input.job_id,
+        input.session_title,
+        ArtifactKind::Realtime,
+        source_label,
+        ArtifactSourceOrigin::Realtime,
+        input.transcript,
+        String::new(),
+        String::new(),
+        String::new(),
+        metadata,
+    )
+    .map_err(|e| ApplicationError::Validation(e.to_string()))?;
+    artifact.audio_available = input.saved_audio_path.is_some();
+    artifact.audio_duration_seconds = input.elapsed_seconds.map(|value| value as f32);
+    artifact.processing_engine = Some(input.processing_engine);
+    artifact.processing_model = Some(input.model_filename);
+    artifact.processing_language = Some(input.language_code);
+    if let Some(path) = input.saved_audio_path.as_ref() {
+        artifact.set_source_external_path(path.to_string_lossy().to_string());
+    }
+
+    Ok(artifact)
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+
+    #[test]
+    fn build_realtime_artifact_preserves_live_job_metadata() {
+        let artifact = build_realtime_artifact(RealtimeArtifactInput {
+            job_id: "live-job-1".to_string(),
+            session_title: "Daily standup".to_string(),
+            language_code: "it".to_string(),
+            model_filename: "ggml-large-v3-turbo.bin".to_string(),
+            processing_engine: "whisper_stream".to_string(),
+            elapsed_seconds: Some(3725),
+            transcript: "Ciao a tutti.".to_string(),
+            segments: Vec::new(),
+            saved_audio_path: Some(PathBuf::from("/tmp/sbobino-live/session.wav")),
+        })
+        .expect("realtime artifact should be valid");
+
+        assert_eq!(artifact.job_id, "live-job-1");
+        assert_eq!(artifact.title, "Daily standup");
+        assert_eq!(artifact.kind, ArtifactKind::Realtime);
+        assert_eq!(artifact.source_origin, ArtifactSourceOrigin::Realtime);
+        assert_eq!(artifact.source_label, "session.wav");
+        assert_eq!(artifact.raw_transcript, "Ciao a tutti.");
+        assert_eq!(
+            artifact.processing_engine.as_deref(),
+            Some("whisper_stream")
+        );
+        assert_eq!(
+            artifact.processing_model.as_deref(),
+            Some("ggml-large-v3-turbo.bin")
+        );
+        assert_eq!(artifact.processing_language.as_deref(), Some("it"));
+        assert_eq!(artifact.audio_duration_seconds, Some(3725.0));
+        assert_eq!(
+            artifact
+                .metadata
+                .get("duration_seconds")
+                .map(String::as_str),
+            Some("3725")
+        );
+        assert_eq!(
+            artifact.metadata.get("audio_saved").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn build_realtime_artifact_rejects_empty_live_transcript() {
+        let error = build_realtime_artifact(RealtimeArtifactInput {
+            job_id: "live-job-2".to_string(),
+            session_title: "Empty live".to_string(),
+            language_code: "en".to_string(),
+            model_filename: "ggml-base.bin".to_string(),
+            processing_engine: "whisper_stream".to_string(),
+            elapsed_seconds: None,
+            transcript: "  ".to_string(),
+            segments: Vec::new(),
+            saved_audio_path: None,
+        })
+        .expect_err("empty live transcript should not produce an artifact");
+
+        assert!(error.to_string().contains("transcript"));
+    }
+
+    #[test]
+    fn build_realtime_artifact_persists_parakeet_timeline_metadata() {
+        let artifact = build_realtime_artifact(RealtimeArtifactInput {
+            job_id: "live-job-3".to_string(),
+            session_title: "Parakeet live".to_string(),
+            language_code: "it".to_string(),
+            model_filename: "nemotron-3.5-asr-streaming-0.6b-q8.gguf".to_string(),
+            processing_engine: "parakeet_cpp".to_string(),
+            elapsed_seconds: Some(42),
+            transcript: "Segmento uno.".to_string(),
+            segments: vec![TimedSegment {
+                text: "Segmento uno.".to_string(),
+                start_seconds: Some(0.0),
+                end_seconds: Some(2.5),
+                speaker_id: None,
+                speaker_label: None,
+                words: Vec::new(),
+            }],
+            saved_audio_path: None,
+        })
+        .expect("parakeet realtime artifact should be valid");
+
+        assert_eq!(artifact.processing_engine.as_deref(), Some("parakeet_cpp"));
+        assert!(
+            artifact.metadata.contains_key("timeline_v2"),
+            "{:?}",
+            artifact.metadata
+        );
+    }
 }
 
 async fn stop_realtime_preview(
@@ -236,66 +479,12 @@ async fn start_realtime_preview(
     Ok(())
 }
 
-async fn apply_realtime_speaker_diarization(
-    state: &AppState,
-    settings: &AppSettings,
-    audio_path: Option<&Path>,
-    segments: &mut Vec<TimedSegment>,
-    metadata: &mut BTreeMap<String, String>,
-) {
-    if !settings.transcription.speaker_diarization.enabled {
-        return;
-    }
-
-    let Some(audio_path) = audio_path else {
-        metadata.insert(
-            "speaker_diarization_status".to_string(),
-            "skipped_no_audio".to_string(),
-        );
-        return;
-    };
-
-    if segments.is_empty() {
-        metadata.insert(
-            "speaker_diarization_status".to_string(),
-            "skipped_no_segments".to_string(),
-        );
-        return;
-    }
-
-    let diarizer = match state.runtime_factory.build_speaker_diarizer(settings) {
-        Ok(Some(diarizer)) => diarizer,
-        Ok(None) => return,
-        Err(error) => {
-            metadata.insert(
-                "speaker_diarization_status".to_string(),
-                "failed".to_string(),
-            );
-            metadata.insert("speaker_diarization_error".to_string(), error.clone());
-            warn!("speaker diarization skipped for realtime session: {error}");
-            return;
-        }
-    };
-
-    match diarizer.diarize(audio_path).await {
-        Ok(turns) => {
-            metadata.insert(
-                "speaker_diarization_status".to_string(),
-                "completed".to_string(),
-            );
-            if !turns.is_empty() {
-                *segments = TranscriptionService::assign_speakers_to_segments(segments, &turns);
-            }
-        }
-        Err(error) => {
-            metadata.insert(
-                "speaker_diarization_status".to_string(),
-                "failed".to_string(),
-            );
-            metadata.insert("speaker_diarization_error".to_string(), error.to_string());
-            warn!("speaker diarization failed for realtime session: {error}");
-        }
-    }
+async fn clear_active_realtime_metadata(state: &AppState) {
+    *state.realtime.active_job_id.lock().await = None;
+    *state.realtime.session_name.lock().await = None;
+    *state.realtime.model_filename.lock().await = None;
+    *state.realtime.model.lock().await = None;
+    *state.realtime.language.lock().await = None;
 }
 
 #[tauri::command]
@@ -311,6 +500,7 @@ pub async fn start_realtime(
         parakeet_model: None,
         language: None,
         resume_artifact_id: None,
+        title: None,
     });
 
     let settings = state
@@ -325,6 +515,10 @@ pub async fn start_realtime(
         .unwrap_or_else(|| settings.transcription.engine.clone());
     let model = payload.model.unwrap_or(default_model);
     let language = payload.language.unwrap_or(default_language);
+    let job_id = Uuid::new_v4().to_string();
+    let requested_title = clean_optional_title(payload.title.clone());
+    let mut session_title = requested_title.clone().unwrap_or_else(fallback_live_title);
+    let mut resume_transcript: Option<String> = None;
 
     if let Some(id) = &payload.resume_artifact_id {
         let artifact = state
@@ -334,13 +528,19 @@ pub async fn start_realtime(
             .map_err(CommandError::from)?
             .ok_or_else(|| CommandError::new("not_found", "realtime session not found"))?;
 
-        *state.realtime.session_name.lock().await = Some(artifact.title.clone());
-    } else {
-        *state.realtime.session_name.lock().await = None;
+        session_title = requested_title.unwrap_or_else(|| artifact.title.clone());
+        resume_transcript = Some(artifact.raw_transcript);
     }
 
-    *state.realtime.language_code.lock().await = language.as_whisper_code().to_string();
+    *state.realtime.active_job_id.lock().await = Some(job_id.clone());
+    *state.realtime.session_name.lock().await = Some(session_title.clone());
+    *state.realtime.language_code.lock().await = match engine_kind.clone() {
+        TranscriptionEngine::WhisperCpp => language.as_whisper_code().to_string(),
+        TranscriptionEngine::ParakeetCpp => parakeet_live_target_lang(language.clone()).to_string(),
+    };
     *state.realtime.active_engine.lock().await = engine_kind.clone();
+    *state.realtime.model.lock().await = Some(model.clone());
+    *state.realtime.language.lock().await = Some(language.clone());
 
     let app_handle = app.clone();
     let emit_delta = Arc::new(move |delta: RealtimeDelta| {
@@ -355,28 +555,31 @@ pub async fn start_realtime(
     eprintln!(
         "[realtime-start] selected engine={engine_kind:?} model={model:?} language={language:?}"
     );
-    match engine_kind {
+    match engine_kind.clone() {
         TranscriptionEngine::WhisperCpp => {
-            let engine = resolve_realtime_engine(&state)?;
+            let engine = match resolve_realtime_engine(&state) {
+                Ok(engine) => engine,
+                Err(error) => {
+                    clear_active_realtime_metadata(&state).await;
+                    return Err(error);
+                }
+            };
             {
                 let mut current_engine = state.realtime.engine.lock().await;
                 *current_engine = engine.clone();
             }
-            if let Some(id) = &payload.resume_artifact_id {
-                if let Some(artifact) = state
-                    .artifact_service
-                    .get(id)
-                    .await
-                    .map_err(CommandError::from)?
-                {
-                    engine.seed_buffer(&artifact.raw_transcript).await;
-                }
+            *state.realtime.parakeet_engine.lock().await = None;
+            if let Some(transcript) = resume_transcript.as_deref() {
+                engine.seed_buffer(transcript).await;
             } else {
                 engine.reset().await;
             }
             *state.realtime.model_filename.lock().await = Some(model.ggml_filename().to_string());
 
-            start_realtime_preview(&app, &state).await?;
+            if let Err(error) = start_realtime_preview(&app, &state).await {
+                clear_active_realtime_metadata(&state).await;
+                return Err(error);
+            }
 
             if let Err(error) = engine
                 .start(
@@ -386,6 +589,7 @@ pub async fn start_realtime(
                 )
                 .await
             {
+                clear_active_realtime_metadata(&state).await;
                 stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
                 return Err(CommandError::from(error));
             }
@@ -393,31 +597,36 @@ pub async fn start_realtime(
         TranscriptionEngine::ParakeetCpp => {
             eprintln!("[realtime-start] parakeet branch entered");
             stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
-            let parakeet_engine = resolve_parakeet_live_engine(&state)?;
+            let parakeet_engine = match resolve_parakeet_live_engine(&state) {
+                Ok(engine) => engine,
+                Err(error) => {
+                    clear_active_realtime_metadata(&state).await;
+                    return Err(error);
+                }
+            };
             let models_dir = state
                 .runtime_factory
                 .resolve_models_dir(&settings.transcription.parakeet_models_dir);
             let requested_model = payload
                 .parakeet_model
                 .unwrap_or(settings.transcription.parakeet_model);
-            let live_model = select_parakeet_live_model(
+            let live_model = match select_parakeet_live_model(
                 std::path::Path::new(&models_dir),
                 requested_model.clone(),
                 language.clone(),
-            )?;
+            ) {
+                Ok(model) => model,
+                Err(error) => {
+                    clear_active_realtime_metadata(&state).await;
+                    return Err(error);
+                }
+            };
             eprintln!(
                 "[realtime-start] parakeet live model requested={requested_model:?} selected={live_model:?} models_dir={models_dir}"
             );
             running_message = "Live listening".to_string();
-            if let Some(id) = &payload.resume_artifact_id {
-                if let Some(artifact) = state
-                    .artifact_service
-                    .get(id)
-                    .await
-                    .map_err(CommandError::from)?
-                {
-                    parakeet_engine.seed_buffer(&artifact.raw_transcript).await;
-                }
+            if let Some(transcript) = resume_transcript.as_deref() {
+                parakeet_engine.seed_buffer(transcript).await;
             } else {
                 parakeet_engine.reset().await;
             }
@@ -439,6 +648,7 @@ pub async fn start_realtime(
                 .await
             {
                 eprintln!("[realtime-start] parakeet engine start failed: {error}");
+                clear_active_realtime_metadata(&state).await;
                 emit_level_event(&app, "idle", 0.0, error.to_string());
                 return Err(CommandError::from(error));
             }
@@ -447,7 +657,7 @@ pub async fn start_realtime(
     }
 
     sleep(Duration::from_millis(350)).await;
-    let running = match engine_kind {
+    let running = match engine_kind.clone() {
         TranscriptionEngine::WhisperCpp => {
             let engine = state.realtime.engine.lock().await.clone();
             engine.is_running().await
@@ -462,7 +672,8 @@ pub async fn start_realtime(
     };
     eprintln!("[realtime-start] post-start running={running}");
     if !running {
-        match engine_kind {
+        clear_active_realtime_metadata(&state).await;
+        match engine_kind.clone() {
             TranscriptionEngine::WhisperCpp => {
                 stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
             }
@@ -499,8 +710,25 @@ pub async fn start_realtime(
         },
     );
 
-    eprintln!("[realtime-start] command completed started=true");
-    Ok(StartRealtimeResponse { started: true })
+    emit_realtime_progress(
+        &app,
+        realtime_job_progress(
+            &job_id,
+            JobStage::Transcribing,
+            "Live listening",
+            0,
+            Some(0.0),
+            None,
+        ),
+        Some(session_title),
+        model,
+        language,
+    );
+
+    Ok(StartRealtimeResponse {
+        started: true,
+        job_id,
+    })
 }
 
 #[tauri::command]
@@ -563,6 +791,34 @@ pub async fn resume_realtime(
     Ok(())
 }
 
+enum RealtimeEngineHandle {
+    Whisper(sbobino_infrastructure::adapters::whisper_stream::WhisperStreamEngine),
+    Parakeet(ParakeetRealtimeEngine),
+}
+
+impl RealtimeEngineHandle {
+    async fn stop(self) -> Result<RealtimeStopResult, ApplicationError> {
+        match self {
+            Self::Whisper(engine) => {
+                let result = engine.stop().await?;
+                Ok(RealtimeStopResult {
+                    transcript: result.transcript,
+                    segments: Vec::new(),
+                    saved_audio_path: result.saved_audio_path,
+                })
+            }
+            Self::Parakeet(engine) => {
+                let result = engine.stop().await?;
+                Ok(RealtimeStopResult {
+                    transcript: result.transcript,
+                    segments: result.segments,
+                    saved_audio_path: result.saved_audio_path,
+                })
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn stop_realtime(
     app: tauri::AppHandle,
@@ -576,17 +832,14 @@ pub async fn stop_realtime(
     });
     let save = payload.save.unwrap_or(true);
 
+    let settings = state
+        .runtime_factory
+        .load_settings()
+        .map_err(|e| CommandError::new("settings", e))?;
     let active_engine = state.realtime.active_engine.lock().await.clone();
-    let mut stop_result = match active_engine {
+    let engine = match active_engine.clone() {
         TranscriptionEngine::WhisperCpp => {
-            let engine = state.realtime.engine.lock().await.clone();
-            let result = engine.stop().await.map_err(CommandError::from)?;
-            stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
-            RealtimeStopResult {
-                transcript: result.transcript,
-                segments: Vec::new(),
-                saved_audio_path: result.saved_audio_path,
-            }
+            RealtimeEngineHandle::Whisper(state.realtime.engine.lock().await.clone())
         }
         TranscriptionEngine::ParakeetCpp => {
             let engine = state
@@ -596,16 +849,58 @@ pub async fn stop_realtime(
                 .await
                 .clone()
                 .ok_or_else(|| CommandError::new("realtime", "Parakeet live is not running"))?;
-            let result: ParakeetRealtimeStopResult =
-                engine.stop().await.map_err(CommandError::from)?;
-            emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
-            RealtimeStopResult {
-                transcript: result.transcript,
-                segments: result.segments,
-                saved_audio_path: result.saved_audio_path,
-            }
+            RealtimeEngineHandle::Parakeet(engine)
         }
     };
+    let processing_engine = match active_engine.clone() {
+        TranscriptionEngine::WhisperCpp => "whisper_stream".to_string(),
+        TranscriptionEngine::ParakeetCpp => "parakeet_cpp".to_string(),
+    };
+    let job_id = state
+        .realtime
+        .active_job_id
+        .lock()
+        .await
+        .take()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let existing_session_title = state.realtime.session_name.lock().await.take();
+    let session_title = clean_optional_title(payload.title.clone())
+        .or(existing_session_title)
+        .unwrap_or_else(fallback_live_title);
+    let language = state
+        .realtime
+        .language
+        .lock()
+        .await
+        .clone()
+        .unwrap_or(settings.transcription.language);
+    let model = state
+        .realtime
+        .model
+        .lock()
+        .await
+        .clone()
+        .unwrap_or(settings.transcription.model);
+    let language_code = state.realtime.language_code.lock().await.clone();
+    let model_filename = state
+        .realtime
+        .model_filename
+        .lock()
+        .await
+        .take()
+        .unwrap_or_else(|| model.ggml_filename().to_string());
+    *state.realtime.model.lock().await = None;
+    *state.realtime.language.lock().await = None;
+
+    match active_engine {
+        TranscriptionEngine::WhisperCpp => {
+            stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+        }
+        TranscriptionEngine::ParakeetCpp => {
+            *state.realtime.parakeet_engine.lock().await = None;
+            emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
+        }
+    }
 
     let _ = app.emit(
         "realtime://status",
@@ -615,127 +910,144 @@ pub async fn stop_realtime(
         },
     );
 
-    if !save || stop_result.transcript.trim().is_empty() {
-        return Ok(StopRealtimeResponse {
-            saved: false,
-            artifact: None,
-        });
-    }
-
-    let settings = state
-        .runtime_factory
-        .load_settings()
-        .map_err(|e| CommandError::new("settings", e))?;
-
-    let session_title = state
-        .realtime
-        .session_name
-        .lock()
-        .await
-        .clone()
-        .or_else(|| {
-            payload
-                .title
-                .clone()
-                .filter(|title| !title.trim().is_empty())
-        })
-        .unwrap_or_else(|| format!("live_{}", Utc::now().format("%d%m%Y_%H%M%S")));
-
-    let language_code = state.realtime.language_code.lock().await.clone();
-    let model_filename = state
-        .realtime
-        .model_filename
-        .lock()
-        .await
-        .clone()
-        .unwrap_or_else(|| settings.transcription.model.ggml_filename().to_string());
-
-    let optimized = String::new();
-    let summary = String::new();
-    let faqs = String::new();
-
-    let mut metadata = BTreeMap::new();
-    metadata.insert("kind".to_string(), "realtime".to_string());
-    metadata.insert("language".to_string(), language_code.clone());
-    metadata.insert("model".to_string(), model_filename.clone());
-    if let Some(elapsed_seconds) = payload.elapsed_seconds {
-        metadata.insert("duration_seconds".to_string(), elapsed_seconds.to_string());
-    }
-    metadata.insert(
-        "audio_saved".to_string(),
-        if stop_result.saved_audio_path.is_some() {
-            "true".to_string()
-        } else {
-            "false".to_string()
-        },
+    emit_realtime_progress(
+        &app,
+        realtime_job_progress(
+            &job_id,
+            if save {
+                JobStage::Persisting
+            } else {
+                JobStage::Cancelled
+            },
+            if save {
+                "Saving live transcription"
+            } else {
+                "Live transcription discarded"
+            },
+            if save { 90 } else { 100 },
+            payload.elapsed_seconds.map(|value| value as f32),
+            None,
+        ),
+        Some(session_title.clone()),
+        model.clone(),
+        language.clone(),
     );
 
-    apply_realtime_speaker_diarization(
-        &state,
-        &settings,
-        stop_result.saved_audio_path.as_deref(),
-        &mut stop_result.segments,
-        &mut metadata,
-    )
-    .await;
-
-    if !stop_result.segments.is_empty() {
-        metadata.insert(
-            "timeline_v2".to_string(),
-            TranscriptionOutput {
-                text: stop_result.transcript.clone(),
-                segments: stop_result.segments.clone(),
+    let app_handle = app.clone();
+    let artifact_service = state.artifact_service.clone();
+    let elapsed_seconds = payload.elapsed_seconds;
+    let job_id_for_task = job_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let stop_result = match engine.stop().await {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = app_handle.emit(
+                    "transcription://failed",
+                    JobFailedEvent {
+                        job_id: job_id_for_task.clone(),
+                        message: error.to_string(),
+                    },
+                );
+                return;
             }
-            .timeline_v2_metadata_json(),
-        );
-    }
+        };
 
-    let source_label = stop_result
-        .saved_audio_path
-        .as_ref()
-        .and_then(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| format!("{session_title}.wav"));
+        if !save {
+            emit_realtime_progress(
+                &app_handle,
+                realtime_job_progress(
+                    &job_id_for_task,
+                    JobStage::Cancelled,
+                    "Live transcription discarded",
+                    100,
+                    elapsed_seconds.map(|value| value as f32),
+                    None,
+                ),
+                Some(session_title),
+                model,
+                language,
+            );
+            return;
+        }
 
-    let mut artifact = TranscriptArtifact::new(
-        Uuid::new_v4().to_string(),
-        session_title.clone(),
-        ArtifactKind::Realtime,
-        source_label,
-        ArtifactSourceOrigin::Realtime,
-        stop_result.transcript,
-        optimized,
-        summary,
-        faqs,
-        metadata,
-    )
-    .map_err(|e| CommandError::new("validation", e.to_string()))?;
-    artifact.audio_available = stop_result.saved_audio_path.is_some();
-    artifact.audio_duration_seconds = payload.elapsed_seconds.map(|value| value as f32);
-    artifact.processing_engine = Some(match active_engine {
-        TranscriptionEngine::WhisperCpp => "whisper_stream".to_string(),
-        TranscriptionEngine::ParakeetCpp => "parakeet_cpp".to_string(),
+        if stop_result.transcript.trim().is_empty() {
+            emit_realtime_progress(
+                &app_handle,
+                realtime_job_progress(
+                    &job_id_for_task,
+                    JobStage::Cancelled,
+                    "Live transcription stopped with no captured speech",
+                    100,
+                    elapsed_seconds.map(|value| value as f32),
+                    None,
+                ),
+                Some(session_title),
+                model,
+                language,
+            );
+            return;
+        }
+
+        let artifact = match build_realtime_artifact(RealtimeArtifactInput {
+            job_id: job_id_for_task.clone(),
+            session_title: session_title.clone(),
+            language_code,
+            model_filename,
+            processing_engine,
+            elapsed_seconds,
+            transcript: stop_result.transcript,
+            segments: stop_result.segments,
+            saved_audio_path: stop_result.saved_audio_path,
+        }) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                let _ = app_handle.emit(
+                    "transcription://failed",
+                    JobFailedEvent {
+                        job_id: job_id_for_task.clone(),
+                        message: error.to_string(),
+                    },
+                );
+                return;
+            }
+        };
+
+        match artifact_service.save(&artifact).await {
+            Ok(()) => {
+                emit_realtime_progress(
+                    &app_handle,
+                    realtime_job_progress(
+                        &artifact.job_id,
+                        JobStage::Completed,
+                        "Live transcription saved",
+                        100,
+                        None,
+                        None,
+                    ),
+                    Some(artifact.title.clone()),
+                    model,
+                    language,
+                );
+                let _ = app_handle.emit("transcription://completed", artifact.clone());
+                let _ = app_handle.emit("realtime://saved", artifact);
+            }
+            Err(error) => {
+                let _ = app_handle.emit(
+                    "transcription://failed",
+                    JobFailedEvent {
+                        job_id: job_id_for_task,
+                        message: error.to_string(),
+                    },
+                );
+            }
+        }
     });
-    artifact.processing_model = Some(model_filename.clone());
-    artifact.processing_language = Some(state.realtime.language_code.lock().await.clone());
-    if let Some(path) = stop_result.saved_audio_path.as_ref() {
-        artifact.set_source_external_path(path.to_string_lossy().to_string());
-    }
-
-    state
-        .artifact_service
-        .save(&artifact)
-        .await
-        .map_err(CommandError::from)?;
-
-    let _ = app.emit("realtime://saved", artifact.clone());
 
     Ok(StopRealtimeResponse {
-        saved: true,
-        artifact: Some(artifact),
+        saved: false,
+        queued: true,
+        job_id: Some(job_id),
+        artifact: None,
     })
 }
 

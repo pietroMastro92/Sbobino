@@ -74,4 +74,49 @@ describe("queue UI wiring", () => {
     expect(appSource).toContain("Completed {completed}");
     expect(appSource).toContain("Failed {failed}");
   });
+
+  it("registers live sessions in the queue as soon as realtime starts", () => {
+    const onStartRealtime = extractFunction(appSource, "onStartRealtime");
+
+    expect(onStartRealtime).toContain("const realtimeJobId = startResult.job_id");
+    expect(onStartRealtime).toContain("const realtimeProgress: JobProgress");
+    expect(onStartRealtime).toContain("setActiveRealtimeJobId(realtimeJobId)");
+    expect(onStartRealtime).toContain("upsertQueueItem(previous, realtimeProgress)");
+    expect(onStartRealtime).toContain('sourceOrigin: "realtime"');
+  });
+
+  it("moves live stop/save into the queue without hydrating the command response", () => {
+    const onStopRealtime = extractFunction(appSource, "onStopRealtime");
+
+    expect(onStopRealtime).toContain("result.queued");
+    expect(onStopRealtime).toContain('stage: saveResult ? "persisting" : "cancelled"');
+    expect(onStopRealtime).toContain('setSection("queue")');
+    expect(onStopRealtime).not.toContain("hydrateDetail(result.artifact)");
+  });
+
+  it("routes live queue cards to the running live view or completed artifact", () => {
+    const onFocusQueueJob = extractFunction(appSource, "onFocusQueueJob");
+
+    expect(onFocusQueueJob).toContain("snapshot?.artifactId");
+    expect(onFocusQueueJob).toContain("onOpenArtifact(snapshot.artifactId)");
+    expect(onFocusQueueJob).toContain(
+      "activeRealtimeJobIdRef.current === item.job_id",
+    );
+    expect(onFocusQueueJob).toContain("realtimeSessionOpen");
+    expect(appSource).toContain("(!isTerminalQueueItem || Boolean(queueArtifactId))");
+  });
+
+  it("starts speaker detection as a queued child transcription", () => {
+    const onStartSpeakerDetection = extractFunction(
+      appSource,
+      "onStartSpeakerDetectionForActiveArtifact",
+    );
+
+    expect(appSource).toContain("showSpeakerDetection={Boolean(");
+    expect(appSource).toContain("detail.runSpeakerDetection");
+    expect(appSource).toContain("detail.rerunSpeakerDetection");
+    expect(onStartSpeakerDetection).toContain("writeTrimmedAudio(");
+    expect(onStartSpeakerDetection).toContain("parentId: activeArtifact.id");
+    expect(onStartSpeakerDetection).toContain("await onStartTranscription(inputPath");
+  });
 });
