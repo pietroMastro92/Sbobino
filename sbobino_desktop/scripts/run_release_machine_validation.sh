@@ -97,13 +97,28 @@ is_base_apple_m1_host() {
   [[ "$brand" == *"Apple M1"* && "$brand" != *"M1 Pro"* && "$brand" != *"M1 Max"* && "$brand" != *"M1 Ultra"* ]]
 }
 
+is_hosted_as_third_validation() {
+  [[ "$MACHINE_CLASS" == "AS-THIRD" ]] || return 1
+  [[ "${SBOBINO_VALIDATION_RUNNER_LABEL:-}" == *"github-hosted"* ]]
+}
+
 parakeet_release_smoke_requires_gpu() {
   if [[ -n "${SBOBINO_REQUIRE_PARAKEET_GPU:-}" ]]; then
     printf '%s\n' "$SBOBINO_REQUIRE_PARAKEET_GPU"
+  elif is_hosted_as_third_validation; then
+    printf '%s\n' "0"
   elif is_base_apple_m1_host && ! truthy_env_value "${SBOBINO_PARAKEET_FORCE_METAL:-}"; then
     printf '%s\n' "0"
   else
     printf '%s\n' "1"
+  fi
+}
+
+parakeet_release_smoke_force_cpu() {
+  if truthy_env_value "${SBOBINO_PARAKEET_FORCE_CPU:-}" || is_hosted_as_third_validation; then
+    printf '%s\n' "1"
+  else
+    printf '%s\n' "0"
   fi
 }
 
@@ -507,8 +522,10 @@ run_parakeet_transcription_smoke() {
   local smoke_log="$TMP_DIR/parakeet-real-smoke.log"
   local compare_log="$TMP_DIR/parakeet-compare.log"
   local require_parakeet_gpu
+  local force_parakeet_cpu
   local skip_parakeet_cpu
   require_parakeet_gpu=$(parakeet_release_smoke_requires_gpu)
+  force_parakeet_cpu=$(parakeet_release_smoke_force_cpu)
   if [[ "$require_parakeet_gpu" == "1" ]]; then
     skip_parakeet_cpu=1
   else
@@ -527,6 +544,7 @@ run_parakeet_transcription_smoke() {
     SBOBINO_PARAKEET_MODELS_DIR="$parakeet_models_dir" \
     SBOBINO_PARAKEET_MODEL="$PARAKEET_MODEL" \
     SBOBINO_PARAKEET_AUDIO="$FIXTURE_AUDIO" \
+    SBOBINO_PARAKEET_FORCE_CPU="$force_parakeet_cpu" \
     SBOBINO_ASR_SAMPLE=artemis \
     "$ROOT_DIR/scripts/smoke_parakeet_real.sh" >"$smoke_log" 2>&1; then
     fail_validation "Parakeet real smoke failed. Last log lines: $(tail -80 "$smoke_log")"
@@ -540,6 +558,7 @@ run_parakeet_transcription_smoke() {
     SBOBINO_ARTEMIS_AUDIO="$FIXTURE_AUDIO" \
     SBOBINO_ASR_SAMPLE=artemis \
     SBOBINO_ASR_COMPARE_MODE=transcribe \
+    SBOBINO_PARAKEET_FORCE_CPU="$force_parakeet_cpu" \
     SBOBINO_REQUIRE_PARAKEET_GPU="$require_parakeet_gpu" \
     SBOBINO_COMPARE_SKIP_PARAKEET_CPU="$skip_parakeet_cpu" \
     SBOBINO_COMPARE_SKIP_WHISPER_GPU=1 \
@@ -581,6 +600,7 @@ run_parakeet_live_smoke() {
     SBOBINO_PARAKEET_MODELS_DIR="$parakeet_models_dir" \
     SBOBINO_PARAKEET_REALTIME_MODEL="$realtime_model" \
     SBOBINO_PARAKEET_AUDIO="$FIXTURE_AUDIO" \
+    SBOBINO_PARAKEET_FORCE_CPU="$(parakeet_release_smoke_force_cpu)" \
     cargo test --manifest-path "$ROOT_DIR/Cargo.toml" -p sbobino-desktop \
       parakeet_realtime_c_api_streams_real_wav \
       -- --ignored --nocapture >"$live_log" 2>&1; then
