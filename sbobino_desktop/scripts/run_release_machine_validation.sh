@@ -128,8 +128,10 @@ need_cmd ditto
 need_cmd hdiutil
 need_cmd open
 need_cmd python3
+need_cmd shasum
 need_cmd sw_vers
 need_cmd uname
+need_cmd unzip
 
 write_report() {
   python3 - <<'PY' \
@@ -281,6 +283,16 @@ download_asset() {
     --show-error \
     --output "$destination" \
     "$url"
+}
+
+verify_sha256() {
+  local expected=$1
+  local path=$2
+  local actual
+  actual=$(shasum -a 256 "$path" | awk '{print $1}')
+  if [[ "$actual" != "$expected" ]]; then
+    fail_validation "Checksum mismatch for '$path': expected $expected, got $actual."
+  fi
 }
 
 install_app_from_dmg() {
@@ -465,6 +477,149 @@ PY
     fi
     sleep 10
   done
+}
+
+install_pyannote_release_assets() {
+  local runtime_dir="$DATA_DIR/runtime/pyannote"
+  local manifest_asset="pyannote-manifest.json"
+  local manifest_path="$TMP_DIR/$manifest_asset"
+  local selection_env="$TMP_DIR/pyannote-selection.env"
+  local host_arch
+  local runtime_kind
+  local runtime_arch
+  host_arch=$(uname -m)
+
+  case "$host_arch" in
+    arm64)
+      runtime_kind="pyannote_runtime_macos_aarch64"
+      runtime_arch="aarch64-apple-darwin"
+      ;;
+    x86_64)
+      runtime_kind="pyannote_runtime_macos_x86_64"
+      runtime_arch="x86_64-apple-darwin"
+      ;;
+    *)
+      fail_validation "Unsupported pyannote runtime architecture '$host_arch'."
+      ;;
+  esac
+
+  download_asset "$VERSION" "$manifest_asset" "$manifest_path"
+  python3 - <<'PY' "$manifest_path" "$runtime_kind" "$runtime_arch" "$selection_env"
+import json
+import shlex
+import sys
+
+manifest_path, runtime_kind, runtime_arch, output_path = sys.argv[1:5]
+manifest = json.load(open(manifest_path, encoding="utf-8"))
+assets = manifest.get("assets") or []
+
+def find_asset(kind):
+    for asset in assets:
+        if asset.get("kind") == kind:
+            return asset
+    raise SystemExit(f"missing asset kind: {kind}")
+
+runtime = find_asset(runtime_kind)
+model = find_asset("pyannote_model")
+values = {
+    "pyannote_app_version": str(manifest.get("app_version") or ""),
+    "pyannote_compat_level": str(manifest.get("compat_level") or ""),
+    "pyannote_runtime_asset": runtime.get("name") or "",
+    "pyannote_runtime_sha256": runtime.get("sha256") or "",
+    "pyannote_model_asset": model.get("name") or "",
+    "pyannote_model_sha256": model.get("sha256") or "",
+    "pyannote_runtime_arch": runtime_arch,
+}
+if not all(values.values()):
+    raise SystemExit("pyannote manifest is missing required fields")
+
+with open(output_path, "w", encoding="utf-8") as handle:
+    for key, value in values.items():
+        handle.write(f"{key}={shlex.quote(value)}\n")
+PY
+  # shellcheck disable=SC1090
+  source "$selection_env"
+
+  local runtime_zip="$TMP_DIR/$pyannote_runtime_asset"
+  local model_zip="$TMP_DIR/$pyannote_model_asset"
+  local stage="$TMP_DIR/pyannote-install"
+  download_asset "$VERSION" "$pyannote_runtime_asset" "$runtime_zip"
+  download_asset "$VERSION" "$pyannote_model_asset" "$model_zip"
+  verify_sha256 "$pyannote_runtime_sha256" "$runtime_zip"
+  verify_sha256 "$pyannote_model_sha256" "$model_zip"
+
+  rm -rf "$stage" "$runtime_dir"
+  mkdir -p "$stage" "$runtime_dir"
+  unzip -q "$runtime_zip" -d "$stage"
+  unzip -q "$model_zip" -d "$stage"
+
+  if [[ ! -x "$stage/python/bin/python3" ]]; then
+    fail_validation "Pyannote runtime asset '$pyannote_runtime_asset' did not contain python/bin/python3."
+  fi
+  if [[ ! -d "$stage/model" ]]; then
+    fail_validation "Pyannote model asset '$pyannote_model_asset' did not contain model/."
+  fi
+
+  mv "$stage/python" "$runtime_dir/python"
+  mv "$stage/model" "$runtime_dir/model"
+  python3 - <<'PY' \
+    "$runtime_dir/manifest.json" \
+    "$runtime_dir/status.json" \
+    "$pyannote_app_version" \
+    "$pyannote_compat_level" \
+    "$pyannote_runtime_asset" \
+    "$pyannote_runtime_sha256" \
+    "$pyannote_model_asset" \
+    "$pyannote_model_sha256" \
+    "$pyannote_runtime_arch"
+import json
+import sys
+from datetime import datetime, timezone
+
+(
+    manifest_path,
+    status_path,
+    app_version,
+    compat_level,
+    runtime_asset,
+    runtime_sha256,
+    model_asset,
+    model_sha256,
+    runtime_arch,
+) = sys.argv[1:10]
+now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+with open(manifest_path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "source": "release_asset",
+            "app_version": app_version,
+            "compat_level": int(compat_level),
+            "runtime_asset": runtime_asset,
+            "runtime_sha256": runtime_sha256,
+            "model_asset": model_asset,
+            "model_sha256": model_sha256,
+            "runtime_arch": runtime_arch,
+            "installed_at": now,
+        },
+        handle,
+        ensure_ascii=False,
+        indent=2,
+    )
+    handle.write("\n")
+with open(status_path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "reason_code": "ok",
+            "message": "Pyannote diarization runtime is ready.",
+            "updated_at": now,
+            "validated_at": now,
+        },
+        handle,
+        ensure_ascii=False,
+        indent=2,
+    )
+    handle.write("\n")
+PY
 }
 
 run_diarization_smoke() {
@@ -690,6 +845,7 @@ validate_as_third() {
   SCENARIO_FUNCTIONAL_PARAKEET_SMOKE="passed"
 
   quit_app
+  install_pyannote_release_assets
   set_speaker_diarization_enabled 1
   launch_app
   wait_for_runtime_health_ready 900 1
