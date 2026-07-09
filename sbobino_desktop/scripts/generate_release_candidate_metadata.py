@@ -34,16 +34,23 @@ def main() -> int:
 
     required_assets = [
         f"Sbobino_{version}_aarch64.dmg",
-        "Sbobino.app.tar.gz",
+        f"Sbobino_{version}_x86_64.dmg",
+        f"Sbobino_{version}_aarch64.app.tar.gz",
+        f"Sbobino_{version}_x86_64.app.tar.gz",
         "latest.json",
         "setup-manifest.json",
         "runtime-manifest.json",
         "speech-runtime-macos-aarch64.zip",
+        "speech-runtime-macos-x86_64.zip",
         "pyannote-manifest.json",
         "pyannote-runtime-macos-aarch64.zip",
+        "pyannote-runtime-macos-x86_64.zip",
         "pyannote-model-community-1.zip",
     ]
-    optional_assets = ["Sbobino.app.tar.gz.sig"]
+    optional_assets = [
+        f"Sbobino_{version}_aarch64.app.tar.gz.sig",
+        f"Sbobino_{version}_x86_64.app.tar.gz.sig",
+    ]
 
     checksums = {}
     for name in required_assets + optional_assets:

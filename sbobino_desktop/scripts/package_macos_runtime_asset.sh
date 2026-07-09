@@ -42,7 +42,7 @@ need_cmd() {
   fi
 }
 
-for command in clang cmake codesign curl find git make otool python3 tar xcrun; do
+for command in clang cmake codesign curl find git lipo make otool python3 tar xcrun; do
   need_cmd "$command"
 done
 
@@ -51,10 +51,18 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-if [[ "$(uname -m)" != "arm64" ]]; then
-  echo "This runtime packaging flow must run on Apple Silicon (arm64)." >&2
-  exit 1
-fi
+case "$(uname -m)" in
+  arm64)
+    RUNTIME_ARCH=arm64
+    ;;
+  x86_64)
+    RUNTIME_ARCH=x86_64
+    ;;
+  *)
+    echo "Unsupported macOS architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
 
 SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
 
@@ -201,6 +209,16 @@ EOF
   chmod 755 "$wrapper"
 }
 
+assert_binary_architecture() {
+  local binary=$1
+  local architectures
+  architectures=$(lipo -archs "$binary")
+  if [[ " $architectures " != *" $RUNTIME_ARCH "* ]]; then
+    echo "$binary does not contain the expected $RUNTIME_ARCH architecture: $architectures" >&2
+    exit 1
+  fi
+}
+
 build_sdl2_static() {
   local archive="$SOURCE_DIR/SDL2-${SDL2_VERSION}.tar.gz"
   local source_root="$BUILD_DIR/SDL2-${SDL2_VERSION}"
@@ -214,7 +232,7 @@ build_sdl2_static() {
   cmake -S "$source_root" -B "$build_root" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_OSX_ARCHITECTURES="$RUNTIME_ARCH" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
     -DCMAKE_OSX_SYSROOT="$SDKROOT" \
     -DSDL_SHARED=OFF \
@@ -238,7 +256,7 @@ build_whisper_binaries() {
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
     -DCMAKE_PREFIX_PATH="$INSTALL_PREFIX" \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_OSX_ARCHITECTURES="$RUNTIME_ARCH" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
     -DCMAKE_OSX_SYSROOT="$SDKROOT" \
     -DBUILD_SHARED_LIBS=OFF \
@@ -268,7 +286,7 @@ build_parakeet_binary() {
   cmake -S "$source_root" -B "$build_root" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DCMAKE_OSX_ARCHITECTURES="$RUNTIME_ARCH" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" \
     -DCMAKE_OSX_SYSROOT="$SDKROOT" \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
@@ -308,7 +326,7 @@ build_parakeet_binary() {
     echo "parakeet_cpp_ref=$PARAKEET_CPP_REF"
     echo "parakeet_cpp_resolved_ref=$resolved_ref"
     echo "parakeet_ggml_metal=$PARAKEET_GGML_METAL"
-    echo "cmake_arch=arm64"
+    echo "cmake_arch=$RUNTIME_ARCH"
     echo "parakeet_cli_wrapper=bin/parakeet-cli"
     echo "parakeet_cli_binary=bin/parakeet-cli-bin"
     echo "parakeet_live_library=lib/libparakeet.dylib"
@@ -330,7 +348,7 @@ build_ffmpeg_binary() {
     export MACOSX_DEPLOYMENT_TARGET
     ./configure \
       --prefix="$INSTALL_PREFIX" \
-      --arch=arm64 \
+      --arch="$RUNTIME_ARCH" \
       --target-os=darwin \
       --enable-cross-compile \
       --cc=clang \
@@ -399,12 +417,14 @@ build_ffmpeg_binary
 for binary in ffmpeg whisper-cli whisper-stream parakeet-cli-bin; do
   chmod 755 "$TARGET_BIN/$binary"
   codesign --force --sign - "$TARGET_BIN/$binary" >/dev/null 2>&1 || true
+  assert_binary_architecture "$TARGET_BIN/$binary"
 done
 chmod 755 "$TARGET_BIN/parakeet-cli"
 chmod 755 "$TARGET_LIB/libparakeet.dylib"
 for dylib in "$TARGET_LIB"/lib*.dylib; do
   chmod 755 "$dylib"
   codesign --force --sign - "$dylib" >/dev/null 2>&1 || true
+  assert_binary_architecture "$dylib"
 done
 
 assert_binary_portable "$TARGET_BIN/ffmpeg" "ffmpeg"

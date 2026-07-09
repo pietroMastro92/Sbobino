@@ -55,7 +55,11 @@ version = sys.argv[2]
 expected_assets = {
     "release-readiness-proof.json",
     "distribution-readiness-proof.json",
+    "intel-distribution-readiness-proof.json",
     "portability-smoke-report.json",
+    "intel-portability-smoke-report.json",
+    "AS-THIRD.validation-report.json",
+    "INTEL-PRIMARY.validation-report.json",
 }
 present_assets = {
     asset.get("name", "").strip()
@@ -83,7 +87,11 @@ gh release download "$TAG" \
   --dir "$TMP_DIR" \
   --pattern "release-readiness-proof.json" \
   --pattern "distribution-readiness-proof.json" \
-  --pattern "portability-smoke-report.json"
+  --pattern "intel-distribution-readiness-proof.json" \
+  --pattern "portability-smoke-report.json" \
+  --pattern "intel-portability-smoke-report.json" \
+  --pattern "AS-THIRD.validation-report.json" \
+  --pattern "INTEL-PRIMARY.validation-report.json"
 
 python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG"
 import json
@@ -124,6 +132,21 @@ if str(distribution.get("status", "")).strip().lower() != "passed":
 if str(distribution.get("gate", "")).strip() != "distribution_readiness.sh":
     raise SystemExit("Stable promotion blocked: distribution-readiness-proof.json gate mismatch.")
 
+intel_distribution = load_json(
+    report_dir / "intel-distribution-readiness-proof.json",
+    "intel-distribution-readiness-proof.json",
+)
+if int(intel_distribution.get("schema_version", 0)) != 1:
+    raise SystemExit(
+        "Stable promotion blocked: intel-distribution-readiness-proof.json has unsupported schema_version."
+    )
+if intel_distribution.get("version") != version or intel_distribution.get("release_tag") != tag:
+    raise SystemExit("Stable promotion blocked: Intel distribution readiness proof version mismatch.")
+if str(intel_distribution.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("Stable promotion blocked: Intel distribution readiness proof is not marked passed.")
+if str(intel_distribution.get("gate", "")).strip() != "distribution_readiness.sh":
+    raise SystemExit("Stable promotion blocked: Intel distribution readiness proof gate mismatch.")
+
 portability = load_json(
     report_dir / "portability-smoke-report.json",
     "portability-smoke-report.json",
@@ -139,41 +162,83 @@ if portability.get("release_tag") != tag:
 if str(portability.get("status", "")).strip().lower() != "passed":
     raise SystemExit("Stable promotion blocked: portability-smoke-report.json is not marked passed.")
 
-# AS-THIRD validation is optional. The release candidate workflow already
-# produces the required GitHub-hosted portability smoke report; when an
-# AS-THIRD report is attached, validate it strictly, but do not require the
-# user's private VM for stable promotion.
-as_third_path = report_dir / "AS-THIRD.validation-report.json"
-if as_third_path.is_file():
-    as_third = load_json(as_third_path, "AS-THIRD.validation-report.json")
-    if int(as_third.get("schema_version", 0)) != 1:
-        raise SystemExit(
-            "Stable promotion blocked: AS-THIRD.validation-report.json has unsupported schema_version."
-        )
-    if as_third.get("machine_class") != "AS-THIRD":
-        raise SystemExit("Stable promotion blocked: AS-THIRD validation report machine_class mismatch.")
-    if as_third.get("version") != version:
-        raise SystemExit("Stable promotion blocked: AS-THIRD validation report version mismatch.")
-    if as_third.get("release_tag") != tag:
-        raise SystemExit("Stable promotion blocked: AS-THIRD validation report release_tag mismatch.")
-    if str(as_third.get("status", "")).strip().lower() != "passed":
-        raise SystemExit("Stable promotion blocked: AS-THIRD validation report is not marked passed.")
-
-    as_third_results = as_third.get("scenario_results") or {}
-    required_as_third_scenarios = {
-        "clean_room_install",
-        "warm_restart",
-        "functional_parakeet_smoke",
-        "functional_diarization_smoke",
-    }
-    missing_as_third = sorted(
-        name for name in required_as_third_scenarios if as_third_results.get(name) != "passed"
+intel_portability = load_json(
+    report_dir / "intel-portability-smoke-report.json",
+    "intel-portability-smoke-report.json",
+)
+if int(intel_portability.get("schema_version", 0)) != 1:
+    raise SystemExit(
+        "Stable promotion blocked: intel-portability-smoke-report.json has unsupported schema_version."
     )
-    if missing_as_third:
-        raise SystemExit(
-            "Stable promotion blocked: AS-THIRD scenarios did not pass: "
-            + ", ".join(missing_as_third)
-        )
+if intel_portability.get("version") != version or intel_portability.get("release_tag") != tag:
+    raise SystemExit("Stable promotion blocked: Intel portability smoke report version mismatch.")
+if str(intel_portability.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("Stable promotion blocked: Intel portability smoke report is not marked passed.")
+
+as_third = load_json(
+    report_dir / "AS-THIRD.validation-report.json",
+    "AS-THIRD.validation-report.json",
+)
+if int(as_third.get("schema_version", 0)) != 1:
+    raise SystemExit(
+        "Stable promotion blocked: AS-THIRD.validation-report.json has unsupported schema_version."
+    )
+if as_third.get("machine_class") != "AS-THIRD":
+    raise SystemExit("Stable promotion blocked: AS-THIRD validation report machine_class mismatch.")
+if as_third.get("version") != version:
+    raise SystemExit("Stable promotion blocked: AS-THIRD validation report version mismatch.")
+if as_third.get("release_tag") != tag:
+    raise SystemExit("Stable promotion blocked: AS-THIRD validation report release_tag mismatch.")
+if str(as_third.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("Stable promotion blocked: AS-THIRD validation report is not marked passed.")
+
+as_third_results = as_third.get("scenario_results") or {}
+required_as_third_scenarios = {
+    "clean_room_install",
+    "warm_restart",
+    "functional_parakeet_smoke",
+    "functional_diarization_smoke",
+}
+missing_as_third = sorted(
+    name for name in required_as_third_scenarios if as_third_results.get(name) != "passed"
+)
+if missing_as_third:
+    raise SystemExit(
+        "Stable promotion blocked: AS-THIRD scenarios did not pass: "
+        + ", ".join(missing_as_third)
+    )
+
+intel_primary = load_json(
+    report_dir / "INTEL-PRIMARY.validation-report.json",
+    "INTEL-PRIMARY.validation-report.json",
+)
+if int(intel_primary.get("schema_version", 0)) != 1:
+    raise SystemExit(
+        "Stable promotion blocked: INTEL-PRIMARY.validation-report.json has unsupported schema_version."
+    )
+if intel_primary.get("machine_class") != "INTEL-PRIMARY":
+    raise SystemExit("Stable promotion blocked: INTEL-PRIMARY validation report machine_class mismatch.")
+if intel_primary.get("version") != version or intel_primary.get("release_tag") != tag:
+    raise SystemExit("Stable promotion blocked: INTEL-PRIMARY validation report version mismatch.")
+if str(intel_primary.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("Stable promotion blocked: INTEL-PRIMARY validation report is not marked passed.")
+
+intel_results = intel_primary.get("scenario_results") or {}
+required_intel_scenarios = {
+    "release_metadata_validation",
+    "bootstrap_layer_validation",
+    "clean_room_install",
+    "warm_restart",
+    "functional_diarization_smoke",
+}
+missing_intel = sorted(
+    name for name in required_intel_scenarios if intel_results.get(name) != "passed"
+)
+if missing_intel:
+    raise SystemExit(
+        "Stable promotion blocked: INTEL-PRIMARY scenarios did not pass: "
+        + ", ".join(missing_intel)
+    )
 PY
 
 gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease=false

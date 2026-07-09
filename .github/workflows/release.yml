@@ -12,8 +12,19 @@ permissions:
   contents: write
 
 jobs:
-  release-readiness:
-    runs-on: macos-14
+  build-native:
+    name: Build native macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-apple-darwin
+            runner: macos-14
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
     env:
       TAG_NAME: ${{ inputs.tag_name }}
     defaults:
@@ -21,43 +32,28 @@ jobs:
         working-directory: sbobino_desktop/apps/desktop
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
           cache-dependency-path: sbobino_desktop/apps/desktop/package-lock.json
 
-      - name: Check version coherence before packaging
-        run: |
-          VERSION="${TAG_NAME#v}"
-          ../../scripts/check_release_versions.sh "$VERSION"
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
-      - name: Verify Rust toolchain
-        run: |
-          command -v cargo
-          cargo --version
-          cargo metadata --no-deps --format-version 1 >/dev/null
-          rustc --version
+      - name: Install packaging dependencies
+        run: brew install whisper-cpp ffmpeg sdl2
 
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Install macOS runtime packaging dependencies
-        run: brew install whisper-cpp ffmpeg sdl2
-
-      - name: Prepare pyannote setup assets
+      - name: Hydrate native Pyannote assets
         run: ../../scripts/setup_bundled_pyannote.sh --force
 
       - name: Inject updater public key
@@ -65,7 +61,7 @@ jobs:
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
         run: ../../scripts/prepare_release_updater_config.sh src-tauri/tauri.conf.json "$TAURI_UPDATER_PUBLIC_KEY"
 
-      - name: Build bundles
+      - name: Build, sign, and stage native artifacts
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -73,391 +69,270 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          if [[ -z "$APPLE_CERTIFICATE" || -z "$APPLE_CERTIFICATE_PASSWORD" || -z "$APPLE_SIGNING_IDENTITY" ]]; then
-            echo "Apple signing secrets are not configured; building unsigned macOS bundles."
-            unset APPLE_CERTIFICATE
-            unset APPLE_CERTIFICATE_PASSWORD
-            unset APPLE_SIGNING_IDENTITY
+          VERSION="${TAG_NAME#v}"
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY is required for release candidates." >&2
+            exit 1
           fi
-          npm run tauri:build -- --target aarch64-apple-darwin --bundles app
+          if [[ -z "$APPLE_CERTIFICATE" || -z "$APPLE_CERTIFICATE_PASSWORD" || -z "$APPLE_SIGNING_IDENTITY" ]]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
+            CODESIGN_IDENTITY="-"
+          else
+            CODESIGN_IDENTITY="$APPLE_SIGNING_IDENTITY"
+          fi
 
-      - name: Re-sign bundled app and updater artifact
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          APP_DIR=../../target/aarch64-apple-darwin/release/bundle/macos
-          APP_NAME="Sbobino.app"
-          APP_PATH="$APP_DIR/$APP_NAME"
+          npm run tauri:build -- --target "${{ matrix.target }}" --bundles app
+
+          BUNDLE_DIR="../../target/${{ matrix.target }}/release/bundle"
+          APP_DIR="$BUNDLE_DIR/macos"
+          APP_PATH="$APP_DIR/Sbobino.app"
           UPDATER_TAR="$APP_DIR/Sbobino.app.tar.gz"
           UPDATER_SIG="$UPDATER_TAR.sig"
+          STAGING_DIR="$RUNNER_TEMP/sbobino-${{ matrix.arch }}"
+          mkdir -p "$STAGING_DIR"
 
-          codesign --force --deep --sign - "$APP_PATH"
+          codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
           rm -f "$UPDATER_TAR" "$UPDATER_SIG"
-          COPYFILE_DISABLE=1 tar -czf "$UPDATER_TAR" -C "$APP_DIR" "$APP_NAME"
+          COPYFILE_DISABLE=1 tar -czf "$UPDATER_TAR" -C "$APP_DIR" "Sbobino.app"
           npx tauri signer sign "$UPDATER_TAR"
 
-      - name: Create standalone macOS DMG
-        run: |
-          APP_DIR=../../target/aarch64-apple-darwin/release/bundle/macos
-          DMG_DIR=../../target/aarch64-apple-darwin/release/bundle/dmg
-          APP_NAME="Sbobino.app"
-          VERSION="${TAG_NAME#v}"
-          DMG_NAME="Sbobino_${VERSION}_aarch64.dmg"
-          STAGING_DIR=$(mktemp -d)
+          DMG_STAGE=$(mktemp -d)
+          cp -R "$APP_PATH" "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          hdiutil create -volname "Sbobino" -srcfolder "$DMG_STAGE" -ov -format UDZO \
+            "$STAGING_DIR/Sbobino_${VERSION}_${{ matrix.arch }}.dmg"
 
-          mkdir -p "$DMG_DIR"
-          cp -R "$APP_DIR/$APP_NAME" "$STAGING_DIR/"
-          ln -s /Applications "$STAGING_DIR/Applications"
-
-          hdiutil create \
-            -volname "Sbobino" \
-            -srcfolder "$STAGING_DIR" \
-            -ov \
-            -format UDZO \
-            "$DMG_DIR/$DMG_NAME"
-
-      - name: Run release readiness gate
-        run: |
-          VERSION="${TAG_NAME#v}"
-          APP_PATH=../../target/aarch64-apple-darwin/release/bundle/macos/Sbobino.app
-          chmod +x ../../scripts/check_release_versions.sh ../../scripts/release_readiness.sh
-          ../../scripts/release_readiness.sh "$VERSION" "$APP_PATH"
-
-      - name: Package pyannote repair assets
-        run: |
-          ASSET_DIR=../../target/aarch64-apple-darwin/release/bundle/pyannote-release
-          mkdir -p "$ASSET_DIR"
+          ../../scripts/package_macos_runtime_asset.sh \
+            "$STAGING_DIR/speech-runtime-macos-${{ matrix.arch }}.zip"
           ../../scripts/package_pyannote_asset.sh \
-            src-tauri/resources/pyannote/python/aarch64-apple-darwin \
+            "src-tauri/resources/pyannote/python/${{ matrix.target }}" \
             python \
-            "$ASSET_DIR/pyannote-runtime-macos-aarch64.zip"
+            "$STAGING_DIR/pyannote-runtime-macos-${{ matrix.arch }}.zip"
           ../../scripts/package_pyannote_asset.sh \
-            src-tauri/resources/pyannote/model \
+            "src-tauri/resources/pyannote/model" \
             model \
-            "$ASSET_DIR/pyannote-model-community-1.zip"
+            "$STAGING_DIR/pyannote-model-community-1.zip"
 
-      - name: Package local runtime setup assets
-        run: |
-          ASSET_DIR=../../target/aarch64-apple-darwin/release/bundle/runtime-release
-          mkdir -p "$ASSET_DIR"
-          ../../scripts/package_macos_runtime_asset.sh "$ASSET_DIR/speech-runtime-macos-aarch64.zip"
+          SBOBINO_RELEASE_TARGET_TRIPLE="${{ matrix.target }}" \
+            ../../scripts/release_readiness.sh "$VERSION" "$APP_PATH"
 
-      - name: Generate release setup manifests
-        run: |
-          RELEASE_ASSET_DIR=../../target/aarch64-apple-darwin/release/bundle/release-assets
-          PYANNOTE_DIR=../../target/aarch64-apple-darwin/release/bundle/pyannote-release
-          RUNTIME_DIR=../../target/aarch64-apple-darwin/release/bundle/runtime-release
-          mkdir -p "$RELEASE_ASSET_DIR"
-          cp "$PYANNOTE_DIR/pyannote-runtime-macos-aarch64.zip" "$RELEASE_ASSET_DIR/"
-          cp "$PYANNOTE_DIR/pyannote-model-community-1.zip" "$RELEASE_ASSET_DIR/"
-          cp "$RUNTIME_DIR/speech-runtime-macos-aarch64.zip" "$RELEASE_ASSET_DIR/"
-          ../../scripts/generate_release_manifests.sh "${TAG_NAME#v}" "$RELEASE_ASSET_DIR"
-          cp "$RELEASE_ASSET_DIR/pyannote-manifest.json" "$PYANNOTE_DIR/"
-          cp "$RELEASE_ASSET_DIR/runtime-manifest.json" "$RUNTIME_DIR/"
+          cp "$UPDATER_TAR" "$STAGING_DIR/Sbobino_${VERSION}_${{ matrix.arch }}.app.tar.gz"
+          cp "$UPDATER_SIG" "$STAGING_DIR/Sbobino_${VERSION}_${{ matrix.arch }}.app.tar.gz.sig"
 
-      - name: Notarize and staple macOS DMG
+      - name: Notarize and staple native DMG
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           if [[ -z "$APPLE_ID" || -z "$APPLE_PASSWORD" || -z "$APPLE_TEAM_ID" ]]; then
-            echo "Apple notarization secrets are not configured; skipping notarization."
+            echo "Apple notarization credentials are not configured; keeping the native DMG unsigned."
             exit 0
           fi
-          shopt -s nullglob
-          for dmg in ../../target/aarch64-apple-darwin/release/bundle/dmg/*.dmg; do
-            xcrun notarytool submit "$dmg" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
-              --wait
-            xcrun stapler staple "$dmg"
-          done
+          VERSION="${TAG_NAME#v}"
+          DMG="$RUNNER_TEMP/sbobino-${{ matrix.arch }}/Sbobino_${VERSION}_${{ matrix.arch }}.dmg"
+          xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$DMG"
 
-      - name: Upload build artifacts
+      - name: Upload native staging artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sbobino-macos-arm64
-          path: |
-            sbobino_desktop/target/aarch64-apple-darwin/release/bundle/**
+          name: sbobino-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/sbobino-${{ matrix.arch }}/*
+          if-no-files-found: error
 
   publish-candidate:
-    needs: release-readiness
+    needs: build-native
     runs-on: ubuntu-latest
     env:
       TAG_NAME: ${{ inputs.tag_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: sbobino-macos-arm64
-          path: dist
+          name: sbobino-macos-aarch64
+          path: sbobino_desktop/dist/staging/aarch64
 
-      - name: Assemble candidate release directory
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbobino-macos-x86_64
+          path: sbobino_desktop/dist/staging/x86_64
+
+      - name: Assemble and publish the dual-architecture candidate
         working-directory: sbobino_desktop
         run: |
           VERSION="${TAG_NAME#v}"
-          ASSET_DIR="$PWD/dist/github-release/v$VERSION"
-          mkdir -p "$ASSET_DIR"
-
-          cp "../dist/dmg/Sbobino_${VERSION}_aarch64.dmg" "$ASSET_DIR/"
-          cp "../dist/macos/Sbobino.app.tar.gz" "$ASSET_DIR/"
-          cp "../dist/macos/Sbobino.app.tar.gz.sig" "$ASSET_DIR/"
-          cp "../dist/release-assets/setup-manifest.json" "$ASSET_DIR/"
-          cp "../dist/runtime-release/speech-runtime-macos-aarch64.zip" "$ASSET_DIR/"
-          cp "../dist/runtime-release/runtime-manifest.json" "$ASSET_DIR/"
-          cp "../dist/pyannote-release/pyannote-runtime-macos-aarch64.zip" "$ASSET_DIR/"
-          cp "../dist/pyannote-release/pyannote-model-community-1.zip" "$ASSET_DIR/"
-          cp "../dist/pyannote-release/pyannote-manifest.json" "$ASSET_DIR/"
-
-      - name: Generate release notes
-        working-directory: sbobino_desktop
-        run: |
-          VERSION="${TAG_NAME#v}"
-          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG_NAME}^" 2>/dev/null || true)
-          if [[ -z "$PREV_TAG" ]]; then
-            # First release ever: walk every reachable commit.
-            PREV_TAG=""
-          fi
-          mkdir -p "dist/github-release/v$VERSION"
-          python3 ./scripts/generate_codex_style_release_notes.py \
+          OUTPUT_DIR="$PWD/dist/github-release/v$VERSION"
+          ./scripts/assemble_local_release.sh \
             "$VERSION" \
-            "$PREV_TAG" \
-            "$TAG_NAME" \
-            --out "dist/github-release/v$VERSION/release-notes.md"
-
-      - name: Generate updater feed
-        working-directory: sbobino_desktop
-        run: |
-          VERSION="${TAG_NAME#v}"
-          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          SIGNATURE=$(tr -d '\n' < "dist/github-release/v$VERSION/Sbobino.app.tar.gz.sig")
-          NOTES=$(cat "dist/github-release/v$VERSION/release-notes.md")
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/Sbobino.app.tar.gz"
-
-          jq -n \
-            --arg version "$VERSION" \
-            --arg notes "$NOTES" \
-            --arg pub_date "$PUB_DATE" \
-            --arg url "$URL" \
-            --arg signature "$SIGNATURE" \
-            '{
-              version: $version,
-              notes: $notes,
-              pub_date: $pub_date,
-              platforms: {
-                "darwin-aarch64": {
-                  url: $url,
-                  signature: $signature
-                }
-              }
-            }' > "dist/github-release/v$VERSION/latest.json"
-
-      - name: Generate release candidate metadata
-        working-directory: sbobino_desktop
-        run: |
-          VERSION="${TAG_NAME#v}"
-          python3 ./scripts/generate_release_candidate_metadata.py \
-            "$PWD/dist/github-release/v$VERSION" \
-            "$VERSION" \
-            --release-profile public \
-            --commit-sha "$(git rev-parse HEAD)"
-
-      - name: Publish prerelease candidate
-        working-directory: sbobino_desktop
-        run: |
-          VERSION="${TAG_NAME#v}"
-          ./scripts/publish_candidate_release.sh "$VERSION" "$GITHUB_REPOSITORY" "$PWD/dist/github-release/v$VERSION"
+            "$PWD/dist/staging/aarch64" \
+            "$PWD/dist/staging/x86_64" \
+            "$OUTPUT_DIR"
+          ./scripts/publish_candidate_release.sh "$VERSION" "$GITHUB_REPOSITORY" "$OUTPUT_DIR"
 
   distribution-readiness:
-    # macos-14 is required: distribution_readiness.sh extracts the pyannote
-    # runtime zip and runs its bundled aarch64 python3 to smoke-test imports.
-    # ubuntu cannot exec the Mach-O binary.
     needs: publish-candidate
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-14
+            proof: distribution-readiness-proof.json
+          - arch: x86_64
+            runner: macos-15-intel
+            proof: intel-distribution-readiness-proof.json
+    runs-on: ${{ matrix.runner }}
     env:
       TAG_NAME: ${{ inputs.tag_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
-      - name: Run distribution readiness
+      - name: Validate public assets on the matching architecture
         working-directory: sbobino_desktop
-        run: |
-          VERSION="${TAG_NAME#v}"
-          ./scripts/distribution_readiness.sh "$VERSION" "$GITHUB_REPOSITORY"
+        run: ./scripts/distribution_readiness.sh "${TAG_NAME#v}" "$GITHUB_REPOSITORY"
 
-      - name: Write distribution readiness proof
+      - name: Write architecture proof
         working-directory: sbobino_desktop
         run: |
-          VERSION="${TAG_NAME#v}"
           python3 ./scripts/write_distribution_readiness_proof.py \
-            "$PWD/distribution-readiness-proof.json" \
-            "$VERSION" \
+            "$PWD/${{ matrix.proof }}" \
+            "${TAG_NAME#v}" \
             --repo-slug "$GITHUB_REPOSITORY" \
             --commit-sha "$(git rev-parse HEAD)"
 
-      - name: Upload distribution readiness artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: distribution-readiness-proof
-          path: sbobino_desktop/distribution-readiness-proof.json
+          name: distribution-readiness-${{ matrix.arch }}
+          path: sbobino_desktop/${{ matrix.proof }}
 
   portability-smoke:
-    # Clean-room third-party Mac simulation on a hosted macos-14 VM. A fresh VM
-    # means no Homebrew, no dev env, no login keychain residue — so a DMG that
-    # installs and launches here will install and launch on any third-party
-    # Apple Silicon Mac that accepts Gatekeeper. A dedicated login keychain is
-    # created so the app's secure_storage can write `master_key_v1` without an
-    # interactive prompt.
     needs: publish-candidate
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-14
+            report: portability-smoke-report.json
+          - arch: x86_64
+            runner: macos-15-intel
+            report: intel-portability-smoke-report.json
+    runs-on: ${{ matrix.runner }}
     env:
       TAG_NAME: ${{ inputs.tag_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
       - name: Bootstrap headless login keychain
         run: |
-          # Hosted macos-14 runners start with no unlocked login keychain.
-          # Without one, `security add-generic-password` (used by the app's
-          # secure storage) raises an interactive prompt that headless CI
-          # cannot answer. Create and unlock an empty keychain up-front.
           KC="$HOME/Library/Keychains/login.keychain-db"
-          if [[ ! -f "$KC" ]]; then
-            security create-keychain -p "" "$KC"
-          fi
+          if [[ ! -f "$KC" ]]; then security create-keychain -p "" "$KC"; fi
           security default-keychain -s "$KC"
           security unlock-keychain -p "" "$KC"
           security set-keychain-settings "$KC"
 
-      - name: Download candidate DMG
+      - name: Download and install matching native DMG
         working-directory: sbobino_desktop
         run: |
           VERSION="${TAG_NAME#v}"
           mkdir -p dist/portability
           gh release download "v$VERSION" \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern "Sbobino_${VERSION}_aarch64.dmg" \
+            --pattern "Sbobino_${VERSION}_${{ matrix.arch }}.dmg" \
             --dir dist/portability
-
-      - name: Install app from DMG
-        working-directory: sbobino_desktop
-        run: |
-          VERSION="${TAG_NAME#v}"
-          DMG="dist/portability/Sbobino_${VERSION}_aarch64.dmg"
           MNT=$(mktemp -d)
-          hdiutil attach "$DMG" -nobrowse -quiet -mountpoint "$MNT"
+          hdiutil attach "dist/portability/Sbobino_${VERSION}_${{ matrix.arch }}.dmg" -nobrowse -quiet -mountpoint "$MNT"
           sudo rm -rf /Applications/Sbobino.app
           /usr/bin/ditto "$MNT/Sbobino.app" /Applications/Sbobino.app
           hdiutil detach "$MNT" -quiet
           xattr -dr com.apple.quarantine /Applications/Sbobino.app || true
 
-      - name: Launch app and confirm it stays alive
+      - name: Launch app and confirm it remains alive
         working-directory: sbobino_desktop
         run: |
           /Applications/Sbobino.app/Contents/MacOS/sbobino-desktop >launch.log 2>&1 &
           APP_PID=$!
-          echo "launched PID=$APP_PID"
           sleep 15
-          if kill -0 "$APP_PID" 2>/dev/null; then
-            echo "App alive after 15s — portability smoke passed."
-            kill "$APP_PID" || true
-            wait "$APP_PID" 2>/dev/null || true
-            exit 0
+          if ! kill -0 "$APP_PID" 2>/dev/null; then
+            wait "$APP_PID" || true
+            tail -80 launch.log >&2 || true
+            exit 1
           fi
-          wait "$APP_PID" 2>/dev/null
-          EXIT=$?
-          echo "App exited prematurely with status $EXIT" >&2
-          echo "---launch.log---" >&2
-          tail -80 launch.log >&2 || true
-          exit 1
+          kill "$APP_PID" || true
+          wait "$APP_PID" 2>/dev/null || true
 
-      - name: Write portability smoke report
+      - name: Write portability report
         if: always()
         working-directory: sbobino_desktop
         run: |
-          VERSION="${TAG_NAME#v}"
-          STATUS="passed"
-          if [[ "${{ job.status }}" != "success" ]]; then
-            STATUS="failed"
-          fi
-          cat > portability-smoke-report.json <<EOF
+          STATUS=passed
+          if [[ "${{ job.status }}" != "success" ]]; then STATUS=failed; fi
+          cat >"${{ matrix.report }}" <<EOF
           {
             "schema_version": 1,
-            "version": "${VERSION}",
+            "version": "${TAG_NAME#v}",
             "release_tag": "${TAG_NAME}",
+            "architecture": "${{ matrix.arch }}",
             "status": "${STATUS}",
-            "runner": "github-hosted macos-14",
+            "runner": "github-hosted ${{ matrix.runner }}",
             "machine_class": "HOSTED-CLEANROOM",
             "tested_at_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
             "commit_sha": "$(git rev-parse HEAD)"
           }
           EOF
 
-      - name: Upload portability smoke report
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: portability-smoke-report
-          path: sbobino_desktop/portability-smoke-report.json
+          name: portability-smoke-${{ matrix.arch }}
+          path: sbobino_desktop/${{ matrix.report }}
 
   upload-validation-assets:
-    needs:
-      - publish-candidate
-      - distribution-readiness
-      - portability-smoke
+    needs: [distribution-readiness, portability-smoke]
     if: always()
     runs-on: ubuntu-latest
     env:
       TAG_NAME: ${{ inputs.tag_name }}
       GH_TOKEN: ${{ github.token }}
-      DISTRIBUTION_RESULT: ${{ needs.distribution-readiness.result }}
-      PORTABILITY_RESULT: ${{ needs.portability-smoke.result }}
     steps:
-      - name: Download distribution readiness proof
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: distribution-readiness-proof
+          name: distribution-readiness-aarch64
           path: validation-assets
 
-      - name: Download portability smoke report
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: portability-smoke-report
+          name: distribution-readiness-x86_64
           path: validation-assets
 
-      - name: Upload validation assets to prerelease
-        run: |
-          gh release upload "$TAG_NAME" \
-            validation-assets/distribution-readiness-proof.json \
-            validation-assets/portability-smoke-report.json \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
+      - uses: actions/download-artifact@v4
+        with:
+          name: portability-smoke-aarch64
+          path: validation-assets
 
-      - name: Fail workflow if mandatory validation failed
+      - uses: actions/download-artifact@v4
+        with:
+          name: portability-smoke-x86_64
+          path: validation-assets
+
+      - name: Upload validation assets to the prerelease
+        run: gh release upload "$TAG_NAME" validation-assets/*.json --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Fail when either native validation path failed
         run: |
-          echo "distribution-readiness: $DISTRIBUTION_RESULT"
-          echo "portability-smoke: $PORTABILITY_RESULT"
-          if [[ "$DISTRIBUTION_RESULT" != "success" || "$PORTABILITY_RESULT" != "success" ]]; then
-            echo "Release candidate validation did not fully pass." >&2
-            exit 1
-          fi
+          [[ "${{ needs.distribution-readiness.result }}" == "success" ]]
+          [[ "${{ needs.portability-smoke.result }}" == "success" ]]

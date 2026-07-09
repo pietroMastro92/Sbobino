@@ -14,7 +14,7 @@ JSON report. Supported machine classes:
 Environment variables:
   SBOBINO_VALIDATION_DATA_DIR        Override app data dir
   SBOBINO_VALIDATION_APP_PATH        Override installed app path
-  SBOBINO_VALIDATION_FIXTURE_AUDIO   Audio fixture used for diarization smoke on Apple Silicon
+  SBOBINO_VALIDATION_FIXTURE_AUDIO   Audio fixture used for diarization smoke
   SBOBINO_VALIDATION_PARAKEET_MODEL  Parakeet GGUF used for AS-THIRD app smoke
   SBOBINO_VALIDATION_TIMEOUT_SECONDS Timeout for setup/runtime readiness waits (default: 2400)
   SBOBINO_VALIDATION_PRIVACY_VERSION Privacy policy version to seed into settings.json
@@ -38,6 +38,9 @@ default_fixture_audio() {
   case "${MACHINE_CLASS:-}" in
     AS-THIRD)
       printf '%s\n' "$HOME/Fixtures/as-third-diarization.wav"
+      ;;
+    INTEL-PRIMARY)
+      printf '%s\n' "$HOME/Fixtures/intel-primary-diarization.wav"
       ;;
     *)
       printf '%s\n' ""
@@ -111,6 +114,7 @@ need_cmd cargo
 need_cmd curl
 need_cmd ditto
 need_cmd hdiutil
+need_cmd lipo
 need_cmd open
 need_cmd python3
 need_cmd sw_vers
@@ -198,11 +202,16 @@ definitions = {
         "required": [
             "release_metadata_validation",
             "bootstrap_layer_validation",
+            "clean_room_install",
+            "warm_restart",
+            "functional_diarization_smoke",
         ],
         "results": {
             "release_metadata_validation": release_metadata_validation,
             "bootstrap_layer_validation": bootstrap_layer_validation,
-            "arm64_binary_execution": arm64_binary_execution,
+            "clean_room_install": clean_room_install,
+            "warm_restart": warm_restart,
+            "functional_diarization_smoke": functional_diarization_smoke,
         },
         "runner_label": "self-hosted,macOS,X64,intel-primary",
     },
@@ -270,10 +279,11 @@ download_asset() {
 
 install_app_from_dmg() {
   local version_arg=$1
-  local dmg_path="$TMP_DIR/Sbobino_${version_arg}_aarch64.dmg"
-  local mount_dir="$TMP_DIR/mount-${version_arg}"
+  local arch=${2:-aarch64}
+  local dmg_path="$TMP_DIR/Sbobino_${version_arg}_${arch}.dmg"
+  local mount_dir="$TMP_DIR/mount-${version_arg}-${arch}"
   mkdir -p "$mount_dir"
-  download_asset "$version_arg" "Sbobino_${version_arg}_aarch64.dmg" "$dmg_path"
+  download_asset "$version_arg" "Sbobino_${version_arg}_${arch}.dmg" "$dmg_path"
   hdiutil attach "$dmg_path" -nobrowse -mountpoint "$mount_dir" -quiet
   rm -rf "$APP_PATH"
   /usr/bin/ditto "$mount_dir/Sbobino.app" "$APP_PATH"
@@ -622,10 +632,10 @@ validate_intel_primary() {
   "$ROOT_DIR/scripts/distribution_readiness.sh" "$VERSION" "$REPO_SLUG"
   SCENARIO_RELEASE_METADATA_VALIDATION="passed"
 
-  local dmg_path="$TMP_DIR/Sbobino_${VERSION}_aarch64.dmg"
+  local dmg_path="$TMP_DIR/Sbobino_${VERSION}_x86_64.dmg"
   local mount_dir="$TMP_DIR/mount-intel"
   mkdir -p "$mount_dir"
-  download_asset "$VERSION" "Sbobino_${VERSION}_aarch64.dmg" "$dmg_path"
+  download_asset "$VERSION" "Sbobino_${VERSION}_x86_64.dmg" "$dmg_path"
   hdiutil attach "$dmg_path" -nobrowse -mountpoint "$mount_dir" -quiet
 
   if [[ ! -d "$mount_dir/Sbobino.app" ]]; then
@@ -640,16 +650,39 @@ validate_intel_primary() {
     fail_validation "Mounted app bundle version '$plist_version' does not match expected version '$VERSION'."
   fi
 
-  if [[ ! -x "$mount_dir/Sbobino.app/Contents/MacOS/Sbobino" ]]; then
+  local executable_name
+  executable_name=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$mount_dir/Sbobino.app/Contents/Info.plist")
+  local app_executable="$mount_dir/Sbobino.app/Contents/MacOS/$executable_name"
+  if [[ ! -x "$app_executable" ]]; then
     hdiutil detach "$mount_dir" -quiet || true
     fail_validation "Mounted app bundle is missing the Sbobino executable."
+  fi
+  if [[ " $(lipo -archs "$app_executable") " != *" x86_64 "* ]]; then
+    hdiutil detach "$mount_dir" -quiet || true
+    fail_validation "Mounted app bundle is not an x86_64-native executable."
   fi
 
   hdiutil detach "$mount_dir" -quiet || true
 
   SCENARIO_BOOTSTRAP_LAYER_VALIDATION="passed"
+  clear_install_state
+  install_app_from_dmg "$VERSION" x86_64
+  seed_privacy_acceptance
+  set_speaker_diarization_enabled 1
+  launch_app
+  wait_for_setup_report_success "$TIMEOUT_SECONDS"
+  wait_for_runtime_health_ready "$TIMEOUT_SECONDS" 1
+  SCENARIO_CLEAN_ROOM_INSTALL="passed"
+
+  quit_app
+  launch_app
+  wait_for_runtime_health_ready 900 1
+  SCENARIO_WARM_RESTART="passed"
+
+  run_diarization_smoke
+  SCENARIO_FUNCTIONAL_DIARIZATION_SMOKE="passed"
   SCENARIO_ARM64_BINARY_EXECUTION="not_applicable"
-  record_success "soft_pass" "Intel runner validated release metadata and bootstrap artifacts for the arm64 candidate."
+  record_success "passed" "Intel runner completed native clean-room setup, warm restart, and diarization validation."
 }
 
 validate_as_third() {

@@ -39,14 +39,19 @@ fi
 
 required_assets=(
   "Sbobino_${VERSION}_aarch64.dmg"
-  "Sbobino.app.tar.gz"
-  "Sbobino.app.tar.gz.sig"
+  "Sbobino_${VERSION}_x86_64.dmg"
+  "Sbobino_${VERSION}_aarch64.app.tar.gz"
+  "Sbobino_${VERSION}_aarch64.app.tar.gz.sig"
+  "Sbobino_${VERSION}_x86_64.app.tar.gz"
+  "Sbobino_${VERSION}_x86_64.app.tar.gz.sig"
   "latest.json"
   "setup-manifest.json"
   "runtime-manifest.json"
   "speech-runtime-macos-aarch64.zip"
+  "speech-runtime-macos-x86_64.zip"
   "pyannote-manifest.json"
   "pyannote-runtime-macos-aarch64.zip"
+  "pyannote-runtime-macos-x86_64.zip"
   "pyannote-model-community-1.zip"
   "release-notes.md"
   "release-readiness-proof.json"
@@ -103,6 +108,15 @@ pyannote = json.loads((asset_dir / "pyannote-manifest.json").read_text(encoding=
 expected_tag = f"v{version}"
 if latest.get("version") != version:
     raise SystemExit("latest.json version does not match requested release version.")
+for arch, target in (("aarch64", "darwin-aarch64"), ("x86_64", "darwin-x86_64")):
+    platform = latest.get("platforms", {}).get(target)
+    if not isinstance(platform, dict):
+        raise SystemExit(f"latest.json is missing {target} updater metadata.")
+    updater_tar = f"Sbobino_{version}_{arch}.app.tar.gz"
+    if not str(platform.get("url", "")).endswith(f"/{updater_tar}"):
+        raise SystemExit(f"latest.json {target} updater URL is not architecture-matched.")
+    if str(platform.get("signature", "")).strip() != (asset_dir / f"{updater_tar}.sig").read_text().strip():
+        raise SystemExit(f"latest.json {target} updater signature mismatch.")
 if setup.get("app_version") != version or setup.get("release_tag") != expected_tag:
     raise SystemExit("setup-manifest.json does not match requested release version/tag.")
 if runtime.get("app_version") != version:
@@ -126,21 +140,11 @@ pyannote_assets = {
     if isinstance(asset, dict)
 }
 
-runtime_release = runtime_assets.get("speech_runtime_macos_aarch64")
-if not isinstance(runtime_release, dict):
-    raise SystemExit("runtime-manifest.json missing speech_runtime_macos_aarch64 asset.")
-
-pyannote_runtime = pyannote_assets.get("pyannote_runtime_macos_aarch64")
 pyannote_model = pyannote_assets.get("pyannote_model")
-if not isinstance(pyannote_runtime, dict):
-    raise SystemExit("pyannote-manifest.json missing pyannote runtime asset.")
 if not isinstance(pyannote_model, dict):
     raise SystemExit("pyannote-manifest.json missing pyannote model asset.")
 
-def assert_descriptor_matches_asset(descriptor_key: str, release_asset: dict, label: str) -> None:
-    descriptor = setup.get(descriptor_key)
-    if not isinstance(descriptor, dict):
-        raise SystemExit(f"setup-manifest.json missing descriptor: {descriptor_key}")
+def assert_descriptor_matches_asset(descriptor: dict, release_asset: dict, label: str) -> None:
     if descriptor.get("name") != release_asset.get("name"):
         raise SystemExit(f"{label} name mismatch between setup and release manifest.")
     if str(descriptor.get("sha256", "")).strip().lower() != str(
@@ -148,9 +152,25 @@ def assert_descriptor_matches_asset(descriptor_key: str, release_asset: dict, la
     ).strip().lower():
         raise SystemExit(f"{label} checksum mismatch between setup and release manifest.")
 
-assert_descriptor_matches_asset("runtime_asset", runtime_release, "runtime asset")
-assert_descriptor_matches_asset("pyannote_runtime_asset", pyannote_runtime, "pyannote runtime asset")
-assert_descriptor_matches_asset("pyannote_model_asset", pyannote_model, "pyannote model asset")
+for arch, target, runtime_kind, pyannote_kind in (
+    ("aarch64", "aarch64-apple-darwin", "speech_runtime_macos_aarch64", "pyannote_runtime_macos_aarch64"),
+    ("x86_64", "x86_64-apple-darwin", "speech_runtime_macos_x86_64", "pyannote_runtime_macos_x86_64"),
+):
+    runtime_release = runtime_assets.get(runtime_kind)
+    pyannote_runtime = pyannote_assets.get(pyannote_kind)
+    if not isinstance(runtime_release, dict) or not isinstance(pyannote_runtime, dict):
+        raise SystemExit(f"release manifests are missing {arch} runtime assets.")
+    runtime_descriptor = setup.get("runtime_assets", {}).get(target)
+    pyannote_descriptor = setup.get("pyannote_runtime_assets", {}).get(target)
+    if not isinstance(runtime_descriptor, dict) or not isinstance(pyannote_descriptor, dict):
+        raise SystemExit(f"setup-manifest.json is missing {arch} runtime descriptors.")
+    assert_descriptor_matches_asset(runtime_descriptor, runtime_release, f"{arch} runtime asset")
+    assert_descriptor_matches_asset(pyannote_descriptor, pyannote_runtime, f"{arch} pyannote runtime asset")
+
+model_descriptor = setup.get("pyannote_model_asset")
+if not isinstance(model_descriptor, dict):
+    raise SystemExit("setup-manifest.json is missing the pyannote model descriptor.")
+assert_descriptor_matches_asset(model_descriptor, pyannote_model, "pyannote model asset")
 
 PY
 
@@ -172,13 +192,18 @@ gh release create "$TAG" \
 
 gh release upload "$TAG" \
   "$ASSET_DIR/Sbobino_${VERSION}_aarch64.dmg" \
-  "$ASSET_DIR/Sbobino.app.tar.gz" \
-  "$ASSET_DIR/Sbobino.app.tar.gz.sig" \
+  "$ASSET_DIR/Sbobino_${VERSION}_x86_64.dmg" \
+  "$ASSET_DIR/Sbobino_${VERSION}_aarch64.app.tar.gz" \
+  "$ASSET_DIR/Sbobino_${VERSION}_aarch64.app.tar.gz.sig" \
+  "$ASSET_DIR/Sbobino_${VERSION}_x86_64.app.tar.gz" \
+  "$ASSET_DIR/Sbobino_${VERSION}_x86_64.app.tar.gz.sig" \
   "$ASSET_DIR/latest.json" \
   "$ASSET_DIR/setup-manifest.json" \
   "$ASSET_DIR/speech-runtime-macos-aarch64.zip" \
+  "$ASSET_DIR/speech-runtime-macos-x86_64.zip" \
   "$ASSET_DIR/runtime-manifest.json" \
   "$ASSET_DIR/pyannote-runtime-macos-aarch64.zip" \
+  "$ASSET_DIR/pyannote-runtime-macos-x86_64.zip" \
   "$ASSET_DIR/pyannote-model-community-1.zip" \
   "$ASSET_DIR/pyannote-manifest.json" \
   "$ASSET_DIR/release-readiness-proof.json" \
@@ -191,7 +216,8 @@ Prerelease candidate published successfully:
 
 Next required steps:
   1. ./scripts/distribution_readiness.sh "$VERSION" "$REPO_SLUG"
-  2. Run portability smoke on a hosted macos-14 runner (automated in release.yml)
+  2. Run hosted ARM64 and Intel portability smoke (automated in release.yml)
   3. ./scripts/run_release_vm_gate.sh "$VERSION" "$REPO_SLUG"
-  4. ./scripts/promote_candidate_release.sh "$VERSION" "$REPO_SLUG"
+  4. Run ./scripts/run_release_machine_validation.sh INTEL-PRIMARY "$VERSION" "$REPO_SLUG"
+  5. ./scripts/promote_candidate_release.sh "$VERSION" "$REPO_SLUG"
 EOF

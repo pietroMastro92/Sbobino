@@ -13,6 +13,15 @@ BASE_URL="https://github.com/$REPO_SLUG/releases/download/$TAG"
 TEMP_DIR=$(mktemp -d)
 CACHE_BUSTER=$(date +%s)
 
+case "$(uname -m)" in
+  arm64) RELEASE_ARCH=aarch64 ;;
+  x86_64) RELEASE_ARCH=x86_64 ;;
+  *)
+    echo "Unsupported macOS architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
 cleanup() {
   rm -rf "$TEMP_DIR"
 }
@@ -29,6 +38,8 @@ need_cmd curl
 need_cmd python3
 need_cmd shasum
 need_cmd ditto
+need_cmd lipo
+need_cmd otool
 
 RELEASE_API_URL="https://api.github.com/repos/$REPO_SLUG/releases/tags/$TAG"
 
@@ -62,14 +73,19 @@ PY
 
 ASSETS=(
   "Sbobino_${VERSION}_aarch64.dmg"
-  "Sbobino.app.tar.gz"
-  "Sbobino.app.tar.gz.sig"
+  "Sbobino_${VERSION}_x86_64.dmg"
+  "Sbobino_${VERSION}_aarch64.app.tar.gz"
+  "Sbobino_${VERSION}_aarch64.app.tar.gz.sig"
+  "Sbobino_${VERSION}_x86_64.app.tar.gz"
+  "Sbobino_${VERSION}_x86_64.app.tar.gz.sig"
   "latest.json"
   "setup-manifest.json"
   "runtime-manifest.json"
   "speech-runtime-macos-aarch64.zip"
+  "speech-runtime-macos-x86_64.zip"
   "pyannote-manifest.json"
   "pyannote-runtime-macos-aarch64.zip"
+  "pyannote-runtime-macos-x86_64.zip"
   "pyannote-model-community-1.zip"
 )
 
@@ -95,13 +111,13 @@ for asset in "${ASSETS[@]}"; do
   download_asset "$asset"
 done
 
-python3 - "$VERSION" "$TAG" "$BASE_URL" "$TEMP_DIR" <<'PY'
+python3 - "$VERSION" "$TAG" "$BASE_URL" "$TEMP_DIR" "$RELEASE_ARCH" <<'PY'
 import hashlib
 import json
 import pathlib
 import sys
 
-version, tag, base_url, asset_dir_raw = sys.argv[1:5]
+version, tag, base_url, asset_dir_raw, host_arch = sys.argv[1:6]
 asset_dir = pathlib.Path(asset_dir_raw)
 
 def sha256(name: str) -> str:
@@ -131,19 +147,41 @@ expected_pyannote_compat_level = 1
 if latest.get("version") != version:
     raise SystemExit(f"latest.json version mismatch: expected {version}, got {latest.get('version')}")
 
-platform = latest.get("platforms", {}).get("darwin-aarch64")
-if not isinstance(platform, dict):
-    raise SystemExit("latest.json is missing the darwin-aarch64 updater payload.")
+architectures = {
+    "aarch64": {
+        "target": "aarch64-apple-darwin",
+        "platform": "darwin-aarch64",
+        "runtime_name": "speech-runtime-macos-aarch64.zip",
+        "runtime_kind": "speech_runtime_macos_aarch64",
+        "pyannote_name": "pyannote-runtime-macos-aarch64.zip",
+        "pyannote_kind": "pyannote_runtime_macos_aarch64",
+    },
+    "x86_64": {
+        "target": "x86_64-apple-darwin",
+        "platform": "darwin-x86_64",
+        "runtime_name": "speech-runtime-macos-x86_64.zip",
+        "runtime_kind": "speech_runtime_macos_x86_64",
+        "pyannote_name": "pyannote-runtime-macos-x86_64.zip",
+        "pyannote_kind": "pyannote_runtime_macos_x86_64",
+    },
+}
 
-expected_tar_url = f"{base_url}/Sbobino.app.tar.gz"
-if platform.get("url") != expected_tar_url:
-    raise SystemExit(
-        f"latest.json tarball URL mismatch: expected {expected_tar_url}, got {platform.get('url')}"
-    )
+if host_arch not in architectures:
+    raise SystemExit(f"unsupported host architecture: {host_arch}")
 
-expected_signature = (asset_dir / "Sbobino.app.tar.gz.sig").read_text().strip()
-if platform.get("signature", "").strip() != expected_signature:
-    raise SystemExit("latest.json signature does not match Sbobino.app.tar.gz.sig")
+for arch, descriptor in architectures.items():
+    updater_tar = f"Sbobino_{version}_{arch}.app.tar.gz"
+    updater_sig = f"{updater_tar}.sig"
+    platform = latest.get("platforms", {}).get(descriptor["platform"])
+    if not isinstance(platform, dict):
+        raise SystemExit(f"latest.json is missing the {descriptor['platform']} updater payload.")
+    expected_tar_url = f"{base_url}/{updater_tar}"
+    if platform.get("url") != expected_tar_url:
+        raise SystemExit(
+            f"latest.json {descriptor['platform']} URL mismatch: expected {expected_tar_url}, got {platform.get('url')}"
+        )
+    if platform.get("signature", "").strip() != (asset_dir / updater_sig).read_text().strip():
+        raise SystemExit(f"latest.json signature does not match {updater_sig}")
 
 if setup.get("app_version") != version:
     raise SystemExit(f"setup-manifest.json app_version mismatch: expected {version}, got {setup.get('app_version')}")
@@ -183,13 +221,28 @@ def ensure_setup_descriptor(key: str, expected_name: str) -> dict:
         )
     return descriptor
 
+def ensure_setup_arch_descriptor(key: str, target: str, expected_name: str) -> dict:
+    descriptors = setup.get(key)
+    if not isinstance(descriptors, dict):
+        raise SystemExit(f"setup-manifest.json is missing descriptor map '{key}'")
+    descriptor = descriptors.get(target)
+    if not isinstance(descriptor, dict):
+        raise SystemExit(f"setup-manifest.json is missing {key}.{target}")
+    if descriptor.get("name") != expected_name:
+        raise SystemExit(
+            f"setup-manifest.json {key}.{target}.name mismatch: expected {expected_name}, got {descriptor.get('name')}"
+        )
+    checksum = descriptor.get("sha256", "").strip().lower()
+    if checksum != sha256(expected_name):
+        raise SystemExit(f"setup-manifest.json {key}.{target}.sha256 mismatch for {expected_name}")
+    if descriptor.get("size_bytes") != file_size(expected_name):
+        raise SystemExit(f"setup-manifest.json {key}.{target}.size_bytes mismatch for {expected_name}")
+    if descriptor.get("expanded_size_bytes") != expanded_size(expected_name):
+        raise SystemExit(f"setup-manifest.json {key}.{target}.expanded_size_bytes mismatch for {expected_name}")
+    return descriptor
+
 runtime_manifest_descriptor = ensure_setup_descriptor("runtime_manifest", "runtime-manifest.json")
-runtime_asset_descriptor = ensure_setup_descriptor("runtime_asset", "speech-runtime-macos-aarch64.zip")
 pyannote_manifest_descriptor = ensure_setup_descriptor("pyannote_manifest", "pyannote-manifest.json")
-pyannote_runtime_descriptor = ensure_setup_descriptor(
-    "pyannote_runtime_asset",
-    "pyannote-runtime-macos-aarch64.zip",
-)
 pyannote_model_descriptor = ensure_setup_descriptor(
     "pyannote_model_asset",
     "pyannote-model-community-1.zip",
@@ -210,33 +263,28 @@ if int(pyannote.get("compat_level", expected_pyannote_compat_level)) != expected
     )
 
 runtime_assets = {asset.get("kind"): asset for asset in runtime.get("assets", [])}
-runtime_asset = runtime_assets.get("speech_runtime_macos_aarch64")
-if not isinstance(runtime_asset, dict):
-    raise SystemExit("runtime-manifest.json is missing speech_runtime_macos_aarch64")
-if runtime_asset.get("name") != runtime_asset_descriptor["name"]:
-    raise SystemExit("runtime-manifest.json runtime asset name does not match setup-manifest.json")
-if runtime_asset.get("sha256", "").strip().lower() != runtime_asset_descriptor["sha256"].strip().lower():
-    raise SystemExit("runtime-manifest.json runtime asset checksum does not match setup-manifest.json")
-if runtime_asset.get("size_bytes") != runtime_asset_descriptor.get("size_bytes"):
-    raise SystemExit("runtime-manifest.json runtime asset size does not match setup-manifest.json")
-if runtime_asset.get("expanded_size_bytes") != runtime_asset_descriptor.get("expanded_size_bytes"):
-    raise SystemExit("runtime-manifest.json runtime expanded size does not match setup-manifest.json")
-
 pyannote_assets = {asset.get("kind"): asset for asset in pyannote.get("assets", [])}
-pyannote_runtime = pyannote_assets.get("pyannote_runtime_macos_aarch64")
+for arch, descriptor in architectures.items():
+    runtime_asset_descriptor = ensure_setup_arch_descriptor(
+        "runtime_assets", descriptor["target"], descriptor["runtime_name"]
+    )
+    pyannote_runtime_descriptor = ensure_setup_arch_descriptor(
+        "pyannote_runtime_assets", descriptor["target"], descriptor["pyannote_name"]
+    )
+    runtime_asset = runtime_assets.get(descriptor["runtime_kind"])
+    if not isinstance(runtime_asset, dict):
+        raise SystemExit(f"runtime-manifest.json is missing {descriptor['runtime_kind']}")
+    if any(runtime_asset.get(field) != runtime_asset_descriptor.get(field) for field in ("name", "sha256", "size_bytes", "expanded_size_bytes")):
+        raise SystemExit(f"runtime-manifest.json {arch} asset does not match setup-manifest.json")
+    pyannote_runtime = pyannote_assets.get(descriptor["pyannote_kind"])
+    if not isinstance(pyannote_runtime, dict):
+        raise SystemExit(f"pyannote-manifest.json is missing {descriptor['pyannote_kind']}")
+    if any(pyannote_runtime.get(field) != pyannote_runtime_descriptor.get(field) for field in ("name", "sha256", "size_bytes", "expanded_size_bytes")):
+        raise SystemExit(f"pyannote-manifest.json {arch} runtime does not match setup-manifest.json")
+
 pyannote_model = pyannote_assets.get("pyannote_model")
-if not isinstance(pyannote_runtime, dict):
-    raise SystemExit("pyannote-manifest.json is missing pyannote_runtime_macos_aarch64")
 if not isinstance(pyannote_model, dict):
     raise SystemExit("pyannote-manifest.json is missing pyannote_model")
-if pyannote_runtime.get("name") != pyannote_runtime_descriptor["name"]:
-    raise SystemExit("pyannote-manifest.json runtime asset name does not match setup-manifest.json")
-if pyannote_runtime.get("sha256", "").strip().lower() != pyannote_runtime_descriptor["sha256"].strip().lower():
-    raise SystemExit("pyannote-manifest.json runtime checksum does not match setup-manifest.json")
-if pyannote_runtime.get("size_bytes") != pyannote_runtime_descriptor.get("size_bytes"):
-    raise SystemExit("pyannote-manifest.json runtime size does not match setup-manifest.json")
-if pyannote_runtime.get("expanded_size_bytes") != pyannote_runtime_descriptor.get("expanded_size_bytes"):
-    raise SystemExit("pyannote-manifest.json runtime expanded size does not match setup-manifest.json")
 if pyannote_model.get("name") != pyannote_model_descriptor["name"]:
     raise SystemExit("pyannote-manifest.json model asset name does not match setup-manifest.json")
 if pyannote_model.get("sha256", "").strip().lower() != pyannote_model_descriptor["sha256"].strip().lower():
@@ -249,9 +297,30 @@ if pyannote_model.get("expanded_size_bytes") != pyannote_model_descriptor.get("e
 print(f"Distribution readiness passed for {tag} from {base_url}")
 PY
 
+RUNTIME_SMOKE_DIR="$TEMP_DIR/runtime-smoke"
+mkdir -p "$RUNTIME_SMOKE_DIR"
+/usr/bin/ditto -x -k "$TEMP_DIR/speech-runtime-macos-$RELEASE_ARCH.zip" "$RUNTIME_SMOKE_DIR"
+
+for binary in ffmpeg whisper-cli whisper-stream parakeet-cli; do
+  candidate="$RUNTIME_SMOKE_DIR/runtime/bin/$binary"
+  if [[ ! -x "$candidate" ]]; then
+    echo "Remote speech runtime is missing executable: $candidate" >&2
+    exit 1
+  fi
+  architectures=$(lipo -archs "$candidate")
+  if [[ " $architectures " != *" $RELEASE_ARCH "* ]]; then
+    echo "Remote speech runtime $binary is not $RELEASE_ARCH-native: $architectures" >&2
+    exit 1
+  fi
+  if otool -L "$candidate" | tail -n +2 | awk '{print $1}' | grep -Eq '^(/opt/homebrew|/usr/local)'; then
+    echo "Remote speech runtime $binary links against a host-managed path." >&2
+    exit 1
+  fi
+done
+
 PYANNOTE_SMOKE_DIR="$TEMP_DIR/pyannote-smoke"
 mkdir -p "$PYANNOTE_SMOKE_DIR"
-/usr/bin/ditto -x -k "$TEMP_DIR/pyannote-runtime-macos-aarch64.zip" "$PYANNOTE_SMOKE_DIR"
+/usr/bin/ditto -x -k "$TEMP_DIR/pyannote-runtime-macos-$RELEASE_ARCH.zip" "$PYANNOTE_SMOKE_DIR"
 
 PATH="/usr/bin:/bin" \
 PYANNOTE_RUNTIME_ROOT="$PYANNOTE_SMOKE_DIR/python" \

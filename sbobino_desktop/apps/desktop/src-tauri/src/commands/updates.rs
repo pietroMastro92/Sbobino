@@ -27,8 +27,31 @@ fn select_manual_download_asset<'a>(
     latest_version: &str,
     assets: &'a [GitHubAsset],
 ) -> Option<&'a GitHubAsset> {
-    let expected_dmg = format!("Sbobino_{latest_version}_aarch64.dmg");
+    select_manual_download_asset_for_arch(latest_version, host_dmg_arch_suffix(), assets)
+}
+
+fn select_manual_download_asset_for_arch<'a>(
+    latest_version: &str,
+    arch_suffix: &str,
+    assets: &'a [GitHubAsset],
+) -> Option<&'a GitHubAsset> {
+    let expected_dmg = format!("Sbobino_{latest_version}_{arch_suffix}.dmg");
     assets.iter().find(|asset| asset.name == expected_dmg)
+}
+
+fn host_dmg_arch_suffix() -> &'static str {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "aarch64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "x86_64"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "aarch64"
+    }
 }
 
 #[tauri::command]
@@ -98,7 +121,10 @@ fn compare_versions(a: &str, b: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_versions, select_manual_download_asset, GitHubAsset};
+    use super::{
+        compare_versions, select_manual_download_asset, select_manual_download_asset_for_arch,
+        GitHubAsset,
+    };
 
     #[test]
     fn manual_download_prefers_exact_apple_silicon_dmg() {
@@ -136,6 +162,27 @@ mod tests {
         ];
 
         assert!(select_manual_download_asset("0.1.16", &assets).is_none());
+    }
+
+    #[test]
+    fn manual_download_selects_the_intel_dmg() {
+        let assets = vec![
+            GitHubAsset {
+                name: "Sbobino_0.1.16_aarch64.dmg".to_string(),
+                browser_download_url: "https://example.com/arm64.dmg".to_string(),
+            },
+            GitHubAsset {
+                name: "Sbobino_0.1.16_x86_64.dmg".to_string(),
+                browser_download_url: "https://example.com/intel.dmg".to_string(),
+            },
+        ];
+
+        let selected = select_manual_download_asset_for_arch("0.1.16", "x86_64", &assets)
+            .expect("expected an Intel DMG");
+        assert_eq!(
+            selected.browser_download_url,
+            "https://example.com/intel.dmg"
+        );
     }
 
     #[test]

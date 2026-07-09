@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const PRODUCTION_RELEASE_REPOSITORY: &str = "pietroMastro92/Sbobino";
 pub const SETUP_MANIFEST_ASSET: &str = "setup-manifest.json";
 pub const RUNTIME_MANIFEST_ASSET: &str = "runtime-manifest.json";
 pub const RUNTIME_AARCH64_ASSET: &str = "speech-runtime-macos-aarch64.zip";
+pub const RUNTIME_X86_64_ASSET: &str = "speech-runtime-macos-x86_64.zip";
 pub const PYANNOTE_MANIFEST_ASSET: &str = "pyannote-manifest.json";
 pub const PYANNOTE_RUNTIME_AARCH64_ASSET: &str = "pyannote-runtime-macos-aarch64.zip";
 pub const PYANNOTE_RUNTIME_X86_64_ASSET: &str = "pyannote-runtime-macos-x86_64.zip";
@@ -31,9 +34,9 @@ pub struct SetupReleaseManifest {
     #[serde(default = "default_pyannote_compat_level")]
     pub pyannote_compat_level: u32,
     pub runtime_manifest: ReleaseAssetDescriptor,
-    pub runtime_asset: ReleaseAssetDescriptor,
+    pub runtime_assets: BTreeMap<String, ReleaseAssetDescriptor>,
     pub pyannote_manifest: ReleaseAssetDescriptor,
-    pub pyannote_runtime_asset: ReleaseAssetDescriptor,
+    pub pyannote_runtime_assets: BTreeMap<String, ReleaseAssetDescriptor>,
     pub pyannote_model_asset: ReleaseAssetDescriptor,
 }
 

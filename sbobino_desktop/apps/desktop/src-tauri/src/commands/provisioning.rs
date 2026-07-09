@@ -15,7 +15,7 @@ use crate::{
         ReleaseAssetDescriptor, RuntimeReleaseAsset, RuntimeReleaseManifest, SetupReleaseManifest,
         PYANNOTE_COMPAT_LEVEL, PYANNOTE_MANIFEST_ASSET, PYANNOTE_MODEL_ASSET,
         PYANNOTE_RUNTIME_AARCH64_ASSET, PYANNOTE_RUNTIME_X86_64_ASSET, RUNTIME_AARCH64_ASSET,
-        RUNTIME_MANIFEST_ASSET, SETUP_MANIFEST_ASSET,
+        RUNTIME_MANIFEST_ASSET, RUNTIME_X86_64_ASSET, SETUP_MANIFEST_ASSET,
     },
     state::AppState,
 };
@@ -2061,6 +2061,7 @@ async fn fetch_pyannote_asset_selection(
     client: &reqwest::Client,
 ) -> Result<PyannoteAssetSelection, String> {
     let bundle = fetch_setup_release_bundle(client).await?;
+    let target_triple = host_pyannote_arch_label();
     let runtime_kind = host_pyannote_runtime_kind();
     let runtime_asset = bundle
         .pyannote_manifest
@@ -2074,8 +2075,13 @@ async fn fetch_pyannote_asset_selection(
                 runtime_kind
             )
         })?;
+    let setup_runtime_descriptor = setup_arch_descriptor(
+        &bundle.setup_manifest.pyannote_runtime_assets,
+        target_triple,
+        "pyannote runtime asset descriptor",
+    )?;
     validate_manifest_asset_descriptor(
-        &bundle.setup_manifest.pyannote_runtime_asset,
+        setup_runtime_descriptor,
         &runtime_asset.name,
         &runtime_asset.sha256,
         "pyannote runtime asset",
@@ -2106,17 +2112,26 @@ async fn fetch_runtime_asset_selection(
     client: &reqwest::Client,
 ) -> Result<RuntimeAssetSelection, String> {
     let bundle = fetch_setup_release_bundle(client).await?;
+    let target_triple = host_pyannote_arch_label();
     let runtime_asset = bundle
         .runtime_manifest
         .assets
         .iter()
-        .find(|asset| asset.kind == "speech_runtime_macos_aarch64")
+        .find(|asset| asset.kind == host_runtime_asset_kind())
         .cloned()
         .ok_or_else(|| {
-            "Runtime release manifest is missing the speech runtime asset.".to_string()
+            format!(
+                "Runtime release manifest is missing the speech runtime asset kind '{}'.",
+                host_runtime_asset_kind()
+            )
         })?;
+    let setup_runtime_descriptor = setup_arch_descriptor(
+        &bundle.setup_manifest.runtime_assets,
+        target_triple,
+        "runtime asset descriptor",
+    )?;
     validate_manifest_asset_descriptor(
-        &bundle.setup_manifest.runtime_asset,
+        setup_runtime_descriptor,
         &runtime_asset.name,
         &runtime_asset.sha256,
         "runtime asset",
@@ -2326,9 +2341,12 @@ fn validate_setup_manifest(version: &str, manifest: &SetupReleaseManifest) -> Re
         RUNTIME_MANIFEST_ASSET,
         "runtime manifest descriptor",
     )?;
-    validate_release_descriptor_name(
-        &manifest.runtime_asset,
-        RUNTIME_AARCH64_ASSET,
+    validate_arch_descriptors(
+        &manifest.runtime_assets,
+        [
+            ("aarch64-apple-darwin", RUNTIME_AARCH64_ASSET),
+            ("x86_64-apple-darwin", RUNTIME_X86_64_ASSET),
+        ],
         "runtime asset descriptor",
     )?;
     validate_release_descriptor_name(
@@ -2336,13 +2354,12 @@ fn validate_setup_manifest(version: &str, manifest: &SetupReleaseManifest) -> Re
         PYANNOTE_MANIFEST_ASSET,
         "pyannote manifest descriptor",
     )?;
-    validate_release_descriptor_name(
-        &manifest.pyannote_runtime_asset,
-        if host_pyannote_runtime_kind() == "pyannote_runtime_macos_x86_64" {
-            PYANNOTE_RUNTIME_X86_64_ASSET
-        } else {
-            PYANNOTE_RUNTIME_AARCH64_ASSET
-        },
+    validate_arch_descriptors(
+        &manifest.pyannote_runtime_assets,
+        [
+            ("aarch64-apple-darwin", PYANNOTE_RUNTIME_AARCH64_ASSET),
+            ("x86_64-apple-darwin", PYANNOTE_RUNTIME_X86_64_ASSET),
+        ],
         "pyannote runtime asset descriptor",
     )?;
     validate_release_descriptor_name(
@@ -2352,6 +2369,31 @@ fn validate_setup_manifest(version: &str, manifest: &SetupReleaseManifest) -> Re
     )?;
 
     Ok(())
+}
+
+fn validate_arch_descriptors(
+    descriptors: &std::collections::BTreeMap<String, ReleaseAssetDescriptor>,
+    expected_assets: [(&str, &str); 2],
+    label: &str,
+) -> Result<(), String> {
+    for (target_triple, expected_name) in expected_assets {
+        let descriptor = setup_arch_descriptor(descriptors, target_triple, label)?;
+        validate_release_descriptor_name(descriptor, expected_name, label)?;
+    }
+    Ok(())
+}
+
+fn setup_arch_descriptor<'a>(
+    descriptors: &'a std::collections::BTreeMap<String, ReleaseAssetDescriptor>,
+    target_triple: &str,
+    label: &str,
+) -> Result<&'a ReleaseAssetDescriptor, String> {
+    descriptors.get(target_triple).ok_or_else(|| {
+        format!(
+            "Setup manifest is missing {} for target '{}'.",
+            label, target_triple
+        )
+    })
 }
 
 fn validate_release_descriptor_name(
@@ -2411,6 +2453,21 @@ fn host_pyannote_runtime_kind() -> &'static str {
     #[cfg(not(target_os = "macos"))]
     {
         "pyannote_runtime_macos_aarch64"
+    }
+}
+
+fn host_runtime_asset_kind() -> &'static str {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        "speech_runtime_macos_aarch64"
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "speech_runtime_macos_x86_64"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "speech_runtime_macos_aarch64"
     }
 }
 
@@ -2734,8 +2791,8 @@ mod tests {
         plan_pyannote_background_action_inner, prepare_pyannote_runtime_stage,
         prepare_pyannote_runtime_swap, promote_staged_pyannote_runtime,
         rollback_pyannote_runtime_swap, sha256_file_hex, transcription_runtime_install_complete,
-        validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
-        PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
+        validate_arch_descriptors, validate_manifest_asset_descriptor, validate_setup_manifest,
+        verify_file_sha256, PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
     };
     use crate::release_assets::{
         PyannoteReleaseAsset, PyannoteReleaseManifest, ReleaseAssetDescriptor, RuntimeReleaseAsset,
@@ -2747,6 +2804,7 @@ mod tests {
         ManagedPyannoteManifest, ManagedRuntimeBinaryHealth, ManagedRuntimeHealth,
         PyannoteRuntimeHealth, RuntimeHealth, RuntimeTranscriptionFactory,
     };
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::tempdir;
@@ -2857,13 +2915,22 @@ mod tests {
     ) {
         let runtime_manifest = RuntimeReleaseManifest {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            assets: vec![RuntimeReleaseAsset {
-                kind: "speech_runtime_macos_aarch64".to_string(),
-                name: "speech-runtime-macos-aarch64.zip".to_string(),
-                sha256: "runtime-sha".to_string(),
-                size_bytes: None,
-                expanded_size_bytes: None,
-            }],
+            assets: vec![
+                RuntimeReleaseAsset {
+                    kind: "speech_runtime_macos_aarch64".to_string(),
+                    name: "speech-runtime-macos-aarch64.zip".to_string(),
+                    sha256: "runtime-sha".to_string(),
+                    size_bytes: None,
+                    expanded_size_bytes: None,
+                },
+                RuntimeReleaseAsset {
+                    kind: "speech_runtime_macos_x86_64".to_string(),
+                    name: "speech-runtime-macos-x86_64.zip".to_string(),
+                    sha256: "runtime-x86-sha".to_string(),
+                    size_bytes: None,
+                    expanded_size_bytes: None,
+                },
+            ],
         };
         let runtime_manifest_body =
             serde_json::to_vec_pretty(&runtime_manifest).expect("runtime manifest should encode");
@@ -2876,9 +2943,16 @@ mod tests {
             compat_level: PYANNOTE_COMPAT_LEVEL,
             assets: vec![
                 PyannoteReleaseAsset {
-                    kind: super::host_pyannote_runtime_kind().to_string(),
+                    kind: "pyannote_runtime_macos_aarch64".to_string(),
                     name: "pyannote-runtime-macos-aarch64.zip".to_string(),
                     sha256: runtime_sha256.to_string(),
+                    size_bytes: None,
+                    expanded_size_bytes: None,
+                },
+                PyannoteReleaseAsset {
+                    kind: "pyannote_runtime_macos_x86_64".to_string(),
+                    name: "pyannote-runtime-macos-x86_64.zip".to_string(),
+                    sha256: "pyannote-runtime-x86-sha".to_string(),
                     size_bytes: None,
                     expanded_size_bytes: None,
                 },
@@ -2902,12 +2976,30 @@ mod tests {
             release_tag: format!("v{}", env!("CARGO_PKG_VERSION")),
             pyannote_compat_level: PYANNOTE_COMPAT_LEVEL,
             runtime_manifest: descriptor(RUNTIME_MANIFEST_ASSET, &runtime_manifest_sha),
-            runtime_asset: descriptor("speech-runtime-macos-aarch64.zip", "runtime-sha"),
+            runtime_assets: BTreeMap::from([
+                (
+                    "aarch64-apple-darwin".to_string(),
+                    descriptor("speech-runtime-macos-aarch64.zip", "runtime-sha"),
+                ),
+                (
+                    "x86_64-apple-darwin".to_string(),
+                    descriptor("speech-runtime-macos-x86_64.zip", "runtime-x86-sha"),
+                ),
+            ]),
             pyannote_manifest: descriptor(PYANNOTE_MANIFEST_ASSET, &pyannote_manifest_sha),
-            pyannote_runtime_asset: descriptor(
-                "pyannote-runtime-macos-aarch64.zip",
-                runtime_sha256,
-            ),
+            pyannote_runtime_assets: BTreeMap::from([
+                (
+                    "aarch64-apple-darwin".to_string(),
+                    descriptor("pyannote-runtime-macos-aarch64.zip", runtime_sha256),
+                ),
+                (
+                    "x86_64-apple-darwin".to_string(),
+                    descriptor(
+                        "pyannote-runtime-macos-x86_64.zip",
+                        "pyannote-runtime-x86-sha",
+                    ),
+                ),
+            ]),
             pyannote_model_asset: descriptor("pyannote-model-community-1.zip", model_sha256),
         };
         let setup_manifest_body =
@@ -3341,9 +3433,27 @@ mod tests {
             release_tag: "v0.1.8".to_string(),
             pyannote_compat_level: 1,
             runtime_manifest: descriptor("runtime-manifest.json", "deadbeef"),
-            runtime_asset: descriptor("speech-runtime-macos-aarch64.zip", "deadbeef"),
+            runtime_assets: BTreeMap::from([
+                (
+                    "aarch64-apple-darwin".to_string(),
+                    descriptor("speech-runtime-macos-aarch64.zip", "deadbeef"),
+                ),
+                (
+                    "x86_64-apple-darwin".to_string(),
+                    descriptor("speech-runtime-macos-x86_64.zip", "deadbeef"),
+                ),
+            ]),
             pyannote_manifest: descriptor("pyannote-manifest.json", "deadbeef"),
-            pyannote_runtime_asset: descriptor("pyannote-runtime-macos-aarch64.zip", "deadbeef"),
+            pyannote_runtime_assets: BTreeMap::from([
+                (
+                    "aarch64-apple-darwin".to_string(),
+                    descriptor("pyannote-runtime-macos-aarch64.zip", "deadbeef"),
+                ),
+                (
+                    "x86_64-apple-darwin".to_string(),
+                    descriptor("pyannote-runtime-macos-x86_64.zip", "deadbeef"),
+                ),
+            ]),
             pyannote_model_asset: descriptor("pyannote-model-community-1.zip", "deadbeef"),
         };
 
@@ -3363,6 +3473,26 @@ mod tests {
         )
         .expect_err("checksum mismatch should fail");
         assert!(error.contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn validate_arch_descriptors_requires_the_intel_runtime_entry() {
+        let descriptors = BTreeMap::from([(
+            "aarch64-apple-darwin".to_string(),
+            descriptor("speech-runtime-macos-aarch64.zip", "deadbeef"),
+        )]);
+
+        let error = validate_arch_descriptors(
+            &descriptors,
+            [
+                ("aarch64-apple-darwin", "speech-runtime-macos-aarch64.zip"),
+                ("x86_64-apple-darwin", "speech-runtime-macos-x86_64.zip"),
+            ],
+            "runtime asset descriptor",
+        )
+        .expect_err("dual-arch releases must include an Intel runtime descriptor");
+
+        assert!(error.contains("x86_64-apple-darwin"));
     }
 
     #[test]

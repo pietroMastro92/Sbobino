@@ -11,14 +11,41 @@ APP_PATH=${2:-}
 RELEASE_PROFILE=${SBOBINO_RELEASE_PROFILE:-public}
 MACOS_RUNTIME_DEPLOYMENT_TARGET=${SBOBINO_MACOS_RUNTIME_DEPLOYMENT_TARGET:-13.0}
 
+case "$(uname -m)" in
+  arm64) HOST_TARGET_TRIPLE="aarch64-apple-darwin" ;;
+  x86_64) HOST_TARGET_TRIPLE="x86_64-apple-darwin" ;;
+  *)
+    echo "Unsupported macOS architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+TARGET_TRIPLE=${SBOBINO_RELEASE_TARGET_TRIPLE:-$HOST_TARGET_TRIPLE}
+if [[ "$TARGET_TRIPLE" != "$HOST_TARGET_TRIPLE" ]]; then
+  echo "Release readiness must run natively: requested '$TARGET_TRIPLE', host is '$HOST_TARGET_TRIPLE'." >&2
+  exit 1
+fi
+
+case "$TARGET_TRIPLE" in
+  aarch64-apple-darwin)
+    RELEASE_ARCH=aarch64
+    ;;
+  x86_64-apple-darwin)
+    RELEASE_ARCH=x86_64
+    ;;
+  *)
+    echo "Unsupported macOS target triple: $TARGET_TRIPLE" >&2
+    exit 1
+    ;;
+esac
+
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DESKTOP_DIR="$ROOT_DIR/apps/desktop"
 SCRIPTS_DIR="$ROOT_DIR/scripts"
 TEMP_DIR=$(mktemp -d)
 ASSET_DIR="$TEMP_DIR/release-assets"
-PYANNOTE_RUNTIME_ZIP="$ASSET_DIR/pyannote-runtime-macos-aarch64.zip"
+PYANNOTE_RUNTIME_ZIP="$ASSET_DIR/pyannote-runtime-macos-$RELEASE_ARCH.zip"
 PYANNOTE_MODEL_ZIP="$ASSET_DIR/pyannote-model-community-1.zip"
-RUNTIME_ZIP="$ASSET_DIR/speech-runtime-macos-aarch64.zip"
+RUNTIME_ZIP="$ASSET_DIR/speech-runtime-macos-$RELEASE_ARCH.zip"
 
 cleanup() {
   rm -rf "$TEMP_DIR"
@@ -539,19 +566,16 @@ mkdir -p "$ASSET_DIR"
 
 "$SCRIPTS_DIR/package_macos_runtime_asset.sh" "$RUNTIME_ZIP"
 "$SCRIPTS_DIR/package_pyannote_asset.sh" \
-  "$DESKTOP_DIR/src-tauri/resources/pyannote/python/aarch64-apple-darwin" \
+  "$DESKTOP_DIR/src-tauri/resources/pyannote/python/$TARGET_TRIPLE" \
   python \
   "$PYANNOTE_RUNTIME_ZIP"
 "$SCRIPTS_DIR/package_pyannote_asset.sh" \
   "$DESKTOP_DIR/src-tauri/resources/pyannote/model" \
   model \
   "$PYANNOTE_MODEL_ZIP"
-"$SCRIPTS_DIR/generate_release_manifests.sh" "$VERSION" "$ASSET_DIR"
 assert_runtime_asset_portability "$RUNTIME_ZIP"
 smoke_test_runtime_asset "$RUNTIME_ZIP"
 smoke_test_pyannote_runtime_asset "$PYANNOTE_RUNTIME_ZIP"
-
-export SBOBINO_LOCAL_RELEASE_ASSETS_DIR="$ASSET_DIR"
 
 pushd "$DESKTOP_DIR" >/dev/null
 npm test
@@ -571,6 +595,11 @@ if [[ -n "$APP_PATH" ]]; then
   APP_EXEC="$APP_PATH/Contents/MacOS/$APP_EXECUTABLE_NAME"
   if [[ ! -x "$APP_EXEC" ]]; then
     echo "App executable missing at '$APP_EXEC'." >&2
+    exit 1
+  fi
+  APP_ARCHES=$(lipo -archs "$APP_EXEC")
+  if [[ " $APP_ARCHES " != *" $RELEASE_ARCH "* ]]; then
+    echo "Bundled app executable does not contain expected $RELEASE_ARCH architecture: $APP_ARCHES" >&2
     exit 1
   fi
 

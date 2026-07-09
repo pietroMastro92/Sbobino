@@ -11,7 +11,7 @@ Ship a macOS release that installs and runs on a clean third-party Apple Silicon
 - ad hoc human debugging during first launch
 
 For now, this document defines the mandatory validation bar for `macOS Apple Silicon`.
-It also defines the shape of the future matrix for `macOS Intel x86_64` and `Windows`.
+It covers native `macOS Apple Silicon` and native `macOS Intel x86_64`; Windows remains future work.
 
 ## What mature software teams do
 
@@ -44,9 +44,9 @@ Mandatory rule:
 
 - `macOS Apple Silicon (arm64)`
 
-### Required supporting platform now
+### Required platform now
 
-- `macOS Intel x86_64` as bootstrap and distribution-layer validation for the arm64 release flow
+- `macOS Intel x86_64`
 
 ### Required platform later
 
@@ -63,7 +63,7 @@ We should maintain these validation environments:
    A physically separate third-party Apple Silicon Mac used as the clean-room install gate.
 
 3. `INTEL-PRIMARY`
-   Intel Mac used to validate release metadata, DMG integrity, manifest parsing, and bootstrap-layer compatibility for the arm64 candidate while Intel-native binaries are still out of scope.
+   Intel Mac used for native Intel clean-room installation, runtime provisioning, warm restart, and diarization validation.
 
 Useful but optional:
 
@@ -175,23 +175,23 @@ Pass criteria:
 - pyannote is preserved or auto-migrated
 - user can still use diarization the same way as before the update
 
-### F. Intel bootstrap-layer validation
+### F. Intel native validation
 
 Machine: `INTEL-PRIMARY`
 
 Steps:
 
-1. Download the exact candidate DMG from the GitHub release.
+1. Download `Sbobino_<version>_x86_64.dmg` from the exact candidate release.
 2. Run `distribution_readiness.sh` against that public release.
-3. Mount the DMG and inspect the shipped app bundle and updater/manifests.
+3. Install the app, complete first-launch setup, enable diarization, and relaunch it.
 
 Pass criteria:
 
 - remote asset integrity passes
-- bundle version matches the requested release version
-- DMG contains a valid `Sbobino.app`
-- executable, updater metadata, and manifests are coherent
-- report may end as `soft_pass` if arm64 execution is intentionally `not_applicable`
+- bundle version and executable architecture are x86_64-native
+- first-launch runtime and Pyannote setup completes without Homebrew or terminal repair
+- warm restart and diarized transcription pass
+- report is `passed`
 
 ### G. First-launch failure recovery
 
@@ -219,7 +219,7 @@ A stable Apple Silicon release is allowed only if:
 2. `distribution_readiness.sh` passes.
 3. `AS-PRIMARY` passes update-path validation, warm restart, and diarization smoke.
 4. `AS-THIRD` passes clean-room install, warm restart, and diarization smoke.
-5. `INTEL-PRIMARY` passes release metadata and bootstrap-layer validation, with `soft_pass` allowed when arm64 execution is `not_applicable`.
+5. `INTEL-PRIMARY` passes native Intel clean-room, warm-restart, and diarization validation.
 6. No mandatory scenario requires terminal repair or manual filesystem intervention.
 
 If any item fails, the release is not distributable.
@@ -245,7 +245,7 @@ Minimum evidence for the release thread or release notes folder:
 - `distribution-readiness-proof.json` uploaded on the GitHub release with `status=passed`
 - `AS-PRIMARY.validation-report.json` uploaded on the GitHub release with `status=passed`
 - `AS-THIRD.validation-report.json` uploaded on the GitHub release with `status=passed`
-- `INTEL-PRIMARY.validation-report.json` uploaded on the GitHub release with `status=passed` or `status=soft_pass`
+- `INTEL-PRIMARY.validation-report.json` uploaded on the GitHub release with `status=passed`
 
 ## Future Matrix Extension
 
@@ -274,7 +274,7 @@ For Apple Silicon, the release bar should now be:
 3. `distribution-readiness-proof.json` uploaded to the prerelease
 4. clean-room validation on `AS-THIRD`
 5. upgrade validation from previous public version on `AS-PRIMARY`
-6. Intel bootstrap-layer validation on `INTEL-PRIMARY`
+6. Intel native clean-room validation on `INTEL-PRIMARY`
 7. only then manual stable promotion
 
 That gives us a real distribution process instead of a developer-machine check.

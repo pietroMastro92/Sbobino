@@ -9,26 +9,33 @@
 
 ### Release (`.github/workflows/release.yml`)
 - Trigger: manual `workflow_dispatch` for an existing tag.
-- First public release target:
-  - `macos-14` -> `aarch64-apple-darwin` (DMG + APP).
+- Native public release targets:
+  - `macos-14` -> `aarch64-apple-darwin` (Apple Silicon DMG + updater).
+  - `macos-15-intel` -> `x86_64-apple-darwin` (Intel DMG + updater).
 - Produces updater artifacts/signatures and publishes only a GitHub prerelease candidate.
 - Runs hosted integrity gates plus self-hosted machine validation on exact public assets before any stable promotion is allowed.
 - Production origin is the current public GitHub repository: `pietroMastro92/Sbobino`.
-- Default recommendation: prepare every release locally first with `./scripts/prepare_local_release.sh <version>`, publish the GitHub release as a prerelease candidate, run remote validation, validate that exact release on the Apple Silicon matrix, then promote only after the validation reports are uploaded as passed.
+- Default recommendation: prepare each release locally once per native architecture with `./scripts/prepare_local_release.sh <version>` and the same output directory, assemble the candidate only after both staging directories exist, then publish and validate the exact public assets before promotion.
 - Candidate validation is mandatory. If a prerelease fails validation on a third-party Mac, retire it and cut a new patch version instead of overwriting a stable release or reusing the same candidate.
 - Required public asset set for every distributable version:
   - `Sbobino_<version>_aarch64.dmg`
-  - `Sbobino.app.tar.gz`
-  - `Sbobino.app.tar.gz.sig`
+  - `Sbobino_<version>_x86_64.dmg`
+  - `Sbobino_<version>_aarch64.app.tar.gz` and `.sig`
+  - `Sbobino_<version>_x86_64.app.tar.gz` and `.sig`
   - `latest.json`
   - `setup-manifest.json`
   - `speech-runtime-macos-aarch64.zip`
+  - `speech-runtime-macos-x86_64.zip`
   - `runtime-manifest.json`
   - `pyannote-runtime-macos-aarch64.zip`
+  - `pyannote-runtime-macos-x86_64.zip`
   - `pyannote-model-community-1.zip`
   - `pyannote-manifest.json`
   - `release-readiness-proof.json`
   - `distribution-readiness-proof.json`
+  - `intel-distribution-readiness-proof.json`
+  - `portability-smoke-report.json`
+  - `intel-portability-smoke-report.json`
   - `AS-PRIMARY.validation-report.json`
   - `AS-THIRD.validation-report.json`
   - `INTEL-PRIMARY.validation-report.json`
@@ -60,17 +67,17 @@
 - If Apple signing or notarization credentials are not configured, the workflow still produces an unsigned Apple Silicon release. In that fallback mode, users must open the app once via Gatekeeper by Control-clicking **Sbobino** and choosing **Open**, or by using **System Settings > Privacy & Security > Open Anyway**.
 - To avoid consuming GitHub Actions minutes, prefer the local release flow:
   - `cd sbobino_desktop`
-  - `./scripts/prepare_local_release.sh <version>`
+  - run `./scripts/prepare_local_release.sh <version>` on both a native Apple Silicon Mac and a native Intel Mac using the same output directory
   - publish the prerelease candidate with `./scripts/publish_candidate_release.sh <version>`
   - upload the generated files from `dist/local-release/v<version>/`
   - run `./scripts/distribution_readiness.sh <version>`
   - generate and upload `distribution-readiness-proof.json`
   - validate that GitHub prerelease on `AS-PRIMARY`, `AS-THIRD`, and `INTEL-PRIMARY`
-  - re-upload all machine validation report JSON assets with `status=passed` or `soft_pass` for `INTEL-PRIMARY`
+  - re-upload all machine validation report JSON assets with `status=passed`
   - promote it only after it passes with `./scripts/promote_candidate_release.sh <version>`
   - if the release fails, delete/retire it with `./scripts/retire_failed_candidate.sh <version>` and cut a new patch version
   - the default `public` profile keeps pyannote out of the app bundle and installs it from release assets during first launch
-  - the script automatically generates and reuses a stable local Tauri updater keypair under the user's config directory when one is not already present
+  - local staging requires `TAURI_UPDATER_PUBLIC_KEY` plus the matching Tauri signing key; CI injects these secrets for candidate builds
   - `SBOBINO_RELEASE_PROFILE=standalone-dev` is reserved for internal/offline builds that intentionally embed bundled pyannote assets
 - Inject the updater public key in CI before `tauri build`:
   - `./scripts/prepare_release_updater_config.sh apps/desktop/src-tauri/tauri.conf.json "$TAURI_UPDATER_PUBLIC_KEY"`
@@ -123,8 +130,8 @@
 - Keep the latest two stable GitHub releases available: the current stable and the immediately previous stable. This gives users a public rollback target if the newest stable release is later found to be bad.
 - `./scripts/promote_candidate_release.sh` enforces this retention after promotion. Override only with `SBOBINO_STABLE_RELEASE_RETENTION=<count>` when there is a deliberate operational reason to keep more stable releases.
 - A release is considered distributable only if the full Apple Silicon matrix in [`distribution-validation-plan.md`](distribution-validation-plan.md) is green on the exact public assets.
-- Stable promotion is blocked unless the release contains `release-readiness-proof.json`, `distribution-readiness-proof.json`, `AS-PRIMARY.validation-report.json`, `AS-THIRD.validation-report.json`, and `INTEL-PRIMARY.validation-report.json`.
-- `AS-PRIMARY` and `AS-THIRD` must be marked `passed`; `INTEL-PRIMARY` may be `passed` or `soft_pass` when `arm64_binary_execution` is intentionally `not_applicable`.
+- Stable promotion is blocked unless the release contains the ARM64 and Intel distribution/portability proofs plus `AS-THIRD.validation-report.json` and `INTEL-PRIMARY.validation-report.json`.
+- Both native platform gates and both machine validation reports must be marked `passed`.
 - The supported correction path is:
   1. retire the failed public release
   2. cut a new patch version

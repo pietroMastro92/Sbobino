@@ -11,7 +11,7 @@ This repository is the production-grade rewrite of the original Python Sbobino a
 - `apps/desktop/src-tauri`: Tauri command host and runtime composition
 - `docs/architecture.md`: architecture and dependency rules
 - `docs/release-and-migration.md`: release pipeline and migration plan
-- `docs/distribution-validation-plan.md`: Apple Silicon clean-room distribution matrix and future Intel/Windows expansion path
+- `docs/distribution-validation-plan.md`: native Apple Silicon and Intel clean-room distribution matrix
 - `docs/self-hosted-release-runners.md`: runner labels, machine preparation, and self-hosted validation requirements
 - `docs/first-real-candidate-runbook.md`: operational checklist for the first live candidate with GitHub Actions + self-hosted Macs
 - `docs/feature-migration-matrix.md`: feature-by-feature parity checklist
@@ -36,23 +36,24 @@ From workspace root:
 
 ## Local Release
 
-Use `./scripts/prepare_local_release.sh <version>` from `sbobino_desktop/` to build and validate a macOS Apple Silicon candidate release locally without publishing anything to GitHub. The default `public` profile prepares a lightweight DMG, keeps pyannote out of the app bundle, signs the updater artifacts with a stable local Tauri updater keypair, and writes the full candidate folder into `dist/local-release/v<version>`.
+Run `./scripts/prepare_local_release.sh <version>` once on Apple Silicon and once on Intel with the same output directory. Each run creates native staging assets; the second run assembles the dual-architecture candidate in `dist/local-release/v<version>` without publishing it.
 
 That folder now always includes:
 - `Sbobino_<version>_aarch64.dmg`
-- `Sbobino.app.tar.gz`
-- `Sbobino.app.tar.gz.sig`
+- `Sbobino_<version>_x86_64.dmg`
+- `Sbobino_<version>_aarch64.app.tar.gz` and `.sig`
+- `Sbobino_<version>_x86_64.app.tar.gz` and `.sig`
 - `latest.json`
 - `setup-manifest.json`
 - `runtime-manifest.json`
 - `speech-runtime-macos-aarch64.zip`
+- `speech-runtime-macos-x86_64.zip`
 - `pyannote-manifest.json`
 - `pyannote-runtime-macos-aarch64.zip`
+- `pyannote-runtime-macos-x86_64.zip`
 - `pyannote-model-community-1.zip`
 - `release-readiness-proof.json` (generated only when `release_readiness.sh` passed)
-- `AS-PRIMARY.validation-report.json` (template, must be uploaded back as `passed`)
-- `AS-THIRD.validation-report.json` (template, must be uploaded back as `passed`)
-- `INTEL-PRIMARY.validation-report.json` (template, must be uploaded back as `passed` or `soft_pass`)
+- `AS-THIRD.validation-report.json` and `INTEL-PRIMARY.validation-report.json` are required before stable promotion and must be uploaded with `status=passed`
 
 Manual publish contract:
 1. build the release locally
@@ -79,8 +80,8 @@ Helper scripts:
 Stable release policy:
 - never overwrite or “fix in place” a stable GitHub release
 - prerelease candidate validation is mandatory before stable promotion
-- mandatory assets for promotion are `release-readiness-proof.json`, `distribution-readiness-proof.json`, `AS-PRIMARY.validation-report.json`, `AS-THIRD.validation-report.json`, and `INTEL-PRIMARY.validation-report.json`
-- the default promotion flow removes older stable releases so only the latest validated stable remains public
+- mandatory assets for promotion include ARM64 and Intel distribution/portability proofs, `AS-THIRD.validation-report.json`, and `INTEL-PRIMARY.validation-report.json`
+- the default promotion flow retains the latest two validated stable releases
 
 Set `SBOBINO_RELEASE_PROFILE=standalone-dev` only for internal/offline builds that intentionally embed bundled pyannote assets.
 
