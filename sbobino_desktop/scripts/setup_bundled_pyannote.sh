@@ -69,8 +69,9 @@ TORCHCODEC_FFMPEG_BASE_URL="https://pytorch.s3.amazonaws.com/torchcodec/ffmpeg/2
 TORCHCODEC_FFMPEG_VERSION="8.0"
 TORCHCODEC_FFMPEG_SHA256="beb936b76f25d2621228a12cdb67c9ae3d1eff7aa713ef8d1167ebf0c25bd5ec"
 PYANNOTE_INTEL_CONDA_CHANNEL=${SBOBINO_PYANNOTE_INTEL_CONDA_CHANNEL:-conda-forge}
-PYANNOTE_INTEL_TORCH_VERSION=${SBOBINO_PYANNOTE_INTEL_TORCH_VERSION:-2.8.0}
-PYANNOTE_INTEL_TORCHCODEC_REF=${SBOBINO_PYANNOTE_INTEL_TORCHCODEC_REF:-v0.7.0}
+PYANNOTE_INTEL_TORCH_VERSION=${SBOBINO_PYANNOTE_INTEL_TORCH_VERSION:-2.9.1}
+PYANNOTE_INTEL_TORCHAUDIO_VERSION=${SBOBINO_PYANNOTE_INTEL_TORCHAUDIO_VERSION:-2.9.1}
+PYANNOTE_INTEL_TORCHCODEC_REF=${SBOBINO_PYANNOTE_INTEL_TORCHCODEC_REF:-v0.8.1}
 TORCHCODEC_FFMPEG_LIB_PATTERNS=(
   "libavutil*.dylib"
   "libavcodec*.dylib"
@@ -591,17 +592,24 @@ resolve_python_executable() {
   exit 1
 }
 
-install_pyannote_dependencies_without_torchaudio() {
+install_pyannote_dependencies_with_native_media_stack() {
   local python_bin=$1
 
   "$python_bin" -m pip install --no-deps "pyannote.audio==4.0.4"
+  PYANNOTE_INTEL_TORCH_VERSION="$PYANNOTE_INTEL_TORCH_VERSION" \
+  PYANNOTE_INTEL_TORCHAUDIO_VERSION="$PYANNOTE_INTEL_TORCHAUDIO_VERSION" \
   "$python_bin" - <<'PY'
 from importlib.metadata import requires
+import os
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 import subprocess
 import sys
+import tempfile
 
+# Torch, TorchAudio, and TorchCodec are provisioned as one native conda/source
+# toolchain below. Keep pip from attempting a PyPI replacement while it
+# installs pyannote's remaining runtime dependencies.
 skip = {"torch", "torchaudio", "torchcodec"}
 requirements = []
 for raw in requires("pyannote.audio") or []:
@@ -612,8 +620,70 @@ for raw in requires("pyannote.audio") or []:
         continue
     requirements.append(str(requirement))
 
-subprocess.check_call([sys.executable, "-m", "pip", "install", *requirements])
+constraints = [
+    f"torch=={os.environ['PYANNOTE_INTEL_TORCH_VERSION']}",
+    f"torchaudio=={os.environ['PYANNOTE_INTEL_TORCHAUDIO_VERSION']}",
+]
+with tempfile.NamedTemporaryFile(mode="w", suffix=".txt") as handle:
+    handle.write("\\n".join(constraints) + "\\n")
+    handle.flush()
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade-strategy",
+            "only-if-needed",
+            "--constraint",
+            handle.name,
+            *requirements,
+        ]
+    )
 PY
+}
+
+install_intel_torchaudio_without_conda_torchcodec() {
+  local package_url
+
+  # conda-forge publishes native osx-64 TorchAudio 2.9.1, but its solver does
+  # not currently select a compatible TorchCodec package for Python 3.11.
+  # Install the matching TorchAudio package without dependency solving, then
+  # compile the compatible TorchCodec release against the same Conda Torch.
+  package_url=$(CONDA_SUBDIR=osx-64 conda search --json --override-channels \
+    -c "$PYANNOTE_INTEL_CONDA_CHANNEL" \
+    "torchaudio=$PYANNOTE_INTEL_TORCHAUDIO_VERSION" | \
+    PYANNOTE_INTEL_TORCH_VERSION="$PYANNOTE_INTEL_TORCH_VERSION" \
+    PYANNOTE_INTEL_TORCHAUDIO_VERSION="$PYANNOTE_INTEL_TORCHAUDIO_VERSION" \
+    PYANNOTE_INTEL_PYTHON_VERSION="$PYTHON_VERSION" \
+    python3 -c '
+import json
+import os
+import sys
+
+python_tag = "py" + os.environ["PYANNOTE_INTEL_PYTHON_VERSION"].replace(".", "")
+torch_version = os.environ["PYANNOTE_INTEL_TORCH_VERSION"]
+torch_major, torch_minor, *_ = torch_version.split(".")
+torch_requirement = f"pytorch >={torch_version},<{torch_major}.{int(torch_minor) + 1}.0a0"
+records = json.load(sys.stdin).get("torchaudio", [])
+matches = [
+    record
+    for record in records
+    if record.get("subdir") == "osx-64"
+    and record.get("version") == os.environ["PYANNOTE_INTEL_TORCHAUDIO_VERSION"]
+    and python_tag in record.get("build", "")
+    and record.get("build_number") == 0
+    and torch_requirement in record.get("depends", [])
+]
+if len(matches) != 1:
+    raise SystemExit(
+        "Could not resolve native osx-64 TorchAudio matching "
+        f"Python {python_tag}, Torch {torch_requirement}: {matches}"
+    )
+print(matches[0]["url"])
+')
+
+  conda install -y --no-deps -p "$STAGE_RUNTIME_DIR" "$package_url"
 }
 
 build_intel_pyannote_runtime() {
@@ -627,11 +697,13 @@ build_intel_pyannote_runtime() {
     "python=$PYTHON_VERSION" \
     "pytorch=$PYANNOTE_INTEL_TORCH_VERSION" \
     "ffmpeg=7" \
+    kaldi \
     pkg-config \
     cmake \
     pybind11
 
   verify_no_external_python_framework_refs "$STAGE_RUNTIME_DIR"
+  install_intel_torchaudio_without_conda_torchcodec
 
   local python_bin="$STAGE_RUNTIME_DIR/bin/python3"
   local torchcodec_source="$STAGE_DIR/torchcodec"
@@ -653,6 +725,9 @@ PY
   cmake -S "$torchcodec_source" -B "$torchcodec_build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+    -DPython_EXECUTABLE="$STAGE_RUNTIME_DIR/bin/python3" \
+    -DPython_ROOT_DIR="$STAGE_RUNTIME_DIR" \
+    -DPython3_EXECUTABLE="$STAGE_RUNTIME_DIR/bin/python3" \
     -DPython3_ROOT_DIR="$STAGE_RUNTIME_DIR" \
     -DPYTHON_VERSION="$PYTHON_VERSION" \
     -DTorch_DIR="$torch_dir" \
@@ -666,7 +741,24 @@ PY
   TORCHCODEC_CMAKE_BUILD_DIR="$torchcodec_build" \
   "$python_bin" -m pip install --no-build-isolation --no-deps "$torchcodec_source"
 
-  install_pyannote_dependencies_without_torchaudio "$python_bin"
+  install_pyannote_dependencies_with_native_media_stack "$python_bin"
+
+  "$python_bin" - <<PY
+from importlib.metadata import version
+import numpy
+import torch
+import torchaudio
+import torchcodec
+
+if not torch.__version__.startswith("$PYANNOTE_INTEL_TORCH_VERSION"):
+    raise SystemExit(f"Unexpected Intel Torch version: {torch.__version__}")
+if not torchaudio.__version__.startswith("$PYANNOTE_INTEL_TORCHAUDIO_VERSION"):
+    raise SystemExit(f"Unexpected Intel TorchAudio version: {torchaudio.__version__}")
+if numpy.__version__.split(".", 1)[0] != "2":
+    raise SystemExit(f"Intel Pyannote requires the NumPy 2.x ABI, found {numpy.__version__}")
+if not version("torchcodec").startswith("$PYANNOTE_INTEL_TORCHCODEC_REF".removeprefix("v")):
+    raise SystemExit(f"Unexpected Intel TorchCodec version: {version('torchcodec')}")
+PY
 
   VERSION_DIR_NAME=$("$python_bin" - <<'PY'
 import sys
