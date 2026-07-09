@@ -28,9 +28,11 @@ fi
 case "$TARGET_TRIPLE" in
   aarch64-apple-darwin)
     RELEASE_ARCH=aarch64
+    MACHO_ARCH=arm64
     ;;
   x86_64-apple-darwin)
     RELEASE_ARCH=x86_64
+    MACHO_ARCH=x86_64
     ;;
   *)
     echo "Unsupported macOS target triple: $TARGET_TRIPLE" >&2
@@ -598,8 +600,8 @@ if [[ -n "$APP_PATH" ]]; then
     exit 1
   fi
   APP_ARCHES=$(lipo -archs "$APP_EXEC")
-  if [[ " $APP_ARCHES " != *" $RELEASE_ARCH "* ]]; then
-    echo "Bundled app executable does not contain expected $RELEASE_ARCH architecture: $APP_ARCHES" >&2
+  if [[ " $APP_ARCHES " != *" $MACHO_ARCH "* ]]; then
+    echo "Bundled app executable does not contain expected Mach-O $MACHO_ARCH architecture: $APP_ARCHES" >&2
     exit 1
   fi
 
