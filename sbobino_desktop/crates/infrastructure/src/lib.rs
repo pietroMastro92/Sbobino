@@ -3243,6 +3243,10 @@ fn is_host_managed_reference(value: &str) -> bool {
 
 fn pyannote_native_binary_paths(runtime_root: &Path) -> Vec<PathBuf> {
     let mut search_roots = Vec::new();
+    let runtime_lib_dir = runtime_root.join("lib");
+    if runtime_lib_dir.is_dir() {
+        search_roots.push(runtime_lib_dir);
+    }
     if let Some(version_dir_name) = pyannote_python_version_dir_name(runtime_root) {
         let stdlib_dir = runtime_root.join("lib").join(version_dir_name);
         for relative in ["lib-dynload", "site-packages"] {
@@ -3396,26 +3400,23 @@ fn validate_embedded_torchcodec_ffmpeg(runtime_root: &Path) -> Result<(), String
         return Ok(());
     };
 
-    let required = [
-        "libavutil.60.dylib",
-        "libavcodec.62.dylib",
-        "libavformat.62.dylib",
-        "libavdevice.62.dylib",
-        "libavfilter.11.dylib",
-        "libswscale.9.dylib",
-        "libswresample.6.dylib",
-    ];
-    for name in required {
-        let candidate = torchcodec_dir.join(".dylibs").join(name);
-        if !candidate.exists() {
-            return Err(format!(
-                "Pyannote runtime is missing bundled TorchCodec FFmpeg library '{}'. Repair or reinstall it from Settings > Local Models.",
-                candidate.display()
-            ));
-        }
-    }
+    let bundled_library_dirs = [torchcodec_dir.join(".dylibs"), runtime_root.join("lib")];
+    let bundled_libraries = bundled_library_dirs
+        .into_iter()
+        .filter_map(|directory| std::fs::read_dir(directory).ok())
+        .flat_map(|entries| entries.flatten())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string)
+        })
+        .collect::<HashSet<_>>();
 
-    for binary in pyannote_torchcodec_binary_paths(runtime_root) {
+    let torchcodec_binaries = pyannote_torchcodec_binary_paths(runtime_root);
+    let mut required_ffmpeg_libraries = HashSet::new();
+    for binary in torchcodec_binaries {
         let deps_output = std::process::Command::new("/usr/bin/otool")
             .arg("-L")
             .arg(&binary)
@@ -3433,6 +3434,14 @@ fn validate_embedded_torchcodec_ffmpeg(runtime_root: &Path) -> Result<(), String
                 String::from_utf8_lossy(&deps_output.stderr).trim()
             ));
         }
+        let deps =
+            parse_otool_linked_library_entries(&String::from_utf8_lossy(&deps_output.stdout));
+        required_ffmpeg_libraries.extend(deps.iter().filter_map(|dependency| {
+            dependency
+                .strip_prefix("@rpath/")
+                .filter(|name| name.starts_with("libav") && name.ends_with(".dylib"))
+                .map(ToString::to_string)
+        }));
         let deps_body = String::from_utf8_lossy(&deps_output.stdout);
         if let Some(dep) = deps_body
             .lines()
@@ -3475,6 +3484,22 @@ fn validate_embedded_torchcodec_ffmpeg(runtime_root: &Path) -> Result<(), String
                 binary.display()
             ));
         }
+    }
+
+    if required_ffmpeg_libraries.is_empty() {
+        return Err(
+            "Pyannote runtime has TorchCodec binaries but none link to a bundled FFmpeg library. Repair or reinstall it from Settings > Local Models."
+                .to_string(),
+        );
+    }
+    if let Some(missing) = required_ffmpeg_libraries
+        .iter()
+        .find(|name| !bundled_libraries.contains(*name))
+    {
+        return Err(format!(
+            "Pyannote runtime is missing bundled TorchCodec FFmpeg library '{}'. Repair or reinstall it from Settings > Local Models.",
+            missing
+        ));
     }
 
     Ok(())
@@ -5171,7 +5196,8 @@ Load command 14
     }
 
     #[test]
-    fn pyannote_native_binary_paths_include_dynload_site_packages_and_embedded_dylibs() {
+    fn pyannote_native_binary_paths_include_runtime_lib_dynload_site_packages_and_embedded_dylibs()
+    {
         let temp = tempdir().expect("failed to create tempdir");
         let runtime_root = temp.path();
         let stdlib_dir = runtime_root.join("lib").join("python3.11");
@@ -5186,11 +5212,13 @@ Load command 14
         let sqlite = dynload.join("_sqlite3.cpython-311-darwin.so");
         let extension = site_packages.join("_portable_native.so");
         let embedded_lib = embedded.join("libsqlite3.dylib");
+        let runtime_lib = runtime_root.join("lib").join("libtorch_cpu.dylib");
         let ignored = stdlib_dir.join("README.txt");
 
         std::fs::write(&sqlite, b"").expect("sqlite shim should be created");
         std::fs::write(&extension, b"").expect("extension shim should be created");
         std::fs::write(&embedded_lib, b"").expect("embedded lib should be created");
+        std::fs::write(&runtime_lib, b"").expect("runtime lib should be created");
         std::fs::write(&ignored, b"ignore").expect("ignored file should be created");
 
         let mut paths = pyannote_native_binary_paths(runtime_root);
@@ -5200,16 +5228,19 @@ Load command 14
         let extension = std::fs::canonicalize(&extension).expect("extension path should resolve");
         let embedded_lib =
             std::fs::canonicalize(&embedded_lib).expect("embedded lib path should resolve");
+        let runtime_lib =
+            std::fs::canonicalize(&runtime_lib).expect("runtime lib path should resolve");
 
-        assert_eq!(paths.len(), 3);
+        assert_eq!(paths.len(), 4);
         assert!(paths.contains(&sqlite));
         assert!(paths.contains(&extension));
         assert!(paths.contains(&embedded_lib));
+        assert!(paths.contains(&runtime_lib));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn validate_embedded_torchcodec_ffmpeg_requires_bundled_libs() {
+    fn validate_embedded_torchcodec_ffmpeg_requires_linked_libraries() {
         let temp = tempdir().expect("failed to create tempdir");
         let runtime_root = temp.path();
         let torchcodec_dir = runtime_root
@@ -5221,7 +5252,7 @@ Load command 14
 
         let error = super::validate_embedded_torchcodec_ffmpeg(runtime_root)
             .expect_err("validation should fail without bundled ffmpeg libs");
-        assert!(error.contains("libavutil.60.dylib"));
+        assert!(error.contains("none link to a bundled FFmpeg library"));
     }
 
     #[test]

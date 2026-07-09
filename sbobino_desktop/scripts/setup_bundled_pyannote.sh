@@ -68,6 +68,9 @@ need_cmd python3
 TORCHCODEC_FFMPEG_BASE_URL="https://pytorch.s3.amazonaws.com/torchcodec/ffmpeg/2025-03-14/macos_arm64"
 TORCHCODEC_FFMPEG_VERSION="8.0"
 TORCHCODEC_FFMPEG_SHA256="beb936b76f25d2621228a12cdb67c9ae3d1eff7aa713ef8d1167ebf0c25bd5ec"
+PYANNOTE_INTEL_CONDA_CHANNEL=${SBOBINO_PYANNOTE_INTEL_CONDA_CHANNEL:-conda-forge}
+PYANNOTE_INTEL_TORCH_VERSION=${SBOBINO_PYANNOTE_INTEL_TORCH_VERSION:-2.8.0}
+PYANNOTE_INTEL_TORCHCODEC_REF=${SBOBINO_PYANNOTE_INTEL_TORCHCODEC_REF:-v0.7.0}
 TORCHCODEC_FFMPEG_LIB_PATTERNS=(
   "libavutil*.dylib"
   "libavcodec*.dylib"
@@ -327,6 +330,9 @@ def parse_otool_rpaths(output: str) -> list[str]:
 
 def candidate_binaries() -> list[Path]:
     roots: list[Path] = []
+    runtime_lib_dir = runtime_root / "lib"
+    if runtime_lib_dir.is_dir():
+        roots.append(runtime_lib_dir)
     for version_dir in sorted((runtime_root / "lib").glob("python3.*")):
         for relative in ("lib-dynload", "site-packages"):
             candidate = version_dir / relative
@@ -495,6 +501,9 @@ def parse_otool_rpaths(output: str) -> list[str]:
 
 
 roots = []
+runtime_lib_dir = runtime_root / "lib"
+if runtime_lib_dir.is_dir():
+    roots.append(runtime_lib_dir)
 for version_dir in sorted((runtime_root / "lib").glob("python3.*")):
     for relative in ("lib-dynload", "site-packages"):
         candidate = version_dir / relative
@@ -582,6 +591,96 @@ resolve_python_executable() {
   exit 1
 }
 
+install_pyannote_dependencies_without_torchaudio() {
+  local python_bin=$1
+
+  "$python_bin" -m pip install --no-deps "pyannote.audio==4.0.4"
+  "$python_bin" - <<'PY'
+from importlib.metadata import requires
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+import subprocess
+import sys
+
+skip = {"torch", "torchaudio", "torchcodec"}
+requirements = []
+for raw in requires("pyannote.audio") or []:
+    requirement = Requirement(raw)
+    if requirement.marker and "extra" in str(requirement.marker):
+        continue
+    if canonicalize_name(requirement.name) in skip:
+        continue
+    requirements.append(str(requirement))
+
+subprocess.check_call([sys.executable, "-m", "pip", "install", *requirements])
+PY
+}
+
+build_intel_pyannote_runtime() {
+  need_cmd conda
+
+  echo "Creating self-contained Intel pyannote runtime with conda-forge PyTorch $PYANNOTE_INTEL_TORCH_VERSION"
+  conda create -y \
+    -p "$STAGE_RUNTIME_DIR" \
+    --override-channels \
+    -c "$PYANNOTE_INTEL_CONDA_CHANNEL" \
+    "python=$PYTHON_VERSION" \
+    "pytorch=$PYANNOTE_INTEL_TORCH_VERSION" \
+    "ffmpeg=7" \
+    pkg-config \
+    cmake \
+    pybind11
+
+  verify_no_external_python_framework_refs "$STAGE_RUNTIME_DIR"
+
+  local python_bin="$STAGE_RUNTIME_DIR/bin/python3"
+  local torchcodec_source="$STAGE_DIR/torchcodec"
+  local torchcodec_build="$STAGE_DIR/torchcodec-build"
+  local torch_dir
+  torch_dir=$("$python_bin" - <<'PY'
+import pathlib
+import torch
+print(pathlib.Path(torch.utils.cmake_prefix_path) / "Torch")
+PY
+)
+
+  git clone --depth 1 --branch "$PYANNOTE_INTEL_TORCHCODEC_REF" \
+    https://github.com/meta-pytorch/torchcodec.git "$torchcodec_source"
+
+  PATH="$STAGE_RUNTIME_DIR/bin:$PATH" \
+  PKG_CONFIG_PATH="$STAGE_RUNTIME_DIR/lib/pkgconfig" \
+  MACOSX_DEPLOYMENT_TARGET=13.0 \
+  cmake -S "$torchcodec_source" -B "$torchcodec_build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+    -DPython3_ROOT_DIR="$STAGE_RUNTIME_DIR" \
+    -DPYTHON_VERSION="$PYTHON_VERSION" \
+    -DTorch_DIR="$torch_dir" \
+    -DTORCHCODEC_DISABLE_COMPILE_WARNING_AS_ERROR=ON
+
+  PATH="$STAGE_RUNTIME_DIR/bin:$PATH" \
+  PKG_CONFIG_PATH="$STAGE_RUNTIME_DIR/lib/pkgconfig" \
+  MACOSX_DEPLOYMENT_TARGET=13.0 \
+  I_CONFIRM_THIS_IS_NOT_A_LICENSE_VIOLATION=1 \
+  TORCHCODEC_DISABLE_COMPILE_WARNING_AS_ERROR=ON \
+  TORCHCODEC_CMAKE_BUILD_DIR="$torchcodec_build" \
+  "$python_bin" -m pip install --no-build-isolation --no-deps "$torchcodec_source"
+
+  install_pyannote_dependencies_without_torchaudio "$python_bin"
+
+  VERSION_DIR_NAME=$("$python_bin" - <<'PY'
+import sys
+print(f"python{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)
+
+  echo "Bundling portable Python native dependencies"
+  bundle_portable_python_native_dependencies "$STAGE_RUNTIME_DIR"
+
+  echo "Asserting standalone portability for the Intel pyannote runtime"
+  assert_python_native_runtime_is_portable "$STAGE_RUNTIME_DIR"
+}
+
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RESOURCE_ROOT="$ROOT_DIR/apps/desktop/src-tauri/resources/pyannote"
 MODEL_DIR="$RESOURCE_ROOT/model"
@@ -634,6 +733,9 @@ if [[ ! -f "$STAGE_MODEL_DIR/config.yaml" ]]; then
   exit 1
 fi
 
+if [[ "$TARGET_TRIPLE" == "x86_64-apple-darwin" ]]; then
+  build_intel_pyannote_runtime
+else
 echo "Creating bundled Python runtime for $TARGET_TRIPLE with Python $PYTHON_VERSION"
 PYTHON_EXECUTABLE=$(resolve_python_executable "$PYTHON_VERSION")
 echo "Using Python executable: $PYTHON_EXECUTABLE"
@@ -770,6 +872,7 @@ bundle_portable_python_native_dependencies "$STAGE_RUNTIME_DIR"
 echo "Asserting standalone portability for bundled Python native modules"
 assert_torchcodec_runtime_is_portable "$STAGE_RUNTIME_DIR" "$VERSION_DIR_NAME"
 assert_python_native_runtime_is_portable "$STAGE_RUNTIME_DIR"
+fi
 
 echo "Verifying bundled pyannote runtime"
 env -i \

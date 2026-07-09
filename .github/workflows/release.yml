@@ -47,6 +47,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Intel conda build environment
+        if: matrix.arch == 'x86_64'
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          auto-update-conda: false
+          use-mamba: false
+
       - name: Install packaging dependencies
         run: brew install whisper-cpp ffmpeg sdl2
 
