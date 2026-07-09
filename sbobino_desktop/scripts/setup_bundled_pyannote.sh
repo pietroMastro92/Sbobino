@@ -625,7 +625,7 @@ constraints = [
     f"torchaudio=={os.environ['PYANNOTE_INTEL_TORCHAUDIO_VERSION']}",
 ]
 with tempfile.NamedTemporaryFile(mode="w", suffix=".txt") as handle:
-    handle.write("\\n".join(constraints) + "\\n")
+    handle.write("\n".join(constraints) + "\n")
     handle.flush()
     subprocess.check_call(
         [
