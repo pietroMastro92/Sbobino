@@ -9,8 +9,8 @@ $ProgressPreference = "SilentlyContinue"
 
 $PythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
 $PythonBase = (& $PythonCommand -c "import sys; print(sys.base_prefix)").Trim()
-$FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
-$FfmpegSha256 = "59df405d7cd022e60feafe663d23dae59ab3aadbf656f2f1c7e2710edeeb0a1e"
+$FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-10-13-44/ffmpeg-n7.1.5-1-g7d0e842004-win64-gpl-shared-7.1.zip"
+$FfmpegSha256 = "19e83b78bee19a0ad1b46ad154413d05491dfc1c51d05fe0aa5acfd2b2194890"
 $TargetTriple = "x86_64-pc-windows-msvc"
 
 function Download-VerifiedArchive {

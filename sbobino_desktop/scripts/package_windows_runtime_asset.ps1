@@ -11,8 +11,8 @@ $WhisperUrl = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/
 $WhisperSha256 = "74f973345cb52ef5ba3ec9e7e7af8e48cc8c71722d1528603b80588a11f82e3e"
 $ParakeetUrl = "https://github.com/mudler/parakeet.cpp/releases/download/v0.4.0/parakeet-v0.4.0-bin-win-cpu-x64.zip"
 $ParakeetSha256 = "2880150a1bad2944baed46f2e6bb9f1bc55263a9f2bb85573785a7ec4fa35f27"
-$FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
-$FfmpegSha256 = "769e77776cee6530595d75271b3d474d95af98b0bd1d1a8c83c28f633b78d619"
+$FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-10-13-44/ffmpeg-n8.1.2-22-g94138f6973-win64-gpl-shared-8.1.zip"
+$FfmpegSha256 = "f5a7056f9e7e09de12fa743ed9a1802f84f644b483ca9edcc4f1d2c0fb7252ea"
 $TargetTriple = "x86_64-pc-windows-msvc"
 
 function Download-VerifiedArchive {
