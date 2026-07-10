@@ -3002,10 +3002,7 @@ mod tests {
                 ),
                 (
                     "x86_64-apple-darwin".to_string(),
-                    descriptor(
-                        "pyannote-runtime-macos-x86_64.zip",
-                        "pyannote-runtime-x86-sha",
-                    ),
+                    descriptor("pyannote-runtime-macos-x86_64.zip", runtime_sha256),
                 ),
             ]),
             pyannote_model_asset: descriptor("pyannote-model-community-1.zip", model_sha256),
