@@ -2873,13 +2873,23 @@ mod tests {
     }
 
     fn write_fake_pyannote_stdlib(runtime_root: &std::path::Path, version_dir_name: &str) {
+        #[cfg(target_os = "windows")]
+        let stdlib_root = {
+            let _ = version_dir_name;
+            std::fs::create_dir_all(runtime_root.join("DLLs"))
+                .expect("runtime DLLs dir should exist");
+            runtime_root.join("Lib")
+        };
+        #[cfg(not(target_os = "windows"))]
         let stdlib_root = runtime_root.join("lib").join(version_dir_name);
         std::fs::create_dir_all(stdlib_root.join("encodings"))
             .expect("stdlib encodings dir should exist");
+        #[cfg(not(target_os = "windows"))]
         std::fs::create_dir_all(stdlib_root.join("lib-dynload"))
             .expect("stdlib lib-dynload dir should exist");
         std::fs::create_dir_all(stdlib_root.join("collections"))
             .expect("stdlib collections dir should exist");
+        #[cfg(not(target_os = "windows"))]
         std::fs::write(
             runtime_root.join("pyvenv.cfg"),
             format!("home = {}\n", runtime_root.join("bin").display()),
@@ -2907,6 +2917,12 @@ mod tests {
         manifest: ManagedPyannoteManifest,
         status_reason_code: &str,
     ) {
+        #[cfg(target_os = "windows")]
+        write_executable_file(
+            &factory.managed_pyannote_python_dir().join("python.exe"),
+            "test executable",
+        );
+        #[cfg(not(target_os = "windows"))]
         write_executable_file(
             &factory
                 .managed_pyannote_python_dir()
