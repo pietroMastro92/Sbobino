@@ -260,10 +260,22 @@ assert_torchcodec_runtime_is_portable() {
       | sort
   )
 
-  local required
-  for required in libavutil.60.dylib libavcodec.62.dylib libavformat.62.dylib libavdevice.62.dylib libavfilter.11.dylib libswscale.9.dylib libswresample.6.dylib; do
-    if [[ ! -e "$torchcodec_dir/.dylibs/$required" ]]; then
-      echo "Torchcodec runtime is missing bundled FFmpeg library: $torchcodec_dir/.dylibs/$required" >&2
+  local family search_root found
+  local ffmpeg_roots=(
+    "$torchcodec_dir/.dylibs"
+    "$runtime_dir/lib/embedded-dylibs"
+    "$runtime_dir/lib"
+  )
+  for family in libavutil libavcodec libavformat libavdevice libavfilter libswscale libswresample; do
+    found=0
+    for search_root in "${ffmpeg_roots[@]}"; do
+      if [[ -d "$search_root" ]] && find "$search_root" -maxdepth 1 -name "${family}*.dylib" -print -quit | grep -q .; then
+        found=1
+        break
+      fi
+    done
+    if [[ $found -ne 1 ]]; then
+      echo "Torchcodec runtime is missing bundled FFmpeg library family: $family" >&2
       exit 1
     fi
   done
@@ -770,6 +782,7 @@ PY
   bundle_portable_python_native_dependencies "$STAGE_RUNTIME_DIR"
 
   echo "Asserting standalone portability for the Intel pyannote runtime"
+  assert_torchcodec_runtime_is_portable "$STAGE_RUNTIME_DIR" "$VERSION_DIR_NAME"
   assert_python_native_runtime_is_portable "$STAGE_RUNTIME_DIR"
 }
 
@@ -978,6 +991,7 @@ import csv
 import encodings
 import ssl
 import sqlite3
+import torchcodec
 from pyannote.audio import Pipeline
 Pipeline.from_pretrained(r"$STAGE_MODEL_DIR")
 print("pyannote pipeline loaded successfully")
