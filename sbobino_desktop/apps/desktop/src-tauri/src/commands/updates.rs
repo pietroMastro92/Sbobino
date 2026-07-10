@@ -143,8 +143,8 @@ mod tests {
             },
         ];
 
-        let selected =
-            select_manual_download_asset("0.1.16", &assets).expect("expected a dmg asset");
+        let selected = select_manual_download_asset_for_arch("0.1.16", "aarch64", &assets)
+            .expect("expected an Apple Silicon DMG asset");
         assert_eq!(selected.name, "Sbobino_0.1.16_aarch64.dmg");
     }
 

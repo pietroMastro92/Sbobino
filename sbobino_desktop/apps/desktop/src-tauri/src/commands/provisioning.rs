@@ -2814,6 +2814,14 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn test_host_pyannote_runtime_asset_name() -> &'static str {
+        match super::host_pyannote_runtime_kind() {
+            "pyannote_runtime_macos_aarch64" => "pyannote-runtime-macos-aarch64.zip",
+            "pyannote_runtime_macos_x86_64" => "pyannote-runtime-macos-x86_64.zip",
+            kind => panic!("unsupported test pyannote runtime kind: {kind}"),
+        }
+    }
+
     fn build_runtime_factory() -> (tempfile::TempDir, Arc<RuntimeTranscriptionFactory>) {
         std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
         std::env::set_var("SBOBINO_RUNTIME_SOURCE_POLICY", "managed-only");
@@ -2952,7 +2960,7 @@ mod tests {
                 PyannoteReleaseAsset {
                     kind: "pyannote_runtime_macos_x86_64".to_string(),
                     name: "pyannote-runtime-macos-x86_64.zip".to_string(),
-                    sha256: "pyannote-runtime-x86-sha".to_string(),
+                    sha256: runtime_sha256.to_string(),
                     size_bytes: None,
                     expanded_size_bytes: None,
                 },
@@ -3135,7 +3143,7 @@ mod tests {
                 source: "release_asset".to_string(),
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
                 compat_level: PYANNOTE_COMPAT_LEVEL + 1,
-                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_asset: test_host_pyannote_runtime_asset_name().to_string(),
                 runtime_sha256: "runtime-sha".to_string(),
                 model_asset: "pyannote-model-community-1.zip".to_string(),
                 model_sha256: "model-sha".to_string(),
@@ -3168,7 +3176,7 @@ mod tests {
                 source: "release_asset".to_string(),
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
                 compat_level: PYANNOTE_COMPAT_LEVEL,
-                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_asset: test_host_pyannote_runtime_asset_name().to_string(),
                 runtime_sha256: "runtime-sha".to_string(),
                 model_asset: "pyannote-model-community-1.zip".to_string(),
                 model_sha256: "model-sha".to_string(),
@@ -3206,7 +3214,7 @@ mod tests {
                 source: "release_asset".to_string(),
                 app_version: "0.1.0".to_string(),
                 compat_level: PYANNOTE_COMPAT_LEVEL,
-                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_asset: test_host_pyannote_runtime_asset_name().to_string(),
                 runtime_sha256: "runtime-sha".to_string(),
                 model_asset: "pyannote-model-community-1.zip".to_string(),
                 model_sha256: "model-sha".to_string(),
@@ -3252,7 +3260,7 @@ mod tests {
                 source: "release_asset".to_string(),
                 app_version: "0.1.0".to_string(),
                 compat_level: PYANNOTE_COMPAT_LEVEL,
-                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_asset: test_host_pyannote_runtime_asset_name().to_string(),
                 runtime_sha256: "installed-runtime-sha".to_string(),
                 model_asset: "pyannote-model-community-1.zip".to_string(),
                 model_sha256: "installed-model-sha".to_string(),
