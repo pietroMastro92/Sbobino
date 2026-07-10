@@ -444,18 +444,30 @@ if torchcodec_dir.is_dir():
                     f"Pyannote runtime asset still exposes a host LC_RPATH: {binary} -> {rpath}"
                 )
 
-    for name in (
-        "libavutil.60.dylib",
-        "libavcodec.62.dylib",
-        "libavformat.62.dylib",
-        "libavdevice.62.dylib",
-        "libavfilter.11.dylib",
-        "libswscale.9.dylib",
-        "libswresample.6.dylib",
+    ffmpeg_roots = (
+        torchcodec_dir / ".dylibs",
+        root / "lib" / "embedded-dylibs",
+        root / "lib",
+    )
+    for family in (
+        "libavutil",
+        "libavcodec",
+        "libavformat",
+        "libavdevice",
+        "libavfilter",
+        "libswscale",
+        "libswresample",
     ):
-        if not (torchcodec_dir / ".dylibs" / name).exists():
+        matches = [
+            candidate
+            for ffmpeg_root in ffmpeg_roots
+            if ffmpeg_root.is_dir()
+            for candidate in ffmpeg_root.glob(f"{family}*.dylib")
+            if candidate.exists() or candidate.is_symlink()
+        ]
+        if not matches:
             raise SystemExit(
-                f"Pyannote runtime asset is missing bundled TorchCodec FFmpeg library: {torchcodec_dir / '.dylibs' / name}"
+                f"Pyannote runtime asset is missing bundled TorchCodec FFmpeg library family: {family}"
             )
 
 env = {
@@ -477,7 +489,7 @@ probe = subprocess.run(
     [
         str(python),
         "-c",
-        "import collections.abc,ctypes,csv,encodings,ssl,sqlite3,traceback,types; import torch; from pyannote.audio import Pipeline; print('ok')",
+        "import collections.abc,ctypes,csv,encodings,ssl,sqlite3,traceback,types; import torch,torchcodec; from pyannote.audio import Pipeline; print('ok')",
     ],
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,

@@ -451,18 +451,30 @@ if torchcodec_dir.is_dir():
                     f"Remote pyannote runtime still exposes a host LC_RPATH: {binary} -> {rpath}"
                 )
 
-    for name in (
-        "libavutil.60.dylib",
-        "libavcodec.62.dylib",
-        "libavformat.62.dylib",
-        "libavdevice.62.dylib",
-        "libavfilter.11.dylib",
-        "libswscale.9.dylib",
-        "libswresample.6.dylib",
+    ffmpeg_roots = (
+        torchcodec_dir / ".dylibs",
+        root / "lib" / "embedded-dylibs",
+        root / "lib",
+    )
+    for family in (
+        "libavutil",
+        "libavcodec",
+        "libavformat",
+        "libavdevice",
+        "libavfilter",
+        "libswscale",
+        "libswresample",
     ):
-        if not (torchcodec_dir / ".dylibs" / name).exists():
+        matches = [
+            candidate
+            for ffmpeg_root in ffmpeg_roots
+            if ffmpeg_root.is_dir()
+            for candidate in ffmpeg_root.glob(f"{family}*.dylib")
+            if candidate.exists() or candidate.is_symlink()
+        ]
+        if not matches:
             raise SystemExit(
-                f"Remote pyannote runtime is missing bundled TorchCodec FFmpeg library: {torchcodec_dir / '.dylibs' / name}"
+                f"Remote pyannote runtime is missing bundled TorchCodec FFmpeg library family: {family}"
             )
 
 import collections.abc
@@ -474,6 +486,7 @@ import sqlite3
 import traceback
 import types
 import torch
+import torchcodec
 from pyannote.audio import Pipeline
 print("Remote pyannote runtime smoke test passed")
 PY
