@@ -56,7 +56,9 @@ jobs:
           use-mamba: false
 
       - name: Install packaging dependencies
-        run: brew install whisper-cpp ffmpeg sdl2
+        # nasm is required by FFmpeg's native x86_64 assembly implementation.
+        # It is a build-only tool: the packaged runtime remains self-contained.
+        run: brew install whisper-cpp ffmpeg sdl2 nasm
 
       - name: Install frontend dependencies
         run: npm ci
