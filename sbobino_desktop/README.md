@@ -11,7 +11,7 @@ This repository is the production-grade rewrite of the original Python Sbobino a
 - `apps/desktop/src-tauri`: Tauri command host and runtime composition
 - `docs/architecture.md`: architecture and dependency rules
 - `docs/release-and-migration.md`: release pipeline and migration plan
-- `docs/distribution-validation-plan.md`: native Apple Silicon and Intel clean-room distribution matrix
+- `docs/distribution-validation-plan.md`: native macOS and Windows clean-room distribution matrix
 - `docs/self-hosted-release-runners.md`: runner labels, machine preparation, and self-hosted validation requirements
 - `docs/first-real-candidate-runbook.md`: operational checklist for the first live candidate with GitHub Actions + self-hosted Macs
 - `docs/feature-migration-matrix.md`: feature-by-feature parity checklist
@@ -32,25 +32,29 @@ From workspace root:
 1. `./scripts/setup_runtime.sh` (downloads `ggml-base.bin` into app data models dir)
 2. In app, keep `Model = Base` for first run.
 3. For public local releases, run `./scripts/setup_bundled_pyannote.sh` only to hydrate the source assets that will be zipped as separate first-launch provisioning artifacts.
-4. The public DMG does not bundle pyannote or the full local runtime. On first launch the app installs FFmpeg, Whisper CLI, Whisper Stream, Whisper models, and pyannote assets into app data through the guided setup flow.
+4. Public installers do not bundle pyannote or the full local runtime. On first launch the app installs FFmpeg, Whisper CLI, Whisper Stream, Whisper models, and pyannote assets into app data through the guided setup flow.
 
 ## Local Release
 
-Run `./scripts/prepare_local_release.sh <version>` once on Apple Silicon and once on Intel with the same output directory. Each run creates native staging assets; the second run assembles the dual-architecture candidate in `dist/local-release/v<version>` without publishing it.
+macOS local staging remains native per architecture. Windows x86_64 artifacts are built and clean-room tested on `windows-2025`; the release workflow assembles all three native staging sets before publication.
 
 That folder now always includes:
 - `Sbobino_<version>_aarch64.dmg`
 - `Sbobino_<version>_x86_64.dmg`
 - `Sbobino_<version>_aarch64.app.tar.gz` and `.sig`
 - `Sbobino_<version>_x86_64.app.tar.gz` and `.sig`
+- `Sbobino_<version>_windows_x86_64-setup.exe`
+- `Sbobino_<version>_windows_x86_64.nsis.zip` and `.sig`
 - `latest.json`
 - `setup-manifest.json`
 - `runtime-manifest.json`
 - `speech-runtime-macos-aarch64.zip`
 - `speech-runtime-macos-x86_64.zip`
+- `speech-runtime-windows-x86_64.zip`
 - `pyannote-manifest.json`
 - `pyannote-runtime-macos-aarch64.zip`
 - `pyannote-runtime-macos-x86_64.zip`
+- `pyannote-runtime-windows-x86_64.zip`
 - `pyannote-model-community-1.zip`
 - `release-readiness-proof.json` (generated only when `release_readiness.sh` passed)
 - `AS-THIRD.validation-report.json` and `INTEL-PRIMARY.validation-report.json` are required before stable promotion and must be uploaded with `status=passed`
@@ -80,7 +84,7 @@ Helper scripts:
 Stable release policy:
 - never overwrite or “fix in place” a stable GitHub release
 - prerelease candidate validation is mandatory before stable promotion
-- mandatory assets for promotion include ARM64 and Intel distribution/portability proofs, `AS-THIRD.validation-report.json`, and `INTEL-PRIMARY.validation-report.json`
+- mandatory assets for promotion include ARM64, Intel, and Windows distribution proofs, macOS portability proofs, `AS-THIRD.validation-report.json`, and `INTEL-PRIMARY.validation-report.json`
 - the default promotion flow retains the latest two validated stable releases
 
 Set `SBOBINO_RELEASE_PROFILE=standalone-dev` only for internal/offline builds that intentionally embed bundled pyannote assets.

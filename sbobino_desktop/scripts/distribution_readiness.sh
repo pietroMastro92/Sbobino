@@ -78,14 +78,19 @@ ASSETS=(
   "Sbobino_${VERSION}_aarch64.app.tar.gz.sig"
   "Sbobino_${VERSION}_x86_64.app.tar.gz"
   "Sbobino_${VERSION}_x86_64.app.tar.gz.sig"
+  "Sbobino_${VERSION}_windows_x86_64-setup.exe"
+  "Sbobino_${VERSION}_windows_x86_64.nsis.zip"
+  "Sbobino_${VERSION}_windows_x86_64.nsis.zip.sig"
   "latest.json"
   "setup-manifest.json"
   "runtime-manifest.json"
   "speech-runtime-macos-aarch64.zip"
   "speech-runtime-macos-x86_64.zip"
+  "speech-runtime-windows-x86_64.zip"
   "pyannote-manifest.json"
   "pyannote-runtime-macos-aarch64.zip"
   "pyannote-runtime-macos-x86_64.zip"
+  "pyannote-runtime-windows-x86_64.zip"
   "pyannote-model-community-1.zip"
 )
 
@@ -155,6 +160,7 @@ architectures = {
         "runtime_kind": "speech_runtime_macos_aarch64",
         "pyannote_name": "pyannote-runtime-macos-aarch64.zip",
         "pyannote_kind": "pyannote_runtime_macos_aarch64",
+        "updater_name": f"Sbobino_{version}_aarch64.app.tar.gz",
     },
     "x86_64": {
         "target": "x86_64-apple-darwin",
@@ -163,6 +169,16 @@ architectures = {
         "runtime_kind": "speech_runtime_macos_x86_64",
         "pyannote_name": "pyannote-runtime-macos-x86_64.zip",
         "pyannote_kind": "pyannote_runtime_macos_x86_64",
+        "updater_name": f"Sbobino_{version}_x86_64.app.tar.gz",
+    },
+    "windows-x86_64": {
+        "target": "x86_64-pc-windows-msvc",
+        "platform": "windows-x86_64",
+        "runtime_name": "speech-runtime-windows-x86_64.zip",
+        "runtime_kind": "speech_runtime_windows_x86_64",
+        "pyannote_name": "pyannote-runtime-windows-x86_64.zip",
+        "pyannote_kind": "pyannote_runtime_windows_x86_64",
+        "updater_name": f"Sbobino_{version}_windows_x86_64.nsis.zip",
     },
 }
 
@@ -170,7 +186,7 @@ if host_arch not in architectures:
     raise SystemExit(f"unsupported host architecture: {host_arch}")
 
 for arch, descriptor in architectures.items():
-    updater_tar = f"Sbobino_{version}_{arch}.app.tar.gz"
+    updater_tar = descriptor["updater_name"]
     updater_sig = f"{updater_tar}.sig"
     platform = latest.get("platforms", {}).get(descriptor["platform"])
     if not isinstance(platform, dict):

@@ -151,8 +151,105 @@ jobs:
           path: ${{ runner.temp }}/sbobino-${{ matrix.arch }}/*
           if-no-files-found: error
 
+  build-windows:
+    name: Build native Windows x86_64
+    runs-on: windows-2025
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
+    defaults:
+      run:
+        working-directory: sbobino_desktop/apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sbobino_desktop/apps/desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build portable Windows speech runtime and sidecars
+        shell: pwsh
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          ../../scripts/package_windows_runtime_asset.ps1 `
+            -OutputZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
+            -SidecarDir (Join-Path $PWD "src-tauri\binaries")
+
+      - name: Download offline Pyannote model
+        shell: pwsh
+        run: |
+          $model = Join-Path $env:RUNNER_TEMP "pyannote-community-1"
+          git lfs install
+          git clone --depth 1 https://huggingface.co/pyannote-community/speaker-diarization-community-1 $model
+          git -C $model lfs pull
+          if (-not (Test-Path (Join-Path $model "config.yaml"))) { throw "Pyannote model is incomplete" }
+
+      - name: Build portable Windows Pyannote runtime
+        shell: pwsh
+        run: |
+          ../../scripts/package_windows_pyannote_runtime.ps1 `
+            -OutputZip (Join-Path $env:RUNNER_TEMP "sbobino-windows\pyannote-runtime-windows-x86_64.zip") `
+            -ModelDir (Join-Path $env:RUNNER_TEMP "pyannote-community-1")
+
+      - name: Inject updater public key
+        shell: bash
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+        run: ../../scripts/prepare_release_updater_config.sh src-tauri/tauri.conf.json "$TAURI_UPDATER_PUBLIC_KEY"
+
+      - name: Test native Windows app
+        run: |
+          npm --prefix apps/desktop test -- --run
+          cargo test --workspace --target x86_64-pc-windows-msvc
+        working-directory: sbobino_desktop
+
+      - name: Build and stage NSIS installer and updater
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw "TAURI_SIGNING_PRIVATE_KEY is required" }
+          $version = $env:TAG_NAME.TrimStart("v")
+          npm run tauri:build -- --target x86_64-pc-windows-msvc --bundles nsis
+          $nsis = Join-Path $PWD "..\..\target\x86_64-pc-windows-msvc\release\bundle\nsis"
+          $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
+          $installer = @(Get-ChildItem $nsis -File -Filter "*-setup.exe")
+          $updater = @(Get-ChildItem $nsis -File -Filter "*.nsis.zip")
+          $signature = @(Get-ChildItem $nsis -File -Filter "*.nsis.zip.sig")
+          if ($installer.Count -ne 1 -or $updater.Count -ne 1 -or $signature.Count -ne 1) {
+            throw "unexpected NSIS artifact set in $nsis"
+          }
+          Copy-Item $installer[0].FullName (Join-Path $staging "Sbobino_${version}_windows_x86_64-setup.exe")
+          Copy-Item $updater[0].FullName (Join-Path $staging "Sbobino_${version}_windows_x86_64.nsis.zip")
+          Copy-Item $signature[0].FullName (Join-Path $staging "Sbobino_${version}_windows_x86_64.nsis.zip.sig")
+          ../../scripts/windows_release_readiness.ps1 -Version $version -StagingDir $staging
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbobino-windows-x86_64
+          path: ${{ runner.temp }}/sbobino-windows/*
+          if-no-files-found: error
+
   publish-candidate:
-    needs: build-native
+    needs: [build-native, build-windows]
     runs-on: ubuntu-latest
     env:
       TAG_NAME: ${{ inputs.tag_name }}
@@ -173,6 +270,11 @@ jobs:
           name: sbobino-macos-x86_64
           path: sbobino_desktop/dist/staging/x86_64
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbobino-windows-x86_64
+          path: sbobino_desktop/dist/staging/windows-x86_64
+
       - name: Assemble and publish the dual-architecture candidate
         working-directory: sbobino_desktop
         run: |
@@ -182,6 +284,7 @@ jobs:
             "$VERSION" \
             "$PWD/dist/staging/aarch64" \
             "$PWD/dist/staging/x86_64" \
+            "$PWD/dist/staging/windows-x86_64" \
             "$OUTPUT_DIR"
           ./scripts/publish_candidate_release.sh "$VERSION" "$GITHUB_REPOSITORY" "$OUTPUT_DIR"
 
@@ -224,6 +327,60 @@ jobs:
         with:
           name: distribution-readiness-${{ matrix.arch }}
           path: sbobino_desktop/${{ matrix.proof }}
+
+  windows-distribution-readiness:
+    needs: publish-candidate
+    runs-on: windows-2025
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
+          fetch-depth: 0
+
+      - name: Download and validate public Windows assets
+        shell: pwsh
+        working-directory: sbobino_desktop
+        run: |
+          $version = $env:TAG_NAME.TrimStart("v")
+          $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows-public"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          gh release download $env:TAG_NAME --repo $env:GITHUB_REPOSITORY `
+            --pattern "Sbobino_${version}_windows_x86_64*" `
+            --pattern "speech-runtime-windows-x86_64.zip" `
+            --pattern "pyannote-runtime-windows-x86_64.zip" `
+            --dir $staging
+          ./scripts/windows_release_readiness.ps1 -Version $version -StagingDir $staging
+
+          $installer = Join-Path $staging "Sbobino_${version}_windows_x86_64-setup.exe"
+          $install = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS installer exited with $($install.ExitCode)" }
+          $app = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "Sbobino.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $app) { throw "installed Sbobino.exe was not found" }
+          $process = Start-Process -FilePath $app.FullName -PassThru
+          Start-Sleep -Seconds 15
+          if ($process.HasExited) { throw "installed app exited during launch smoke with $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+
+          @{
+            schema_version = 1
+            version = $version
+            release_tag = $env:TAG_NAME
+            architecture = "x86_64"
+            platform = "windows"
+            status = "passed"
+            runner = "github-hosted windows-2025"
+            machine_class = "WINDOWS-HOSTED-CLEANROOM"
+            tested_at_utc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            commit_sha = (git rev-parse HEAD)
+          } | ConvertTo-Json | Set-Content windows-distribution-readiness-proof.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distribution-readiness-windows-x86_64
+          path: sbobino_desktop/windows-distribution-readiness-proof.json
 
   portability-smoke:
     needs: publish-candidate
@@ -312,7 +469,7 @@ jobs:
           path: sbobino_desktop/${{ matrix.report }}
 
   upload-validation-assets:
-    needs: [distribution-readiness, portability-smoke]
+    needs: [distribution-readiness, windows-distribution-readiness, portability-smoke]
     if: always()
     runs-on: ubuntu-latest
     env:
@@ -331,6 +488,11 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          name: distribution-readiness-windows-x86_64
+          path: validation-assets
+
+      - uses: actions/download-artifact@v4
+        with:
           name: portability-smoke-aarch64
           path: validation-assets
 
@@ -345,4 +507,5 @@ jobs:
       - name: Fail when either native validation path failed
         run: |
           [[ "${{ needs.distribution-readiness.result }}" == "success" ]]
+          [[ "${{ needs.windows-distribution-readiness.result }}" == "success" ]]
           [[ "${{ needs.portability-smoke.result }}" == "success" ]]

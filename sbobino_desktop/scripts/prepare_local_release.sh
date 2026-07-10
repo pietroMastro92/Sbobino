@@ -187,18 +187,23 @@ if [[ "$RELEASE_ARCH" == "aarch64" ]]; then
   OTHER_ARCH=x86_64
 fi
 
-if [[ -f "$OUTPUT_DIR/staging/$OTHER_ARCH/Sbobino_${VERSION}_${OTHER_ARCH}.dmg" ]]; then
+WINDOWS_STAGING="$OUTPUT_DIR/staging/windows-x86_64"
+if [[ -f "$OUTPUT_DIR/staging/$OTHER_ARCH/Sbobino_${VERSION}_${OTHER_ARCH}.dmg" \
+  && -f "$WINDOWS_STAGING/Sbobino_${VERSION}_windows_x86_64-setup.exe" ]]; then
   "$ROOT_DIR/scripts/assemble_local_release.sh" \
     "$VERSION" \
     "$OUTPUT_DIR/staging/aarch64" \
     "$OUTPUT_DIR/staging/x86_64" \
+    "$WINDOWS_STAGING" \
     "$OUTPUT_DIR"
 else
   cat <<EOF
 Native $RELEASE_ARCH staging completed in:
   $STAGING_DIR
 
-Run this same command on a native $OTHER_ARCH Mac with the same output directory,
-then the dual-architecture candidate will be assembled automatically.
+Final assembly requires native Apple Silicon, macOS Intel, and Windows x86_64
+staging. Use the Release Candidate GitHub Actions workflow for the native
+Windows build, or place its downloaded staging artifact in:
+  $WINDOWS_STAGING
 EOF
 fi

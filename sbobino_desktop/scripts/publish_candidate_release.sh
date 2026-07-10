@@ -44,14 +44,19 @@ required_assets=(
   "Sbobino_${VERSION}_aarch64.app.tar.gz.sig"
   "Sbobino_${VERSION}_x86_64.app.tar.gz"
   "Sbobino_${VERSION}_x86_64.app.tar.gz.sig"
+  "Sbobino_${VERSION}_windows_x86_64-setup.exe"
+  "Sbobino_${VERSION}_windows_x86_64.nsis.zip"
+  "Sbobino_${VERSION}_windows_x86_64.nsis.zip.sig"
   "latest.json"
   "setup-manifest.json"
   "runtime-manifest.json"
   "speech-runtime-macos-aarch64.zip"
   "speech-runtime-macos-x86_64.zip"
+  "speech-runtime-windows-x86_64.zip"
   "pyannote-manifest.json"
   "pyannote-runtime-macos-aarch64.zip"
   "pyannote-runtime-macos-x86_64.zip"
+  "pyannote-runtime-windows-x86_64.zip"
   "pyannote-model-community-1.zip"
   "release-notes.md"
   "release-readiness-proof.json"
@@ -117,6 +122,14 @@ for arch, target in (("aarch64", "darwin-aarch64"), ("x86_64", "darwin-x86_64"))
         raise SystemExit(f"latest.json {target} updater URL is not architecture-matched.")
     if str(platform.get("signature", "")).strip() != (asset_dir / f"{updater_tar}.sig").read_text().strip():
         raise SystemExit(f"latest.json {target} updater signature mismatch.")
+windows_updater = f"Sbobino_{version}_windows_x86_64.nsis.zip"
+windows_platform = latest.get("platforms", {}).get("windows-x86_64")
+if not isinstance(windows_platform, dict):
+    raise SystemExit("latest.json is missing windows-x86_64 updater metadata.")
+if not str(windows_platform.get("url", "")).endswith(f"/{windows_updater}"):
+    raise SystemExit("latest.json windows-x86_64 updater URL is not architecture-matched.")
+if str(windows_platform.get("signature", "")).strip() != (asset_dir / f"{windows_updater}.sig").read_text().strip():
+    raise SystemExit("latest.json windows-x86_64 updater signature mismatch.")
 if setup.get("app_version") != version or setup.get("release_tag") != expected_tag:
     raise SystemExit("setup-manifest.json does not match requested release version/tag.")
 if runtime.get("app_version") != version:
@@ -155,6 +168,7 @@ def assert_descriptor_matches_asset(descriptor: dict, release_asset: dict, label
 for arch, target, runtime_kind, pyannote_kind in (
     ("aarch64", "aarch64-apple-darwin", "speech_runtime_macos_aarch64", "pyannote_runtime_macos_aarch64"),
     ("x86_64", "x86_64-apple-darwin", "speech_runtime_macos_x86_64", "pyannote_runtime_macos_x86_64"),
+    ("windows-x86_64", "x86_64-pc-windows-msvc", "speech_runtime_windows_x86_64", "pyannote_runtime_windows_x86_64"),
 ):
     runtime_release = runtime_assets.get(runtime_kind)
     pyannote_runtime = pyannote_assets.get(pyannote_kind)
@@ -197,13 +211,18 @@ gh release upload "$TAG" \
   "$ASSET_DIR/Sbobino_${VERSION}_aarch64.app.tar.gz.sig" \
   "$ASSET_DIR/Sbobino_${VERSION}_x86_64.app.tar.gz" \
   "$ASSET_DIR/Sbobino_${VERSION}_x86_64.app.tar.gz.sig" \
+  "$ASSET_DIR/Sbobino_${VERSION}_windows_x86_64-setup.exe" \
+  "$ASSET_DIR/Sbobino_${VERSION}_windows_x86_64.nsis.zip" \
+  "$ASSET_DIR/Sbobino_${VERSION}_windows_x86_64.nsis.zip.sig" \
   "$ASSET_DIR/latest.json" \
   "$ASSET_DIR/setup-manifest.json" \
   "$ASSET_DIR/speech-runtime-macos-aarch64.zip" \
   "$ASSET_DIR/speech-runtime-macos-x86_64.zip" \
+  "$ASSET_DIR/speech-runtime-windows-x86_64.zip" \
   "$ASSET_DIR/runtime-manifest.json" \
   "$ASSET_DIR/pyannote-runtime-macos-aarch64.zip" \
   "$ASSET_DIR/pyannote-runtime-macos-x86_64.zip" \
+  "$ASSET_DIR/pyannote-runtime-windows-x86_64.zip" \
   "$ASSET_DIR/pyannote-model-community-1.zip" \
   "$ASSET_DIR/pyannote-manifest.json" \
   "$ASSET_DIR/release-readiness-proof.json" \

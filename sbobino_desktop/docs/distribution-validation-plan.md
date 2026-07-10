@@ -2,7 +2,7 @@
 
 ## Goal
 
-Ship a macOS release that installs and runs on a clean third-party Apple Silicon Mac without requiring:
+Ship native macOS and Windows releases that install and run on clean machines without requiring:
 
 - Homebrew
 - host Python
@@ -10,8 +10,7 @@ Ship a macOS release that installs and runs on a clean third-party Apple Silicon
 - terminal repair steps
 - ad hoc human debugging during first launch
 
-For now, this document defines the mandatory validation bar for `macOS Apple Silicon`.
-It covers native `macOS Apple Silicon` and native `macOS Intel x86_64`; Windows remains future work.
+This document covers native `macOS Apple Silicon`, native `macOS Intel x86_64`, and native `Windows x86_64`.
 
 ## What mature software teams do
 
@@ -48,7 +47,7 @@ Mandatory rule:
 
 - `macOS Intel x86_64`
 
-### Required platform later
+### Required platform now
 
 - `Windows x86_64`
 
@@ -247,11 +246,11 @@ Minimum evidence for the release thread or release notes folder:
 - `AS-THIRD.validation-report.json` uploaded on the GitHub release with `status=passed`
 - `INTEL-PRIMARY.validation-report.json` uploaded on the GitHub release with `status=passed`
 
-## Future Matrix Extension
+## Windows x86_64 Matrix
 
 ### Windows x86_64
 
-When Windows support is introduced, repeat the same structure with:
+The hosted `windows-2025` clean-room gate is mandatory for every candidate. Physical-machine validation can extend this baseline with:
 
 - `WIN-CLEAN-PRIMARY`
 - `WIN-THIRD-PC`
@@ -267,7 +266,7 @@ Additional checks:
 
 ## Immediate Next Step For Sbobino
 
-For Apple Silicon, the release bar should now be:
+The release bar is:
 
 1. local `release_readiness.sh`
 2. uploaded release `distribution_readiness.sh`
@@ -275,6 +274,7 @@ For Apple Silicon, the release bar should now be:
 4. clean-room validation on `AS-THIRD`
 5. upgrade validation from previous public version on `AS-PRIMARY`
 6. Intel native clean-room validation on `INTEL-PRIMARY`
-7. only then manual stable promotion
+7. Windows native runtime, installer, launch, and public-asset validation on `windows-2025`
+8. only then manual stable promotion
 
 That gives us a real distribution process instead of a developer-machine check.

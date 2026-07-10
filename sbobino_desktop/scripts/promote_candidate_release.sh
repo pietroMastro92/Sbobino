@@ -56,6 +56,7 @@ expected_assets = {
     "release-readiness-proof.json",
     "distribution-readiness-proof.json",
     "intel-distribution-readiness-proof.json",
+    "windows-distribution-readiness-proof.json",
     "portability-smoke-report.json",
     "intel-portability-smoke-report.json",
     "AS-THIRD.validation-report.json",
@@ -88,6 +89,7 @@ gh release download "$TAG" \
   --pattern "release-readiness-proof.json" \
   --pattern "distribution-readiness-proof.json" \
   --pattern "intel-distribution-readiness-proof.json" \
+  --pattern "windows-distribution-readiness-proof.json" \
   --pattern "portability-smoke-report.json" \
   --pattern "intel-portability-smoke-report.json" \
   --pattern "AS-THIRD.validation-report.json" \
@@ -146,6 +148,21 @@ if str(intel_distribution.get("status", "")).strip().lower() != "passed":
     raise SystemExit("Stable promotion blocked: Intel distribution readiness proof is not marked passed.")
 if str(intel_distribution.get("gate", "")).strip() != "distribution_readiness.sh":
     raise SystemExit("Stable promotion blocked: Intel distribution readiness proof gate mismatch.")
+
+windows_distribution = load_json(
+    report_dir / "windows-distribution-readiness-proof.json",
+    "windows-distribution-readiness-proof.json",
+)
+if int(windows_distribution.get("schema_version", 0)) != 1:
+    raise SystemExit(
+        "Stable promotion blocked: windows-distribution-readiness-proof.json has unsupported schema_version."
+    )
+if windows_distribution.get("version") != version or windows_distribution.get("release_tag") != tag:
+    raise SystemExit("Stable promotion blocked: Windows distribution readiness proof version mismatch.")
+if str(windows_distribution.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("Stable promotion blocked: Windows distribution readiness proof is not marked passed.")
+if windows_distribution.get("platform") != "windows" or windows_distribution.get("architecture") != "x86_64":
+    raise SystemExit("Stable promotion blocked: Windows distribution readiness proof target mismatch.")
 
 portability = load_json(
     report_dir / "portability-smoke-report.json",

@@ -12,6 +12,7 @@
 - Native public release targets:
   - `macos-14` -> `aarch64-apple-darwin` (Apple Silicon DMG + updater).
   - `macos-15-intel` -> `x86_64-apple-darwin` (Intel DMG + updater).
+  - `windows-2025` -> `x86_64-pc-windows-msvc` (NSIS installer + updater).
 - Produces updater artifacts/signatures and publishes only a GitHub prerelease candidate.
 - Runs hosted integrity gates plus self-hosted machine validation on exact public assets before any stable promotion is allowed.
 - Production origin is the current public GitHub repository: `pietroMastro92/Sbobino`.
@@ -22,18 +23,23 @@
   - `Sbobino_<version>_x86_64.dmg`
   - `Sbobino_<version>_aarch64.app.tar.gz` and `.sig`
   - `Sbobino_<version>_x86_64.app.tar.gz` and `.sig`
+  - `Sbobino_<version>_windows_x86_64-setup.exe`
+  - `Sbobino_<version>_windows_x86_64.nsis.zip` and `.sig`
   - `latest.json`
   - `setup-manifest.json`
   - `speech-runtime-macos-aarch64.zip`
   - `speech-runtime-macos-x86_64.zip`
+  - `speech-runtime-windows-x86_64.zip`
   - `runtime-manifest.json`
   - `pyannote-runtime-macos-aarch64.zip`
   - `pyannote-runtime-macos-x86_64.zip`
+  - `pyannote-runtime-windows-x86_64.zip`
   - `pyannote-model-community-1.zip`
   - `pyannote-manifest.json`
   - `release-readiness-proof.json`
   - `distribution-readiness-proof.json`
   - `intel-distribution-readiness-proof.json`
+  - `windows-distribution-readiness-proof.json`
   - `portability-smoke-report.json`
   - `intel-portability-smoke-report.json`
   - `AS-PRIMARY.validation-report.json`
@@ -78,6 +84,13 @@
   - if the release fails, delete/retire it with `./scripts/retire_failed_candidate.sh <version>` and cut a new patch version
   - the default `public` profile keeps pyannote out of the app bundle and installs it from release assets during first launch
   - local staging requires `TAURI_UPDATER_PUBLIC_KEY` plus the matching Tauri signing key; CI injects these secrets for candidate builds
+
+### Windows
+
+- CI builds a native x86_64 NSIS installer and signed Tauri updater on `windows-2025`.
+- Speech and Pyannote runtimes are self-contained; first launch does not require Python, FFmpeg, or Homebrew-equivalent package managers on the host.
+- The public installer is silently installed and launched on a clean hosted Windows runner before its distribution proof is uploaded.
+- Without an Authenticode certificate, Windows may show a SmartScreen reputation warning even though updater payloads remain cryptographically signed by Tauri.
   - `SBOBINO_RELEASE_PROFILE=standalone-dev` is reserved for internal/offline builds that intentionally embed bundled pyannote assets
 - Inject the updater public key in CI before `tauri build`:
   - `./scripts/prepare_release_updater_config.sh apps/desktop/src-tauri/tauri.conf.json "$TAURI_UPDATER_PUBLIC_KEY"`

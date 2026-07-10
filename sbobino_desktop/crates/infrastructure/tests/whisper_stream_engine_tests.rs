@@ -490,8 +490,8 @@ async fn realtime_start_uses_managed_runtime_bin_dir_on_path() {
 if [ "${PATH#"$PWD"}" = "$PATH" ]; then
   :
 fi
-case ":$PATH:" in
-  *":__BIN_DIR__:/usr/bin:/bin:"*) ;;
+case "$PATH" in
+  "__BIN_DIR__":*) ;;
   *)
     printf 'path-missing\n' 1>&2
     exit 1
