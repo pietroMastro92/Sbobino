@@ -4,8 +4,12 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
-const appSource = fs.readFileSync(path.resolve(currentDir, "../App.tsx"), "utf8");
-const cssSource = fs.readFileSync(path.resolve(currentDir, "../styles.css"), "utf8");
+const appSource = fs
+  .readFileSync(path.resolve(currentDir, "../App.tsx"), "utf8")
+  .replaceAll("\r\n", "\n");
+const cssSource = fs
+  .readFileSync(path.resolve(currentDir, "../styles.css"), "utf8")
+  .replaceAll("\r\n", "\n");
 
 function extractBlock(source: string, selector: string): string {
   const startToken = `${selector} {`;

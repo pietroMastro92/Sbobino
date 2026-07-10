@@ -4,7 +4,9 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
-const appSource = fs.readFileSync(path.resolve(currentDir, "../App.tsx"), "utf8");
+const appSource = fs
+  .readFileSync(path.resolve(currentDir, "../App.tsx"), "utf8")
+  .replaceAll("\r\n", "\n");
 
 function extractFunction(source: string, name: string): string {
   const start = source.indexOf(`function ${name}`);
