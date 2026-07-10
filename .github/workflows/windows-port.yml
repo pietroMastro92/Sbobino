@@ -2,6 +2,9 @@ name: Windows Port Validation
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/windows-port
 
 permissions:
   contents: read
