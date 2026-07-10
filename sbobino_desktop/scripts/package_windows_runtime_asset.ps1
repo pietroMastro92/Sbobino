@@ -122,6 +122,7 @@ try {
         if ($LASTEXITCODE -ne 0 -and $parakeetOutput -notmatch "parakeet-cli|transcribe|Usage") {
             throw "parakeet-cli probe failed: $parakeetOutput"
         }
+        $global:LASTEXITCODE = 0
     }
     finally {
         $env:PATH = $previousPath
@@ -151,3 +152,4 @@ try {
 finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
 }
+$global:LASTEXITCODE = 0
