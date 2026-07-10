@@ -1,5 +1,7 @@
 use serde::Deserialize;
-use tauri::{Emitter, Manager, TitleBarStyle};
+#[cfg(target_os = "macos")]
+use tauri::TitleBarStyle;
+use tauri::{Emitter, Manager};
 
 use crate::error::CommandError;
 
@@ -39,7 +41,7 @@ pub async fn open_settings_window(
 
     let main_window = app.get_webview_window("main");
 
-    let mut builder = tauri::WebviewWindowBuilder::new(
+    let builder = tauri::WebviewWindowBuilder::new(
         &app,
         "settings",
         tauri::WebviewUrl::App(settings_url.into()),
@@ -48,9 +50,14 @@ pub async fn open_settings_window(
     .inner_size(1024.0, 760.0)
     .min_inner_size(900.0, 620.0)
     .resizable(true)
-    .transparent(false)
-    .title_bar_style(TitleBarStyle::Overlay)
-    .hidden_title(true);
+    .transparent(false);
+
+    #[cfg(target_os = "macos")]
+    let mut builder = builder
+        .title_bar_style(TitleBarStyle::Overlay)
+        .hidden_title(true);
+    #[cfg(not(target_os = "macos"))]
+    let mut builder = builder;
 
     // Make settings an owned child of the main window.
     // On macOS this keeps settings above main and prevents main from being focused.

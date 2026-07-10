@@ -272,10 +272,10 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("failed to build sbobino desktop app")
-        .run(|app_handle, event| {
+        .run(|_app_handle, _event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
-                show_main_window(app_handle);
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                show_main_window(_app_handle);
             }
         });
 }
