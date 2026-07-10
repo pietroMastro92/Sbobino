@@ -2931,6 +2931,21 @@ mod tests {
         runtime_sha256: &str,
         model_sha256: &str,
     ) {
+        let arm_runtime_sha = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            runtime_sha256
+        } else {
+            "pyannote-runtime-arm-sha"
+        };
+        let intel_runtime_sha = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            runtime_sha256
+        } else {
+            "pyannote-runtime-x86-sha"
+        };
+        let windows_runtime_sha = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            runtime_sha256
+        } else {
+            "pyannote-runtime-windows-sha"
+        };
         let runtime_manifest = RuntimeReleaseManifest {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             assets: vec![
@@ -2970,21 +2985,21 @@ mod tests {
                 PyannoteReleaseAsset {
                     kind: "pyannote_runtime_macos_aarch64".to_string(),
                     name: "pyannote-runtime-macos-aarch64.zip".to_string(),
-                    sha256: runtime_sha256.to_string(),
+                    sha256: arm_runtime_sha.to_string(),
                     size_bytes: None,
                     expanded_size_bytes: None,
                 },
                 PyannoteReleaseAsset {
                     kind: "pyannote_runtime_macos_x86_64".to_string(),
                     name: "pyannote-runtime-macos-x86_64.zip".to_string(),
-                    sha256: "pyannote-runtime-x86-sha".to_string(),
+                    sha256: intel_runtime_sha.to_string(),
                     size_bytes: None,
                     expanded_size_bytes: None,
                 },
                 PyannoteReleaseAsset {
                     kind: "pyannote_runtime_windows_x86_64".to_string(),
                     name: "pyannote-runtime-windows-x86_64.zip".to_string(),
-                    sha256: "pyannote-runtime-windows-sha".to_string(),
+                    sha256: windows_runtime_sha.to_string(),
                     size_bytes: None,
                     expanded_size_bytes: None,
                 },
@@ -3026,21 +3041,15 @@ mod tests {
             pyannote_runtime_assets: BTreeMap::from([
                 (
                     "aarch64-apple-darwin".to_string(),
-                    descriptor("pyannote-runtime-macos-aarch64.zip", runtime_sha256),
+                    descriptor("pyannote-runtime-macos-aarch64.zip", arm_runtime_sha),
                 ),
                 (
                     "x86_64-apple-darwin".to_string(),
-                    descriptor(
-                        "pyannote-runtime-macos-x86_64.zip",
-                        "pyannote-runtime-x86-sha",
-                    ),
+                    descriptor("pyannote-runtime-macos-x86_64.zip", intel_runtime_sha),
                 ),
                 (
                     "x86_64-pc-windows-msvc".to_string(),
-                    descriptor(
-                        "pyannote-runtime-windows-x86_64.zip",
-                        "pyannote-runtime-windows-sha",
-                    ),
+                    descriptor("pyannote-runtime-windows-x86_64.zip", windows_runtime_sha),
                 ),
             ]),
             pyannote_model_asset: descriptor("pyannote-model-community-1.zip", model_sha256),
@@ -3058,6 +3067,17 @@ mod tests {
             size_bytes: None,
             expanded_size_bytes: None,
         }
+    }
+
+    fn host_test_pyannote_runtime_asset_name() -> &'static str {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        return "pyannote-runtime-macos-aarch64.zip";
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        return "pyannote-runtime-macos-x86_64.zip";
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        return "pyannote-runtime-windows-x86_64.zip";
+        #[allow(unreachable_code)]
+        "pyannote-runtime-unsupported.zip"
     }
 
     fn managed_binary_health(available: bool) -> ManagedRuntimeBinaryHealth {
@@ -3249,7 +3269,7 @@ mod tests {
                 source: "release_asset".to_string(),
                 app_version: "0.1.0".to_string(),
                 compat_level: PYANNOTE_COMPAT_LEVEL,
-                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_asset: host_test_pyannote_runtime_asset_name().to_string(),
                 runtime_sha256: "runtime-sha".to_string(),
                 model_asset: "pyannote-model-community-1.zip".to_string(),
                 model_sha256: "model-sha".to_string(),
@@ -3295,7 +3315,7 @@ mod tests {
                 source: "release_asset".to_string(),
                 app_version: "0.1.0".to_string(),
                 compat_level: PYANNOTE_COMPAT_LEVEL,
-                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_asset: host_test_pyannote_runtime_asset_name().to_string(),
                 runtime_sha256: "installed-runtime-sha".to_string(),
                 model_asset: "pyannote-model-community-1.zip".to_string(),
                 model_sha256: "installed-model-sha".to_string(),
