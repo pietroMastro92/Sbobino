@@ -2,9 +2,18 @@
 
 import argparse
 import json
+import os
 import sys
 import wave
+from pathlib import Path
 from typing import Dict, List
+
+
+_DLL_DIRECTORY_HANDLES = []
+if sys.platform == "win32":
+    dll_dir = Path(sys.executable).resolve().parent / "DLLs"
+    if dll_dir.is_dir():
+        _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(dll_dir)))
 
 
 def resolve_device_candidates(requested: str):

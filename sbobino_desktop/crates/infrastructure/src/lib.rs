@@ -3910,7 +3910,12 @@ fn validate_pyannote_python_runtime(
 
 fn pyannote_runtime_validation_script() -> &'static str {
     concat!(
-        "import sys, traceback\n",
+        "import os, pathlib, sys, traceback\n",
+        "_dll_handles = []\n",
+        "if sys.platform == 'win32':\n",
+        "    _dll_dir = pathlib.Path(sys.executable).resolve().parent / 'DLLs'\n",
+        "    if _dll_dir.is_dir():\n",
+        "        _dll_handles.append(os.add_dll_directory(str(_dll_dir)))\n",
         "try:\n",
         "    import collections.abc, ctypes, csv, encodings, ssl, sqlite3, traceback as _traceback, types\n",
         "    import torch\n",

@@ -92,10 +92,10 @@ try {
         $env:PATH = "$runtimeRoot;$runtimeRoot\DLLs;$env:SystemRoot\System32"
         $env:PYTHONHOME = $runtimeRoot
         $env:PYTHONPATH = "$runtimeRoot\Lib;$sitePackages"
-        & $runtimePython -c "import numpy, torch, torchaudio, torchcodec; from pyannote.audio import Pipeline; assert torch.__version__.startswith('2.9.1'); assert torchaudio.__version__.startswith('2.9.1'); print('pyannote-windows-runtime-ok')"
+        & $runtimePython -c "import os, pathlib, sys; _dll=os.add_dll_directory(str(pathlib.Path(sys.executable).parent/'DLLs')); import numpy, torch, torchaudio, torchcodec; from pyannote.audio import Pipeline; assert torch.__version__.startswith('2.9.1'); assert torchaudio.__version__.startswith('2.9.1'); print('pyannote-windows-runtime-ok')"
         if ($LASTEXITCODE -ne 0) { throw "isolated Windows pyannote runtime validation failed" }
         if ($ModelDir) {
-            & $runtimePython -c "from pyannote.audio import Pipeline; Pipeline.from_pretrained(r'$ModelDir'); print('pyannote-windows-model-ok')"
+            & $runtimePython -c "import os, pathlib, sys; _dll=os.add_dll_directory(str(pathlib.Path(sys.executable).parent/'DLLs')); from pyannote.audio import Pipeline; Pipeline.from_pretrained(r'$ModelDir'); print('pyannote-windows-model-ok')"
             if ($LASTEXITCODE -ne 0) { throw "offline pyannote model validation failed" }
         }
     }

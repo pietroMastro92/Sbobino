@@ -92,7 +92,7 @@ try {
         $env:PYTHONHOME = $pythonRoot
         $env:PYTHONPATH = "$pythonRoot\Lib;$pythonRoot\Lib\site-packages"
         $env:PATH = "$pythonRoot;$pythonRoot\DLLs;$runtimeBin;$runtimeLib;$env:SystemRoot\System32"
-        & $python -c "import numpy, torch, torchaudio, torchcodec; from pyannote.audio import Pipeline; print('windows-pyannote-readiness-ok')"
+        & $python -c "import os, pathlib, sys; _dll=os.add_dll_directory(str(pathlib.Path(sys.executable).parent/'DLLs')); import numpy, torch, torchaudio, torchcodec; from pyannote.audio import Pipeline; print('windows-pyannote-readiness-ok')"
         if ($LASTEXITCODE -ne 0) { throw "isolated Pyannote import probe failed" }
     }
     finally {
