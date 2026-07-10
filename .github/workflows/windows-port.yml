@@ -1,0 +1,129 @@
+name: Windows Port Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-native:
+    runs-on: windows-2025
+    defaults:
+      run:
+        working-directory: sbobino_desktop/apps/desktop
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sbobino_desktop/apps/desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build portable Windows speech runtime and Tauri sidecars
+        shell: pwsh
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          ../../scripts/package_windows_runtime_asset.ps1 `
+            -OutputZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
+            -SidecarDir (Join-Path $PWD "src-tauri\binaries")
+
+      - name: Download offline Pyannote model
+        shell: pwsh
+        run: |
+          $model = Join-Path $env:RUNNER_TEMP "pyannote-community-1"
+          git lfs install
+          git clone --depth 1 https://huggingface.co/pyannote-community/speaker-diarization-community-1 $model
+          git -C $model lfs pull
+          if (-not (Test-Path (Join-Path $model "config.yaml"))) { throw "Pyannote model is incomplete" }
+
+      - name: Build portable Windows Pyannote runtime
+        shell: pwsh
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
+          ../../scripts/package_windows_pyannote_runtime.ps1 `
+            -OutputZip (Join-Path $staging "pyannote-runtime-windows-x86_64.zip") `
+            -ModelDir (Join-Path $env:RUNNER_TEMP "pyannote-community-1")
+
+      - name: Inject updater public key
+        shell: bash
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}
+        run: ../../scripts/prepare_release_updater_config.sh src-tauri/tauri.conf.json "$TAURI_UPDATER_PUBLIC_KEY"
+
+      - name: Run frontend tests
+        run: npm test -- --run
+
+      - name: Run native Windows Rust tests
+        run: cargo test --workspace --target x86_64-pc-windows-msvc
+        working-directory: sbobino_desktop
+
+      - name: Build native NSIS installer and updater
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw "TAURI_SIGNING_PRIVATE_KEY is required" }
+          npm run tauri:build -- --target x86_64-pc-windows-msvc --bundles nsis
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $nsis = Join-Path $PWD "..\..\target\x86_64-pc-windows-msvc\release\bundle\nsis"
+          $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
+          $installer = @(Get-ChildItem $nsis -File -Filter "*-setup.exe")
+          $updater = @(Get-ChildItem $nsis -File -Filter "*.nsis.zip")
+          $signature = @(Get-ChildItem $nsis -File -Filter "*.nsis.zip.sig")
+          if ($installer.Count -ne 1 -or $updater.Count -ne 1 -or $signature.Count -ne 1) {
+            throw "unexpected NSIS artifact set in $nsis"
+          }
+          Copy-Item $installer[0].FullName (Join-Path $staging "Sbobino_${version}_windows_x86_64-setup.exe")
+          Copy-Item $updater[0].FullName (Join-Path $staging "Sbobino_${version}_windows_x86_64.nsis.zip")
+          Copy-Item $signature[0].FullName (Join-Path $staging "Sbobino_${version}_windows_x86_64.nsis.zip.sig")
+
+      - name: Validate portable Windows distribution
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          ../../scripts/windows_release_readiness.ps1 `
+            -Version $version `
+            -StagingDir (Join-Path $env:RUNNER_TEMP "sbobino-windows")
+
+      - name: Smoke install and launch NSIS package
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          $installer = Join-Path $env:RUNNER_TEMP "sbobino-windows\Sbobino_${version}_windows_x86_64-setup.exe"
+          $install = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS installer exited with $($install.ExitCode)" }
+          $app = Join-Path $env:LOCALAPPDATA "Sbobino\Sbobino.exe"
+          if (-not (Test-Path $app)) {
+            $match = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "Sbobino.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $match) { throw "installed Sbobino.exe was not found" }
+            $app = $match.FullName
+          }
+          $process = Start-Process -FilePath $app -PassThru
+          Start-Sleep -Seconds 12
+          if ($process.HasExited) { throw "installed app exited during launch smoke with $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbobino-windows-x86_64
+          path: ${{ runner.temp }}/sbobino-windows/*
+          if-no-files-found: error

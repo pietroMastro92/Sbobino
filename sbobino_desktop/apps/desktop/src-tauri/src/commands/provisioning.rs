@@ -14,8 +14,9 @@ use crate::{
         release_asset_url, release_tag, PyannoteReleaseAsset, PyannoteReleaseManifest,
         ReleaseAssetDescriptor, RuntimeReleaseAsset, RuntimeReleaseManifest, SetupReleaseManifest,
         PYANNOTE_COMPAT_LEVEL, PYANNOTE_MANIFEST_ASSET, PYANNOTE_MODEL_ASSET,
-        PYANNOTE_RUNTIME_AARCH64_ASSET, PYANNOTE_RUNTIME_X86_64_ASSET, RUNTIME_AARCH64_ASSET,
-        RUNTIME_MANIFEST_ASSET, RUNTIME_X86_64_ASSET, SETUP_MANIFEST_ASSET,
+        PYANNOTE_RUNTIME_AARCH64_ASSET, PYANNOTE_RUNTIME_WINDOWS_X86_64_ASSET,
+        PYANNOTE_RUNTIME_X86_64_ASSET, RUNTIME_AARCH64_ASSET, RUNTIME_MANIFEST_ASSET,
+        RUNTIME_WINDOWS_X86_64_ASSET, RUNTIME_X86_64_ASSET, SETUP_MANIFEST_ASSET,
     },
     state::AppState,
 };
@@ -2343,9 +2344,10 @@ fn validate_setup_manifest(version: &str, manifest: &SetupReleaseManifest) -> Re
     )?;
     validate_arch_descriptors(
         &manifest.runtime_assets,
-        [
+        &[
             ("aarch64-apple-darwin", RUNTIME_AARCH64_ASSET),
             ("x86_64-apple-darwin", RUNTIME_X86_64_ASSET),
+            ("x86_64-pc-windows-msvc", RUNTIME_WINDOWS_X86_64_ASSET),
         ],
         "runtime asset descriptor",
     )?;
@@ -2356,9 +2358,13 @@ fn validate_setup_manifest(version: &str, manifest: &SetupReleaseManifest) -> Re
     )?;
     validate_arch_descriptors(
         &manifest.pyannote_runtime_assets,
-        [
+        &[
             ("aarch64-apple-darwin", PYANNOTE_RUNTIME_AARCH64_ASSET),
             ("x86_64-apple-darwin", PYANNOTE_RUNTIME_X86_64_ASSET),
+            (
+                "x86_64-pc-windows-msvc",
+                PYANNOTE_RUNTIME_WINDOWS_X86_64_ASSET,
+            ),
         ],
         "pyannote runtime asset descriptor",
     )?;
@@ -2373,10 +2379,10 @@ fn validate_setup_manifest(version: &str, manifest: &SetupReleaseManifest) -> Re
 
 fn validate_arch_descriptors(
     descriptors: &std::collections::BTreeMap<String, ReleaseAssetDescriptor>,
-    expected_assets: [(&str, &str); 2],
+    expected_assets: &[(&str, &str)],
     label: &str,
 ) -> Result<(), String> {
-    for (target_triple, expected_name) in expected_assets {
+    for &(target_triple, expected_name) in expected_assets {
         let descriptor = setup_arch_descriptor(descriptors, target_triple, label)?;
         validate_release_descriptor_name(descriptor, expected_name, label)?;
     }
@@ -2450,7 +2456,11 @@ fn host_pyannote_runtime_kind() -> &'static str {
     {
         "pyannote_runtime_macos_x86_64"
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "pyannote_runtime_windows_x86_64"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "pyannote_runtime_macos_aarch64"
     }
@@ -2465,7 +2475,11 @@ fn host_runtime_asset_kind() -> &'static str {
     {
         "speech_runtime_macos_x86_64"
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "speech_runtime_windows_x86_64"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "speech_runtime_macos_aarch64"
     }
@@ -2480,7 +2494,11 @@ fn host_pyannote_arch_label() -> &'static str {
     {
         "x86_64-apple-darwin"
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "x86_64-pc-windows-msvc"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         "aarch64-apple-darwin"
     }
@@ -2930,6 +2948,13 @@ mod tests {
                     size_bytes: None,
                     expanded_size_bytes: None,
                 },
+                RuntimeReleaseAsset {
+                    kind: "speech_runtime_windows_x86_64".to_string(),
+                    name: "speech-runtime-windows-x86_64.zip".to_string(),
+                    sha256: "runtime-windows-sha".to_string(),
+                    size_bytes: None,
+                    expanded_size_bytes: None,
+                },
             ],
         };
         let runtime_manifest_body =
@@ -2953,6 +2978,13 @@ mod tests {
                     kind: "pyannote_runtime_macos_x86_64".to_string(),
                     name: "pyannote-runtime-macos-x86_64.zip".to_string(),
                     sha256: "pyannote-runtime-x86-sha".to_string(),
+                    size_bytes: None,
+                    expanded_size_bytes: None,
+                },
+                PyannoteReleaseAsset {
+                    kind: "pyannote_runtime_windows_x86_64".to_string(),
+                    name: "pyannote-runtime-windows-x86_64.zip".to_string(),
+                    sha256: "pyannote-runtime-windows-sha".to_string(),
                     size_bytes: None,
                     expanded_size_bytes: None,
                 },
@@ -2985,6 +3017,10 @@ mod tests {
                     "x86_64-apple-darwin".to_string(),
                     descriptor("speech-runtime-macos-x86_64.zip", "runtime-x86-sha"),
                 ),
+                (
+                    "x86_64-pc-windows-msvc".to_string(),
+                    descriptor("speech-runtime-windows-x86_64.zip", "runtime-windows-sha"),
+                ),
             ]),
             pyannote_manifest: descriptor(PYANNOTE_MANIFEST_ASSET, &pyannote_manifest_sha),
             pyannote_runtime_assets: BTreeMap::from([
@@ -2997,6 +3033,13 @@ mod tests {
                     descriptor(
                         "pyannote-runtime-macos-x86_64.zip",
                         "pyannote-runtime-x86-sha",
+                    ),
+                ),
+                (
+                    "x86_64-pc-windows-msvc".to_string(),
+                    descriptor(
+                        "pyannote-runtime-windows-x86_64.zip",
+                        "pyannote-runtime-windows-sha",
                     ),
                 ),
             ]),
@@ -3442,6 +3485,10 @@ mod tests {
                     "x86_64-apple-darwin".to_string(),
                     descriptor("speech-runtime-macos-x86_64.zip", "deadbeef"),
                 ),
+                (
+                    "x86_64-pc-windows-msvc".to_string(),
+                    descriptor("speech-runtime-windows-x86_64.zip", "deadbeef"),
+                ),
             ]),
             pyannote_manifest: descriptor("pyannote-manifest.json", "deadbeef"),
             pyannote_runtime_assets: BTreeMap::from([
@@ -3452,6 +3499,10 @@ mod tests {
                 (
                     "x86_64-apple-darwin".to_string(),
                     descriptor("pyannote-runtime-macos-x86_64.zip", "deadbeef"),
+                ),
+                (
+                    "x86_64-pc-windows-msvc".to_string(),
+                    descriptor("pyannote-runtime-windows-x86_64.zip", "deadbeef"),
                 ),
             ]),
             pyannote_model_asset: descriptor("pyannote-model-community-1.zip", "deadbeef"),
@@ -3484,9 +3535,13 @@ mod tests {
 
         let error = validate_arch_descriptors(
             &descriptors,
-            [
+            &[
                 ("aarch64-apple-darwin", "speech-runtime-macos-aarch64.zip"),
                 ("x86_64-apple-darwin", "speech-runtime-macos-x86_64.zip"),
+                (
+                    "x86_64-pc-windows-msvc",
+                    "speech-runtime-windows-x86_64.zip",
+                ),
             ],
             "runtime asset descriptor",
         )

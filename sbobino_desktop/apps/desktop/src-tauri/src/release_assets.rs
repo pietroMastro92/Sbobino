@@ -7,9 +7,11 @@ pub const SETUP_MANIFEST_ASSET: &str = "setup-manifest.json";
 pub const RUNTIME_MANIFEST_ASSET: &str = "runtime-manifest.json";
 pub const RUNTIME_AARCH64_ASSET: &str = "speech-runtime-macos-aarch64.zip";
 pub const RUNTIME_X86_64_ASSET: &str = "speech-runtime-macos-x86_64.zip";
+pub const RUNTIME_WINDOWS_X86_64_ASSET: &str = "speech-runtime-windows-x86_64.zip";
 pub const PYANNOTE_MANIFEST_ASSET: &str = "pyannote-manifest.json";
 pub const PYANNOTE_RUNTIME_AARCH64_ASSET: &str = "pyannote-runtime-macos-aarch64.zip";
 pub const PYANNOTE_RUNTIME_X86_64_ASSET: &str = "pyannote-runtime-macos-x86_64.zip";
+pub const PYANNOTE_RUNTIME_WINDOWS_X86_64_ASSET: &str = "pyannote-runtime-windows-x86_64.zip";
 pub const PYANNOTE_MODEL_ASSET: &str = "pyannote-model-community-1.zip";
 pub const PYANNOTE_COMPAT_LEVEL: u32 = 1;
 

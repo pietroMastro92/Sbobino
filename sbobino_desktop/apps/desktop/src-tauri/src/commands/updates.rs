@@ -27,30 +27,34 @@ fn select_manual_download_asset<'a>(
     latest_version: &str,
     assets: &'a [GitHubAsset],
 ) -> Option<&'a GitHubAsset> {
-    select_manual_download_asset_for_arch(latest_version, host_dmg_arch_suffix(), assets)
+    select_manual_download_asset_for_suffix(latest_version, host_installer_suffix(), assets)
 }
 
-fn select_manual_download_asset_for_arch<'a>(
+fn select_manual_download_asset_for_suffix<'a>(
     latest_version: &str,
-    arch_suffix: &str,
+    installer_suffix: &str,
     assets: &'a [GitHubAsset],
 ) -> Option<&'a GitHubAsset> {
-    let expected_dmg = format!("Sbobino_{latest_version}_{arch_suffix}.dmg");
-    assets.iter().find(|asset| asset.name == expected_dmg)
+    let expected_asset = format!("Sbobino_{latest_version}_{installer_suffix}");
+    assets.iter().find(|asset| asset.name == expected_asset)
 }
 
-fn host_dmg_arch_suffix() -> &'static str {
+fn host_installer_suffix() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        "aarch64"
+        "aarch64.dmg"
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        "x86_64"
+        "x86_64.dmg"
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        "aarch64"
+        "windows_x86_64-setup.exe"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "aarch64.dmg"
     }
 }
 
@@ -122,7 +126,7 @@ fn compare_versions(a: &str, b: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_versions, select_manual_download_asset, select_manual_download_asset_for_arch,
+        compare_versions, select_manual_download_asset, select_manual_download_asset_for_suffix,
         GitHubAsset,
     };
 
@@ -177,11 +181,33 @@ mod tests {
             },
         ];
 
-        let selected = select_manual_download_asset_for_arch("0.1.16", "x86_64", &assets)
+        let selected = select_manual_download_asset_for_suffix("0.1.16", "x86_64.dmg", &assets)
             .expect("expected an Intel DMG");
         assert_eq!(
             selected.browser_download_url,
             "https://example.com/intel.dmg"
+        );
+    }
+
+    #[test]
+    fn manual_download_selects_the_windows_installer() {
+        let assets = vec![
+            GitHubAsset {
+                name: "Sbobino_0.1.16_x86_64.dmg".to_string(),
+                browser_download_url: "https://example.com/intel.dmg".to_string(),
+            },
+            GitHubAsset {
+                name: "Sbobino_0.1.16_windows_x86_64-setup.exe".to_string(),
+                browser_download_url: "https://example.com/windows.exe".to_string(),
+            },
+        ];
+
+        let selected =
+            select_manual_download_asset_for_suffix("0.1.16", "windows_x86_64-setup.exe", &assets)
+                .expect("expected a Windows installer");
+        assert_eq!(
+            selected.browser_download_url,
+            "https://example.com/windows.exe"
         );
     }
 

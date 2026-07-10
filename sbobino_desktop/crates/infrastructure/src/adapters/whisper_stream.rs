@@ -123,12 +123,20 @@ impl WhisperStreamEngine {
     }
 
     fn process_is_alive(pid: u32) -> bool {
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        #[cfg(unix)]
+        {
+            std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            true
+        }
     }
 
     fn model_path(&self, model_filename: &str) -> PathBuf {
@@ -379,13 +387,21 @@ impl WhisperStreamEngine {
         }
 
         if let Some(bin_dir) = self.runtime_bin_dir() {
-            command.env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()));
-        }
-
-        if let Some(lib_dir) = self.runtime_lib_dir().filter(|path| path.is_dir()) {
-            command
-                .env("DYLD_LIBRARY_PATH", &lib_dir)
-                .env("DYLD_FALLBACK_LIBRARY_PATH", &lib_dir);
+            let lib_dir = self.runtime_lib_dir().filter(|path| path.is_dir());
+            let mut runtime_paths = vec![bin_dir];
+            runtime_paths.extend(lib_dir.iter().cloned());
+            if let Some(existing) = std::env::var_os("PATH") {
+                runtime_paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(path) = std::env::join_paths(runtime_paths) {
+                command.env("PATH", path);
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(lib_dir) = lib_dir {
+                command
+                    .env("DYLD_LIBRARY_PATH", &lib_dir)
+                    .env("DYLD_FALLBACK_LIBRARY_PATH", &lib_dir);
+            }
         }
 
         let mut child = command.spawn().map_err(|e| {
@@ -450,9 +466,14 @@ impl WhisperStreamEngine {
 
         if let Some(child) = &mut child {
             if let Some(pid) = child.id() {
+                #[cfg(unix)]
                 let _ = std::process::Command::new("kill")
                     .arg("-INT")
                     .arg(pid.to_string())
+                    .status();
+                #[cfg(target_os = "windows")]
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string()])
                     .status();
             }
 
@@ -461,9 +482,14 @@ impl WhisperStreamEngine {
                 .is_err()
             {
                 if let Some(pid) = child.id() {
+                    #[cfg(unix)]
                     let _ = std::process::Command::new("kill")
                         .arg("-TERM")
                         .arg(pid.to_string())
+                        .status();
+                    #[cfg(target_os = "windows")]
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/PID", &pid.to_string()])
                         .status();
                 }
                 if timeout(Duration::from_millis(500), child.wait())

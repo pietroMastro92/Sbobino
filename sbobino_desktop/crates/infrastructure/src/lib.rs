@@ -1121,13 +1121,20 @@ impl RuntimeTranscriptionFactory {
         let ffmpeg_path = self
             .resolve_transcription_binary_details(&settings.transcription.ffmpeg_path, "ffmpeg")
             .resolved_path;
-        let ffmpeg_dir = PathBuf::from(&ffmpeg_path)
+        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+        let mut runtime_path_prepend = PathBuf::from(&ffmpeg_path)
             .parent()
             .map(PathBuf::from)
             .into_iter()
             .collect::<Vec<_>>();
-        let python_home = pyannote_python_home(&self.managed_pyannote_python_dir());
-        let python_path_env = pyannote_python_path_env(&self.managed_pyannote_python_dir());
+        let managed_python_dir = self.managed_pyannote_python_dir();
+        #[cfg(target_os = "windows")]
+        {
+            runtime_path_prepend.push(managed_python_dir.clone());
+            runtime_path_prepend.push(managed_python_dir.join("DLLs"));
+        }
+        let python_home = pyannote_python_home(&managed_python_dir);
+        let python_path_env = pyannote_python_path_env(&managed_python_dir);
 
         Ok(Some(Arc::new(PyannoteSpeakerDiarizationEngine::new(
             python_path,
@@ -1136,7 +1143,7 @@ impl RuntimeTranscriptionFactory {
             script_path,
             model_path,
             diarization.device.trim().to_string(),
-            ffmpeg_dir,
+            runtime_path_prepend,
         ))))
     }
 
@@ -1172,10 +1179,10 @@ impl RuntimeTranscriptionFactory {
     }
 
     fn managed_runtime_binary_path(&self, binary_name: &str) -> PathBuf {
-        let file_name = binary_name_variants(binary_name)
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| binary_name.to_string());
+        #[cfg(target_os = "windows")]
+        let file_name = format!("{}.exe", binary_name.trim_end_matches(".exe"));
+        #[cfg(not(target_os = "windows"))]
+        let file_name = binary_name.to_string();
         self.managed_runtime_bin_dir().join(file_name)
     }
 
@@ -1702,7 +1709,8 @@ impl RuntimeTranscriptionFactory {
 
     fn managed_pyannote_python_candidates(&self) -> Vec<PathBuf> {
         let runtime_dir = self.managed_pyannote_runtime_dir();
-        vec![
+        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+        let mut candidates = vec![
             self.managed_pyannote_python_dir()
                 .join("bin")
                 .join("python3"),
@@ -1711,7 +1719,14 @@ impl RuntimeTranscriptionFactory {
                 .join("python"),
             runtime_dir.join("venv").join("bin").join("python3"),
             runtime_dir.join("venv").join("bin").join("python"),
-        ]
+        ];
+        #[cfg(target_os = "windows")]
+        {
+            candidates.insert(0, self.managed_pyannote_python_dir().join("python.exe"));
+            candidates.insert(1, self.managed_pyannote_python_dir().join("python3.exe"));
+            candidates.push(runtime_dir.join("venv").join("Scripts").join("python.exe"));
+        }
+        candidates
     }
 
     fn install_bundled_pyannote_override_if_available(&self) -> Result<(), String> {
@@ -2367,17 +2382,23 @@ fn verify_managed_runtime_binary(candidate: &Path, lib_dir: &Path) -> ManagedRun
 
     let probe = managed_runnable_binary_probe(candidate);
     let mut command = std::process::Command::new(candidate);
+    command.args(probe.args);
+    let mut path_entries = candidate
+        .parent()
+        .map(PathBuf::from)
+        .into_iter()
+        .collect::<Vec<_>>();
+    path_entries.push(lib_dir.to_path_buf());
+    if let Some(existing) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&existing));
+    }
+    if let Ok(path) = std::env::join_paths(path_entries) {
+        command.env("PATH", path);
+    }
+    #[cfg(target_os = "macos")]
     command
-        .args(probe.args)
         .env("DYLD_LIBRARY_PATH", lib_dir)
-        .env("DYLD_FALLBACK_LIBRARY_PATH", lib_dir)
-        .env(
-            "PATH",
-            candidate
-                .parent()
-                .map(|value| format!("{}:/usr/bin:/bin", value.to_string_lossy()))
-                .unwrap_or_else(|| "/usr/bin:/bin".to_string()),
-        );
+        .env("DYLD_FALLBACK_LIBRARY_PATH", lib_dir);
 
     let mut child = match command
         .stdin(Stdio::null())
@@ -2476,7 +2497,10 @@ fn binary_probe_accepts_nonzero_exit(candidate: &Path, output: &std::process::Ou
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    if !file_name.eq_ignore_ascii_case("parakeet-cli") {
+    if !file_name
+        .trim_end_matches(".exe")
+        .eq_ignore_ascii_case("parakeet-cli")
+    {
         return false;
     }
 
@@ -2551,7 +2575,10 @@ fn runnable_binary_probe(candidate: &Path) -> RunnableBinaryProbe {
         .and_then(|value| value.to_str())
         .unwrap_or_default();
 
-    if file_name.eq_ignore_ascii_case("ffmpeg") {
+    if file_name
+        .trim_end_matches(".exe")
+        .eq_ignore_ascii_case("ffmpeg")
+    {
         return RunnableBinaryProbe {
             args: &["-version"],
             timeout: Duration::from_secs(3),
@@ -2572,7 +2599,10 @@ fn managed_runnable_binary_probe(candidate: &Path) -> RunnableBinaryProbe {
         .and_then(|value| value.to_str())
         .unwrap_or_default();
 
-    if file_name.eq_ignore_ascii_case("ffmpeg") {
+    if file_name
+        .trim_end_matches(".exe")
+        .eq_ignore_ascii_case("ffmpeg")
+    {
         return RunnableBinaryProbe {
             args: &["-version"],
             timeout: Duration::from_secs(45),
@@ -3062,12 +3092,19 @@ fn pyannote_runtime_layout_is_usable(runtime_dir: &Path) -> bool {
     }
 
     let python_dir = runtime_dir.join("python");
-    let python_ready = [
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut python_candidates = vec![
         python_dir.join("bin").join("python3"),
         python_dir.join("bin").join("python"),
-    ]
-    .iter()
-    .any(|candidate| is_runnable_binary_file(candidate));
+    ];
+    #[cfg(target_os = "windows")]
+    {
+        python_candidates.insert(0, python_dir.join("python.exe"));
+        python_candidates.insert(1, python_dir.join("python3.exe"));
+    }
+    let python_ready = python_candidates
+        .iter()
+        .any(|candidate| is_runnable_binary_file(candidate));
     let model_ready = is_pyannote_model_dir(&runtime_dir.join("model"));
 
     python_ready && model_ready
@@ -3181,18 +3218,33 @@ fn pyannote_python_version_dir_name(runtime_root: &Path) -> Option<String> {
 }
 
 fn pyannote_python_home(runtime_root: &Path) -> Option<PathBuf> {
-    let version_dir_name = pyannote_python_version_dir_name(runtime_root)?;
-    let stdlib_dir = runtime_root.join("lib").join(version_dir_name);
-    if pyannote_stdlib_looks_complete(&stdlib_dir) {
-        Some(runtime_root.to_path_buf())
-    } else {
-        None
+    #[cfg(target_os = "windows")]
+    {
+        let stdlib_dir = runtime_root.join("Lib");
+        return pyannote_stdlib_looks_complete(&stdlib_dir).then(|| runtime_root.to_path_buf());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let version_dir_name = pyannote_python_version_dir_name(runtime_root)?;
+        let stdlib_dir = runtime_root.join("lib").join(version_dir_name);
+        if pyannote_stdlib_looks_complete(&stdlib_dir) {
+            Some(runtime_root.to_path_buf())
+        } else {
+            None
+        }
     }
 }
 
 fn pyannote_stdlib_looks_complete(stdlib_dir: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    let native_modules_ready = stdlib_dir
+        .parent()
+        .is_some_and(|root| root.join("DLLs").is_dir());
+    #[cfg(not(target_os = "windows"))]
+    let native_modules_ready = stdlib_dir.join("lib-dynload").is_dir();
+
     stdlib_dir.join("encodings").is_dir()
-        && stdlib_dir.join("lib-dynload").is_dir()
+        && native_modules_ready
         && stdlib_dir.join("types.py").is_file()
         && stdlib_dir.join("traceback.py").is_file()
         && stdlib_dir.join("collections").join("__init__.py").is_file()
@@ -3200,34 +3252,59 @@ fn pyannote_stdlib_looks_complete(stdlib_dir: &Path) -> bool {
 }
 
 fn pyannote_python_path_env(runtime_root: &Path) -> Option<std::ffi::OsString> {
-    let version_dir_name = pyannote_python_version_dir_name(runtime_root)?;
-    let stdlib_dir = runtime_root.join("lib").join(&version_dir_name);
-    let dynload_dir = stdlib_dir.join("lib-dynload");
-    let site_packages_dir = stdlib_dir.join("site-packages");
-    let mut entries = Vec::new();
-    if stdlib_dir.is_dir() {
-        entries.push(stdlib_dir);
+    #[cfg(target_os = "windows")]
+    {
+        let entries = [
+            runtime_root.join("Lib"),
+            runtime_root.join("DLLs"),
+            runtime_root.join("Lib").join("site-packages"),
+        ]
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+        return (!entries.is_empty())
+            .then(|| std::env::join_paths(entries).ok())
+            .flatten();
     }
-    if dynload_dir.is_dir() {
-        entries.push(dynload_dir);
-    }
-    if site_packages_dir.is_dir() {
-        entries.push(site_packages_dir);
-    }
-    if entries.is_empty() {
-        None
-    } else {
-        std::env::join_paths(entries).ok()
+    #[cfg(not(target_os = "windows"))]
+    {
+        let version_dir_name = pyannote_python_version_dir_name(runtime_root)?;
+        let stdlib_dir = runtime_root.join("lib").join(&version_dir_name);
+        let dynload_dir = stdlib_dir.join("lib-dynload");
+        let site_packages_dir = stdlib_dir.join("site-packages");
+        let mut entries = Vec::new();
+        if stdlib_dir.is_dir() {
+            entries.push(stdlib_dir);
+        }
+        if dynload_dir.is_dir() {
+            entries.push(dynload_dir);
+        }
+        if site_packages_dir.is_dir() {
+            entries.push(site_packages_dir);
+        }
+        if entries.is_empty() {
+            None
+        } else {
+            std::env::join_paths(entries).ok()
+        }
     }
 }
 
 fn pyannote_torchcodec_dir(runtime_root: &Path) -> Option<PathBuf> {
-    let version_dir_name = pyannote_python_version_dir_name(runtime_root)?;
+    #[cfg(target_os = "windows")]
     let candidate = runtime_root
-        .join("lib")
-        .join(version_dir_name)
+        .join("Lib")
         .join("site-packages")
         .join("torchcodec");
+    #[cfg(not(target_os = "windows"))]
+    let candidate = {
+        let version_dir_name = pyannote_python_version_dir_name(runtime_root)?;
+        runtime_root
+            .join("lib")
+            .join(version_dir_name)
+            .join("site-packages")
+            .join("torchcodec")
+    };
     if candidate.is_dir() {
         Some(candidate)
     } else {
@@ -3765,6 +3842,16 @@ fn validate_pyannote_python_runtime(
     command
         .env("PYTHONHOME", &python_home)
         .env("PYTHONNOUSERSITE", "1");
+    #[cfg(target_os = "windows")]
+    {
+        let mut path_entries = vec![runtime_root.to_path_buf(), runtime_root.join("DLLs")];
+        if let Some(existing) = std::env::var_os("PATH") {
+            path_entries.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(path) = std::env::join_paths(path_entries) {
+            command.env("PATH", path);
+        }
+    }
     if let Some(python_path_env) = pyannote_python_path_env(runtime_root) {
         command.env("PYTHONPATH", python_path_env);
     }
@@ -3840,8 +3927,19 @@ fn is_pyannote_model_dir(path: &Path) -> bool {
 }
 
 fn is_pyannote_runtime_dir(path: &Path) -> bool {
-    path.is_dir()
-        && (path.join("bin").join("python3").is_file() || path.join("bin").join("python").is_file())
+    if !path.is_dir() {
+        return false;
+    }
+    let unix_layout =
+        path.join("bin").join("python3").is_file() || path.join("bin").join("python").is_file();
+    #[cfg(target_os = "windows")]
+    {
+        unix_layout || path.join("python.exe").is_file() || path.join("python3.exe").is_file()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        unix_layout
+    }
 }
 
 fn expand_home(path: &str) -> String {

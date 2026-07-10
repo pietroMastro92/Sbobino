@@ -617,21 +617,38 @@ impl WhisperCppEngine {
             let libexec_lib = binary_dir.join("../libexec/lib");
             let sibling_lib = binary_dir.join("../lib");
 
-            let mut dyld_paths = Vec::new();
-            // Always include the binary's own directory first — covers Tauri
-            // bundled deployments where dylibs sit right next to whisper-cli.
-            dyld_paths.push(binary_dir.to_string_lossy().to_string());
+            let mut runtime_paths = vec![binary_dir.clone()];
             if libexec_lib.exists() {
-                dyld_paths.push(libexec_lib.to_string_lossy().to_string());
+                runtime_paths.push(libexec_lib.clone());
             }
             if sibling_lib.exists() {
-                dyld_paths.push(sibling_lib.to_string_lossy().to_string());
+                runtime_paths.push(sibling_lib.clone());
             }
-            if let Ok(existing) = std::env::var("DYLD_LIBRARY_PATH") {
-                dyld_paths.push(existing);
+            if let Some(existing) = std::env::var_os("PATH") {
+                runtime_paths.extend(std::env::split_paths(&existing));
             }
-            if !dyld_paths.is_empty() {
-                command.env("DYLD_LIBRARY_PATH", dyld_paths.join(":"));
+            if let Ok(path) = std::env::join_paths(runtime_paths) {
+                command.env("PATH", path);
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let mut dyld_paths = Vec::new();
+                // Always include the binary's own directory first — covers Tauri
+                // bundled deployments where dylibs sit right next to whisper-cli.
+                dyld_paths.push(binary_dir.to_string_lossy().to_string());
+                if libexec_lib.exists() {
+                    dyld_paths.push(libexec_lib.to_string_lossy().to_string());
+                }
+                if sibling_lib.exists() {
+                    dyld_paths.push(sibling_lib.to_string_lossy().to_string());
+                }
+                if let Ok(existing) = std::env::var("DYLD_LIBRARY_PATH") {
+                    dyld_paths.push(existing);
+                }
+                if !dyld_paths.is_empty() {
+                    command.env("DYLD_LIBRARY_PATH", dyld_paths.join(":"));
+                }
             }
         }
     }
