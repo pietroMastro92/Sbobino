@@ -24,5 +24,8 @@ tempfile = "3.13"
 sbobino-domain = { path = "../domain" }
 sbobino-application = { path = "../application" }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
 [dev-dependencies]
 regex = "1"

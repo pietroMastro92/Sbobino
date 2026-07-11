@@ -1,6 +1,7 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use ring::{
@@ -59,7 +60,7 @@ impl SecureStorage {
         if let Some(existing) = read_keychain_secret(MASTER_KEY_ACCOUNT)? {
             let master_key = decode_hex(&existing).ok_or_else(|| {
                 ApplicationError::Persistence(
-                    "invalid master key encoding in macOS Keychain".to_string(),
+                    "invalid master key encoding in platform secure storage".to_string(),
                 )
             })?;
             return Ok(Self {
@@ -218,6 +219,7 @@ impl ring::hkdf::KeyType for HkdfLen {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn read_keychain_secret(account: &str) -> Result<Option<String>, ApplicationError> {
     let output = Command::new("/usr/bin/security")
         .arg("find-generic-password")
@@ -250,6 +252,30 @@ fn read_keychain_secret(account: &str) -> Result<Option<String>, ApplicationErro
     )))
 }
 
+#[cfg(target_os = "windows")]
+fn read_keychain_secret(account: &str) -> Result<Option<String>, ApplicationError> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE_NAME, account).map_err(|error| {
+        ApplicationError::Persistence(format!(
+            "failed to open Windows Credential Manager entry `{account}`: {error}"
+        ))
+    })?;
+    match entry.get_password() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(ApplicationError::Persistence(format!(
+            "Windows Credential Manager lookup failed for `{account}`: {error}"
+        ))),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn read_keychain_secret(account: &str) -> Result<Option<String>, ApplicationError> {
+    Err(ApplicationError::Persistence(format!(
+        "platform secure storage is unavailable for `{account}`"
+    )))
+}
+
+#[cfg(target_os = "macos")]
 fn write_keychain_secret(account: &str, secret: &str) -> Result<(), ApplicationError> {
     let _ = delete_keychain_secret(account);
     let output = Command::new("/usr/bin/security")
@@ -278,6 +304,28 @@ fn write_keychain_secret(account: &str, secret: &str) -> Result<(), ApplicationE
     )))
 }
 
+#[cfg(target_os = "windows")]
+fn write_keychain_secret(account: &str, secret: &str) -> Result<(), ApplicationError> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE_NAME, account).map_err(|error| {
+        ApplicationError::Persistence(format!(
+            "failed to open Windows Credential Manager entry `{account}`: {error}"
+        ))
+    })?;
+    entry.set_password(secret).map_err(|error| {
+        ApplicationError::Persistence(format!(
+            "Windows Credential Manager write failed for `{account}`: {error}"
+        ))
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn write_keychain_secret(account: &str, _secret: &str) -> Result<(), ApplicationError> {
+    Err(ApplicationError::Persistence(format!(
+        "platform secure storage is unavailable for `{account}`"
+    )))
+}
+
+#[cfg(target_os = "macos")]
 fn delete_keychain_secret(account: &str) -> Result<(), ApplicationError> {
     let output = Command::new("/usr/bin/security")
         .arg("delete-generic-password")
@@ -304,6 +352,28 @@ fn delete_keychain_secret(account: &str) -> Result<(), ApplicationError> {
     Err(ApplicationError::Persistence(format!(
         "macOS Keychain delete failed for `{account}`: {}",
         stderr.trim()
+    )))
+}
+
+#[cfg(target_os = "windows")]
+fn delete_keychain_secret(account: &str) -> Result<(), ApplicationError> {
+    let entry = keyring::Entry::new(KEYCHAIN_SERVICE_NAME, account).map_err(|error| {
+        ApplicationError::Persistence(format!(
+            "failed to open Windows Credential Manager entry `{account}`: {error}"
+        ))
+    })?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(ApplicationError::Persistence(format!(
+            "Windows Credential Manager delete failed for `{account}`: {error}"
+        ))),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn delete_keychain_secret(account: &str) -> Result<(), ApplicationError> {
+    Err(ApplicationError::Persistence(format!(
+        "platform secure storage is unavailable for `{account}`"
     )))
 }
 
@@ -755,5 +825,29 @@ mod tests {
         assert!(error
             .to_string()
             .contains("backup password is invalid or the backup file is corrupted"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_credential_manager_roundtrip() {
+        let account = format!(
+            "test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should follow epoch")
+                .as_nanos()
+        );
+        super::write_keychain_secret(&account, "sbobino-test-secret")
+            .expect("credential should write");
+        assert_eq!(
+            super::read_keychain_secret(&account).expect("credential should read"),
+            Some("sbobino-test-secret".to_string())
+        );
+        super::delete_keychain_secret(&account).expect("credential should delete");
+        assert_eq!(
+            super::read_keychain_secret(&account).expect("deleted credential should read"),
+            None
+        );
     }
 }
