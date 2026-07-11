@@ -237,7 +237,8 @@ jobs:
         run: |
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw "TAURI_SIGNING_PRIVATE_KEY is required" }
           $version = $env:TAG_NAME.TrimStart("v")
-          npm run tauri:build -- --target x86_64-pc-windows-msvc --bundles nsis
+          $env:SBOBINO_RELEASE_PROFILE = "standalone-dev"
+          npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
           $nsis = Join-Path $PWD "..\..\target\x86_64-pc-windows-msvc\release\bundle\nsis"
           $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
           $installer = @(Get-ChildItem $nsis -File -Filter "*-setup.exe")

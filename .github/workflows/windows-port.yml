@@ -92,7 +92,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw "TAURI_SIGNING_PRIVATE_KEY is required" }
-          npm run tauri:build -- --target x86_64-pc-windows-msvc --bundles nsis
+          $env:SBOBINO_RELEASE_PROFILE = "standalone-dev"
+          npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
           $version = (Get-Content package.json | ConvertFrom-Json).version
           $nsis = Join-Path $PWD "..\..\target\x86_64-pc-windows-msvc\release\bundle\nsis"
           $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
