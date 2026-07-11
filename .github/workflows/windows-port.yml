@@ -122,10 +122,10 @@ jobs:
           $installer = Join-Path $env:RUNNER_TEMP "sbobino-windows\Sbobino_${version}_windows_x86_64-setup.exe"
           $install = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "NSIS installer exited with $($install.ExitCode)" }
-          $app = Join-Path $env:LOCALAPPDATA "Sbobino\Sbobino.exe"
+          $app = Join-Path $env:LOCALAPPDATA "Sbobino\sbobino-desktop.exe"
           if (-not (Test-Path $app)) {
-            $match = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "Sbobino.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -eq $match) { throw "installed Sbobino.exe was not found" }
+            $match = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "sbobino-desktop.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $match) { throw "installed sbobino-desktop.exe was not found" }
             $app = $match.FullName
           }
           $process = Start-Process -FilePath $app -PassThru
@@ -134,6 +134,7 @@ jobs:
           Stop-Process -Id $process.Id -Force
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: sbobino-windows-x86_64
           path: ${{ runner.temp }}/sbobino-windows/*

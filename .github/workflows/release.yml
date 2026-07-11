@@ -367,8 +367,8 @@ jobs:
           $installer = Join-Path $staging "Sbobino_${version}_windows_x86_64-setup.exe"
           $install = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
           if ($install.ExitCode -ne 0) { throw "NSIS installer exited with $($install.ExitCode)" }
-          $app = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "Sbobino.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($null -eq $app) { throw "installed Sbobino.exe was not found" }
+          $app = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "sbobino-desktop.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $app) { throw "installed sbobino-desktop.exe was not found" }
           $process = Start-Process -FilePath $app.FullName -PassThru
           Start-Sleep -Seconds 15
           if ($process.HasExited) { throw "installed app exited during launch smoke with $($process.ExitCode)" }
