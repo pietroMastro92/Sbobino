@@ -1,0 +1,74 @@
+name: Windows Smoke Diagnostic
+
+on:
+  push:
+    branches:
+      - codex/windows-port
+    paths:
+      - .github/workflows/windows-smoke-diagnostic.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  diagnose-installed-app:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download validated Windows artifacts
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 29144845742 `
+            --repo $env:GITHUB_REPOSITORY `
+            --name sbobino-windows-x86_64 `
+            --dir (Join-Path $env:RUNNER_TEMP "sbobino-windows")
+
+      - name: Install and capture startup diagnostics
+        id: smoke
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
+          $installer = Join-Path $staging "Sbobino_2.0.18_windows_x86_64-setup.exe"
+          $install = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS installer exited with $($install.ExitCode)" }
+
+          $app = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "sbobino-desktop.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $app) { throw "installed sbobino-desktop.exe was not found" }
+          Write-Host "Installed app: $($app.FullName)"
+          Get-ChildItem $app.DirectoryName -Force | Format-Table Name,Length,LastWriteTime
+
+          $env:RUST_BACKTRACE = "full"
+          $env:RUST_LOG = "debug"
+          $stdout = Join-Path $staging "app-stdout.log"
+          $stderr = Join-Path $staging "app-stderr.log"
+          $process = Start-Process -FilePath $app.FullName -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Start-Sleep -Seconds 15
+          if ($process.HasExited) {
+            Write-Host "App exit code: $($process.ExitCode)"
+            Get-Content $stdout -ErrorAction SilentlyContinue
+            Get-Content $stderr -ErrorAction SilentlyContinue
+            Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-5) } -ErrorAction SilentlyContinue |
+              Select-Object -First 30 TimeCreated,ProviderName,Id,LevelDisplayName,Message |
+              Format-List | Out-File (Join-Path $staging "windows-application-events.log")
+            throw "installed app exited during launch smoke with $($process.ExitCode)"
+          }
+          Stop-Process -Id $process.Id -Force
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-smoke-diagnostics
+          path: |
+            ${{ runner.temp }}/sbobino-windows/*.log
+          if-no-files-found: warn
+
+      - name: Enforce smoke result
+        if: steps.smoke.outcome != 'success'
+        shell: pwsh
+        run: throw "installed application smoke failed; see diagnostics artifact"
