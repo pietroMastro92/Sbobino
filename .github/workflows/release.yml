@@ -192,8 +192,15 @@ jobs:
             -OutputZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
             -SidecarDir (Join-Path $PWD "src-tauri\binaries")
 
-      - name: Test native Windows Rust workspace
-        run: cargo test --workspace --target x86_64-pc-windows-msvc
+      - name: Compile all Windows Rust tests
+        run: cargo test --workspace --target x86_64-pc-windows-msvc --no-run
+        working-directory: sbobino_desktop
+
+      - name: Run portable Windows Rust tests
+        # Infrastructure process-probe tests use intentional POSIX shell fixtures.
+        # Compile that crate above, then validate its production binaries below
+        # through readiness plus the installed NSIS application smoke.
+        run: cargo test -p sbobino-domain -p sbobino-application -p sbobino-desktop --target x86_64-pc-windows-msvc -- --test-threads=1
         working-directory: sbobino_desktop
 
       - name: Download offline Pyannote model
