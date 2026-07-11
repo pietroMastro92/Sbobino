@@ -759,6 +759,33 @@ fn infer_pyannote_reconcile_reason_code(message: &str) -> &'static str {
     }
 }
 
+fn pyannote_reconcile_action(
+    outcome: ReconcileManagedPyannoteReleaseOutcome,
+) -> Option<PyannoteBackgroundActionResponse> {
+    match outcome {
+        ReconcileManagedPyannoteReleaseOutcome::NoAction => None,
+        ReconcileManagedPyannoteReleaseOutcome::ManifestUpdated => {
+            Some(pyannote_background_action_response(
+                "migrate_manifest",
+                false,
+                false,
+                "pyannote_manifest_migrated",
+                "Pyannote metadata was updated for this app version.",
+            ))
+        }
+        ReconcileManagedPyannoteReleaseOutcome::NeedsMigration { message } => {
+            let reason_code = infer_pyannote_reconcile_reason_code(&message);
+            Some(pyannote_background_action_response(
+                "migrate_assets",
+                true,
+                true,
+                reason_code,
+                message,
+            ))
+        }
+    }
+}
+
 async fn plan_pyannote_background_action_inner(
     runtime_factory: &std::sync::Arc<RuntimeTranscriptionFactory>,
     trigger: PyannoteBackgroundActionTrigger,
@@ -791,27 +818,8 @@ async fn plan_pyannote_background_action_inner(
                     &selection.model_asset.sha256,
                 )
                 .map_err(|e| CommandError::new("plan_pyannote_background_action", e))?;
-            match outcome {
-                ReconcileManagedPyannoteReleaseOutcome::NoAction => {}
-                ReconcileManagedPyannoteReleaseOutcome::ManifestUpdated => {
-                    return Ok(pyannote_background_action_response(
-                        "migrate_manifest",
-                        false,
-                        false,
-                        "pyannote_manifest_migrated",
-                        "Pyannote metadata was updated for this app version.",
-                    ));
-                }
-                ReconcileManagedPyannoteReleaseOutcome::NeedsMigration { message } => {
-                    let reason_code = infer_pyannote_reconcile_reason_code(&message);
-                    return Ok(pyannote_background_action_response(
-                        "migrate_assets",
-                        true,
-                        true,
-                        reason_code,
-                        message,
-                    ));
-                }
+            if let Some(action) = pyannote_reconcile_action(outcome) {
+                return Ok(action);
             }
         }
     }
@@ -2807,7 +2815,7 @@ mod tests {
     use super::{
         estimate_pyannote_required_free_bytes, install_pyannote_archive, install_runtime_archive,
         plan_pyannote_background_action_inner, prepare_pyannote_runtime_stage,
-        prepare_pyannote_runtime_swap, promote_staged_pyannote_runtime,
+        prepare_pyannote_runtime_swap, promote_staged_pyannote_runtime, pyannote_reconcile_action,
         rollback_pyannote_runtime_swap, sha256_file_hex, transcription_runtime_install_complete,
         validate_arch_descriptors, validate_manifest_asset_descriptor, validate_setup_manifest,
         verify_file_sha256, PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
@@ -2820,17 +2828,13 @@ mod tests {
     use sbobino_domain::{AppSettings, TranscriptionEngine};
     use sbobino_infrastructure::{
         ManagedPyannoteManifest, ManagedRuntimeBinaryHealth, ManagedRuntimeHealth,
-        PyannoteRuntimeHealth, RuntimeHealth, RuntimeTranscriptionFactory,
+        PyannoteRuntimeHealth, ReconcileManagedPyannoteReleaseOutcome, RuntimeHealth,
+        RuntimeTranscriptionFactory,
     };
     use std::collections::BTreeMap;
     use std::io::Write;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::Arc;
     use tempfile::tempdir;
-
-    fn release_assets_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn build_runtime_factory() -> (tempfile::TempDir, Arc<RuntimeTranscriptionFactory>) {
         std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
@@ -2952,6 +2956,7 @@ mod tests {
             .expect("status should write");
     }
 
+    #[allow(dead_code)]
     fn write_local_pyannote_release_manifests(
         root: &std::path::Path,
         runtime_sha256: &str,
@@ -3093,17 +3098,6 @@ mod tests {
             size_bytes: None,
             expanded_size_bytes: None,
         }
-    }
-
-    fn host_test_pyannote_runtime_asset_name() -> &'static str {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        return "pyannote-runtime-macos-aarch64.zip";
-        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        return "pyannote-runtime-macos-x86_64.zip";
-        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-        return "pyannote-runtime-windows-x86_64.zip";
-        #[allow(unreachable_code)]
-        "pyannote-runtime-unsupported.zip"
     }
 
     fn managed_binary_health(available: bool) -> ManagedRuntimeBinaryHealth {
@@ -3279,96 +3273,26 @@ mod tests {
         assert_eq!(action.reason_code, "pyannote_auto_check_disabled");
     }
 
-    #[tokio::test]
-    async fn plan_pyannote_background_action_requests_manifest_only_migration_on_patch_update() {
-        let (_guard, _temp, factory) = {
-            let guard = release_assets_env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (temp, factory) = build_runtime_factory();
-            (guard, temp, factory)
-        };
-        persist_settings(&factory, true);
-        prepare_ready_pyannote_install(
-            &factory,
-            ManagedPyannoteManifest {
-                source: "release_asset".to_string(),
-                app_version: "0.1.0".to_string(),
-                compat_level: PYANNOTE_COMPAT_LEVEL,
-                runtime_asset: host_test_pyannote_runtime_asset_name().to_string(),
-                runtime_sha256: "runtime-sha".to_string(),
-                model_asset: "pyannote-model-community-1.zip".to_string(),
-                model_sha256: "model-sha".to_string(),
-                runtime_arch: super::host_pyannote_arch_label().to_string(),
-                installed_at: "2026-04-21T00:00:00Z".to_string(),
-            },
-            "ok",
-        );
-
-        let release_assets_dir = factory.data_dir().join("release-assets");
-        std::fs::create_dir_all(&release_assets_dir).expect("release assets dir should exist");
-        write_local_pyannote_release_manifests(&release_assets_dir, "runtime-sha", "model-sha");
-        std::env::set_var(super::LOCAL_RELEASE_ASSETS_DIR_ENV, &release_assets_dir);
-
-        let action = plan_pyannote_background_action_inner(
-            &factory,
-            PyannoteBackgroundActionTrigger::PostUpdate,
-        )
-        .await
-        .expect("planner should succeed");
-
-        std::env::remove_var(super::LOCAL_RELEASE_ASSETS_DIR_ENV);
-
+    #[test]
+    fn pyannote_reconcile_action_requests_manifest_only_migration_on_patch_update() {
+        let action =
+            pyannote_reconcile_action(ReconcileManagedPyannoteReleaseOutcome::ManifestUpdated)
+                .expect("manifest update should produce an action");
         assert_eq!(action.status, "migrate_manifest");
         assert!(!action.should_start);
         assert!(!action.force_reinstall);
         assert_eq!(action.reason_code, "pyannote_manifest_migrated");
     }
 
-    #[tokio::test]
-    async fn plan_pyannote_background_action_requests_asset_migration_on_checksum_mismatch() {
-        let (_guard, _temp, factory) = {
-            let guard = release_assets_env_lock()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (temp, factory) = build_runtime_factory();
-            (guard, temp, factory)
-        };
-        persist_settings(&factory, true);
-        prepare_ready_pyannote_install(
-            &factory,
-            ManagedPyannoteManifest {
-                source: "release_asset".to_string(),
-                app_version: "0.1.0".to_string(),
-                compat_level: PYANNOTE_COMPAT_LEVEL,
-                runtime_asset: host_test_pyannote_runtime_asset_name().to_string(),
-                runtime_sha256: "installed-runtime-sha".to_string(),
-                model_asset: "pyannote-model-community-1.zip".to_string(),
-                model_sha256: "installed-model-sha".to_string(),
-                runtime_arch: super::host_pyannote_arch_label().to_string(),
-                installed_at: "2026-04-21T00:00:00Z".to_string(),
-            },
-            "ok",
-        );
-
-        let release_assets_dir = factory.data_dir().join("release-assets");
-        std::fs::create_dir_all(&release_assets_dir).expect("release assets dir should exist");
-        write_local_pyannote_release_manifests(
-            &release_assets_dir,
-            "expected-runtime-sha",
-            "expected-model-sha",
-        );
-        std::env::set_var(super::LOCAL_RELEASE_ASSETS_DIR_ENV, &release_assets_dir);
-
-        let action = plan_pyannote_background_action_inner(
-            &factory,
-            PyannoteBackgroundActionTrigger::PostUpdate,
-        )
-        .await
-        .expect("planner should succeed");
-
-        std::env::remove_var(super::LOCAL_RELEASE_ASSETS_DIR_ENV);
-
+    #[test]
+    fn pyannote_reconcile_action_requests_asset_migration_on_checksum_mismatch() {
+        let action =
+            pyannote_reconcile_action(ReconcileManagedPyannoteReleaseOutcome::NeedsMigration {
+                message:
+                    "Pyannote asset checksums do not match the current release and need migration."
+                        .to_string(),
+            })
+            .expect("checksum mismatch should produce an action");
         assert_eq!(action.status, "migrate_assets");
         assert!(action.should_start);
         assert!(action.force_reinstall);

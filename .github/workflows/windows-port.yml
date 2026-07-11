@@ -49,7 +49,9 @@ jobs:
             -SidecarDir (Join-Path $PWD "src-tauri\binaries")
 
       - name: Run native Windows Rust tests
-        run: cargo test --workspace --target x86_64-pc-windows-msvc
+        # Several tests temporarily modify process-wide environment variables.
+        # Run them serially so Windows never observes another test's fixture.
+        run: cargo test --workspace --target x86_64-pc-windows-msvc -- --test-threads=1
         working-directory: sbobino_desktop
 
       - name: Download offline Pyannote model
