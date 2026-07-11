@@ -4217,7 +4217,7 @@ dependencies = [
 
 [[package]]
 name = "sbobino-application"
-version = "2.0.18"
+version = "2.0.20"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4236,7 +4236,7 @@ dependencies = [
 
 [[package]]
 name = "sbobino-desktop"
-version = "2.0.18"
+version = "2.0.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4273,7 +4273,7 @@ dependencies = [
 
 [[package]]
 name = "sbobino-domain"
-version = "2.0.18"
+version = "2.0.20"
 dependencies = [
  "chrono",
  "num_cpus",
@@ -4284,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "sbobino-infrastructure"
-version = "2.0.18"
+version = "2.0.20"
 dependencies = [
  "async-trait",
  "chrono",
