@@ -1,0 +1,68 @@
+name: Validate Published Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing prerelease tag whose public assets must be validated
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  distribution-readiness:
+    name: Validate public macOS ${{ matrix.arch }} assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-14
+            proof: distribution-readiness-proof.json
+          - arch: x86_64
+            runner: macos-15-intel
+            proof: intel-distribution-readiness-proof.json
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate public assets on the matching architecture
+        working-directory: sbobino_desktop
+        run: ./scripts/distribution_readiness.sh "${TAG_NAME#v}" "$GITHUB_REPOSITORY"
+
+      - name: Write architecture proof
+        working-directory: sbobino_desktop
+        run: |
+          python3 ./scripts/write_distribution_readiness_proof.py \
+            "$PWD/${{ matrix.proof }}" \
+            "${TAG_NAME#v}" \
+            --repo-slug "$GITHUB_REPOSITORY" \
+            --commit-sha "$(git rev-list -n 1 "$TAG_NAME")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: published-distribution-readiness-${{ matrix.arch }}
+          path: sbobino_desktop/${{ matrix.proof }}
+
+  upload-proofs:
+    needs: distribution-readiness
+    runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: published-distribution-readiness-*
+          path: validation-assets
+          merge-multiple: true
+
+      - name: Attach distribution proofs to the prerelease
+        run: gh release upload "$TAG_NAME" validation-assets/*.json --repo "$GITHUB_REPOSITORY" --clobber

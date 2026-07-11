@@ -14,8 +14,14 @@ TEMP_DIR=$(mktemp -d)
 CACHE_BUSTER=$(date +%s)
 
 case "$(uname -m)" in
-  arm64) RELEASE_ARCH=aarch64 ;;
-  x86_64) RELEASE_ARCH=x86_64 ;;
+  arm64)
+    RELEASE_ARCH=aarch64
+    MACHO_ARCH=arm64
+    ;;
+  x86_64)
+    RELEASE_ARCH=x86_64
+    MACHO_ARCH=x86_64
+    ;;
   *)
     echo "Unsupported macOS architecture: $(uname -m)" >&2
     exit 1
@@ -301,15 +307,15 @@ RUNTIME_SMOKE_DIR="$TEMP_DIR/runtime-smoke"
 mkdir -p "$RUNTIME_SMOKE_DIR"
 /usr/bin/ditto -x -k "$TEMP_DIR/speech-runtime-macos-$RELEASE_ARCH.zip" "$RUNTIME_SMOKE_DIR"
 
-for binary in ffmpeg whisper-cli whisper-stream parakeet-cli; do
+for binary in ffmpeg whisper-cli whisper-stream parakeet-cli-bin; do
   candidate="$RUNTIME_SMOKE_DIR/runtime/bin/$binary"
   if [[ ! -x "$candidate" ]]; then
     echo "Remote speech runtime is missing executable: $candidate" >&2
     exit 1
   fi
   architectures=$(lipo -archs "$candidate")
-  if [[ " $architectures " != *" $RELEASE_ARCH "* ]]; then
-    echo "Remote speech runtime $binary is not $RELEASE_ARCH-native: $architectures" >&2
+  if [[ " $architectures " != *" $MACHO_ARCH "* ]]; then
+    echo "Remote speech runtime $binary is not $MACHO_ARCH-native: $architectures" >&2
     exit 1
   fi
   if otool -L "$candidate" | tail -n +2 | awk '{print $1}' | grep -Eq '^(/opt/homebrew|/usr/local)'; then
@@ -317,6 +323,16 @@ for binary in ffmpeg whisper-cli whisper-stream parakeet-cli; do
     exit 1
   fi
 done
+
+PARAKEET_WRAPPER="$RUNTIME_SMOKE_DIR/runtime/bin/parakeet-cli"
+if [[ ! -x "$PARAKEET_WRAPPER" ]]; then
+  echo "Remote speech runtime is missing executable wrapper: $PARAKEET_WRAPPER" >&2
+  exit 1
+fi
+if ! grep -q 'parakeet-cli-bin' "$PARAKEET_WRAPPER"; then
+  echo "Remote speech runtime parakeet-cli wrapper does not launch parakeet-cli-bin." >&2
+  exit 1
+fi
 
 PYANNOTE_SMOKE_DIR="$TEMP_DIR/pyannote-smoke"
 mkdir -p "$PYANNOTE_SMOKE_DIR"
