@@ -203,6 +203,10 @@ jobs:
         run: cargo test -p sbobino-domain -p sbobino-application -p sbobino-desktop --target x86_64-pc-windows-msvc -- --test-threads=1
         working-directory: sbobino_desktop
 
+      - name: Verify Windows Credential Manager roundtrip
+        run: cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc secure_storage::tests::windows_credential_manager_roundtrip -- --exact
+        working-directory: sbobino_desktop
+
       - name: Download offline Pyannote model
         shell: pwsh
         run: |
