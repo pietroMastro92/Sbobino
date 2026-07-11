@@ -48,6 +48,10 @@ jobs:
             -OutputZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
             -SidecarDir (Join-Path $PWD "src-tauri\binaries")
 
+      - name: Run native Windows Rust tests
+        run: cargo test --workspace --target x86_64-pc-windows-msvc
+        working-directory: sbobino_desktop
+
       - name: Download offline Pyannote model
         shell: pwsh
         run: |
@@ -73,10 +77,6 @@ jobs:
 
       - name: Run frontend tests
         run: npm test -- --run
-
-      - name: Run native Windows Rust tests
-        run: cargo test --workspace --target x86_64-pc-windows-msvc
-        working-directory: sbobino_desktop
 
       - name: Build native NSIS installer and updater
         shell: pwsh

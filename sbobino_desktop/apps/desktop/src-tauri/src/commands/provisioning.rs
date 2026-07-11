@@ -2918,10 +2918,20 @@ mod tests {
         status_reason_code: &str,
     ) {
         #[cfg(target_os = "windows")]
-        write_executable_file(
-            &factory.managed_pyannote_python_dir().join("python.exe"),
-            "test executable",
-        );
+        {
+            let python_path = factory.managed_pyannote_python_dir().join("python.exe");
+            std::fs::create_dir_all(
+                python_path
+                    .parent()
+                    .expect("test Python path should have a parent"),
+            )
+            .expect("test Python parent should exist");
+            std::fs::copy(
+                std::env::current_exe().expect("current test executable should resolve"),
+                &python_path,
+            )
+            .expect("test Python executable should copy");
+        }
         #[cfg(not(target_os = "windows"))]
         write_executable_file(
             &factory

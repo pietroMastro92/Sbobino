@@ -192,6 +192,10 @@ jobs:
             -OutputZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
             -SidecarDir (Join-Path $PWD "src-tauri\binaries")
 
+      - name: Test native Windows Rust workspace
+        run: cargo test --workspace --target x86_64-pc-windows-msvc
+        working-directory: sbobino_desktop
+
       - name: Download offline Pyannote model
         shell: pwsh
         run: |
@@ -215,9 +219,7 @@ jobs:
         run: ../../scripts/prepare_release_updater_config.sh src-tauri/tauri.conf.json "$TAURI_UPDATER_PUBLIC_KEY"
 
       - name: Test native Windows app
-        run: |
-          npm --prefix apps/desktop test -- --run
-          cargo test --workspace --target x86_64-pc-windows-msvc
+        run: npm --prefix apps/desktop test -- --run
         working-directory: sbobino_desktop
 
       - name: Build and stage NSIS installer and updater
