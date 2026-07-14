@@ -9,6 +9,11 @@ import {
 import { useAppStore } from "./state/useAppStore";
 import "./styles.css";
 
+const browserPlatform = `${navigator.userAgent ?? ""} ${navigator.platform ?? ""}`.toLowerCase();
+if (browserPlatform.includes("windows") || browserPlatform.includes("win32")) {
+  document.documentElement.dataset.platform = "windows";
+}
+
 const standaloneSettingsWindow =
   new URLSearchParams(window.location.search).get("window") === "settings";
 

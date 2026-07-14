@@ -5,12 +5,16 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
+
+#[cfg(target_os = "windows")]
+use crate::background_process::std_background_command;
+use crate::background_process::tokio_background_command;
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -365,7 +369,7 @@ impl WhisperStreamEngine {
         }
 
         let session_dir = Self::create_session_dir()?;
-        let mut command = Command::new(&self.binary_path);
+        let mut command = tokio_background_command(&self.binary_path);
         command
             .kill_on_drop(true)
             .arg("-m")
@@ -472,7 +476,7 @@ impl WhisperStreamEngine {
                     .arg(pid.to_string())
                     .status();
                 #[cfg(target_os = "windows")]
-                let _ = std::process::Command::new("taskkill")
+                let _ = std_background_command("taskkill")
                     .args(["/PID", &pid.to_string()])
                     .status();
             }
@@ -488,7 +492,7 @@ impl WhisperStreamEngine {
                         .arg(pid.to_string())
                         .status();
                     #[cfg(target_os = "windows")]
-                    let _ = std::process::Command::new("taskkill")
+                    let _ = std_background_command("taskkill")
                         .args(["/F", "/PID", &pid.to_string()])
                         .status();
                 }

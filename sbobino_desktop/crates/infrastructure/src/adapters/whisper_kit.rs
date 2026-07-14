@@ -23,6 +23,7 @@ use sbobino_domain::{
 };
 
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
+use crate::background_process::tokio_background_command;
 
 #[derive(Debug, Clone)]
 pub struct WhisperKitEngine {
@@ -625,7 +626,7 @@ impl WhisperKitEngine {
         let host = "127.0.0.1";
         let base_url = format!("http://{host}:{port}");
 
-        let mut command = Command::new(&self.binary_path);
+        let mut command = tokio_background_command(&self.binary_path);
         command
             .kill_on_drop(true)
             .arg("serve")
@@ -977,7 +978,7 @@ impl WhisperKitEngine {
             })?;
 
         let total_audio_seconds = Self::wav_duration_seconds(input_wav);
-        let mut command = Command::new(&self.binary_path);
+        let mut command = tokio_background_command(&self.binary_path);
         command
             .kill_on_drop(true)
             .arg("transcribe")

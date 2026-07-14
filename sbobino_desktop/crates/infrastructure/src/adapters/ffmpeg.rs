@@ -6,6 +6,8 @@ use tokio::time::{timeout, Duration};
 
 use sbobino_application::{ApplicationError, AudioTranscoder};
 
+use crate::background_process::tokio_background_command;
+
 #[derive(Debug, Clone)]
 pub struct FfmpegAdapter {
     binary_path: String,
@@ -17,7 +19,7 @@ impl FfmpegAdapter {
     }
 
     fn build_transcode_command(&self, input: &Path, output: &Path) -> Command {
-        let mut command = Command::new(&self.binary_path);
+        let mut command = tokio_background_command(&self.binary_path);
         if let Some(binary_dir) = Path::new(&self.binary_path).parent() {
             let sibling_lib = binary_dir.join("../lib");
             let mut runtime_paths = vec![binary_dir.to_path_buf()];

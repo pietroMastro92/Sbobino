@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 use sbobino_application::{ApplicationError, SpeakerDiarizationEngine};
 use sbobino_domain::SpeakerTurn;
+
+use crate::background_process::tokio_background_command;
 
 pub const EMBEDDED_HELPER_FILENAME: &str = "pyannote_diarize.py";
 const PYTHON_ENV_VARS_TO_CLEAR: &[&str] = &[
@@ -122,7 +123,7 @@ impl PyannoteSpeakerDiarizationEngine {
 #[async_trait]
 impl SpeakerDiarizationEngine for PyannoteSpeakerDiarizationEngine {
     async fn diarize(&self, input_wav: &Path) -> Result<Vec<SpeakerTurn>, ApplicationError> {
-        let mut command = Command::new(&self.python_path);
+        let mut command = tokio_background_command(&self.python_path);
         command
             .arg(&self.script_path)
             .arg("--audio-path")

@@ -41,6 +41,20 @@
   --settings-window-header-bg: rgba(244, 248, 253, 0.94);
 }
 
+/* Windows uses an opaque native window. Preserve the glass hierarchy inside
+   the app while preventing the desktop and other applications from bleeding
+   through the root compositor surface. macOS intentionally keeps its native
+   transparent window and does not receive these overrides. */
+:root[data-platform="windows"] {
+  --body-bg: rgb(247, 250, 254);
+  --frame-surface: rgb(248, 251, 255);
+}
+
+:root[data-theme="dark"][data-platform="windows"] {
+  --body-bg: rgb(34, 40, 49);
+  --frame-surface: rgb(34, 40, 49);
+}
+
 * {
   box-sizing: border-box;
 }

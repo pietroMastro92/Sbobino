@@ -20,6 +20,7 @@ use sbobino_domain::{
 };
 
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
+use crate::background_process::tokio_background_command;
 
 static OUTPUT_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
@@ -764,7 +765,7 @@ impl WhisperCppEngine {
         let output_txt_path = output_base.with_extension("txt");
         let output_json_path = output_base.with_extension("json");
 
-        let mut command = Command::new(&self.binary_path);
+        let mut command = tokio_background_command(&self.binary_path);
         Self::configure_command_environment(&mut command, &self.binary_path);
         Self::append_cli_flags(
             &mut command,

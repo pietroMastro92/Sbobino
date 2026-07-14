@@ -207,6 +207,10 @@ jobs:
         run: cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc secure_storage::tests::windows_credential_manager_roundtrip -- --exact
         working-directory: sbobino_desktop
 
+      - name: Build Windows background-process smoke harness
+        run: cargo build -p sbobino-infrastructure --bin windows_background_process_smoke --target x86_64-pc-windows-msvc --release
+        working-directory: sbobino_desktop
+
       - name: Download offline Pyannote model
         shell: pwsh
         run: |
@@ -256,10 +260,34 @@ jobs:
           Copy-Item $signature[0].FullName (Join-Path $staging "Sbobino_${version}_windows_x86_64.nsis.zip.sig")
           ../../scripts/windows_release_readiness.ps1 -Version $version -StagingDir $staging
 
+      - name: Smoke install opaque GUI without visible background consoles
+        shell: pwsh
+        run: |
+          $version = $env:TAG_NAME.TrimStart("v")
+          $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
+          $installer = Join-Path $staging "Sbobino_${version}_windows_x86_64-setup.exe"
+          $install = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS installer exited with $($install.ExitCode)" }
+          $app = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "sbobino-desktop.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $app) { throw "installed sbobino-desktop.exe was not found" }
+          $harness = Join-Path $PWD "..\..\target\x86_64-pc-windows-msvc\release\windows_background_process_smoke.exe"
+          ../../scripts/windows_gui_smoke.ps1 `
+            -AppPath $app.FullName `
+            -HarnessPath $harness `
+            -SpeechRuntimeZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
+            -PyannoteRuntimeZip (Join-Path $staging "pyannote-runtime-windows-x86_64.zip") `
+            -ReportPath (Join-Path $env:RUNNER_TEMP "windows-gui-smoke-report.json")
+
       - uses: actions/upload-artifact@v4
         with:
           name: sbobino-windows-x86_64
           path: ${{ runner.temp }}/sbobino-windows/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-gui-smoke-harness
+          path: sbobino_desktop/target/x86_64-pc-windows-msvc/release/windows_background_process_smoke.exe
           if-no-files-found: error
 
   publish-candidate:
@@ -354,6 +382,11 @@ jobs:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-gui-smoke-harness
+          path: ${{ runner.temp }}/windows-gui-smoke-harness
+
       - name: Download and validate public Windows assets
         shell: pwsh
         working-directory: sbobino_desktop
@@ -378,10 +411,14 @@ jobs:
           if ($unexpectedSidecars.Count -gt 0) {
             throw "public Windows install contains unmanaged native sidecars: $($unexpectedSidecars.Name -join ', ')"
           }
-          $process = Start-Process -FilePath $app.FullName -PassThru
-          Start-Sleep -Seconds 15
-          if ($process.HasExited) { throw "installed app exited during launch smoke with $($process.ExitCode)" }
-          Stop-Process -Id $process.Id -Force
+          $guiReportPath = Join-Path $PWD "windows-gui-smoke-report.json"
+          ./scripts/windows_gui_smoke.ps1 `
+            -AppPath $app.FullName `
+            -HarnessPath (Join-Path $env:RUNNER_TEMP "windows-gui-smoke-harness\windows_background_process_smoke.exe") `
+            -SpeechRuntimeZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
+            -PyannoteRuntimeZip (Join-Path $staging "pyannote-runtime-windows-x86_64.zip") `
+            -ReportPath $guiReportPath
+          $guiReport = Get-Content $guiReportPath -Raw | ConvertFrom-Json
 
           @{
             schema_version = 1
@@ -394,12 +431,18 @@ jobs:
             machine_class = "WINDOWS-HOSTED-CLEANROOM"
             tested_at_utc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
             commit_sha = (git rev-parse HEAD)
+            visible_console_windows = $guiReport.visible_console_windows
+            main_window_count = $guiReport.main_window_count
+            main_window_opaque = $guiReport.main_window_opaque
+            macos_transparency_preserved = $guiReport.macos_transparency_preserved
           } | ConvertTo-Json | Set-Content windows-distribution-readiness-proof.json
 
       - uses: actions/upload-artifact@v4
         with:
           name: distribution-readiness-windows-x86_64
-          path: sbobino_desktop/windows-distribution-readiness-proof.json
+          path: |
+            sbobino_desktop/windows-distribution-readiness-proof.json
+            sbobino_desktop/windows-gui-smoke-report.json
 
   portability-smoke:
     needs: publish-candidate

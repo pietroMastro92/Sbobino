@@ -2272,7 +2272,7 @@ pub async fn write_trimmed_audio(
     state: State<'_, AppState>,
     payload: WriteTrimmedAudioPayload,
 ) -> Result<WriteTrimmedAudioResponse, CommandError> {
-    use tokio::process::Command;
+    use sbobino_infrastructure::background_process::tokio_background_command;
 
     if payload.regions.is_empty() {
         return Err(CommandError::new("trim", "no regions selected"));
@@ -2336,7 +2336,7 @@ pub async fn write_trimmed_audio(
     if sorted_regions.len() == 1 {
         // Single region: direct ffmpeg extraction
         let region = &sorted_regions[0];
-        let result = Command::new(&ffmpeg_path)
+        let result = tokio_background_command(&ffmpeg_path)
             .kill_on_drop(true)
             .arg("-y")
             .arg("-i")
@@ -2373,7 +2373,7 @@ pub async fn write_trimmed_audio(
             let part_filename = format!("sbobino_part_{}_{}_{}.wav", stem, i, Uuid::new_v4());
             let part_path = temp_dir.join(&part_filename);
 
-            let result = Command::new(&ffmpeg_path)
+            let result = tokio_background_command(&ffmpeg_path)
                 .kill_on_drop(true)
                 .arg("-y")
                 .arg("-i")
@@ -2424,7 +2424,7 @@ pub async fn write_trimmed_audio(
             .await
             .map_err(|e| CommandError::new("trim", format!("failed to write concat list: {e}")))?;
 
-        let result = Command::new(&ffmpeg_path)
+        let result = tokio_background_command(&ffmpeg_path)
             .kill_on_drop(true)
             .arg("-y")
             .arg("-f")

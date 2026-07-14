@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod background_process;
 pub mod repositories;
 pub mod secure_storage;
 
@@ -38,6 +39,7 @@ use adapters::{
     whisper_cpp::WhisperCppEngine,
     whisper_stream::WhisperStreamEngine,
 };
+use background_process::std_background_command;
 use repositories::{
     fs_settings_repository::FsSettingsRepository,
     sqlite_artifact_repository::SqliteArtifactRepository,
@@ -2381,7 +2383,7 @@ fn verify_managed_runtime_binary(candidate: &Path, lib_dir: &Path) -> ManagedRun
     }
 
     let probe = managed_runnable_binary_probe(candidate);
-    let mut command = std::process::Command::new(candidate);
+    let mut command = std_background_command(candidate);
     command.args(probe.args);
     let mut path_entries = candidate
         .parent()
@@ -2529,7 +2531,7 @@ fn is_runnable_binary_file(candidate: &Path) -> bool {
     }
 
     let probe = runnable_binary_probe(candidate);
-    let mut command = std::process::Command::new(candidate);
+    let mut command = std_background_command(candidate);
     command.args(probe.args);
 
     let mut child = match command
@@ -3828,7 +3830,7 @@ fn validate_pyannote_python_runtime(
     validate_portable_pyannote_native_dependencies(runtime_root)?;
     validate_embedded_torchcodec_ffmpeg(runtime_root)?;
 
-    let mut command = std::process::Command::new(python_binary);
+    let mut command = std_background_command(python_binary);
     let validation_started = Instant::now();
     command
         .arg("-c")

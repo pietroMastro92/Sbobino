@@ -12,6 +12,7 @@ use sbobino_application::{ApplicationError, SpeechToTextEngine};
 use sbobino_domain::{TimedSegment, TimedWord, TranscriptionOutput, WhisperOptions};
 
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
+use crate::background_process::tokio_background_command;
 
 const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
 const REALTIME_EOU_F16_MODEL: &str = "realtime_eou_120m-v1-f16.gguf";
@@ -820,7 +821,7 @@ impl ParakeetCppEngine {
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
         language_code: &str,
     ) -> Result<(), ApplicationError> {
-        let mut command = Command::new(&self.binary_path);
+        let mut command = tokio_background_command(&self.binary_path);
         Self::configure_command_environment(&mut command, &self.binary_path);
         command
             .arg("transcribe")
@@ -1078,7 +1079,7 @@ impl ParakeetCppEngine {
         preview_model_path: &Path,
         language_code: &str,
     ) -> Result<String, ApplicationError> {
-        let mut command = Command::new(&self.binary_path);
+        let mut command = tokio_background_command(&self.binary_path);
         Self::configure_command_environment(&mut command, &self.binary_path);
         command
             .arg("transcribe")
@@ -1228,7 +1229,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
             }
         }
 
-        let mut command = Command::new(&self.binary_path);
+        let mut command = tokio_background_command(&self.binary_path);
         Self::configure_command_environment(&mut command, &self.binary_path);
         command
             .arg("transcribe")

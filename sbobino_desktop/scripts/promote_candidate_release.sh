@@ -57,10 +57,12 @@ expected_assets = {
     "distribution-readiness-proof.json",
     "intel-distribution-readiness-proof.json",
     "windows-distribution-readiness-proof.json",
+    "windows-gui-smoke-report.json",
     "portability-smoke-report.json",
     "intel-portability-smoke-report.json",
     "AS-THIRD.validation-report.json",
     "INTEL-PRIMARY.validation-report.json",
+    "WINDOWS-PRIMARY.validation-report.json",
 }
 present_assets = {
     asset.get("name", "").strip()
@@ -90,10 +92,12 @@ gh release download "$TAG" \
   --pattern "distribution-readiness-proof.json" \
   --pattern "intel-distribution-readiness-proof.json" \
   --pattern "windows-distribution-readiness-proof.json" \
+  --pattern "windows-gui-smoke-report.json" \
   --pattern "portability-smoke-report.json" \
   --pattern "intel-portability-smoke-report.json" \
   --pattern "AS-THIRD.validation-report.json" \
-  --pattern "INTEL-PRIMARY.validation-report.json"
+  --pattern "INTEL-PRIMARY.validation-report.json" \
+  --pattern "WINDOWS-PRIMARY.validation-report.json"
 
 python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG"
 import json
@@ -163,6 +167,38 @@ if str(windows_distribution.get("status", "")).strip().lower() != "passed":
     raise SystemExit("Stable promotion blocked: Windows distribution readiness proof is not marked passed.")
 if windows_distribution.get("platform") != "windows" or windows_distribution.get("architecture") != "x86_64":
     raise SystemExit("Stable promotion blocked: Windows distribution readiness proof target mismatch.")
+
+windows_gui = load_json(
+    report_dir / "windows-gui-smoke-report.json",
+    "windows-gui-smoke-report.json",
+)
+if int(windows_gui.get("schema_version", 0)) != 1:
+    raise SystemExit("Stable promotion blocked: Windows GUI smoke report schema mismatch.")
+if str(windows_gui.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("Stable promotion blocked: Windows GUI smoke report is not marked passed.")
+if windows_gui.get("platform") != "windows":
+    raise SystemExit("Stable promotion blocked: Windows GUI smoke report platform mismatch.")
+if int(windows_gui.get("visible_console_windows", -1)) != 0:
+    raise SystemExit("Stable promotion blocked: Windows GUI smoke detected visible console windows.")
+if int(windows_gui.get("main_window_count", -1)) != 1:
+    raise SystemExit("Stable promotion blocked: Windows GUI smoke did not find exactly one main window.")
+if windows_gui.get("main_window_opaque") is not True:
+    raise SystemExit("Stable promotion blocked: Windows main window is not opaque.")
+if windows_gui.get("macos_transparency_preserved") is not True:
+    raise SystemExit("Stable promotion blocked: shared macOS transparency contract changed.")
+if set(windows_gui.get("helper_probes") or []) != {"ffmpeg", "whisper", "parakeet", "python"}:
+    raise SystemExit("Stable promotion blocked: Windows GUI smoke did not exercise every real helper.")
+
+for field in (
+    "visible_console_windows",
+    "main_window_count",
+    "main_window_opaque",
+    "macos_transparency_preserved",
+):
+    if windows_distribution.get(field) != windows_gui.get(field):
+        raise SystemExit(
+            f"Stable promotion blocked: Windows distribution proof disagrees with GUI smoke for {field}."
+        )
 
 portability = load_json(
     report_dir / "portability-smoke-report.json",
@@ -255,6 +291,40 @@ if missing_intel:
     raise SystemExit(
         "Stable promotion blocked: INTEL-PRIMARY scenarios did not pass: "
         + ", ".join(missing_intel)
+    )
+
+windows_primary = load_json(
+    report_dir / "WINDOWS-PRIMARY.validation-report.json",
+    "WINDOWS-PRIMARY.validation-report.json",
+)
+if int(windows_primary.get("schema_version", 0)) != 1:
+    raise SystemExit(
+        "Stable promotion blocked: WINDOWS-PRIMARY.validation-report.json has unsupported schema_version."
+    )
+if windows_primary.get("machine_class") != "WINDOWS-PRIMARY":
+    raise SystemExit("Stable promotion blocked: WINDOWS-PRIMARY validation report machine_class mismatch.")
+if windows_primary.get("version") != version or windows_primary.get("release_tag") != tag:
+    raise SystemExit("Stable promotion blocked: WINDOWS-PRIMARY validation report version mismatch.")
+if str(windows_primary.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("Stable promotion blocked: WINDOWS-PRIMARY validation report is not marked passed.")
+
+windows_results = windows_primary.get("scenario_results") or {}
+required_windows_scenarios = {
+    "clean_room_install",
+    "first_setup",
+    "functional_transcription_smoke",
+    "functional_diarization_smoke",
+    "warm_restart",
+    "no_visible_console_windows",
+    "opaque_main_window",
+}
+missing_windows = sorted(
+    name for name in required_windows_scenarios if windows_results.get(name) != "passed"
+)
+if missing_windows:
+    raise SystemExit(
+        "Stable promotion blocked: WINDOWS-PRIMARY scenarios did not pass: "
+        + ", ".join(missing_windows)
     )
 PY
 

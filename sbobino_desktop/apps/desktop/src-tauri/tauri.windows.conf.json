@@ -1,4 +1,22 @@
 {
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Sbobino",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 560,
+        "minHeight": 520,
+        "resizable": true,
+        "fullscreen": false,
+        "transparent": false,
+        "backgroundColor": "#f8fbff",
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ]
+  },
   "bundle": {
     "externalBin": []
   }
