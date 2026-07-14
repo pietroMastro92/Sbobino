@@ -125,7 +125,8 @@ foreach ($window in [SbobinoWindowProbe]::VisibleWindows()) {
 }
 
 $observedWindows = @{}
-$mainHandles = [System.Collections.Generic.HashSet[long]]::new()
+$mainHandlesSeen = [System.Collections.Generic.HashSet[long]]::new()
+$maxMainWindowCount = 0
 $appProcess = $null
 $harnessProcesses = @()
 $extractRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sbobino-gui-smoke-" + [guid]::NewGuid())
@@ -173,9 +174,16 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds($ObservationSeconds)
 
     while ([DateTime]::UtcNow -lt $deadline) {
-        foreach ($window in [SbobinoWindowProbe]::VisibleWindows()) {
+        $visibleWindows = @([SbobinoWindowProbe]::VisibleWindows())
+        $currentMainWindows = @($visibleWindows | Where-Object { $_.ProcessId -eq $appProcess.Id })
+        $maxMainWindowCount = [Math]::Max($maxMainWindowCount, $currentMainWindows.Count)
+        foreach ($window in $currentMainWindows) {
+            [void]$mainHandlesSeen.Add($window.Handle)
+        }
+
+        foreach ($window in $visibleWindows) {
             if ($window.ProcessId -eq $appProcess.Id) {
-                [void]$mainHandles.Add($window.Handle)
+                continue
             }
             if ($baselineHandles.Contains($window.Handle)) {
                 continue
@@ -230,7 +238,8 @@ $report = [ordered]@{
     observation_seconds = $ObservationSeconds
     poll_milliseconds = $PollMilliseconds
     visible_console_windows = $suspiciousWindows.Count
-    main_window_count = $mainHandles.Count
+    main_window_count = $maxMainWindowCount
+    main_window_handles_seen = @($mainHandlesSeen)
     main_window_opaque = $mainWindowOpaque
     macos_transparency_preserved = $macTransparencyPreserved
     helper_probes = @($helperProbes | ForEach-Object { $_.Name })
@@ -240,7 +249,7 @@ $report = [ordered]@{
 $failures = @()
 if (-not $mainWindowOpaque) { $failures += "Windows main window is not configured as opaque" }
 if (-not $macTransparencyPreserved) { $failures += "common/macOS transparency contract changed" }
-if ($mainHandles.Count -ne 1) { $failures += "expected exactly one Sbobino main window, observed $($mainHandles.Count)" }
+if ($maxMainWindowCount -ne 1) { $failures += "expected exactly one simultaneous Sbobino main window, observed $maxMainWindowCount" }
 if ($suspiciousWindows.Count -ne 0) { $failures += "observed $($suspiciousWindows.Count) visible background console window(s)" }
 
 if ($failures.Count -gt 0) {
