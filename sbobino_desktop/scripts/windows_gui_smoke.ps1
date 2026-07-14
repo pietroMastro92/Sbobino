@@ -139,6 +139,19 @@ function Find-OneHelper {
     return $matches[0].FullName
 }
 
+function Find-PyannotePython {
+    param([string]$Root)
+    $manifests = @(Get-ChildItem $Root -Recurse -File -Filter "sbobino-runtime.json")
+    if ($manifests.Count -ne 1) {
+        throw "expected exactly one Pyannote runtime manifest below '$Root', found $($manifests.Count)"
+    }
+    $python = Join-Path $manifests[0].Directory.FullName "python.exe"
+    if (-not (Test-Path $python -PathType Leaf)) {
+        throw "Pyannote runtime python.exe is missing beside '$($manifests[0].FullName)'"
+    }
+    return $python
+}
+
 try {
     $speechRoot = Join-Path $extractRoot "speech"
     $pyannoteRoot = Join-Path $extractRoot "pyannote"
@@ -148,7 +161,7 @@ try {
         @{ Name = "ffmpeg"; Path = (Find-OneHelper $speechRoot "ffmpeg.exe"); Args = @("-version") },
         @{ Name = "whisper"; Path = (Find-OneHelper $speechRoot "whisper-cli.exe"); Args = @("--help") },
         @{ Name = "parakeet"; Path = (Find-OneHelper $speechRoot "parakeet-cli.exe"); Args = @("--help") },
-        @{ Name = "python"; Path = (Find-OneHelper $pyannoteRoot "python.exe"); Args = @("--version") }
+        @{ Name = "python"; Path = (Find-PyannotePython $pyannoteRoot); Args = @("--version") }
     )
 
     $appProcess = Start-Process -FilePath $AppPath -PassThru
