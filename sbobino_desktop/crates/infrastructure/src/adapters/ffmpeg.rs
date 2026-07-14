@@ -18,6 +18,25 @@ impl FfmpegAdapter {
 
     fn build_transcode_command(&self, input: &Path, output: &Path) -> Command {
         let mut command = Command::new(&self.binary_path);
+        if let Some(binary_dir) = Path::new(&self.binary_path).parent() {
+            let sibling_lib = binary_dir.join("../lib");
+            let mut runtime_paths = vec![binary_dir.to_path_buf()];
+            if sibling_lib.is_dir() {
+                runtime_paths.push(sibling_lib.clone());
+            }
+            if let Some(existing) = std::env::var_os("PATH") {
+                runtime_paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(path) = std::env::join_paths(runtime_paths) {
+                command.env("PATH", path);
+            }
+            #[cfg(target_os = "macos")]
+            if sibling_lib.is_dir() {
+                command
+                    .env("DYLD_LIBRARY_PATH", &sibling_lib)
+                    .env("DYLD_FALLBACK_LIBRARY_PATH", &sibling_lib);
+            }
+        }
         command
             .kill_on_drop(true)
             .arg("-y")
@@ -96,5 +115,18 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-map_metadata", "-1"]));
         assert!(args.windows(2).any(|pair| pair == ["-c:a", "pcm_s16le"]));
         assert!(args.windows(2).any(|pair| pair == ["-f", "wav"]));
+    }
+
+    #[test]
+    fn transcode_command_prepends_runtime_binary_and_library_directories() {
+        let adapter = FfmpegAdapter::new("runtime/bin/ffmpeg.exe".to_string());
+        let command = adapter.build_transcode_command(Path::new("in.mp3"), Path::new("out.wav"));
+        let path = command
+            .as_std()
+            .get_envs()
+            .find_map(|(name, value)| (name == "PATH").then_some(value).flatten())
+            .expect("PATH should be configured for a packaged FFmpeg binary")
+            .to_string_lossy();
+        assert!(path.contains("runtime/bin"));
     }
 }

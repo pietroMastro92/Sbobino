@@ -241,7 +241,7 @@ jobs:
         run: |
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw "TAURI_SIGNING_PRIVATE_KEY is required" }
           $version = $env:TAG_NAME.TrimStart("v")
-          $env:SBOBINO_RELEASE_PROFILE = "standalone-dev"
+          $env:SBOBINO_RELEASE_PROFILE = "public"
           npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
           $nsis = Join-Path $PWD "..\..\target\x86_64-pc-windows-msvc\release\bundle\nsis"
           $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
@@ -373,6 +373,11 @@ jobs:
           if ($install.ExitCode -ne 0) { throw "NSIS installer exited with $($install.ExitCode)" }
           $app = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "sbobino-desktop.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($null -eq $app) { throw "installed sbobino-desktop.exe was not found" }
+          $unexpectedSidecars = @(Get-ChildItem $app.Directory.FullName -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^(ffmpeg|whisper|parakeet).+\.exe$' })
+          if ($unexpectedSidecars.Count -gt 0) {
+            throw "public Windows install contains unmanaged native sidecars: $($unexpectedSidecars.Name -join ', ')"
+          }
           $process = Start-Process -FilePath $app.FullName -PassThru
           Start-Sleep -Seconds 15
           if ($process.HasExited) { throw "installed app exited during launch smoke with $($process.ExitCode)" }

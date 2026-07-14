@@ -96,7 +96,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw "TAURI_SIGNING_PRIVATE_KEY is required" }
-          $env:SBOBINO_RELEASE_PROFILE = "standalone-dev"
+          $env:SBOBINO_RELEASE_PROFILE = "public"
           npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
           $version = (Get-Content package.json | ConvertFrom-Json).version
           $nsis = Join-Path $PWD "..\..\target\x86_64-pc-windows-msvc\release\bundle\nsis"
@@ -131,6 +131,12 @@ jobs:
             $match = Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter "sbobino-desktop.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($null -eq $match) { throw "installed sbobino-desktop.exe was not found" }
             $app = $match.FullName
+          }
+          $appDirectory = Split-Path -Parent $app
+          $unexpectedSidecars = @(Get-ChildItem $appDirectory -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^(ffmpeg|whisper|parakeet).+\.exe$' })
+          if ($unexpectedSidecars.Count -gt 0) {
+            throw "public Windows install contains unmanaged native sidecars: $($unexpectedSidecars.Name -join ', ')"
           }
           $process = Start-Process -FilePath $app -PassThru
           Start-Sleep -Seconds 12

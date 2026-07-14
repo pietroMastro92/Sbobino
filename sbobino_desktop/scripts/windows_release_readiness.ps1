@@ -55,13 +55,21 @@ try {
         if (-not (Test-Path -PathType Leaf $path)) { throw "runtime is missing $binary" }
         Assert-X64Pe $path
     }
-    $runtimeDlls = @(Get-ChildItem -Path $runtimeLib -File -Filter "*.dll")
-    if ($runtimeDlls.Count -eq 0) { throw "Windows speech runtime contains no DLLs" }
+    $runtimeDlls = @(Get-ChildItem -Path $runtimeBin -File -Filter "*.dll")
+    if ($runtimeDlls.Count -eq 0) { throw "Windows speech runtime contains no app-local DLLs" }
     $runtimeDlls | ForEach-Object { Assert-X64Pe $_.FullName }
+    foreach ($dependency in @(
+        "SDL2.dll", "whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll",
+        "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "vcomp140.dll"
+    )) {
+        if (-not (Test-Path -PathType Leaf (Join-Path $runtimeBin $dependency))) {
+            throw "Windows speech runtime is missing app-local dependency $dependency"
+        }
+    }
 
     $previousPath = $env:PATH
     try {
-        $env:PATH = "$runtimeBin;$runtimeLib;$env:SystemRoot\System32"
+        $env:PATH = "$runtimeBin;$env:SystemRoot\System32;$env:SystemRoot"
         & (Join-Path $runtimeBin "ffmpeg.exe") -version | Out-Null
         & (Join-Path $runtimeBin "whisper-cli.exe") --help 2>&1 | Out-Null
         & (Join-Path $runtimeBin "whisper-stream.exe") --help 2>&1 | Out-Null
