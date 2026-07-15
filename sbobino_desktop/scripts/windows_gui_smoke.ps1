@@ -127,6 +127,8 @@ foreach ($window in [SbobinoWindowProbe]::VisibleWindows()) {
 $observedWindows = @{}
 $mainHandlesSeen = [System.Collections.Generic.HashSet[long]]::new()
 $maxMainWindowCount = 0
+$maxAppTopLevelWindowCount = 0
+$appWindowsObserved = @{}
 $appProcess = $null
 $harnessProcesses = @()
 $extractRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sbobino-gui-smoke-" + [guid]::NewGuid())
@@ -175,8 +177,20 @@ try {
 
     while ([DateTime]::UtcNow -lt $deadline) {
         $visibleWindows = @([SbobinoWindowProbe]::VisibleWindows())
-        $currentMainWindows = @($visibleWindows | Where-Object { $_.ProcessId -eq $appProcess.Id })
+        $currentAppWindows = @($visibleWindows | Where-Object { $_.ProcessId -eq $appProcess.Id })
+        $currentMainWindows = @($currentAppWindows | Where-Object { $_.Title -eq "Sbobino" })
+        $maxAppTopLevelWindowCount = [Math]::Max($maxAppTopLevelWindowCount, $currentAppWindows.Count)
         $maxMainWindowCount = [Math]::Max($maxMainWindowCount, $currentMainWindows.Count)
+        foreach ($window in $currentAppWindows) {
+            $key = [string]$window.Handle
+            if (-not $appWindowsObserved.ContainsKey($key)) {
+                $appWindowsObserved[$key] = [ordered]@{
+                    handle = $window.Handle
+                    class_name = $window.ClassName
+                    title = $window.Title
+                }
+            }
+        }
         foreach ($window in $currentMainWindows) {
             [void]$mainHandlesSeen.Add($window.Handle)
         }
@@ -240,6 +254,8 @@ $report = [ordered]@{
     visible_console_windows = $suspiciousWindows.Count
     main_window_count = $maxMainWindowCount
     main_window_handles_seen = @($mainHandlesSeen)
+    app_top_level_window_count = $maxAppTopLevelWindowCount
+    app_windows_observed = @($appWindowsObserved.Values)
     main_window_opaque = $mainWindowOpaque
     macos_transparency_preserved = $macTransparencyPreserved
     helper_probes = @($helperProbes | ForEach-Object { $_.Name })
