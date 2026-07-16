@@ -3697,17 +3697,15 @@ mod tests {
 
     use super::{
         add_conversation_context, build_artifact_context_transcript, build_chat_context_candidates,
-        build_chunk_note_prompt,
-        build_confidence_aware_optimize_prompt, build_direct_summary_prompt, build_export_content,
-        build_export_document, build_export_segments, build_summary_instructions,
-        build_summary_synthesis_prompt, chunk_text_by_words, extract_low_confidence_spans,
-        is_context_window_error, optimize_with_rag, render_markdown_document,
-        render_plain_text_document, run_cancellable, summarize_with_rag,
-        timeline_segments_for_diarization, trimmed_audio_output_metadata,
-        validate_trimmed_audio_output, ApplicationError, ArtifactAiContextOptions, ArtifactKind,
-        ArtifactChatMessage, ExportStyle,
-        SummarizeArtifactPayload, TranscriptArtifact, TranscriptEnhancer,
-        MIN_TRIMMED_AUDIO_DURATION_SECONDS,
+        build_chunk_note_prompt, build_confidence_aware_optimize_prompt,
+        build_direct_summary_prompt, build_export_content, build_export_document,
+        build_export_segments, build_summary_instructions, build_summary_synthesis_prompt,
+        chunk_text_by_words, extract_low_confidence_spans, is_context_window_error,
+        optimize_with_rag, render_markdown_document, render_plain_text_document, run_cancellable,
+        summarize_with_rag, timeline_segments_for_diarization, trimmed_audio_output_metadata,
+        validate_trimmed_audio_output, ApplicationError, ArtifactAiContextOptions,
+        ArtifactChatMessage, ArtifactKind, ExportStyle, SummarizeArtifactPayload,
+        TranscriptArtifact, TranscriptEnhancer, MIN_TRIMMED_AUDIO_DURATION_SECONDS,
     };
 
     struct TrackingEnhancer {
