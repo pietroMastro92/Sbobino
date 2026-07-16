@@ -6,8 +6,8 @@ pub mod settings;
 pub mod transcript_cleanup;
 
 pub use artifact::{
-    ArtifactAudioBackfillStatus, ArtifactKind, ArtifactSourceOrigin, SpeakerTurn, TimedSegment,
-    TimedWord, TranscriptArtifact, TranscriptionOutput,
+    ArtifactAudioBackfillStatus, ArtifactChatMessage, ArtifactKind, ArtifactSourceOrigin,
+    SpeakerTurn, TimedSegment, TimedWord, TranscriptArtifact, TranscriptionOutput,
 };
 pub use emotion_analysis::{
     EmotionAnalysisResult, EmotionBridge, EmotionOverview, EmotionSemanticCluster,

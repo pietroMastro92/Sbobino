@@ -9,7 +9,7 @@ use uuid::Uuid;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 use sbobino_application::{ApplicationError, ArtifactQuery};
-use sbobino_domain::{AppSettings, TranscriptArtifact};
+use sbobino_domain::{AppSettings, ArtifactChatMessage, TranscriptArtifact};
 use sbobino_infrastructure::{
     repositories::sqlite_artifact_repository::SqliteArtifactRepository,
     secure_storage::{decrypt_file_with_password, encrypt_file_with_password},
@@ -17,7 +17,7 @@ use sbobino_infrastructure::{
 
 use crate::{error::CommandError, state::AppState};
 
-const BACKUP_FORMAT_VERSION: u32 = 1;
+const BACKUP_FORMAT_VERSION: u32 = 2;
 const BACKUP_BATCH_SIZE: usize = 500;
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +70,10 @@ struct PortableBackupRecord {
     ai_provider_snapshot_json: Option<String>,
     source_fingerprint_json: Option<String>,
     audio_entry_name: Option<String>,
+    #[serde(default)]
+    chat_messages: Vec<ArtifactChatMessage>,
+    #[serde(default)]
+    chat_summary: Option<String>,
 }
 
 impl PortableBackupRecord {
@@ -78,6 +82,8 @@ impl PortableBackupRecord {
         is_deleted: bool,
         deleted_at: Option<String>,
         audio_entry_name: Option<String>,
+        chat_messages: Vec<ArtifactChatMessage>,
+        chat_summary: Option<String>,
     ) -> Self {
         Self {
             artifact: artifact.clone(),
@@ -89,6 +95,8 @@ impl PortableBackupRecord {
             ai_provider_snapshot_json: artifact.ai_provider_snapshot_json.clone(),
             source_fingerprint_json: artifact.source_fingerprint_json.clone(),
             audio_entry_name,
+            chat_messages,
+            chat_summary,
         }
     }
 
@@ -156,11 +164,23 @@ pub async fn export_app_backup(
             None
         };
 
+        let chat_messages = state
+            .artifact_service
+            .list_chat_messages(&artifact.id)
+            .await
+            .map_err(CommandError::from)?;
+        let chat_summary = state
+            .artifact_service
+            .load_chat_summary(&artifact.id)
+            .await
+            .map_err(CommandError::from)?;
         records.push(PortableBackupRecord::from_artifact(
             artifact,
             false,
             None,
             audio_entry_name,
+            chat_messages,
+            chat_summary,
         ));
     }
 
@@ -184,11 +204,23 @@ pub async fn export_app_backup(
             None
         };
 
+        let chat_messages = state
+            .artifact_service
+            .list_chat_messages(&artifact.id)
+            .await
+            .map_err(CommandError::from)?;
+        let chat_summary = state
+            .artifact_service
+            .load_chat_summary(&artifact.id)
+            .await
+            .map_err(CommandError::from)?;
         records.push(PortableBackupRecord::from_artifact(
             artifact,
             true,
             Some(artifact.updated_at.to_rfc3339()),
             audio_entry_name,
+            chat_messages,
+            chat_summary,
         ));
     }
 
@@ -516,7 +548,7 @@ fn prepare_import(backup_path: &Path, password: &str) -> Result<PreparedImport, 
     })?;
 
     let manifest: PortableBackupManifest = read_zip_json(&mut archive, "manifest.json")?;
-    if manifest.format_version != BACKUP_FORMAT_VERSION {
+    if !matches!(manifest.format_version, 1 | BACKUP_FORMAT_VERSION) {
         return Err(ApplicationError::Validation(format!(
             "unsupported backup format version {}",
             manifest.format_version
@@ -564,6 +596,12 @@ fn prepare_import(backup_path: &Path, password: &str) -> Result<PreparedImport, 
             record.is_deleted,
             record.deleted_at.as_deref(),
         )?;
+        for message in &record.chat_messages {
+            repo.import_backup_chat_message(message)?;
+        }
+        if let Some(summary) = record.chat_summary.as_deref() {
+            repo.import_backup_chat_summary(&artifact.id, summary)?;
+        }
     }
 
     Ok(PreparedImport {
@@ -783,8 +821,8 @@ mod tests {
 
     use sbobino_application::ArtifactRepository;
     use sbobino_domain::{
-        AiProvider, AppSettings, ArtifactAudioBackfillStatus, ArtifactKind, ArtifactSourceOrigin,
-        RemoteServiceConfig, RemoteServiceKind, TranscriptArtifact,
+        AiProvider, AppSettings, ArtifactAudioBackfillStatus, ArtifactChatMessage, ArtifactKind,
+        ArtifactSourceOrigin, RemoteServiceConfig, RemoteServiceKind, TranscriptArtifact,
     };
     use sbobino_infrastructure::{
         repositories::sqlite_artifact_repository::SqliteArtifactRepository,
@@ -871,18 +909,29 @@ mod tests {
         let deleted = sample_artifact("deleted", "trimmed-audio.m4a", true);
         let active_audio = b"active-audio-bytes".to_vec();
         let deleted_audio = b"deleted-audio-bytes".to_vec();
+        let active_chat = vec![ArtifactChatMessage::new(
+            active.id.clone(),
+            "user",
+            "What was decided?",
+            "typed",
+            "complete",
+        )];
         let records = vec![
             PortableBackupRecord::from_artifact(
                 &active,
                 false,
                 None,
                 Some(backup_audio_entry_name(&active)),
+                active_chat,
+                Some("user: What was decided?".to_string()),
             ),
             PortableBackupRecord::from_artifact(
                 &deleted,
                 true,
                 Some(deleted.updated_at.to_rfc3339()),
                 Some(backup_audio_entry_name(&deleted)),
+                Vec::new(),
+                None,
             ),
         ];
         let manifest = PortableBackupManifest {
@@ -940,6 +989,19 @@ mod tests {
                 .await
                 .expect("read active audio"),
             Some(active_audio)
+        );
+        let restored_chat = repo
+            .list_chat_messages(&active.id)
+            .await
+            .expect("list restored chat");
+        assert_eq!(restored_chat.len(), 1);
+        assert_eq!(restored_chat[0].text, "What was decided?");
+        assert_eq!(
+            repo.load_chat_summary(&active.id)
+                .await
+                .expect("load restored summary")
+                .as_deref(),
+            Some("user: What was decided?")
         );
 
         let deleted_entries = repo

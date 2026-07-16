@@ -60,10 +60,12 @@ export function buildChatArtifactPayload(params: {
   prompt: string;
   includeTimestamps: boolean;
   includeSpeakers: boolean;
+  origin?: ChatArtifactPayload["origin"];
 }): ChatArtifactPayload {
   return {
     id: params.id,
     prompt: params.prompt.trim(),
+    origin: params.origin,
     include_timestamps: params.includeTimestamps,
     include_speakers: params.includeSpeakers,
   };

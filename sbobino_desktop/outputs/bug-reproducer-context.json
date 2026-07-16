@@ -1,0 +1,111 @@
+{
+  "title": "Concurrent chat context corruption and AI quota misclassification",
+  "project": "Sbobino Desktop",
+  "generated_at": "2026-07-16",
+  "mode": "hunt-and-prove",
+  "original_report": "Inspect the provider and persistent-chat implementation for concrete correctness defects before preparing a stable candidate release.",
+  "discovery_scope": [
+    "Tauri artifact chat orchestration and adaptive context construction",
+    "AI service verification error classification",
+    "Provider configuration and model discovery paths"
+  ],
+  "candidates": [
+    {
+      "candidate": "Concurrent questions can be paired with the wrong answers or omitted from model context",
+      "location": "/Users/pietromastro/Documents/sbobino_tauri/sbobino_desktop/apps/desktop/src-tauri/src/commands/artifacts.rs:851",
+      "contract": "Only complete question-answer pairs become context, and concurrent conversations must preserve every turn.",
+      "trigger": "Persist user1, user2, assistant1, assistant2 before building the next prompt.",
+      "confidence": "high",
+      "outcome": "REPRODUCED"
+    },
+    {
+      "candidate": "HTTP 429 responses mentioning an API key are classified as authentication failures",
+      "location": "/Users/pietromastro/Documents/sbobino_tauri/sbobino_desktop/apps/desktop/src-tauri/src/commands/settings.rs:546",
+      "contract": "Authentication and quota failures have distinct localized UI states.",
+      "trigger": "Classify AI provider returned 429: API key quota exceeded.",
+      "confidence": "high",
+      "outcome": "REPRODUCED"
+    }
+  ],
+  "expected": "Concurrent completed turns remain correctly paired and HTTP 429 is reported as a quota failure.",
+  "actual": "The first concurrent question disappeared from context, while the quota error was labeled as authentication.",
+  "environment": "macOS Apple Silicon, Rust workspace and Vitest frontend, local test environment",
+  "reproduction": "Two focused Rust unit tests exercise the production context builder and service-error classifier with deterministic inputs.",
+  "failure_signal": "The context omitted Question one; the classifier returned ai_authentication instead of ai_quota.",
+  "root_cause": "Chat context retained only one pending user and backend chat calls were not serialized per artifact. Error classification searched for API key before checking the authoritative 429/quota signal.",
+  "fix_summary": "Added per-artifact backend chat serialization, FIFO recovery for interleaved historical turns, and quota-first error classification.",
+  "why_causal": "Serialization prevents new interleaving, FIFO preserves already interleaved complete pairs, and prioritizing 429 directly corrects the erroneous branch selection.",
+  "reproduction_files": [
+    {
+      "path": "/Users/pietromastro/Documents/sbobino_tauri/sbobino_desktop/apps/desktop/src-tauri/src/commands/artifacts.rs",
+      "line": 3488,
+      "summary": "Approved concurrent-turn regression test."
+    },
+    {
+      "path": "/Users/pietromastro/Documents/sbobino_tauri/sbobino_desktop/apps/desktop/src-tauri/src/commands/settings.rs",
+      "line": 703,
+      "summary": "Approved quota-classification regression test."
+    }
+  ],
+  "fix_files": [
+    {
+      "path": "/Users/pietromastro/Documents/sbobino_tauri/sbobino_desktop/apps/desktop/src-tauri/src/state.rs",
+      "line": 39,
+      "summary": "Per-artifact weak chat-lock registry."
+    },
+    {
+      "path": "/Users/pietromastro/Documents/sbobino_tauri/sbobino_desktop/apps/desktop/src-tauri/src/lib.rs",
+      "line": 177,
+      "summary": "Initializes the chat-lock registry."
+    },
+    {
+      "path": "/Users/pietromastro/Documents/sbobino_tauri/sbobino_desktop/apps/desktop/src-tauri/src/commands/artifacts.rs",
+      "line": 667,
+      "summary": "Serializes each artifact conversation and pairs queued turns FIFO."
+    },
+    {
+      "path": "/Users/pietromastro/Documents/sbobino_tauri/sbobino_desktop/apps/desktop/src-tauri/src/commands/settings.rs",
+      "line": 546,
+      "summary": "Prioritizes quota signals over authentication wording."
+    }
+  ],
+  "checks": [
+    {
+      "name": "Focused regressions",
+      "status": "passed",
+      "detail": "Both tests changed from deterministic failure to pass."
+    },
+    {
+      "name": "Rust workspace",
+      "status": "passed",
+      "detail": "cargo test --workspace passed; two pre-existing real-runtime smoke tests remain intentionally ignored."
+    },
+    {
+      "name": "Frontend tests",
+      "status": "passed",
+      "detail": "30 files and 139 tests passed."
+    },
+    {
+      "name": "Frontend production build",
+      "status": "passed",
+      "detail": "TypeScript and Vite production build completed."
+    }
+  ],
+  "reproduce": [
+    "cargo test -p sbobino-desktop concurrent_completed_chat_turns_keep_correct_question_answer_pairs -- --nocapture",
+    "cargo test -p sbobino-desktop quota_errors_are_not_misclassified_as_authentication -- --nocapture"
+  ],
+  "limitations": [
+    "The deterministic concurrency regression exercises the production pairing logic; the backend lock is covered by compilation and the broader suite rather than a timed multi-request integration test.",
+    "Live provider credentials and a Windows host were not part of this local proof."
+  ],
+  "residual_risks": [
+    "Provider fallback attribution and draft-aware model discovery remain untested candidates from the read-only audit.",
+    "Stable release readiness still requires native artifact and real-runtime validation on Apple Silicon, Intel macOS, and Windows."
+  ],
+  "notes": [
+    "Gate 1 approved only the two focused regression tests.",
+    "Gate 2 approved the four production files and the exact causal transformation.",
+    "No dependencies or public command signatures changed."
+  ]
+}

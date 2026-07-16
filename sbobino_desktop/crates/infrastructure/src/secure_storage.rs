@@ -44,6 +44,9 @@ impl SecureStorage {
     }
 
     fn load_or_create_internal(fallback_root: Option<&Path>) -> Result<Self, ApplicationError> {
+        if let Some(root) = fallback_root.filter(|_| local_fallback_enabled()) {
+            return Self::load_or_create_local(root);
+        }
         match Self::load_or_create_keychain() {
             Ok(storage) => Ok(storage),
             Err(error) => {

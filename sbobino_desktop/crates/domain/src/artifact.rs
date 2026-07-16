@@ -7,6 +7,43 @@ use uuid::Uuid;
 use crate::DomainError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactChatMessage {
+    pub id: String,
+    pub artifact_id: String,
+    pub role: String,
+    pub text: String,
+    pub origin: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ArtifactChatMessage {
+    pub fn new(
+        artifact_id: impl Into<String>,
+        role: impl Into<String>,
+        text: impl Into<String>,
+        origin: impl Into<String>,
+        status: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            artifact_id: artifact_id.into(),
+            role: role.into(),
+            text: text.into(),
+            origin: origin.into(),
+            status: status.into(),
+            provider: None,
+            model: None,
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactKind {
     File,

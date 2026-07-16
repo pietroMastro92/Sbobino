@@ -386,6 +386,19 @@ export type ArtifactAiContextOptions = {
 export type ChatArtifactPayload = ArtifactAiContextOptions & {
   id: string;
   prompt: string;
+  origin?: "typed" | "prompt" | "emotion";
+};
+
+export type ArtifactChatMessage = {
+  id: string;
+  artifact_id: string;
+  role: "user" | "assistant";
+  text: string;
+  origin: "typed" | "prompt" | "emotion";
+  status: "pending" | "complete" | "error";
+  provider?: string | null;
+  model?: string | null;
+  created_at: string;
 };
 
 export type SummarizeArtifactPayload = ArtifactAiContextOptions & {

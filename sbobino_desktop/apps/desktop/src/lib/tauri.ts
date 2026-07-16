@@ -6,6 +6,7 @@ import type {
   ArtifactSpeakerDiarizationProgress,
   AutomaticImportScanResponse,
   AppSettings,
+  ArtifactChatMessage,
   ChatArtifactPayload,
   EmotionAnalysisPayload,
   EmotionAnalysisResult,
@@ -109,6 +110,17 @@ export async function listGeminiModels(api_key?: string): Promise<string[]> {
     return invoke<string[]>("list_gemini_models");
   }
   return invoke<string[]>("list_gemini_models", { payload: { api_key } });
+}
+
+export async function testAiService(service_id: string): Promise<{
+  ok: boolean;
+  message: string;
+}> {
+  return invoke("test_ai_service", { payload: { service_id } });
+}
+
+export async function listAiServiceModels(service_id: string): Promise<string[]> {
+  return invoke<string[]>("list_ai_service_models", { payload: { service_id } });
 }
 
 export async function listPromptTemplates(): Promise<PromptTemplate[]> {
@@ -276,6 +288,10 @@ export async function importAppBackup(payload: {
 
 export async function chatArtifact(payload: ChatArtifactPayload): Promise<string> {
   return invoke<string>("chat_artifact", { payload });
+}
+
+export async function listArtifactChat(id: string): Promise<ArtifactChatMessage[]> {
+  return invoke<ArtifactChatMessage[]>("list_artifact_chat", { payload: { id } });
 }
 
 export async function summarizeArtifact(payload: SummarizeArtifactPayload): Promise<string> {

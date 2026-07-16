@@ -3,7 +3,8 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use sbobino_domain::{
-    AppSettings, ArtifactKind, SpeakerTurn, TranscriptArtifact, TranscriptionOutput, WhisperOptions,
+    AppSettings, ArtifactChatMessage, ArtifactKind, SpeakerTurn, TranscriptArtifact,
+    TranscriptionOutput, WhisperOptions,
 };
 
 use crate::{dto::SummaryFaq, ApplicationError};
@@ -126,6 +127,37 @@ pub trait ArtifactRepository: Send + Sync {
     async fn purge_deleted_older_than_days(&self, days: u32) -> Result<usize, ApplicationError>;
     async fn delete_many(&self, ids: &[String]) -> Result<usize, ApplicationError>;
     async fn read_audio_bytes(&self, id: &str) -> Result<Option<Vec<u8>>, ApplicationError>;
+
+    async fn append_chat_message(
+        &self,
+        _message: &ArtifactChatMessage,
+    ) -> Result<(), ApplicationError> {
+        Err(ApplicationError::Persistence(
+            "artifact chat persistence is not supported".to_string(),
+        ))
+    }
+
+    async fn list_chat_messages(
+        &self,
+        _artifact_id: &str,
+    ) -> Result<Vec<ArtifactChatMessage>, ApplicationError> {
+        Ok(Vec::new())
+    }
+
+    async fn save_chat_summary(
+        &self,
+        _artifact_id: &str,
+        _summary: &str,
+    ) -> Result<(), ApplicationError> {
+        Ok(())
+    }
+
+    async fn load_chat_summary(
+        &self,
+        _artifact_id: &str,
+    ) -> Result<Option<String>, ApplicationError> {
+        Ok(None)
+    }
 }
 
 #[async_trait]

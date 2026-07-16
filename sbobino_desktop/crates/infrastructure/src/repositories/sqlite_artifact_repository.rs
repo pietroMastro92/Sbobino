@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 
 use sbobino_application::{ApplicationError, ArtifactRepository};
 use sbobino_domain::{
-    ArtifactAudioBackfillStatus, ArtifactKind, ArtifactSourceOrigin, TranscriptArtifact,
+    ArtifactAudioBackfillStatus, ArtifactChatMessage, ArtifactKind, ArtifactSourceOrigin,
+    TranscriptArtifact,
 };
 
 use crate::secure_storage::{decrypt_from_file, encrypt_to_file, SecureStorage};
@@ -109,6 +110,58 @@ impl SqliteArtifactRepository {
         Ok(repo)
     }
 
+    pub fn import_backup_chat_message(
+        &self,
+        message: &ArtifactChatMessage,
+    ) -> Result<(), ApplicationError> {
+        let conn = self.open_connection()?;
+        let field = format!("chat_message:{}", message.id);
+        let text_enc = self.encrypt_text(&message.artifact_id, &field, &message.text)?;
+        conn.execute(
+            r#"
+            INSERT INTO artifact_chat_messages (
+                id, artifact_id, role, text_enc, origin, status, provider, model, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                message.id,
+                message.artifact_id,
+                message.role,
+                text_enc,
+                message.origin,
+                message.status,
+                message.provider,
+                message.model,
+                message.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| {
+            ApplicationError::Persistence(format!("failed to save artifact chat message: {e}"))
+        })?;
+        Ok(())
+    }
+
+    pub fn import_backup_chat_summary(
+        &self,
+        artifact_id: &str,
+        summary: &str,
+    ) -> Result<(), ApplicationError> {
+        let conn = self.open_connection()?;
+        let summary_enc = self.encrypt_text(artifact_id, "chat_summary", summary)?;
+        conn.execute(
+            r#"
+            INSERT INTO artifact_chat_context (artifact_id, summary_enc, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(artifact_id) DO UPDATE SET
+                summary_enc = excluded.summary_enc,
+                updated_at = excluded.updated_at
+            "#,
+            params![artifact_id, summary_enc, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| ApplicationError::Persistence(format!("failed to save chat summary: {e}")))?;
+        Ok(())
+    }
+
     fn init_schema(&self) -> Result<(), ApplicationError> {
         if let Some(parent) = self.db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -187,6 +240,29 @@ impl SqliteArtifactRepository {
                 emotion_generated_at TEXT,
                 FOREIGN KEY(artifact_id) REFERENCES transcript_artifacts(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS artifact_chat_messages (
+                id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                text_enc BLOB NOT NULL,
+                origin TEXT NOT NULL,
+                status TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(artifact_id) REFERENCES transcript_artifacts(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS artifact_chat_context (
+                artifact_id TEXT PRIMARY KEY,
+                summary_enc BLOB NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(artifact_id) REFERENCES transcript_artifacts(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_artifact_chat_messages_artifact
+            ON artifact_chat_messages(artifact_id, created_at, id);
 
             CREATE INDEX IF NOT EXISTS idx_transcript_artifacts_created_at
             ON transcript_artifacts(created_at DESC);
@@ -1540,6 +1616,123 @@ impl ArtifactRepository for SqliteArtifactRepository {
                 &full_path,
             )?;
             Ok(Some(bytes))
+        })
+        .await
+        .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn append_chat_message(
+        &self,
+        message: &ArtifactChatMessage,
+    ) -> Result<(), ApplicationError> {
+        let repo = self.clone();
+        let message = message.clone();
+        tokio::task::spawn_blocking(move || repo.import_backup_chat_message(&message))
+            .await
+            .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn list_chat_messages(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Vec<ArtifactChatMessage>, ApplicationError> {
+        let repo = self.clone();
+        let artifact_id = artifact_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = repo.open_connection()?;
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT id, role, text_enc, origin, status, provider, model, created_at
+                    FROM artifact_chat_messages
+                    WHERE artifact_id = ?1
+                    ORDER BY created_at ASC, id ASC
+                    "#,
+                )
+                .map_err(|e| {
+                    ApplicationError::Persistence(format!("failed to prepare chat query: {e}"))
+                })?;
+            let rows = stmt
+                .query_map(params![artifact_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                })
+                .map_err(|e| {
+                    ApplicationError::Persistence(format!("failed to query artifact chat: {e}"))
+                })?;
+
+            rows.map(|row| {
+                let (id, role, text_enc, origin, status, provider, model, created_at) = row
+                    .map_err(|e| {
+                        ApplicationError::Persistence(format!("failed to read chat row: {e}"))
+                    })?;
+                let field = format!("chat_message:{id}");
+                let text = repo.decrypt_text(&artifact_id, &field, &text_enc)?;
+                let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
+                    .map(|value| value.with_timezone(&Utc))
+                    .map_err(|e| {
+                        ApplicationError::Persistence(format!("invalid chat timestamp: {e}"))
+                    })?;
+                Ok(ArtifactChatMessage {
+                    id,
+                    artifact_id: artifact_id.clone(),
+                    role,
+                    text,
+                    origin,
+                    status,
+                    provider,
+                    model,
+                    created_at,
+                })
+            })
+            .collect()
+        })
+        .await
+        .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn save_chat_summary(
+        &self,
+        artifact_id: &str,
+        summary: &str,
+    ) -> Result<(), ApplicationError> {
+        let repo = self.clone();
+        let artifact_id = artifact_id.to_string();
+        let summary = summary.to_string();
+        tokio::task::spawn_blocking(move || repo.import_backup_chat_summary(&artifact_id, &summary))
+            .await
+            .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn load_chat_summary(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<String>, ApplicationError> {
+        let repo = self.clone();
+        let artifact_id = artifact_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = repo.open_connection()?;
+            let encrypted: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT summary_enc FROM artifact_chat_context WHERE artifact_id = ?1",
+                    params![artifact_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| {
+                    ApplicationError::Persistence(format!("failed to load chat summary: {e}"))
+                })?;
+            encrypted
+                .map(|value| repo.decrypt_text(&artifact_id, "chat_summary", &value))
+                .transpose()
         })
         .await
         .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?

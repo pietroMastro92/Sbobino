@@ -3,6 +3,7 @@ use std::fs::File;
 use std::future::Future;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 use docx_rs::{Docx, Paragraph, Run};
@@ -22,8 +23,8 @@ use sbobino_application::{
 };
 use sbobino_domain::{
     constrain_transcript_edit, merge_optimized_transcript_sections,
-    minimize_transcript_repetitions, ArtifactKind, PromptTask, TimedSegment, TimedWord,
-    TranscriptArtifact, TranscriptionOutput,
+    minimize_transcript_repetitions, ArtifactChatMessage, ArtifactKind, PromptTask, TimedSegment,
+    TimedWord, TranscriptArtifact, TranscriptionOutput,
 };
 
 use crate::{
@@ -107,8 +108,26 @@ pub struct ArtifactSpeakerDiarizationProgressEvent {
 pub struct ChatArtifactPayload {
     pub id: String,
     pub prompt: String,
+    #[serde(default = "default_chat_origin")]
+    pub origin: String,
     #[serde(flatten)]
     pub context: ArtifactAiContextOptions,
+}
+
+fn default_chat_origin() -> String {
+    "typed".to_string()
+}
+
+#[tauri::command]
+pub async fn list_artifact_chat(
+    state: State<'_, AppState>,
+    payload: GetArtifactPayload,
+) -> Result<Vec<ArtifactChatMessage>, CommandError> {
+    state
+        .artifact_service
+        .list_chat_messages(&payload.id)
+        .await
+        .map_err(CommandError::from)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1134,25 +1153,24 @@ pub async fn chat_artifact(
     state: State<'_, AppState>,
     payload: ChatArtifactPayload,
 ) -> Result<String, CommandError> {
+    let chat_lock = {
+        let mut locks = state.artifact_chat_locks.lock().await;
+        if let Some(lock) = locks.get(&payload.id).and_then(std::sync::Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(payload.id.clone(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    let _chat_guard = chat_lock.lock().await;
+
     let artifact = state
         .artifact_service
         .get(&payload.id)
         .await
         .map_err(CommandError::from)?
         .ok_or_else(|| CommandError::new("not_found", "artifact not found"))?;
-
-    let enhancer = state
-        .runtime_factory
-        .build_enhancer_candidates()
-        .map_err(|e| CommandError::new("runtime_factory", e))?;
-    if enhancer.is_empty() {
-        let reason = state
-            .runtime_factory
-            .ai_capability_status()
-            .ok()
-            .and_then(|status| status.unavailable_reason);
-        return Err(missing_ai_provider_command_error(reason.as_deref()));
-    }
 
     let prompt = payload.prompt.trim();
     if prompt.is_empty() {
@@ -1162,13 +1180,201 @@ pub async fn chat_artifact(
         ));
     }
 
-    let candidates = build_chat_context_candidates(&artifact, prompt, payload.context);
-    run_with_enhancer_fallback(&enhancer, "chat", |active_enhancer| {
+    let previous_messages = state
+        .artifact_service
+        .list_chat_messages(&payload.id)
+        .await
+        .map_err(CommandError::from)?;
+    let question = ArtifactChatMessage::new(
+        payload.id.clone(),
+        "user",
+        prompt,
+        payload.origin,
+        "complete",
+    );
+    state
+        .artifact_service
+        .append_chat_message(&question)
+        .await
+        .map_err(CommandError::from)?;
+
+    let enhancer = match state.runtime_factory.build_enhancer_candidates() {
+        Ok(enhancers) if !enhancers.is_empty() => enhancers,
+        Ok(_) => {
+            let reason = state
+                .runtime_factory
+                .ai_capability_status()
+                .ok()
+                .and_then(|status| status.unavailable_reason);
+            let error = missing_ai_provider_command_error(reason.as_deref());
+            let failed = ArtifactChatMessage::new(
+                payload.id,
+                "assistant",
+                error.message.clone(),
+                question.origin,
+                "error",
+            );
+            let _ = state.artifact_service.append_chat_message(&failed).await;
+            return Err(error);
+        }
+        Err(message) => {
+            let error = CommandError::new("runtime_factory", message);
+            let failed = ArtifactChatMessage::new(
+                payload.id,
+                "assistant",
+                error.message.clone(),
+                question.origin,
+                "error",
+            );
+            let _ = state.artifact_service.append_chat_message(&failed).await;
+            return Err(error);
+        }
+    };
+
+    let rolling_summary = build_rolling_chat_summary(&previous_messages);
+    if let Some(summary) = rolling_summary.as_deref() {
+        let _ = state
+            .artifact_service
+            .save_chat_summary(&payload.id, summary)
+            .await;
+    }
+    let persisted_summary = match rolling_summary {
+        Some(summary) => Some(summary),
+        None => state
+            .artifact_service
+            .load_chat_summary(&payload.id)
+            .await
+            .unwrap_or(None),
+    };
+    let candidates = add_conversation_context(
+        build_chat_context_candidates(&artifact, prompt, payload.context),
+        &previous_messages,
+        persisted_summary.as_deref(),
+    );
+    let result = run_with_enhancer_fallback(&enhancer, "chat", |active_enhancer| {
         let candidates = candidates.clone();
         Box::pin(async move { ask_with_overflow_fallback(active_enhancer, candidates).await })
     })
-    .await
-    .map_err(CommandError::from)
+    .await;
+
+    match result {
+        Ok(answer) => {
+            let mut response = ArtifactChatMessage::new(
+                payload.id,
+                "assistant",
+                answer.clone(),
+                question.origin,
+                "complete",
+            );
+            response.provider = enhancer.first().map(|candidate| candidate.label.clone());
+            state
+                .artifact_service
+                .append_chat_message(&response)
+                .await
+                .map_err(CommandError::from)?;
+            Ok(answer)
+        }
+        Err(error) => {
+            let failed = ArtifactChatMessage::new(
+                payload.id,
+                "assistant",
+                error.to_string(),
+                question.origin,
+                "error",
+            );
+            let _ = state.artifact_service.append_chat_message(&failed).await;
+            Err(CommandError::from(error))
+        }
+    }
+}
+
+fn add_conversation_context(
+    candidates: Vec<String>,
+    messages: &[ArtifactChatMessage],
+    persisted_summary: Option<&str>,
+) -> Vec<String> {
+    let completed = completed_chat_turns(messages);
+    if completed.is_empty() {
+        return candidates;
+    }
+
+    let recent_start = completed.len().saturating_sub(12);
+    let older = &completed[..recent_start];
+    let recent = &completed[recent_start..];
+    let older_digest =
+        if let Some(summary) = persisted_summary.filter(|value| !value.trim().is_empty()) {
+            summary.to_string()
+        } else if older.is_empty() {
+            String::new()
+        } else {
+            truncate_chars(
+                &older
+                    .iter()
+                    .map(|message| format!("{}: {}", message.role, message.text))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                2400,
+            )
+        };
+    let recent_text = truncate_chars(
+        &recent
+            .iter()
+            .map(|message| format!("{}: {}", message.role, message.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        7200,
+    );
+    let history = format!(
+        "Previous conversation summary:\n{older_digest}\n\nRecent conversation turns:\n{recent_text}\n\n"
+    );
+
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            candidate.replace("User question:\n", &format!("{history}User question:\n"))
+        })
+        .collect()
+}
+
+fn completed_chat_turns(messages: &[ArtifactChatMessage]) -> Vec<&ArtifactChatMessage> {
+    use std::collections::VecDeque;
+
+    let mut completed = Vec::new();
+    let mut pending_users = VecDeque::new();
+    for message in messages {
+        if message.role == "user" {
+            if message.status == "complete" {
+                pending_users.push_back(message);
+            }
+            continue;
+        }
+        if message.role == "assistant" {
+            if message.status == "complete" {
+                if let Some(user) = pending_users.pop_front() {
+                    completed.push(user);
+                    completed.push(message);
+                }
+            } else {
+                pending_users.pop_front();
+            }
+        }
+    }
+    completed
+}
+
+fn build_rolling_chat_summary(messages: &[ArtifactChatMessage]) -> Option<String> {
+    let completed = completed_chat_turns(messages);
+    if completed.len() <= 12 {
+        return None;
+    }
+    Some(truncate_chars(
+        &completed[..completed.len() - 12]
+            .iter()
+            .map(|message| format!("{}: {}", message.role, message.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        2400,
+    ))
 }
 
 #[tauri::command]
@@ -3490,7 +3696,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        build_artifact_context_transcript, build_chat_context_candidates, build_chunk_note_prompt,
+        add_conversation_context, build_artifact_context_transcript, build_chat_context_candidates,
+        build_chunk_note_prompt,
         build_confidence_aware_optimize_prompt, build_direct_summary_prompt, build_export_content,
         build_export_document, build_export_segments, build_summary_instructions,
         build_summary_synthesis_prompt, chunk_text_by_words, extract_low_confidence_spans,
@@ -3498,7 +3705,8 @@ mod tests {
         render_plain_text_document, run_cancellable, summarize_with_rag,
         timeline_segments_for_diarization, trimmed_audio_output_metadata,
         validate_trimmed_audio_output, ApplicationError, ArtifactAiContextOptions, ArtifactKind,
-        ExportStyle, SummarizeArtifactPayload, TranscriptArtifact, TranscriptEnhancer,
+        ArtifactChatMessage, ExportStyle,
+        SummarizeArtifactPayload, TranscriptArtifact, TranscriptEnhancer,
         MIN_TRIMMED_AUDIO_DURATION_SECONDS,
     };
 
@@ -3870,6 +4078,51 @@ mod tests {
         assert!(candidates
             .iter()
             .all(|value| value.contains("Reply in the same language as the user's question")));
+    }
+
+    #[test]
+    fn completed_chat_turns_are_included_in_the_next_question_context() {
+        let candidates =
+            vec!["Transcript snippets:\nmeeting\nUser question:\nWhat next?".to_string()];
+        let messages = vec![
+            ArtifactChatMessage::new("id-1", "user", "What was approved?", "typed", "complete"),
+            ArtifactChatMessage::new(
+                "id-1",
+                "assistant",
+                "The launch was approved.",
+                "typed",
+                "complete",
+            ),
+            ArtifactChatMessage::new("id-1", "assistant", "temporary failure", "typed", "error"),
+            ArtifactChatMessage::new("id-1", "user", "incomplete question", "typed", "complete"),
+        ];
+
+        let enriched = add_conversation_context(candidates, &messages, None);
+
+        assert!(enriched[0].contains("What was approved?"));
+        assert!(enriched[0].contains("The launch was approved."));
+        assert!(!enriched[0].contains("temporary failure"));
+        assert!(!enriched[0].contains("incomplete question"));
+        assert!(enriched[0].ends_with("User question:\nWhat next?"));
+    }
+
+    #[test]
+    fn concurrent_completed_chat_turns_keep_correct_question_answer_pairs() {
+        let candidates =
+            vec!["Transcript snippets:\nmeeting\nUser question:\nWhat next?".to_string()];
+        let messages = vec![
+            ArtifactChatMessage::new("id-1", "user", "Question one", "typed", "complete"),
+            ArtifactChatMessage::new("id-1", "user", "Question two", "typed", "complete"),
+            ArtifactChatMessage::new("id-1", "assistant", "Answer one", "typed", "complete"),
+            ArtifactChatMessage::new("id-1", "assistant", "Answer two", "typed", "complete"),
+        ];
+
+        let enriched = add_conversation_context(candidates, &messages, None);
+
+        assert!(enriched[0].contains("user: Question one"));
+        assert!(enriched[0].contains("assistant: Answer one"));
+        assert!(enriched[0].contains("user: Question two"));
+        assert!(enriched[0].contains("assistant: Answer two"));
     }
 
     #[test]

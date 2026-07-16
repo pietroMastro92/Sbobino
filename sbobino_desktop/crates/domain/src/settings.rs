@@ -830,10 +830,12 @@ impl AppSettings {
     }
 
     pub fn refresh_secret_presence_flags(&mut self) {
-        self.ai.providers.gemini.has_api_key = self.ai.providers.gemini.api_key.is_some();
-        self.gemini_api_key_present = self.ai.providers.gemini.has_api_key;
+        self.ai.providers.gemini.has_api_key =
+            self.ai.providers.gemini.has_api_key || self.ai.providers.gemini.api_key.is_some();
+        self.gemini_api_key_present =
+            self.gemini_api_key_present || self.ai.providers.gemini.has_api_key;
         for service in &mut self.ai.remote_services {
-            service.has_api_key = service.api_key.is_some();
+            service.has_api_key = service.has_api_key || service.api_key.is_some();
         }
     }
 

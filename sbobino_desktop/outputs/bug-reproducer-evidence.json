@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "status": "FIX_PROVEN",
+  "reason": "Both approved regression tests failed for the predicted causes, passed after the approved causal fixes, and the broader Rust and TypeScript gates passed.",
+  "reproduction": "confirmed",
+  "full_suite": "passed",
+  "same_command": true,
+  "before": {
+    "command": [
+      "cargo test -p sbobino-desktop concurrent_completed_chat_turns_keep_correct_question_answer_pairs -- --nocapture",
+      "cargo test -p sbobino-desktop quota_errors_are_not_misclassified_as_authentication -- --nocapture"
+    ],
+    "exit_code": 101,
+    "timed_out": false,
+    "duration_ms": 15730,
+    "stdout": "",
+    "stderr": "concurrent_completed_chat_turns_keep_correct_question_answer_pairs failed: assertion failed: enriched[0].contains(\"user: Question one\")\nquota_errors_are_not_misclassified_as_authentication failed: left ai_authentication, right ai_quota"
+  },
+  "after": {
+    "command": [
+      "cargo test -p sbobino-desktop concurrent_completed_chat_turns_keep_correct_question_answer_pairs -- --nocapture",
+      "cargo test -p sbobino-desktop quota_errors_are_not_misclassified_as_authentication -- --nocapture"
+    ],
+    "exit_code": 0,
+    "timed_out": false,
+    "duration_ms": 15970,
+    "stdout": "concurrent_completed_chat_turns_keep_correct_question_answer_pairs ... ok\nquota_errors_are_not_misclassified_as_authentication ... ok",
+    "stderr": ""
+  }
+}

@@ -256,7 +256,7 @@ pub struct AiCapabilityStatus {
     pub unavailable_reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct EnhancerOverrides {
     model_override: Option<String>,
     optimize_prompt_override: Option<String>,
@@ -348,6 +348,19 @@ impl RuntimeTranscriptionFactory {
 
     pub fn artifacts_db_path(&self) -> PathBuf {
         self.data_dir.join("artifacts.db")
+    }
+
+    pub fn build_remote_service_enhancer_for_test(
+        &self,
+        service_id: &str,
+    ) -> Result<Option<Arc<dyn TranscriptEnhancer>>, String> {
+        let settings = self.load_settings()?;
+        self.build_remote_service_enhancer_from_settings(
+            &settings,
+            service_id,
+            &EnhancerOverrides::default(),
+        )
+        .map(|value| value.map(Arc::from))
     }
 
     pub fn vault_dir(&self) -> PathBuf {
@@ -954,6 +967,29 @@ impl RuntimeTranscriptionFactory {
             return Err(format!("{} service requires a model name", service.label));
         };
 
+        if service.kind == RemoteServiceKind::Anthropic {
+            let api_key = service
+                .api_key
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "Anthropic service requires an API key".to_string())?;
+            return OpenAiCompatibleEnhancer::new_anthropic(
+                base_url,
+                model,
+                api_key,
+                overrides
+                    .optimize_prompt_override
+                    .clone()
+                    .or_else(|| settings.prompt_for_task(PromptTask::Optimize)),
+                overrides
+                    .summary_prompt_override
+                    .clone()
+                    .or_else(|| settings.prompt_for_task(PromptTask::Summary)),
+            )
+            .map(Some)
+            .map_err(|error| error.to_string());
+        }
+
         let auth_style = match &service.kind {
             RemoteServiceKind::LmStudio | RemoteServiceKind::Ollama | RemoteServiceKind::Custom => {
                 if service
@@ -971,8 +1007,8 @@ impl RuntimeTranscriptionFactory {
             RemoteServiceKind::OpenAi
             | RemoteServiceKind::OpenRouter
             | RemoteServiceKind::Xai
-            | RemoteServiceKind::Anthropic
             | RemoteServiceKind::HuggingFace => AuthStyle::Bearer,
+            RemoteServiceKind::Anthropic => unreachable!("handled by Anthropic Messages adapter"),
             RemoteServiceKind::Google => {
                 return Ok(None);
             }
@@ -2967,7 +3003,7 @@ fn default_base_url_for_service_kind(kind: &RemoteServiceKind) -> Option<&'stati
         RemoteServiceKind::Xai => Some("https://api.x.ai/v1"),
         RemoteServiceKind::HuggingFace => Some("https://router.huggingface.co/v1"),
         RemoteServiceKind::Anthropic => Some("https://api.anthropic.com/v1"),
-        RemoteServiceKind::Azure => Some("https://{resource}.openai.azure.com"),
+        RemoteServiceKind::Azure => Some("https://{resource}.openai.azure.com/openai/v1"),
         RemoteServiceKind::Custom => None,
     }
 }

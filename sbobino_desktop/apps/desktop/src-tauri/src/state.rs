@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 use sbobino_application::{ArtifactService, SettingsService};
 use sbobino_domain::TranscriptionEngine;
@@ -46,6 +49,7 @@ pub struct AppState {
     pub runtime_factory: Arc<RuntimeTranscriptionFactory>,
     pub transcription_tasks: Arc<Mutex<HashMap<String, TranscriptionTask>>>,
     pub diarization_tasks: Arc<Mutex<HashMap<String, DiarizationTask>>>,
+    pub artifact_chat_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     // Serializes heavy transcription work. Multiple start_transcription
     // invocations return immediately with a job id, but only one job at a
     // time acquires this permit and runs whisper-cli + pyannote. Prevents

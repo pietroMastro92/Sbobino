@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
@@ -44,6 +45,22 @@ pub struct UpdateAiProvidersPayload {
 #[derive(Debug, Deserialize, Default)]
 pub struct ListGeminiModelsPayload {
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TestAiServicePayload {
+    pub service_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AiServiceIdPayload {
+    pub service_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TestAiServiceResponse {
+    pub ok: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +351,102 @@ pub async fn list_gemini_models(
 }
 
 #[tauri::command]
+pub async fn list_ai_service_models(
+    state: State<'_, AppState>,
+    payload: AiServiceIdPayload,
+) -> Result<Vec<String>, CommandError> {
+    let settings = state
+        .settings_service
+        .snapshot()
+        .await
+        .map_err(CommandError::from)?;
+    let service = settings
+        .ai
+        .remote_services
+        .iter()
+        .find(|service| service.id == payload.service_id)
+        .ok_or_else(|| CommandError::new("not_found", "AI service not found"))?;
+    if service.kind == sbobino_domain::RemoteServiceKind::Google {
+        return Err(CommandError::new(
+            "validation",
+            "Use the Gemini model catalog for Google services",
+        ));
+    }
+    if matches!(
+        service.kind,
+        sbobino_domain::RemoteServiceKind::Azure | sbobino_domain::RemoteServiceKind::Custom
+    ) {
+        return Ok(Vec::new());
+    }
+    let base_url = service
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CommandError::new("validation", "AI service base URL is required"))?;
+    let base_url = base_url
+        .split("/chat/completions")
+        .next()
+        .unwrap_or(base_url)
+        .trim_end_matches('/');
+    let endpoint = format!("{base_url}/models");
+    let mut headers = HeaderMap::new();
+    if service.kind == sbobino_domain::RemoteServiceKind::Anthropic {
+        let key = service
+            .api_key
+            .as_deref()
+            .ok_or_else(|| CommandError::new("missing_api_key", "Anthropic API key is required"))?;
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_str(key)
+                .map_err(|error| CommandError::new("validation", error.to_string()))?,
+        );
+        headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+    } else if let Some(key) = service
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+    {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", key.trim()))
+                .map_err(|error| CommandError::new("validation", error.to_string()))?,
+        );
+    }
+    let response = reqwest::Client::new()
+        .get(endpoint)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|error| CommandError::new("ai_models", error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(CommandError::new(
+            "ai_models",
+            format!(
+                "Model catalog request failed with status {}",
+                response.status()
+            ),
+        ));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| CommandError::new("ai_models", error.to_string()))?;
+    let mut models = BTreeSet::new();
+    if let Some(entries) = body.get("data").and_then(|value| value.as_array()) {
+        for entry in entries {
+            if let Some(id) = entry.get("id").and_then(|value| value.as_str()) {
+                models.insert(id.to_string());
+            }
+        }
+    }
+    Ok(models.into_iter().collect())
+}
+
+#[tauri::command]
 pub async fn list_prompts(state: State<'_, AppState>) -> Result<Vec<PromptTemplate>, CommandError> {
     state
         .settings_service
@@ -397,6 +510,75 @@ pub async fn get_ai_capability_status(
         .runtime_factory
         .ai_capability_status()
         .map_err(|e| CommandError::new("runtime_factory", e))
+}
+
+#[tauri::command]
+pub async fn test_ai_service(
+    state: State<'_, AppState>,
+    payload: TestAiServicePayload,
+) -> Result<TestAiServiceResponse, CommandError> {
+    let enhancer = state
+        .runtime_factory
+        .build_remote_service_enhancer_for_test(payload.service_id.trim())
+        .map_err(|error| CommandError::new("ai_service_configuration", error))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "ai_service_unavailable",
+                "The AI service is disabled or its configuration is incomplete",
+            )
+        })?;
+    let answer = enhancer
+        .ask("Reply with exactly: OK")
+        .await
+        .map_err(classify_ai_service_error)?;
+    if answer.trim().is_empty() {
+        return Err(CommandError::new(
+            "ai_service_empty_response",
+            "The AI service returned an empty response",
+        ));
+    }
+    Ok(TestAiServiceResponse {
+        ok: true,
+        message: "AI service connection verified".to_string(),
+    })
+}
+
+fn classify_ai_service_error(error: sbobino_application::ApplicationError) -> CommandError {
+    let message = error.to_string();
+    let normalized = message.to_ascii_lowercase();
+    let code = if normalized.contains("429")
+        || normalized.contains("quota")
+        || normalized.contains("rate limit")
+    {
+        "ai_quota"
+    } else if normalized.contains("401")
+        || normalized.contains("403")
+        || normalized.contains("authentication")
+        || normalized.contains("api key")
+    {
+        "ai_authentication"
+    } else if normalized.contains("model")
+        && (normalized.contains("not found")
+            || normalized.contains("invalid")
+            || normalized.contains("404"))
+    {
+        "ai_model"
+    } else if normalized.contains("request failed")
+        || normalized.contains("connection")
+        || normalized.contains("network")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+    {
+        "ai_connection"
+    } else if normalized.contains("404")
+        || normalized.contains("endpoint")
+        || normalized.contains("url")
+    {
+        "ai_endpoint"
+    } else {
+        "ai_service_test"
+    };
+    CommandError::new(code, message)
 }
 
 #[tauri::command]
@@ -513,5 +695,23 @@ pub async fn test_prompt(
                 model,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sbobino_application::ApplicationError;
+
+    use super::classify_ai_service_error;
+
+    #[test]
+    fn quota_errors_are_not_misclassified_as_authentication() {
+        let error = ApplicationError::PostProcessing(
+            "AI provider returned 429: API key quota exceeded".to_string(),
+        );
+
+        let classified = classify_ai_service_error(error);
+
+        assert_eq!(classified.code, "ai_quota");
     }
 }

@@ -1,17 +1,26 @@
 use std::fs;
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::tempdir;
 
 use sbobino_application::SettingsRepository;
-use sbobino_domain::{LanguageCode, SpeechModel};
+use sbobino_domain::{LanguageCode, RemoteServiceConfig, RemoteServiceKind, SpeechModel};
 use sbobino_infrastructure::repositories::fs_settings_repository::FsSettingsRepository;
 
 fn enable_local_secure_storage_for_tests() {
     std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
 }
 
+fn secure_storage_test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[tokio::test]
 async fn load_creates_default_settings_when_file_is_missing() {
+    let _guard = secure_storage_test_guard();
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("config").join("settings.json");
@@ -30,6 +39,7 @@ async fn load_creates_default_settings_when_file_is_missing() {
 
 #[tokio::test]
 async fn save_then_load_round_trips_settings() {
+    let _guard = secure_storage_test_guard();
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
@@ -61,7 +71,98 @@ async fn save_then_load_round_trips_settings() {
 }
 
 #[tokio::test]
+async fn save_then_load_persists_new_ai_provider_secrets() {
+    let _guard = secure_storage_test_guard();
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let settings_path = temp.path().join("settings.json");
+    let repo = FsSettingsRepository::new(settings_path);
+
+    let mut settings = repo.load().await.expect("initial load should succeed");
+    settings.ai.providers.gemini.api_key = Some("gemini-secret".to_string());
+    settings.ai.providers.gemini.has_api_key = true;
+    settings.ai.remote_services.push(RemoteServiceConfig {
+        id: "openai-primary".to_string(),
+        kind: RemoteServiceKind::OpenAi,
+        label: "OpenAI".to_string(),
+        enabled: true,
+        api_key: Some("openai-secret".to_string()),
+        has_api_key: true,
+        model: Some("gpt-4.1-mini".to_string()),
+        base_url: Some("https://api.openai.com/v1".to_string()),
+    });
+
+    repo.save(&settings).await.expect("save should succeed");
+    let loaded = repo.load().await.expect("second load should succeed");
+
+    assert_eq!(
+        loaded.ai.providers.gemini.api_key.as_deref(),
+        Some("gemini-secret")
+    );
+    assert_eq!(
+        loaded.ai.remote_services[0].api_key.as_deref(),
+        Some("openai-secret")
+    );
+}
+
+#[tokio::test]
+async fn redacted_ai_updates_keep_secrets_until_explicitly_cleared() {
+    let _guard = secure_storage_test_guard();
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let settings_path = temp.path().join("settings.json");
+    let repo = FsSettingsRepository::new(settings_path);
+    let mut settings = repo.load().await.expect("initial load should succeed");
+    settings.ai.providers.gemini.api_key = Some("gemini-secret".to_string());
+    settings.ai.providers.gemini.has_api_key = true;
+    settings.sync_legacy_from_sections();
+    repo.save(&settings)
+        .await
+        .expect("initial secret save should succeed");
+
+    let mut redacted = repo
+        .load()
+        .await
+        .expect("settings should load")
+        .redacted_clone();
+    redacted.ai.providers.gemini.model = "gemini-2.5-pro".to_string();
+    redacted.sync_legacy_from_sections();
+    repo.save(&redacted)
+        .await
+        .expect("redacted update should succeed");
+    assert_eq!(
+        repo.load()
+            .await
+            .expect("settings should reload")
+            .ai
+            .providers
+            .gemini
+            .api_key
+            .as_deref(),
+        Some("gemini-secret")
+    );
+
+    let mut cleared = repo.load().await.expect("settings should load for clear");
+    cleared.ai.providers.gemini.api_key = None;
+    cleared.ai.providers.gemini.has_api_key = false;
+    cleared.sync_legacy_from_sections();
+    repo.save(&cleared)
+        .await
+        .expect("explicit clear should succeed");
+    assert!(repo
+        .load()
+        .await
+        .expect("settings should reload after clear")
+        .ai
+        .providers
+        .gemini
+        .api_key
+        .is_none());
+}
+
+#[tokio::test]
 async fn save_then_load_preserves_structured_transcription_settings() {
+    let _guard = secure_storage_test_guard();
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
@@ -97,6 +198,7 @@ async fn save_then_load_preserves_structured_transcription_settings() {
 
 #[tokio::test]
 async fn save_then_load_preserves_automatic_import_and_workspace_settings() {
+    let _guard = secure_storage_test_guard();
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
@@ -162,6 +264,7 @@ async fn save_then_load_preserves_automatic_import_and_workspace_settings() {
 
 #[tokio::test]
 async fn load_backfills_legacy_automatic_import_source_model_and_language() {
+    let _guard = secure_storage_test_guard();
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");

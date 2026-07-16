@@ -88,6 +88,8 @@ import {
   getArtifact,
   hardDeleteArtifacts,
   importAppBackup,
+  listArtifactChat,
+  listAiServiceModels,
   listDeletedArtifacts,
   listGeminiModels,
   listRecentArtifacts,
@@ -131,6 +133,7 @@ import {
   subscribeSettingsNavigate,
   subscribeSettingsUpdated,
   testPromptTemplate,
+  testAiService,
   updateArtifact,
   updateArtifactTimeline,
   writeTrimmedAudio,
@@ -832,7 +835,7 @@ const serviceCatalog: ServiceCatalogItem[] = [
     icon: Cloud,
     tone: "azure",
     defaultModel: null,
-    defaultBaseUrl: "https://{resource}.openai.azure.com",
+    defaultBaseUrl: "https://{resource}.openai.azure.com/openai/v1",
   },
   {
     kind: "lm_studio",
@@ -1897,6 +1900,10 @@ function formatProviderLabel(kind: RemoteServiceKind): string {
     .replace(/\b\w/g, (match) => match.toUpperCase());
 }
 
+function matchesManualModelProvider(kind: RemoteServiceKind): boolean {
+  return kind === "azure" || kind === "custom";
+}
+
 function formatRemoteServiceLabel(
   service: Pick<RemoteServiceConfig, "kind" | "label" | "model">,
   settings?: AppSettings | null,
@@ -1995,6 +2002,21 @@ function formatUiError(key: string, fallback: string, error: unknown): string {
     return base;
   }
   return `${base}: ${detail}`;
+}
+
+function formatAiServiceVerificationError(error: unknown): string {
+  const messages: Record<string, [string, string]> = {
+    ai_authentication: ["error.aiAuthentication", "Authentication failed"],
+    ai_model: ["error.aiModel", "The selected model is unavailable"],
+    ai_endpoint: ["error.aiEndpoint", "The provider endpoint is invalid"],
+    ai_quota: ["error.aiQuota", "The provider quota or rate limit was reached"],
+    ai_connection: ["error.aiConnection", "Could not connect to the provider"],
+  };
+  const [key, fallback] = messages[formatAppErrorCode(error) ?? ""] ?? [
+    "error.aiServiceVerificationFailed",
+    "Could not verify this AI service",
+  ];
+  return formatUiError(key, fallback, error);
 }
 
 function formatPyannoteHealthMessage(
@@ -3419,9 +3441,24 @@ export function App({
   const [loadingGeminiModels, setLoadingGeminiModels] = useState(false);
   const [geminiModelFetchNonce, setGeminiModelFetchNonce] = useState(0);
   const [geminiApiKeyDraft, setGeminiApiKeyDraft] = useState("");
+  const [geminiModelDraft, setGeminiModelDraft] = useState<string | null>(null);
   const [remoteServiceApiKeyDrafts, setRemoteServiceApiKeyDrafts] = useState<
     Record<string, string>
   >({});
+  const [remoteServiceModelDrafts, setRemoteServiceModelDrafts] = useState<
+    Record<string, string>
+  >({});
+  const [remoteServiceBaseUrlDrafts, setRemoteServiceBaseUrlDrafts] = useState<
+    Record<string, string>
+  >({});
+  const [testingAiServiceId, setTestingAiServiceId] = useState<string | null>(null);
+  const [verifiedAiServiceIds, setVerifiedAiServiceIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [remoteServiceModelChoices, setRemoteServiceModelChoices] = useState<
+    Record<string, string[]>
+  >({});
+  const [loadingRemoteModelsId, setLoadingRemoteModelsId] = useState<string | null>(null);
 
   const [activePromptId, setActivePromptId] = useState("");
   const [promptDraft, setPromptDraft] = useState<PromptTemplate | null>(null);
@@ -3950,6 +3987,42 @@ export function App({
     setSpeakerDraft("");
     setShowConfidenceColors(false);
   }, [activeArtifactId]);
+
+  useEffect(() => {
+    if (!activeArtifactId) {
+      setChatHistory([]);
+      return;
+    }
+    let cancelled = false;
+    void listArtifactChat(activeArtifactId)
+      .then((messages) => {
+        if (cancelled) return;
+        setChatHistory(
+          messages.map((message) => ({
+            id: message.id,
+            role: message.role,
+            text: message.text,
+            status: message.status,
+            origin: message.origin,
+            canCopy: message.role === "assistant" && message.status !== "pending",
+          })),
+        );
+      })
+      .catch((chatLoadError) => {
+        if (!cancelled) {
+          setError(
+            formatUiError(
+              "error.chatLoadFailed",
+              "Could not load this transcription's chat",
+              chatLoadError,
+            ),
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeArtifactId, setError]);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -10347,6 +10420,7 @@ export function App({
           prompt,
           includeTimestamps: chatIncludeTimestamps,
           includeSpeakers: chatIncludeSpeakers,
+          origin,
         }),
       );
       setChatHistory((previous) =>
@@ -16344,6 +16418,125 @@ export function App({
       remoteServices.map((service) => service.kind),
     );
 
+    const markAiServiceUnverified = (id: string): void => {
+      setVerifiedAiServiceIds((current) => {
+        if (!current.has(id)) return current;
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    };
+
+    const saveAndVerifyAiService = async (
+      service: RemoteServiceConfig,
+      apiKeyDraft: string,
+    ): Promise<void> => {
+      const modelDraft =
+        service.kind === "google"
+          ? geminiModelDraft
+          : remoteServiceModelDrafts[service.id];
+      const baseUrlDraft = remoteServiceBaseUrlDrafts[service.id];
+      setTestingAiServiceId(service.id);
+      setError(null);
+      try {
+        await patchAiSettings((current) => ({
+          ...current,
+          providers:
+            service.kind === "google"
+              ? {
+                  ...current.providers,
+                  gemini: {
+                    ...current.providers.gemini,
+                    model:
+                      modelDraft?.trim() || current.providers.gemini.model,
+                    api_key:
+                      apiKeyDraft.trim().length > 0
+                        ? apiKeyDraft
+                        : current.providers.gemini.api_key,
+                    has_api_key:
+                      apiKeyDraft.trim().length > 0 ||
+                      current.providers.gemini.has_api_key,
+                  },
+                }
+              : current.providers,
+          remote_services: (current.remote_services ?? []).map((entry) =>
+            entry.id === service.id
+              ? {
+                  ...entry,
+                  enabled: true,
+                  api_key:
+                    apiKeyDraft.trim().length > 0
+                      ? apiKeyDraft
+                      : entry.api_key,
+                  has_api_key:
+                    apiKeyDraft.trim().length > 0 || entry.has_api_key,
+                  model:
+                    modelDraft == null
+                      ? entry.model
+                      : modelDraft.trim() || null,
+                  base_url:
+                    baseUrlDraft === undefined
+                      ? entry.base_url
+                      : baseUrlDraft.trim() || null,
+                }
+              : entry,
+          ),
+        }));
+        await testAiService(service.id);
+        setVerifiedAiServiceIds((current) => new Set(current).add(service.id));
+        setRemoteServiceApiKeyDrafts((current) => ({
+          ...current,
+          [service.id]: "",
+        }));
+        if (service.kind === "google") setGeminiApiKeyDraft("");
+        if (service.kind === "google") setGeminiModelDraft(null);
+        setRemoteServiceModelDrafts((current) => {
+          const next = { ...current };
+          delete next[service.id];
+          return next;
+        });
+        setRemoteServiceBaseUrlDrafts((current) => {
+          const next = { ...current };
+          delete next[service.id];
+          return next;
+        });
+        setAiCapabilityStatus(await fetchAiCapabilityStatus());
+      } catch (verificationError) {
+        markAiServiceUnverified(service.id);
+        setError(formatAiServiceVerificationError(verificationError));
+      } finally {
+        setTestingAiServiceId(null);
+      }
+    };
+
+    const clearAiServiceApiKey = (service: RemoteServiceConfig): void => {
+      markAiServiceUnverified(service.id);
+      void patchAiSettings((current) => ({
+        ...current,
+        providers:
+          service.kind === "google"
+            ? {
+                ...current.providers,
+                gemini: {
+                  ...current.providers.gemini,
+                  api_key: null,
+                  has_api_key: false,
+                },
+              }
+            : current.providers,
+        remote_services: (current.remote_services ?? []).map((entry) =>
+          entry.id === service.id
+            ? { ...entry, api_key: null, has_api_key: false }
+            : entry,
+        ),
+      }));
+      if (service.kind === "google") setGeminiApiKeyDraft("");
+      setRemoteServiceApiKeyDrafts((current) => ({
+        ...current,
+        [service.id]: "",
+      }));
+    };
+
     const createRemoteServiceEntry = (
       kind: RemoteServiceKind,
     ): RemoteServiceConfig | null => {
@@ -16585,7 +16778,12 @@ export function App({
                   </button>
                   <button
                     className="secondary-button"
-                    disabled={!geminiConfigured || geminiActive}
+                    disabled={
+                      !geminiConfigured ||
+                      geminiActive ||
+                      !googleService ||
+                      !verifiedAiServiceIds.has(googleService.id)
+                    }
                     onClick={activateGemini}
                   >
                     {geminiActive
@@ -16607,33 +16805,8 @@ export function App({
                       )}
                       value={geminiApiKeyDraft}
                       onChange={(event) => {
-                        const value = event.target.value.trim();
                         setGeminiApiKeyDraft(event.target.value);
-                        void patchAiSettings((current) => ({
-                          ...current,
-                          providers: {
-                            ...current.providers,
-                            gemini: {
-                              ...current.providers.gemini,
-                              api_key:
-                                value.length > 0 ? event.target.value : null,
-                              has_api_key: value.length > 0,
-                            },
-                          },
-                          remote_services: (current.remote_services ?? []).map(
-                            (service) =>
-                              service.kind === "google"
-                                ? {
-                                    ...service,
-                                    api_key:
-                                      value.length > 0
-                                        ? event.target.value
-                                        : null,
-                                    has_api_key: value.length > 0,
-                                  }
-                                : service,
-                          ),
-                        }));
+                        if (googleService) markAiServiceUnverified(googleService.id);
                       }}
                     />
                   </label>
@@ -16642,28 +16815,12 @@ export function App({
                     <label>
                       {t("settings.ai.geminiModel", "Gemini Model")}
                       <select
-                        value={settings.ai.providers.gemini.model}
+                        value={
+                          geminiModelDraft ?? settings.ai.providers.gemini.model
+                        }
                         onChange={(event) => {
-                          void patchAiSettings((current) => ({
-                            ...current,
-                            providers: {
-                              ...current.providers,
-                              gemini: {
-                                ...current.providers.gemini,
-                                model: event.target.value,
-                              },
-                            },
-                            remote_services: (
-                              current.remote_services ?? []
-                            ).map((service) =>
-                              service.kind === "google"
-                                ? {
-                                    ...service,
-                                    model: event.target.value,
-                                  }
-                                : service,
-                            ),
-                          }));
+                          if (googleService) markAiServiceUnverified(googleService.id);
+                          setGeminiModelDraft(event.target.value);
                         }}
                       >
                         {geminiModelChoices.map((model) => (
@@ -16700,6 +16857,31 @@ export function App({
                   </div>
 
                   <div className="ai-service-config-actions">
+                    {googleService ? (
+                      <>
+                        <button
+                          className="primary-button"
+                          disabled={testingAiServiceId === googleService.id}
+                          onClick={() =>
+                            void saveAndVerifyAiService(
+                              googleService,
+                              geminiApiKeyDraft,
+                            )
+                          }
+                        >
+                          {testingAiServiceId === googleService.id
+                            ? t("settings.ai.verifying", "Verifying...")
+                            : t("settings.ai.saveAndVerify", "Save and verify")}
+                        </button>
+                        <button
+                          className="secondary-button"
+                          disabled={!settings.ai.providers.gemini.has_api_key}
+                          onClick={() => clearAiServiceApiKey(googleService)}
+                        >
+                          {t("settings.ai.clearApiKey", "Clear API key")}
+                        </button>
+                      </>
+                    ) : null}
                     <button
                       className="secondary-button"
                       onClick={() => {
@@ -16835,8 +17017,13 @@ export function App({
                       </button>
                       <button
                         className="secondary-button"
-                        disabled={!service.enabled || isActiveRemote}
+                        disabled={
+                          !service.enabled ||
+                          isActiveRemote ||
+                          !verifiedAiServiceIds.has(service.id)
+                        }
                         onClick={() => {
+                          if (!verifiedAiServiceIds.has(service.id)) return;
                           void patchAiSettings((current) => ({
                             ...current,
                             active_provider:
@@ -16865,54 +17052,110 @@ export function App({
                               ...current,
                               [service.id]: nextValue,
                             }));
-                            patchRemoteService(service.id, (current) => ({
-                              ...current,
-                              api_key:
-                                nextValue.trim().length > 0 ? nextValue : null,
-                              has_api_key: nextValue.trim().length > 0,
-                            }));
+                            markAiServiceUnverified(service.id);
                           }}
                         />
                       </label>
                       <label>
                         {t("settings.ai.model", "Model")}
                         <input
-                          value={service.model ?? ""}
+                          list={`ai-models-${service.id}`}
+                          value={
+                            remoteServiceModelDrafts[service.id] ??
+                            service.model ??
+                            ""
+                          }
                           placeholder={t(
                             "settings.ai.modelPlaceholder",
                             "Optional model name",
                           )}
-                          onChange={(event) =>
-                            patchRemoteService(service.id, (current) => ({
+                          onChange={(event) => {
+                            markAiServiceUnverified(service.id);
+                            setRemoteServiceModelDrafts((current) => ({
                               ...current,
-                              model:
-                                event.target.value.trim().length > 0
-                                  ? event.target.value
-                                  : null,
-                            }))
-                          }
+                              [service.id]: event.target.value,
+                            }));
+                          }}
                         />
+                        <datalist id={`ai-models-${service.id}`}>
+                          {(remoteServiceModelChoices[service.id] ?? []).map((model) => (
+                            <option key={model} value={model} />
+                          ))}
+                        </datalist>
                       </label>
+                      {!matchesManualModelProvider(service.kind) ? (
+                        <button
+                          className="secondary-button"
+                          disabled={loadingRemoteModelsId === service.id}
+                          onClick={() => {
+                            setLoadingRemoteModelsId(service.id);
+                            void listAiServiceModels(service.id)
+                              .then((models) =>
+                                setRemoteServiceModelChoices((current) => ({
+                                  ...current,
+                                  [service.id]: models,
+                                })),
+                              )
+                              .catch((modelsError) =>
+                                setError(
+                                  formatUiError(
+                                    "error.aiModelsFailed",
+                                    "Could not load models",
+                                    modelsError,
+                                  ),
+                                ),
+                              )
+                              .finally(() => setLoadingRemoteModelsId(null));
+                          }}
+                        >
+                          {loadingRemoteModelsId === service.id
+                            ? t("settings.ai.loadingModels", "Loading models...")
+                            : t("settings.ai.refreshModels", "Refresh models")}
+                        </button>
+                      ) : null}
                       <label>
                         {t("settings.ai.baseUrl", "Base URL")}
                         <input
-                          value={service.base_url ?? ""}
+                          value={
+                            remoteServiceBaseUrlDrafts[service.id] ??
+                            service.base_url ??
+                            ""
+                          }
                           placeholder={t(
                             "settings.ai.baseUrlPlaceholder",
                             "Optional API endpoint",
                           )}
-                          onChange={(event) =>
-                            patchRemoteService(service.id, (current) => ({
+                          onChange={(event) => {
+                            markAiServiceUnverified(service.id);
+                            setRemoteServiceBaseUrlDrafts((current) => ({
                               ...current,
-                              base_url:
-                                event.target.value.trim().length > 0
-                                  ? event.target.value
-                                  : null,
-                            }))
-                          }
+                              [service.id]: event.target.value,
+                            }));
+                          }}
                         />
                       </label>
                       <div className="ai-service-config-actions">
+                        <button
+                          className="primary-button"
+                          disabled={testingAiServiceId === service.id}
+                          onClick={() =>
+                            void saveAndVerifyAiService(
+                              service,
+                              remoteServiceApiKeyDrafts[service.id] ?? "",
+                            )
+                          }
+                        >
+                          {testingAiServiceId === service.id
+                            ? t("settings.ai.verifying", "Verifying...")
+                            : t("settings.ai.saveAndVerify", "Save and verify")}
+                        </button>
+                        <button
+                          className="secondary-button"
+                          disabled={!service.has_api_key}
+                          onClick={() => clearAiServiceApiKey(service)}
+                        >
+                          {t("settings.ai.clearApiKey", "Clear API key")}
+                        </button>
                         <button
                           className="secondary-button"
                           onClick={() => removeRemoteService(service.id)}

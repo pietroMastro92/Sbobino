@@ -15,6 +15,12 @@ pub enum AuthStyle {
     ApiKeyHeader,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ProviderProtocol {
+    OpenAiCompatible,
+    AnthropicMessages,
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleEnhancer {
     client: Client,
@@ -23,6 +29,7 @@ pub struct OpenAiCompatibleEnhancer {
     headers: HeaderMap,
     optimize_prompt_override: Option<String>,
     summary_prompt_override: Option<String>,
+    protocol: ProviderProtocol,
 }
 
 impl OpenAiCompatibleEnhancer {
@@ -93,25 +100,73 @@ impl OpenAiCompatibleEnhancer {
             headers,
             optimize_prompt_override: normalize_prompt(optimize_prompt_override),
             summary_prompt_override: normalize_prompt(summary_prompt_override),
+            protocol: ProviderProtocol::OpenAiCompatible,
+        })
+    }
+
+    pub fn new_anthropic(
+        base_url: String,
+        model: String,
+        api_key: String,
+        optimize_prompt_override: Option<String>,
+        summary_prompt_override: Option<String>,
+    ) -> Result<Self, ApplicationError> {
+        let endpoint = normalize_anthropic_messages_endpoint(&base_url);
+        let model = model.trim().to_string();
+        if endpoint.is_empty() || model.is_empty() || api_key.trim().is_empty() {
+            return Err(ApplicationError::Settings(
+                "Anthropic endpoint, model, and API key are required".to_string(),
+            ));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_str(api_key.trim()).map_err(|e| {
+                ApplicationError::Settings(format!("invalid Anthropic API key header: {e}"))
+            })?,
+        );
+        Ok(Self {
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(90))
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            endpoint,
+            model,
+            headers,
+            optimize_prompt_override: normalize_prompt(optimize_prompt_override),
+            summary_prompt_override: normalize_prompt(summary_prompt_override),
+            protocol: ProviderProtocol::AnthropicMessages,
         })
     }
 
     async fn generate(&self, prompt: &str) -> Result<String, ApplicationError> {
+        let payload = match self.protocol {
+            ProviderProtocol::OpenAiCompatible => json!({
+                "model": self.model,
+                "messages": [{ "role": "user", "content": prompt }],
+                "temperature": 0.3,
+                "max_tokens": 4096
+            }),
+            ProviderProtocol::AnthropicMessages => json!({
+                "model": self.model,
+                "messages": [{ "role": "user", "content": prompt }],
+                "temperature": 0.3,
+                "max_tokens": 4096
+            }),
+        };
         let response = self
             .client
             .post(&self.endpoint)
             .headers(self.headers.clone())
-            .json(&json!({
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.3,
-                "max_tokens": 4096
-            }))
+            .json(&payload)
             .send()
             .await
             .map_err(|e| ApplicationError::PostProcessing(format!("AI request failed: {e}")))?;
@@ -124,14 +179,33 @@ impl OpenAiCompatibleEnhancer {
             )));
         }
 
-        let payload: OpenAiChatResponse = response.json().await.map_err(|e| {
+        let payload: serde_json::Value = response.json().await.map_err(|e| {
             ApplicationError::PostProcessing(format!("invalid AI provider response: {e}"))
         })?;
+        let generated = match self.protocol {
+            ProviderProtocol::OpenAiCompatible => payload
+                .get("choices")
+                .and_then(|value| value.as_array())
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .and_then(|message| message.get("content"))
+                .cloned()
+                .and_then(|content| serde_json::from_value(content).ok())
+                .and_then(extract_content),
+            ProviderProtocol::AnthropicMessages => payload
+                .get("content")
+                .and_then(|value| value.as_array())
+                .and_then(|items| {
+                    items.iter().find_map(|item| {
+                        (item.get("type").and_then(|value| value.as_str()) == Some("text"))
+                            .then(|| item.get("text").and_then(|value| value.as_str()))
+                            .flatten()
+                    })
+                })
+                .map(str::to_string),
+        };
 
-        payload
-            .choices
-            .into_iter()
-            .find_map(|choice| extract_content(choice.message.content))
+        generated
             .and_then(|text| {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
@@ -253,6 +327,18 @@ fn normalize_chat_endpoint(base_url: &str) -> String {
     }
 }
 
+fn normalize_anthropic_messages_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.ends_with("/messages") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/messages")
+    }
+}
+
 fn build_optimize_prompt(
     text: &str,
     language_code: &str,
@@ -330,7 +416,7 @@ fn build_summary_prompt(
 }
 
 #[cfg(test)]
-mod tests {
+mod contract_tests {
     use super::build_optimize_prompt;
 
     #[test]
@@ -522,22 +608,6 @@ fn extract_content(content: MessageContent) -> Option<String> {
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenAiChatResponse {
-    #[serde(default)]
-    choices: Vec<OpenAiChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiChatChoice {
-    message: OpenAiMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiMessage {
-    content: MessageContent,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum MessageContent {
     Text(String),
@@ -548,4 +618,117 @@ enum MessageContent {
 struct MessageContentPart {
     #[serde(default)]
     text: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    use super::{AuthStyle, OpenAiCompatibleEnhancer};
+
+    fn capture_one_request(response_body: &'static str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let mut expected_len = None;
+            loop {
+                let read = stream.read(&mut chunk).expect("request should read");
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+                if expected_len.is_none() {
+                    if let Some(header_end) =
+                        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(str::trim)
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+                if expected_len.is_some_and(|length| bytes.len() >= length) {
+                    break;
+                }
+            }
+            sender
+                .send(String::from_utf8_lossy(&bytes).to_string())
+                .expect("captured request should send");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("response should write");
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    #[tokio::test]
+    async fn anthropic_uses_messages_endpoint_and_native_headers() {
+        let (base_url, captured) =
+            capture_one_request(r#"{"content":[{"type":"text","text":"OK"}]}"#);
+        let enhancer = OpenAiCompatibleEnhancer::new_anthropic(
+            format!("{base_url}/v1"),
+            "claude-test".to_string(),
+            "anthropic-secret".to_string(),
+            None,
+            None,
+        )
+        .expect("Anthropic enhancer should build");
+
+        let answer = enhancer.ask("hello").await.expect("request should succeed");
+        let request = captured.recv().expect("request should be captured");
+        let lower = request.to_ascii_lowercase();
+        assert_eq!(answer, "OK");
+        assert!(request.starts_with("POST /v1/messages HTTP/1.1"));
+        assert!(lower.contains("x-api-key: anthropic-secret"));
+        assert!(lower.contains("anthropic-version: 2023-06-01"));
+        assert!(request.contains("\"model\":\"claude-test\""));
+    }
+
+    #[tokio::test]
+    async fn compatible_providers_use_chat_completions_and_bearer_auth() {
+        let (base_url, captured) =
+            capture_one_request(r#"{"choices":[{"message":{"content":"OK"}}]}"#);
+        let enhancer = OpenAiCompatibleEnhancer::new(
+            format!("{base_url}/v1"),
+            "model-test".to_string(),
+            Some("provider-secret".to_string()),
+            AuthStyle::Bearer,
+            None,
+            None,
+        )
+        .expect("compatible enhancer should build");
+
+        let answer = enhancer.ask("hello").await.expect("request should succeed");
+        let request = captured.recv().expect("request should be captured");
+        let lower = request.to_ascii_lowercase();
+        assert_eq!(answer, "OK");
+        assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        assert!(lower.contains("authorization: bearer provider-secret"));
+        assert!(request.contains("\"model\":\"model-test\""));
+    }
 }

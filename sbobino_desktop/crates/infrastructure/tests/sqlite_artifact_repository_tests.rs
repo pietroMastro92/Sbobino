@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use tempfile::tempdir;
 
 use sbobino_application::ArtifactRepository;
-use sbobino_domain::{ArtifactKind, ArtifactSourceOrigin, TranscriptArtifact};
+use sbobino_domain::{ArtifactChatMessage, ArtifactKind, ArtifactSourceOrigin, TranscriptArtifact};
 use sbobino_infrastructure::repositories::sqlite_artifact_repository::SqliteArtifactRepository;
 
 fn enable_local_secure_storage_for_tests() {
@@ -54,6 +54,76 @@ async fn save_then_get_by_id_returns_persisted_artifact() {
     assert_eq!(loaded.job_id, "job-a");
     assert_eq!(loaded.raw_transcript, "hello transcript");
     assert_eq!(loaded.optimized_transcript, "hello transcript");
+}
+
+#[tokio::test]
+async fn artifact_chat_survives_reopen_and_is_deleted_with_artifact() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let db_path = temp.path().join("artifacts.db");
+    let repo = SqliteArtifactRepository::new(db_path.clone()).expect("repo should initialize");
+    let artifact = artifact_with_job("job-chat", "/tmp/chat.wav", "meeting transcript");
+    let artifact_id = artifact.id.clone();
+    repo.save(&artifact).await.expect("save should succeed");
+
+    repo.append_chat_message(&ArtifactChatMessage::new(
+        artifact_id.clone(),
+        "user",
+        "What was decided?",
+        "typed",
+        "complete",
+    ))
+    .await
+    .expect("question should persist");
+    repo.append_chat_message(&ArtifactChatMessage::new(
+        artifact_id.clone(),
+        "assistant",
+        "The team approved the launch.",
+        "typed",
+        "complete",
+    ))
+    .await
+    .expect("answer should persist");
+
+    let reopened = SqliteArtifactRepository::new(db_path).expect("repo should reopen");
+    let messages = reopened
+        .list_chat_messages(&artifact_id)
+        .await
+        .expect("chat should load");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].text, "What was decided?");
+    assert_eq!(messages[1].text, "The team approved the launch.");
+    reopened
+        .save_chat_summary(&artifact_id, "Earlier discussion summary")
+        .await
+        .expect("summary should persist");
+    assert_eq!(
+        reopened
+            .load_chat_summary(&artifact_id)
+            .await
+            .expect("summary should load")
+            .as_deref(),
+        Some("Earlier discussion summary")
+    );
+
+    reopened
+        .delete_many(std::slice::from_ref(&artifact_id))
+        .await
+        .expect("soft delete should succeed");
+    reopened
+        .hard_delete_many(std::slice::from_ref(&artifact_id))
+        .await
+        .expect("hard delete should succeed");
+    assert!(reopened
+        .list_chat_messages(&artifact_id)
+        .await
+        .expect("chat lookup should succeed")
+        .is_empty());
+    assert!(reopened
+        .load_chat_summary(&artifact_id)
+        .await
+        .expect("summary lookup should succeed")
+        .is_none());
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use sbobino_domain::TranscriptArtifact;
+use sbobino_domain::{ArtifactChatMessage, TranscriptArtifact};
 
 use crate::{ApplicationError, ArtifactQuery, ArtifactRepository};
 
@@ -129,5 +129,34 @@ impl ArtifactService {
 
     pub async fn read_audio_bytes(&self, id: &str) -> Result<Option<Vec<u8>>, ApplicationError> {
         self.artifacts.read_audio_bytes(id).await
+    }
+
+    pub async fn append_chat_message(
+        &self,
+        message: &ArtifactChatMessage,
+    ) -> Result<(), ApplicationError> {
+        self.artifacts.append_chat_message(message).await
+    }
+
+    pub async fn list_chat_messages(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Vec<ArtifactChatMessage>, ApplicationError> {
+        self.artifacts.list_chat_messages(artifact_id).await
+    }
+
+    pub async fn save_chat_summary(
+        &self,
+        artifact_id: &str,
+        summary: &str,
+    ) -> Result<(), ApplicationError> {
+        self.artifacts.save_chat_summary(artifact_id, summary).await
+    }
+
+    pub async fn load_chat_summary(
+        &self,
+        artifact_id: &str,
+    ) -> Result<Option<String>, ApplicationError> {
+        self.artifacts.load_chat_summary(artifact_id).await
     }
 }

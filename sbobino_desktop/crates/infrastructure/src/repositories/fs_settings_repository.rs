@@ -118,7 +118,7 @@ impl FsSettingsRepository {
 
     pub fn save_sync(&self, settings: &AppSettings) -> Result<(), ApplicationError> {
         let mut normalized = settings.clone();
-        self.populate_secrets(&mut normalized)?;
+        self.merge_stored_secrets_for_save(&mut normalized)?;
         if should_treat_legacy_fields_as_source(&normalized) {
             normalized.sync_sections_from_legacy();
         }
@@ -149,6 +149,36 @@ impl FsSettingsRepository {
                 self.path.display()
             ))
         })
+    }
+
+    fn merge_stored_secrets_for_save(
+        &self,
+        settings: &mut AppSettings,
+    ) -> Result<(), ApplicationError> {
+        if settings.ai.providers.gemini.api_key.is_none()
+            && settings.ai.providers.gemini.has_api_key
+        {
+            settings.ai.providers.gemini.api_key =
+                self.secure_storage.read_secret("settings.gemini_api_key")?;
+        }
+        if settings.gemini_api_key.is_none() && settings.gemini_api_key_present {
+            settings.gemini_api_key = settings
+                .ai
+                .providers
+                .gemini
+                .api_key
+                .clone()
+                .or(self.secure_storage.read_secret("settings.gemini_api_key")?);
+        }
+
+        for service in &mut settings.ai.remote_services {
+            if service.api_key.is_none() && service.has_api_key {
+                let account = format!("remote_service.{}.api_key", service.id);
+                service.api_key = self.secure_storage.read_secret(&account)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn populate_secrets(&self, settings: &mut AppSettings) -> Result<(), ApplicationError> {

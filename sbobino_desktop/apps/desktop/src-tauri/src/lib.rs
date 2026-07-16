@@ -22,10 +22,11 @@ use tracing_subscriber::{fmt, EnvFilter};
 use crate::commands::artifacts::{
     analyze_artifact_emotions, cancel_artifact_speaker_diarization, chat_artifact,
     delete_artifacts, empty_deleted_artifacts, export_artifact, generate_artifact_pack,
-    get_artifact, hard_delete_artifacts, list_artifacts, list_deleted_artifacts,
-    list_recent_artifacts, optimize_artifact, read_artifact_audio, read_audio_file,
-    rename_artifact, restore_artifacts, run_artifact_speaker_diarization, summarize_artifact,
-    update_artifact, update_artifact_timeline, write_trimmed_audio,
+    get_artifact, hard_delete_artifacts,
+    list_artifact_chat, list_artifacts, list_deleted_artifacts, list_recent_artifacts,
+    optimize_artifact, read_artifact_audio, read_audio_file, rename_artifact, restore_artifacts,
+    run_artifact_speaker_diarization, summarize_artifact, update_artifact,
+    update_artifact_timeline, write_trimmed_audio,
 };
 use crate::commands::automatic_import::{
     clear_automatic_import_quarantine_item, retry_automatic_import_quarantine_item,
@@ -48,8 +49,8 @@ use crate::commands::runtime::{
 };
 use crate::commands::settings::{
     delete_prompt, get_ai_capability_status, get_ai_providers, get_settings, get_settings_snapshot,
-    list_gemini_models, list_prompts, reset_prompts, save_prompt, test_prompt, update_ai_providers,
-    update_settings, update_settings_partial,
+    list_ai_service_models, list_gemini_models, list_prompts, reset_prompts, save_prompt,
+    test_ai_service, test_prompt, update_ai_providers, update_settings, update_settings_partial,
 };
 use crate::commands::transcription::{cancel_transcription, start_transcription};
 use crate::commands::updates::check_updates;
@@ -180,6 +181,7 @@ pub fn run() {
                 runtime_factory: bundle.runtime_factory,
                 transcription_tasks: Arc::new(Mutex::new(HashMap::new())),
                 diarization_tasks: Arc::new(Mutex::new(HashMap::new())),
+                artifact_chat_locks: Arc::new(Mutex::new(HashMap::new())),
                 transcription_gate: Arc::new(Semaphore::new(1)),
                 realtime: RealtimeRuntime {
                     engine: Arc::new(Mutex::new(realtime_engine)),
@@ -214,11 +216,13 @@ pub fn run() {
             get_ai_capability_status,
             update_ai_providers,
             list_gemini_models,
+            list_ai_service_models,
             list_prompts,
             save_prompt,
             delete_prompt,
             reset_prompts,
             test_prompt,
+            test_ai_service,
             start_transcription,
             cancel_transcription,
             run_artifact_speaker_diarization,
@@ -227,6 +231,7 @@ pub fn run() {
             list_deleted_artifacts,
             list_recent_artifacts,
             get_artifact,
+            list_artifact_chat,
             update_artifact,
             update_artifact_timeline,
             rename_artifact,
