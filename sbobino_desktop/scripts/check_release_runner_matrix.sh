@@ -5,11 +5,13 @@ usage() {
   cat >&2 <<'EOF'
 Usage: check_release_runner_matrix.sh [repo-slug]
 
-Verifies that the three required self-hosted runner classes for Sbobino release
-validation are online on GitHub:
-  - AS-PRIMARY
-  - AS-THIRD
-  - INTEL-PRIMARY
+Verifies that the release clean-room gates can run fully on GitHub-hosted runners.
+Self-hosted AS-PRIMARY remains optional for upgrade-path checks.
+
+Hosted machine classes:
+  - AS-THIRD        -> macos-14 (arm64)
+  - INTEL-PRIMARY   -> macos-15-intel (x86_64)
+  - WINDOWS-PRIMARY -> windows-2025 (x86_64)
 EOF
 }
 
@@ -25,43 +27,62 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 1
 fi
 
-RUNNERS_JSON=$(gh api "repos/${REPO_SLUG}/actions/runners")
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Missing required command: python3" >&2
+  exit 1
+fi
 
-python3 - <<'PY' "$RUNNERS_JSON" "$REPO_SLUG"
-import json
+WORKFLOW_JSON=$(
+  gh api "repos/${REPO_SLUG}/contents/.github/workflows/release-vm-validation.yml" --jq '.content' \
+    | python3 -c 'import base64,sys; print(base64.b64decode(sys.stdin.read().strip()).decode("utf-8"))'
+)
+
+python3 - <<'PY' "$WORKFLOW_JSON" "$REPO_SLUG"
+import re
 import sys
 
-runners = json.loads(sys.argv[1]).get("runners", [])
+workflow = sys.argv[1]
 repo_slug = sys.argv[2]
+
 required = {
-    "AS-PRIMARY": {"self-hosted", "macos", "apple-silicon", "as-primary"},
-    "AS-THIRD": {"self-hosted", "macos", "apple-silicon", "as-third"},
-    "INTEL-PRIMARY": {"self-hosted", "macos", "x64", "intel-primary"},
+    "AS-THIRD": {
+        "machine_class": "AS-THIRD",
+        "runs_on": "macos-14",
+        "report": "AS-THIRD.validation-report.json",
+    },
+    "INTEL-PRIMARY": {
+        "machine_class": "INTEL-PRIMARY",
+        "runs_on": "macos-15-intel",
+        "report": "INTEL-PRIMARY.validation-report.json",
+    },
+    "WINDOWS-PRIMARY": {
+        "machine_class": "WINDOWS-PRIMARY",
+        "runs_on": "windows-2025",
+        "report": "WINDOWS-PRIMARY.validation-report.json",
+    },
 }
 
-matched = {}
-for machine_class, labels_expected in required.items():
-    for runner in runners:
-        labels_display = {label.get("name") for label in runner.get("labels", []) if label.get("name")}
-        labels = {label.lower() for label in labels_display}
-        if labels_expected.issubset(labels) and runner.get("status") == "online":
-            matched[machine_class] = {
-                "name": runner.get("name", "unknown"),
-                "busy": bool(runner.get("busy")),
-                "labels": sorted(labels_display),
-            }
-            break
+missing = []
+for machine_class, expectation in required.items():
+    if f"- {expectation['machine_class']}" not in workflow and f"'{expectation['machine_class']}'" not in workflow:
+        missing.append(f"{machine_class}: workflow choice missing")
+        continue
+    if expectation["runs_on"] not in workflow:
+        missing.append(f"{machine_class}: runs-on '{expectation['runs_on']}' missing")
+    if expectation["report"] not in workflow:
+        missing.append(f"{machine_class}: report asset '{expectation['report']}' missing")
 
-missing = [machine_class for machine_class in required if machine_class not in matched]
+if "machine_class" not in workflow or "workflow_dispatch" not in workflow:
+    missing.append("workflow_dispatch machine_class input missing")
+
 if missing:
-    print(f"Release runner matrix is NOT ready for {repo_slug}.", file=sys.stderr)
-    for machine_class in missing:
-        print(f"  - missing online runner for {machine_class}", file=sys.stderr)
+    print(f"Hosted release runner matrix is NOT ready for {repo_slug}.", file=sys.stderr)
+    for item in missing:
+        print(f"  - {item}", file=sys.stderr)
     raise SystemExit(1)
 
-print(f"Release runner matrix is ready for {repo_slug}.")
-for machine_class in ("AS-PRIMARY", "AS-THIRD", "INTEL-PRIMARY"):
-    runner = matched[machine_class]
-    busy = "busy" if runner["busy"] else "idle"
-    print(f"  - {machine_class}: {runner['name']} ({busy})")
+print(f"Hosted release runner matrix is ready for {repo_slug}.")
+for machine_class, expectation in required.items():
+    print(f"  - {machine_class}: github-hosted ({expectation['runs_on']})")
+print("  - AS-PRIMARY: optional self-hosted upgrade-path runner (not required for stable promotion)")
 PY

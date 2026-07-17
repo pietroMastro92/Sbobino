@@ -57,7 +57,7 @@ That folder now always includes:
 - `pyannote-runtime-windows-x86_64.zip`
 - `pyannote-model-community-1.zip`
 - `release-readiness-proof.json` (generated only when `release_readiness.sh` passed)
-- `AS-THIRD.validation-report.json` and `INTEL-PRIMARY.validation-report.json` are required before stable promotion and must be uploaded with `status=passed`
+- `AS-THIRD.validation-report.json`, `INTEL-PRIMARY.validation-report.json`, and `WINDOWS-PRIMARY.validation-report.json` are required before stable promotion and must be uploaded with `status=passed`
 
 Manual publish contract:
 1. build the release locally
@@ -73,10 +73,12 @@ Manual publish contract:
 Helper scripts:
 - `./scripts/publish_candidate_release.sh <version>` publishes a prerelease candidate and refuses publishing if readiness proof/checksums/manifests/templates are inconsistent
 - `./scripts/promote_candidate_release.sh <version>`
-- `./scripts/run_release_machine_validation.sh <machine-class> <version>` validates the exact public candidate on `AS-PRIMARY`, `AS-THIRD`, or `INTEL-PRIMARY`
-- `./scripts/install_self_hosted_runner_macos.sh <machine-class>` installs and registers a macOS self-hosted runner with the right labels
+- `./scripts/run_release_machine_validation.sh <machine-class> <version>` validates the exact public candidate on macOS (`AS-PRIMARY`, `AS-THIRD`, `INTEL-PRIMARY`)
+- `./scripts/windows_release_machine_validation.ps1 -Version <version>` validates the public Windows candidate (`WINDOWS-PRIMARY`)
+- `./scripts/run_release_vm_gate.sh <version> [repo] [machine-class]` dispatches/watches hosted clean-room gates (`AS-THIRD`, `INTEL-PRIMARY`, `WINDOWS-PRIMARY`)
+- `./scripts/install_self_hosted_runner_macos.sh <machine-class>` installs and registers a macOS self-hosted runner with the right labels (optional upgrade-path machines)
 - `./scripts/preflight_self_hosted_runner.sh <machine-class>` checks whether a machine is truly ready to serve as a release runner
-- `./scripts/check_release_runner_matrix.sh` confirms the full GitHub runner matrix is online before dispatch
+- `./scripts/check_release_runner_matrix.sh` confirms the hosted clean-room workflow covers AS-THIRD, INTEL-PRIMARY, and WINDOWS-PRIMARY
 - `./scripts/dispatch_release_candidate.sh v<version>` triggers the Release Candidate workflow only when the runner matrix is complete
 - `./scripts/watch_release_candidate.sh` watches the latest candidate run and summarizes the jobs at the end
 - `./scripts/retire_failed_candidate.sh <version>`
@@ -84,7 +86,7 @@ Helper scripts:
 Stable release policy:
 - never overwrite or “fix in place” a stable GitHub release
 - prerelease candidate validation is mandatory before stable promotion
-- mandatory assets for promotion include ARM64, Intel, and Windows distribution proofs, macOS portability proofs, `AS-THIRD.validation-report.json`, and `INTEL-PRIMARY.validation-report.json`
+- mandatory assets for promotion include ARM64, Intel, and Windows distribution proofs, macOS portability proofs, plus `AS-THIRD`, `INTEL-PRIMARY`, and `WINDOWS-PRIMARY` validation reports
 - the default promotion flow retains the latest two validated stable releases
 
 Set `SBOBINO_RELEASE_PROFILE=standalone-dev` only for internal/offline builds that intentionally embed bundled pyannote assets.

@@ -17,7 +17,7 @@ fi
 
 MACHINE_CLASS=$1
 case "$MACHINE_CLASS" in
-  AS-THIRD)
+  AS-THIRD|INTEL-PRIMARY)
     ;;
   *)
     echo "Refusing to clean release validation state for unsupported machine class: $MACHINE_CLASS" >&2

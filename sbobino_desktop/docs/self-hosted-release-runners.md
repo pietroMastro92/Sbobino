@@ -1,10 +1,30 @@
-# Self-Hosted Release Runners
+# Release Validation Runners
 
 ## Goal
 
-Use GitHub Actions as the orchestrator while running distribution-critical validation on real Macs already available to the team.
+Use GitHub Actions as the orchestrator for distribution-critical clean-room validation.
+Promotion-blocking clean-room gates run on **GitHub-hosted** runners (no local UTM/self-hosted VM required).
+Self-hosted Macs remain optional for upgrade-path checks (`AS-PRIMARY`).
 
-## Required runners
+## Hosted clean-room matrix (required for stable promotion)
+
+| Machine class | Hosted runner | Report asset |
+| --- | --- | --- |
+| `AS-THIRD` | `macos-14` (arm64) | `AS-THIRD.validation-report.json` |
+| `INTEL-PRIMARY` | `macos-15-intel` (x86_64) | `INTEL-PRIMARY.validation-report.json` |
+| `WINDOWS-PRIMARY` | `windows-2025` (x86_64) | `WINDOWS-PRIMARY.validation-report.json` |
+
+Dispatch via:
+
+```bash
+./scripts/run_release_vm_gate.sh <version> pietroMastro92/Sbobino AS-THIRD
+./scripts/run_release_vm_gate.sh <version> pietroMastro92/Sbobino INTEL-PRIMARY
+./scripts/run_release_vm_gate.sh <version> pietroMastro92/Sbobino WINDOWS-PRIMARY
+```
+
+Set `SBOBINO_RELEASE_VM_WORKFLOW_REF=<branch>` when the workflow/scripts live on a branch newer than the release tag.
+
+## Optional self-hosted runners
 
 ### `AS-PRIMARY`
 
@@ -19,32 +39,10 @@ Use GitHub Actions as the orchestrator while running distribution-critical valid
   - warm restart validation
   - diarization smoke after update
 
-### `AS-THIRD`
+### Legacy local labels (superseded for clean-room)
 
-- machine: third-party Apple Silicon Mac reserved for clean-room validation
-- labels:
-  - `self-hosted`
-  - `macos`
-  - `apple-silicon`
-  - `as-third`
-- purpose:
-  - clean-room install from the public DMG
-  - first-launch setup validation
-  - warm restart validation
-  - diarization smoke on a machine without developer residue
-
-### `INTEL-PRIMARY`
-
-- machine: Intel MacBook Pro x86_64
-- labels:
-  - `self-hosted`
-  - `macos`
-  - `x64`
-  - `intel-primary`
-- purpose:
-  - bootstrap-layer validation for the arm64 release process
-  - manifest/updater/download flow verification
-  - future bridge toward Intel and Windows expansion
+`AS-THIRD` and `INTEL-PRIMARY` historically used self-hosted Macs / UTM VMs.
+Clean-room promotion gates now run on the hosted matrix above; keep local labels only if you still want private offline experimentation.
 
 ## GitHub runner registration
 

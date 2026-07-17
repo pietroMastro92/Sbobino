@@ -14,6 +14,8 @@ on:
         type: choice
         options:
           - AS-THIRD
+          - INTEL-PRIMARY
+          - WINDOWS-PRIMARY
 
 run-name: ${{ inputs.machine_class }} v${{ inputs.version }} release VM validation
 
@@ -42,7 +44,9 @@ jobs:
           git checkout "$GITHUB_SHA" -- \
             sbobino_desktop/scripts/lib/asr_samples.sh \
             sbobino_desktop/scripts/setup_parakeet_fixtures.sh \
-            sbobino_desktop/scripts/run_release_machine_validation.sh
+            sbobino_desktop/scripts/run_release_machine_validation.sh \
+            sbobino_desktop/scripts/clean_release_validation_state.sh \
+            sbobino_desktop/scripts/pyannote_diarize.py
 
       - name: Add VM toolchain paths
         run: |
@@ -111,5 +115,167 @@ jobs:
         run: |
           gh release upload "$TAG_NAME" \
             AS-THIRD.validation-report.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+  intel-primary:
+    if: ${{ inputs.machine_class == 'INTEL-PRIMARY' }}
+    # GitHub-hosted Intel macOS (x86_64). Prefer macos-15-intel; fall back label is macos-14-large.
+    runs-on: macos-15-intel
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG_NAME: v${{ inputs.version }}
+      SBOBINO_VALIDATION_RUNNER_LABEL: github-hosted,macos-15-intel,intel-primary
+      SBOBINO_RUNNER_MIN_FREE_GB: "8.0"
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ inputs.version }}
+          fetch-depth: 0
+
+      - name: Overlay hosted validation scripts
+        run: |
+          git fetch --no-tags origin "$GITHUB_SHA"
+          git checkout "$GITHUB_SHA" -- \
+            sbobino_desktop/scripts/lib/asr_samples.sh \
+            sbobino_desktop/scripts/setup_parakeet_fixtures.sh \
+            sbobino_desktop/scripts/run_release_machine_validation.sh \
+            sbobino_desktop/scripts/clean_release_validation_state.sh \
+            sbobino_desktop/scripts/distribution_readiness.sh \
+            sbobino_desktop/scripts/pyannote_diarize.py
+
+      - name: Add VM toolchain paths
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/sbin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Rust
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:$PATH"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain stable -y
+          else
+            rustup toolchain install stable --profile minimal --no-self-update
+            rustup default stable
+          fi
+          toolchain_bin="$(dirname "$(rustup which rustc)")"
+          export PATH="$toolchain_bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "$toolchain_bin" >> "$GITHUB_PATH"
+          uname -m
+          cargo --version
+          rustc --version
+
+      - name: Setup hosted media tools
+        run: |
+          set -euo pipefail
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
+      - name: Clean previous validation state
+        working-directory: sbobino_desktop
+        run: ./scripts/clean_release_validation_state.sh INTEL-PRIMARY
+
+      - name: Prepare hosted INTEL-PRIMARY fixture audio
+        working-directory: sbobino_desktop
+        run: |
+          fixture_dir="$RUNNER_TEMP/parakeet-fixtures"
+          SBOBINO_PARAKEET_FIXTURES_DIR="$fixture_dir" ./scripts/setup_parakeet_fixtures.sh
+          echo "SBOBINO_VALIDATION_FIXTURE_AUDIO=$fixture_dir/speech.wav" >> "$GITHUB_ENV"
+
+      - name: Run INTEL-PRIMARY clean-room validation
+        working-directory: sbobino_desktop
+        run: |
+          ./scripts/run_release_machine_validation.sh \
+            INTEL-PRIMARY \
+            "${{ inputs.version }}" \
+            "$GITHUB_REPOSITORY" \
+            "$PWD/INTEL-PRIMARY.validation-report.json"
+
+      - name: Upload validation report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: INTEL-PRIMARY.validation-report
+          path: sbobino_desktop/INTEL-PRIMARY.validation-report.json
+          if-no-files-found: error
+
+      - name: Upload validation report to prerelease
+        if: always()
+        working-directory: sbobino_desktop
+        run: |
+          gh release upload "$TAG_NAME" \
+            INTEL-PRIMARY.validation-report.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+  windows-primary:
+    if: ${{ inputs.machine_class == 'WINDOWS-PRIMARY' }}
+    runs-on: windows-2025
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG_NAME: v${{ inputs.version }}
+      SBOBINO_VALIDATION_RUNNER_LABEL: github-hosted,windows-2025,windows-primary
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ inputs.version }}
+          fetch-depth: 0
+
+      - name: Overlay hosted validation scripts
+        shell: bash
+        run: |
+          git fetch --no-tags origin "$GITHUB_SHA"
+          git checkout "$GITHUB_SHA" -- \
+            sbobino_desktop/scripts/windows_release_machine_validation.ps1 \
+            sbobino_desktop/scripts/pyannote_diarize.py \
+            sbobino_desktop/apps/desktop/src-tauri/tauri.conf.json \
+            sbobino_desktop/apps/desktop/src-tauri/tauri.windows.conf.json
+
+      - name: Prepare hosted WINDOWS-PRIMARY fixture audio
+        shell: pwsh
+        working-directory: sbobino_desktop
+        run: |
+          $fixtureDir = Join-Path $env:RUNNER_TEMP "parakeet-fixtures"
+          New-Item -ItemType Directory -Force -Path $fixtureDir | Out-Null
+          $fixture = Join-Path $fixtureDir "speech.wav"
+          $url = "https://raw.githubusercontent.com/mudler/parakeet.cpp/9edf17c3ada66e0f881dcff155492867db7ac4cf/tests/fixtures/speech.wav"
+          Invoke-WebRequest -Uri $url -OutFile $fixture -UseBasicParsing
+          "SBOBINO_VALIDATION_FIXTURE_AUDIO=$fixture" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run WINDOWS-PRIMARY clean-room validation
+        shell: pwsh
+        working-directory: sbobino_desktop
+        run: |
+          ./scripts/windows_release_machine_validation.ps1 `
+            -Version "${{ inputs.version }}" `
+            -RepoSlug "$env:GITHUB_REPOSITORY" `
+            -ReportPath "$PWD/WINDOWS-PRIMARY.validation-report.json" `
+            -FixtureAudio "$env:SBOBINO_VALIDATION_FIXTURE_AUDIO" `
+            -RunnerLabel "$env:SBOBINO_VALIDATION_RUNNER_LABEL"
+
+      - name: Upload validation report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WINDOWS-PRIMARY.validation-report
+          path: sbobino_desktop/WINDOWS-PRIMARY.validation-report.json
+          if-no-files-found: error
+
+      - name: Upload validation report to prerelease
+        if: always()
+        shell: bash
+        working-directory: sbobino_desktop
+        run: |
+          gh release upload "$TAG_NAME" \
+            WINDOWS-PRIMARY.validation-report.json \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
