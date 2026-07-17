@@ -29,7 +29,17 @@ need_cmd() {
 need_cmd gh
 need_cmd python3
 
-RELEASE_JSON=$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets,isPrerelease,name,tagName,url)
+# Force plain JSON from gh (colorized CLI output breaks json.loads).
+export NO_COLOR=1
+export GH_NO_COLOR=1
+export CLICOLOR=0
+unset CLICOLOR_FORCE FORCE_COLOR COLORTERM || true
+
+strip_ansi() {
+  python3 -c 'import re,sys; print(re.sub(r"\x1b\[[0-9;]*m", "", sys.stdin.read()))'
+}
+
+RELEASE_JSON=$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets,isPrerelease,name,tagName,url | strip_ansi)
 if [[ -z "$RELEASE_JSON" ]]; then
   echo "Release $TAG was not found in $REPO_SLUG." >&2
   exit 1
