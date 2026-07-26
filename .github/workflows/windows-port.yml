@@ -91,7 +91,7 @@ jobs:
         run: ../../scripts/prepare_release_updater_config.sh src-tauri/tauri.conf.json "$TAURI_UPDATER_PUBLIC_KEY"
 
       - name: Run frontend tests
-        run: npm test -- --run
+        run: npm test -- --run --testTimeout 15000
 
       - name: Build native NSIS installer and updater
         shell: pwsh

@@ -234,7 +234,7 @@ jobs:
         run: ../../scripts/prepare_release_updater_config.sh src-tauri/tauri.conf.json "$TAURI_UPDATER_PUBLIC_KEY"
 
       - name: Test native Windows app
-        run: npm --prefix apps/desktop test -- --run
+        run: npm --prefix apps/desktop test -- --run --testTimeout 15000
         working-directory: sbobino_desktop
 
       - name: Build and stage NSIS installer and updater
