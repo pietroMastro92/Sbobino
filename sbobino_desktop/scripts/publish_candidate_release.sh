@@ -235,8 +235,7 @@ Prerelease candidate published successfully:
 
 Next required steps:
   1. ./scripts/distribution_readiness.sh "$VERSION" "$REPO_SLUG"
-  2. Run hosted ARM64 and Intel portability smoke (automated in release.yml)
-  3. ./scripts/run_release_vm_gate.sh "$VERSION" "$REPO_SLUG"
-  4. Run ./scripts/run_release_machine_validation.sh INTEL-PRIMARY "$VERSION" "$REPO_SLUG"
-  5. ./scripts/promote_candidate_release.sh "$VERSION" "$REPO_SLUG"
+  2. Run the hosted ARM64, Intel, and Windows validation matrix (automated in release.yml)
+  3. Upload every hosted validation proof asset
+  4. ./scripts/promote_candidate_release.sh "$VERSION" "$REPO_SLUG"
 EOF

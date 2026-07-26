@@ -5,10 +5,8 @@ usage() {
   cat >&2 <<'EOF'
 Usage: check_release_runner_matrix.sh [repo-slug]
 
-Verifies that the three required self-hosted runner classes for Sbobino release
-validation are online on GitHub:
+Verifies that the optional self-hosted runner classes are online on GitHub:
   - AS-PRIMARY
-  - AS-THIRD
   - INTEL-PRIMARY
 EOF
 }
@@ -35,7 +33,6 @@ runners = json.loads(sys.argv[1]).get("runners", [])
 repo_slug = sys.argv[2]
 required = {
     "AS-PRIMARY": {"self-hosted", "macos", "apple-silicon", "as-primary"},
-    "AS-THIRD": {"self-hosted", "macos", "apple-silicon", "as-third"},
     "INTEL-PRIMARY": {"self-hosted", "macos", "x64", "intel-primary"},
 }
 
@@ -60,7 +57,7 @@ if missing:
     raise SystemExit(1)
 
 print(f"Release runner matrix is ready for {repo_slug}.")
-for machine_class in ("AS-PRIMARY", "AS-THIRD", "INTEL-PRIMARY"):
+for machine_class in ("AS-PRIMARY", "INTEL-PRIMARY"):
     runner = matched[machine_class]
     busy = "busy" if runner["busy"] else "idle"
     print(f"  - {machine_class}: {runner['name']} ({busy})")

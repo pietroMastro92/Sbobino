@@ -5,10 +5,9 @@ usage() {
   cat >&2 <<'EOF'
 Usage: check_release_runner_class.sh <machine-class> [repo-slug]
 
-Verifies that one required self-hosted runner class for Sbobino release
-validation is online on GitHub. Supported machine classes:
+Verifies that one optional self-hosted diagnostic runner class is online on
+GitHub. Supported machine classes:
   - AS-PRIMARY
-  - AS-THIRD
   - INTEL-PRIMARY
 EOF
 }
@@ -37,7 +36,6 @@ repo_slug = sys.argv[2]
 machine_class = sys.argv[3]
 required = {
     "AS-PRIMARY": {"self-hosted", "macos", "apple-silicon", "as-primary"},
-    "AS-THIRD": {"self-hosted", "macos", "apple-silicon", "as-third"},
     "INTEL-PRIMARY": {"self-hosted", "macos", "x64", "intel-primary"},
 }
 

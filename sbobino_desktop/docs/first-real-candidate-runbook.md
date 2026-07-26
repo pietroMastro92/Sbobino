@@ -1,109 +1,74 @@
-# First Real Candidate Runbook
+# Release Candidate Runbook
 
 ## Goal
 
-Bring the new release pipeline into real use without guesswork:
+Build, publish, validate, and promote a native multi-platform Sbobino release using GitHub Actions only.
 
-1. register all three self-hosted runners
-2. preflight each machine
-3. confirm the runner matrix is online on GitHub
-4. dispatch the candidate workflow
-5. watch it through hosted and self-hosted validation
-6. promote only if the full matrix is green
+## Required GitHub-hosted runners
 
-## Required machines
+- `macos-14` for `aarch64-apple-darwin`
+- `macos-15-intel` for `x86_64-apple-darwin`
+- `windows-2025` for `x86_64-pc-windows-msvc`
 
-- `AS-PRIMARY`
-- `AS-THIRD`
-- `INTEL-PRIMARY`
+No self-hosted runner is required for stable promotion.
 
-Reference labels and machine prep are documented in [self-hosted-release-runners.md](self-hosted-release-runners.md).
+## Step 1: Prepare the tag
 
-## Step 1: Install the runner on each Mac
-
-Run this on each target machine:
+Verify version coherence and push the release tag:
 
 ```bash
-cd /path/to/sbobino_tauri/sbobino_desktop
-./scripts/install_self_hosted_runner_macos.sh <MACHINE_CLASS> pietroMastro92/Sbobino
+cd sbobino_desktop
+./scripts/check_release_versions.sh <version>
+git push origin v<version>
 ```
 
-Examples:
+## Step 2: Dispatch the candidate
 
-```bash
-./scripts/install_self_hosted_runner_macos.sh AS-PRIMARY pietroMastro92/Sbobino
-./scripts/install_self_hosted_runner_macos.sh AS-THIRD pietroMastro92/Sbobino
-./scripts/install_self_hosted_runner_macos.sh INTEL-PRIMARY pietroMastro92/Sbobino
-```
+Use the `Release Candidate` workflow with `tag_name=v<version>`. The workflow:
 
-## Step 2: Preflight each machine
+1. builds all three native targets;
+2. signs and stages updater artifacts;
+3. publishes one GitHub prerelease;
+4. downloads the exact public assets on matching native runners;
+5. uploads the validation proof assets.
 
-Run this on the same machine after installation:
+## Step 3: Require the full hosted matrix
 
-```bash
-./scripts/preflight_self_hosted_runner.sh <MACHINE_CLASS> pietroMastro92/Sbobino
-```
+The following jobs must be `success`:
 
-Notes:
+- native Windows build and installed NSIS smoke;
+- native macOS ARM64 build;
+- native macOS Intel build;
+- candidate publication;
+- ARM64 and Intel distribution readiness;
+- Windows distribution readiness;
+- ARM64 and Intel portability smoke;
+- validation proof upload.
 
-- `AS-PRIMARY` and `AS-THIRD` require `SBOBINO_VALIDATION_FIXTURE_AUDIO`
-- `INTEL-PRIMARY` does not require the audio fixture
-- preflight fails closed if the GitHub runner is not online with the expected labels
+## Step 4: Verify public proof assets
 
-## Step 3: Confirm the full matrix is online
+The candidate must contain passed:
 
-Run from any machine with GitHub CLI access:
+- `release-readiness-proof.json`
+- `distribution-readiness-proof.json`
+- `intel-distribution-readiness-proof.json`
+- `windows-distribution-readiness-proof.json`
+- `portability-smoke-report.json`
+- `intel-portability-smoke-report.json`
+- `windows-gui-smoke-report.json`
 
-```bash
-./scripts/check_release_runner_matrix.sh pietroMastro92/Sbobino
-```
+`latest.json` must expose `darwin-aarch64`, `darwin-x86_64`, and `windows-x86_64`.
 
-This must report all three classes online before dispatching a real candidate.
+## Step 5: Promote
 
-## Step 4: Dispatch the candidate
-
-```bash
-./scripts/dispatch_release_candidate.sh v<version> pietroMastro92/Sbobino
-```
-
-Example:
-
-```bash
-./scripts/dispatch_release_candidate.sh v0.1.17 pietroMastro92/Sbobino
-```
-
-The dispatch helper refuses to start if the runner matrix is incomplete.
-
-## Step 5: Watch the run
-
-```bash
-./scripts/watch_release_candidate.sh pietroMastro92/Sbobino
-```
-
-Expected successful jobs:
-
-- `release-readiness`
-- `publish-candidate`
-- `distribution-readiness`
-- `validate-as-primary`
-- `validate-as-third`
-- `validate-intel-primary`
-- `upload-validation-assets`
-
-## Step 6: Promote only after green validation
-
-Use either GitHub Actions `Promote Release Candidate` or:
+Use GitHub Actions `Promote Release Candidate` or:
 
 ```bash
 ./scripts/promote_candidate_release.sh <version> pietroMastro92/Sbobino
 ```
 
+Promotion marks the release stable and Latest, then keeps the newest two stable releases for rollback.
+
 ## Failure rule
 
-If any mandatory job or machine validation fails:
-
-- do not patch the candidate in place
-- retire the prerelease
-- fix the issue
-- cut a new patch version
-- rerun the candidate flow
+If any mandatory hosted job or proof fails, do not promote. Fix the issue, publish a new patch candidate, and rerun the complete matrix.

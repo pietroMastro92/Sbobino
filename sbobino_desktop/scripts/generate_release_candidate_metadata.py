@@ -12,7 +12,7 @@ def sha256(path: Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Generate release-readiness proof and machine validation templates."
+        description="Generate the release-readiness proof for a candidate."
     )
     parser.add_argument("output_dir", help="Directory containing the candidate release assets")
     parser.add_argument("version", help="Release version without the leading v")

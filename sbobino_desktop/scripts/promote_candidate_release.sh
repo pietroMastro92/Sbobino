@@ -7,6 +7,9 @@ Usage: promote_candidate_release.sh <version> [repo-slug]
 
 Promotes a previously validated GitHub prerelease candidate to stable and
 keeps the latest two stable releases available for rollback by default.
+
+Set SBOBINO_PROMOTION_DRY_RUN=1 to validate the public proof assets without
+changing the release state.
 EOF
 }
 
@@ -60,9 +63,6 @@ expected_assets = {
     "windows-gui-smoke-report.json",
     "portability-smoke-report.json",
     "intel-portability-smoke-report.json",
-    "AS-THIRD.validation-report.json",
-    "INTEL-PRIMARY.validation-report.json",
-    "WINDOWS-PRIMARY.validation-report.json",
 }
 present_assets = {
     asset.get("name", "").strip()
@@ -94,10 +94,7 @@ gh release download "$TAG" \
   --pattern "windows-distribution-readiness-proof.json" \
   --pattern "windows-gui-smoke-report.json" \
   --pattern "portability-smoke-report.json" \
-  --pattern "intel-portability-smoke-report.json" \
-  --pattern "AS-THIRD.validation-report.json" \
-  --pattern "INTEL-PRIMARY.validation-report.json" \
-  --pattern "WINDOWS-PRIMARY.validation-report.json"
+  --pattern "intel-portability-smoke-report.json"
 
 python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG"
 import json
@@ -227,108 +224,18 @@ if intel_portability.get("version") != version or intel_portability.get("release
     raise SystemExit("Stable promotion blocked: Intel portability smoke report version mismatch.")
 if str(intel_portability.get("status", "")).strip().lower() != "passed":
     raise SystemExit("Stable promotion blocked: Intel portability smoke report is not marked passed.")
-
-as_third = load_json(
-    report_dir / "AS-THIRD.validation-report.json",
-    "AS-THIRD.validation-report.json",
-)
-if int(as_third.get("schema_version", 0)) != 1:
-    raise SystemExit(
-        "Stable promotion blocked: AS-THIRD.validation-report.json has unsupported schema_version."
-    )
-if as_third.get("machine_class") != "AS-THIRD":
-    raise SystemExit("Stable promotion blocked: AS-THIRD validation report machine_class mismatch.")
-if as_third.get("version") != version:
-    raise SystemExit("Stable promotion blocked: AS-THIRD validation report version mismatch.")
-if as_third.get("release_tag") != tag:
-    raise SystemExit("Stable promotion blocked: AS-THIRD validation report release_tag mismatch.")
-if str(as_third.get("status", "")).strip().lower() != "passed":
-    raise SystemExit("Stable promotion blocked: AS-THIRD validation report is not marked passed.")
-
-as_third_results = as_third.get("scenario_results") or {}
-required_as_third_scenarios = {
-    "clean_room_install",
-    "warm_restart",
-    "functional_parakeet_smoke",
-    "functional_diarization_smoke",
-}
-missing_as_third = sorted(
-    name for name in required_as_third_scenarios if as_third_results.get(name) != "passed"
-)
-if missing_as_third:
-    raise SystemExit(
-        "Stable promotion blocked: AS-THIRD scenarios did not pass: "
-        + ", ".join(missing_as_third)
-    )
-
-intel_primary = load_json(
-    report_dir / "INTEL-PRIMARY.validation-report.json",
-    "INTEL-PRIMARY.validation-report.json",
-)
-if int(intel_primary.get("schema_version", 0)) != 1:
-    raise SystemExit(
-        "Stable promotion blocked: INTEL-PRIMARY.validation-report.json has unsupported schema_version."
-    )
-if intel_primary.get("machine_class") != "INTEL-PRIMARY":
-    raise SystemExit("Stable promotion blocked: INTEL-PRIMARY validation report machine_class mismatch.")
-if intel_primary.get("version") != version or intel_primary.get("release_tag") != tag:
-    raise SystemExit("Stable promotion blocked: INTEL-PRIMARY validation report version mismatch.")
-if str(intel_primary.get("status", "")).strip().lower() != "passed":
-    raise SystemExit("Stable promotion blocked: INTEL-PRIMARY validation report is not marked passed.")
-
-intel_results = intel_primary.get("scenario_results") or {}
-required_intel_scenarios = {
-    "release_metadata_validation",
-    "bootstrap_layer_validation",
-    "clean_room_install",
-    "warm_restart",
-    "functional_diarization_smoke",
-}
-missing_intel = sorted(
-    name for name in required_intel_scenarios if intel_results.get(name) != "passed"
-)
-if missing_intel:
-    raise SystemExit(
-        "Stable promotion blocked: INTEL-PRIMARY scenarios did not pass: "
-        + ", ".join(missing_intel)
-    )
-
-windows_primary = load_json(
-    report_dir / "WINDOWS-PRIMARY.validation-report.json",
-    "WINDOWS-PRIMARY.validation-report.json",
-)
-if int(windows_primary.get("schema_version", 0)) != 1:
-    raise SystemExit(
-        "Stable promotion blocked: WINDOWS-PRIMARY.validation-report.json has unsupported schema_version."
-    )
-if windows_primary.get("machine_class") != "WINDOWS-PRIMARY":
-    raise SystemExit("Stable promotion blocked: WINDOWS-PRIMARY validation report machine_class mismatch.")
-if windows_primary.get("version") != version or windows_primary.get("release_tag") != tag:
-    raise SystemExit("Stable promotion blocked: WINDOWS-PRIMARY validation report version mismatch.")
-if str(windows_primary.get("status", "")).strip().lower() != "passed":
-    raise SystemExit("Stable promotion blocked: WINDOWS-PRIMARY validation report is not marked passed.")
-
-windows_results = windows_primary.get("scenario_results") or {}
-required_windows_scenarios = {
-    "clean_room_install",
-    "first_setup",
-    "functional_transcription_smoke",
-    "functional_diarization_smoke",
-    "warm_restart",
-    "no_visible_console_windows",
-    "opaque_main_window",
-}
-missing_windows = sorted(
-    name for name in required_windows_scenarios if windows_results.get(name) != "passed"
-)
-if missing_windows:
-    raise SystemExit(
-        "Stable promotion blocked: WINDOWS-PRIMARY scenarios did not pass: "
-        + ", ".join(missing_windows)
-    )
 PY
 
-gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease=false
+if [[ "${SBOBINO_PROMOTION_DRY_RUN:-0}" == "1" ]]; then
+  cat <<EOF
+Candidate promotion proof gate passed (dry run):
+  repo: $REPO_SLUG
+  tag:  $TAG
+EOF
+  exit 0
+fi
+
+gh release edit "$TAG" --repo "$REPO_SLUG" --prerelease=false --latest
 
 STABLE_RELEASE_RETENTION=${SBOBINO_STABLE_RELEASE_RETENTION:-2}
 if ! [[ "$STABLE_RELEASE_RETENTION" =~ ^[0-9]+$ ]] || [[ "$STABLE_RELEASE_RETENTION" -lt 1 ]]; then

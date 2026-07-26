@@ -8,14 +8,13 @@ Usage: run_release_machine_validation.sh <machine-class> <version> [repo-slug] [
 Runs release validation on a self-hosted machine and writes a machine-readable
 JSON report. Supported machine classes:
   - AS-PRIMARY
-  - AS-THIRD
   - INTEL-PRIMARY
 
 Environment variables:
   SBOBINO_VALIDATION_DATA_DIR        Override app data dir
   SBOBINO_VALIDATION_APP_PATH        Override installed app path
   SBOBINO_VALIDATION_FIXTURE_AUDIO   Audio fixture used for diarization smoke
-  SBOBINO_VALIDATION_PARAKEET_MODEL  Parakeet GGUF used for AS-THIRD app smoke
+  SBOBINO_VALIDATION_PARAKEET_MODEL  Parakeet GGUF used for optional app smoke
   SBOBINO_VALIDATION_TIMEOUT_SECONDS Timeout for setup/runtime readiness waits (default: 2400)
   SBOBINO_VALIDATION_PRIVACY_VERSION Privacy policy version to seed into settings.json
 EOF
@@ -36,9 +35,6 @@ DATA_DIR=${SBOBINO_VALIDATION_DATA_DIR:-"$HOME/Library/Application Support/com.s
 APP_PATH=${SBOBINO_VALIDATION_APP_PATH:-"/Applications/Sbobino.app"}
 default_fixture_audio() {
   case "${MACHINE_CLASS:-}" in
-    AS-THIRD)
-      printf '%s\n' "$HOME/Fixtures/as-third-diarization.wav"
-      ;;
     INTEL-PRIMARY)
       printf '%s\n' "$HOME/Fixtures/intel-primary-diarization.wav"
       ;;
@@ -182,21 +178,6 @@ definitions = {
             "functional_diarization_smoke": functional_diarization_smoke,
         },
         "runner_label": "self-hosted,macOS,ARM64,apple-silicon,as-primary",
-    },
-    "AS-THIRD": {
-        "required": [
-            "clean_room_install",
-            "warm_restart",
-            "functional_parakeet_smoke",
-            "functional_diarization_smoke",
-        ],
-        "results": {
-            "clean_room_install": clean_room_install,
-            "warm_restart": warm_restart,
-            "functional_parakeet_smoke": functional_parakeet_smoke,
-            "functional_diarization_smoke": functional_diarization_smoke,
-        },
-        "runner_label": "self-hosted,macOS,ARM64,apple-silicon,as-third",
     },
     "INTEL-PRIMARY": {
         "required": [
@@ -505,7 +486,7 @@ PY
 
 run_parakeet_transcription_smoke() {
   if [[ -z "${FIXTURE_AUDIO// }" ]]; then
-    fail_validation "SBOBINO_VALIDATION_FIXTURE_AUDIO is required for AS-THIRD Parakeet smoke."
+    fail_validation "SBOBINO_VALIDATION_FIXTURE_AUDIO is required for the Parakeet smoke."
   fi
   if [[ ! -f "$FIXTURE_AUDIO" ]]; then
     fail_validation "Parakeet smoke audio fixture not found at '$FIXTURE_AUDIO'."
@@ -560,7 +541,7 @@ run_parakeet_transcription_smoke() {
 
 run_parakeet_live_smoke() {
   if [[ -z "${FIXTURE_AUDIO// }" ]]; then
-    fail_validation "SBOBINO_VALIDATION_FIXTURE_AUDIO is required for AS-THIRD Parakeet live smoke."
+    fail_validation "SBOBINO_VALIDATION_FIXTURE_AUDIO is required for the Parakeet live smoke."
   fi
   if [[ ! -f "$FIXTURE_AUDIO" ]]; then
     fail_validation "Parakeet live smoke audio fixture not found at '$FIXTURE_AUDIO'."
@@ -685,35 +666,6 @@ validate_intel_primary() {
   record_success "passed" "Intel runner completed native clean-room setup, warm restart, and diarization validation."
 }
 
-validate_as_third() {
-  if [[ "$(uname -m)" != "arm64" ]]; then
-    fail_validation "AS-THIRD validation must run on an Apple Silicon Mac."
-  fi
-
-  clear_install_state
-  install_app_from_dmg "$VERSION"
-  seed_privacy_acceptance
-  launch_app
-  wait_for_setup_report_success "$TIMEOUT_SECONDS"
-  wait_for_runtime_health_ready "$TIMEOUT_SECONDS" 0
-  SCENARIO_CLEAN_ROOM_INSTALL="passed"
-
-  run_parakeet_transcription_smoke
-  run_parakeet_live_smoke
-  SCENARIO_FUNCTIONAL_PARAKEET_SMOKE="passed"
-
-  quit_app
-  set_speaker_diarization_enabled 1
-  launch_app
-  wait_for_runtime_health_ready 900 1
-  SCENARIO_WARM_RESTART="passed"
-
-  run_diarization_smoke
-  SCENARIO_FUNCTIONAL_DIARIZATION_SMOKE="passed"
-
-  record_success "passed" "Third Apple Silicon machine completed clean-room install, enabled diarization without blocking the app, and passed the first pyannote smoke after background setup."
-}
-
 validate_as_primary() {
   if [[ "$(uname -m)" != "arm64" ]]; then
     fail_validation "AS-PRIMARY validation must run on an Apple Silicon Mac."
@@ -753,9 +705,6 @@ validate_as_primary() {
 case "$MACHINE_CLASS" in
   AS-PRIMARY)
     validate_as_primary
-    ;;
-  AS-THIRD)
-    validate_as_third
     ;;
   INTEL-PRIMARY)
     validate_intel_primary

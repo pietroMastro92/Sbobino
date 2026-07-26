@@ -21,7 +21,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
       - name: Promote validated candidate

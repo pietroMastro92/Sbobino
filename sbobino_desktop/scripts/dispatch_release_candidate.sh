@@ -6,8 +6,8 @@ usage() {
 Usage: dispatch_release_candidate.sh <tag-name> [repo-slug]
 
 Dispatches the Release Candidate workflow. The workflow runs entirely on
-GitHub-hosted runners (macos-14 + ubuntu-latest); no self-hosted Mac
-infrastructure is required.
+native GitHub-hosted runners (macos-14, macos-15-intel, and windows-2025);
+no self-hosted infrastructure is required.
 EOF
 }
 

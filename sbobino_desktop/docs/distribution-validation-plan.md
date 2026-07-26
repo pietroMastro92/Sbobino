@@ -1,280 +1,69 @@
 # Distribution Validation Plan
 
-## Goal
+## Authority
 
-Ship native macOS and Windows releases that install and run on clean machines without requiring:
+GitHub Actions is the release-validation authority. Stable promotion depends on native hosted runners validating the exact public prerelease assets.
 
-- Homebrew
-- host Python
-- manually installed ffmpeg / whisper / pyannote dependencies
-- terminal repair steps
-- ad hoc human debugging during first launch
+## Native matrix
 
-This document covers native `macOS Apple Silicon`, native `macOS Intel x86_64`, and native `Windows x86_64`.
+| Platform | Runner | Target | Required validation |
+| --- | --- | --- | --- |
+| macOS Apple Silicon | `macos-14` | `aarch64-apple-darwin` | public DMG install, bundle architecture, portability launch, updater wiring |
+| macOS Intel | `macos-15-intel` | `x86_64-apple-darwin` | public DMG install, bundle architecture, portability launch, updater wiring |
+| Windows | `windows-2025` | `x86_64-pc-windows-msvc` | public NSIS install, runtime/DLL audit, opaque GUI, invisible helper processes |
 
-## What mature software teams do
+## Mandatory candidate proof assets
 
-Teams that consistently ship reliable desktop software usually combine:
+- `release-readiness-proof.json`
+- `distribution-readiness-proof.json`
+- `intel-distribution-readiness-proof.json`
+- `windows-distribution-readiness-proof.json`
+- `portability-smoke-report.json`
+- `intel-portability-smoke-report.json`
+- `windows-gui-smoke-report.json`
 
-1. Deterministic build inputs.
-2. Signed and notarized installers.
-3. A release-candidate gate that validates the exact public artifacts, not just local builds.
-4. Clean-room install testing on machines that do not share developer state.
-5. Upgrade-path testing from at least one previous public version.
-6. Clear exit criteria that block release if any mandatory scenario fails.
-7. A small validation matrix that grows by platform instead of relying on one “works on my Mac” machine.
+Every proof must have `status=passed`, match the requested version, and refer to the same public release tag where that field is defined.
 
-That is the direction this plan formalizes for Sbobino.
+## macOS gates
 
-## Release Policy
+Both macOS runners must:
 
-A release is distributable only if all mandatory Apple Silicon scenarios pass on the exact GitHub release assets for that version.
+1. download the matching public DMG;
+2. install the app from that DMG;
+3. verify the app executable and packaged runtime are native for the runner architecture;
+4. reject Homebrew or developer-machine library paths;
+5. launch the installed app and confirm it remains alive;
+6. validate the matching updater artifact and signature.
 
-Mandatory rule:
+## Windows gates
 
-- Do not publish or promote a stable release until the Apple Silicon distribution matrix in this document is green.
-- Publish the release as a prerelease candidate first, then promote only after `release-readiness-proof.json`, `distribution-readiness-proof.json`, and the machine validation report assets are uploaded with passed statuses.
-- If the release fails on a third-party Mac, retire it and cut a new patch version.
-- Never fix a broken stable release in place.
+The Windows runner must:
 
-## Current Scope
+1. download and silently install the public NSIS package;
+2. validate all runtime executables and app-local DLL dependencies;
+3. launch the installed application;
+4. exercise FFmpeg, Whisper, Parakeet, and Python helper probes;
+5. report zero visible console windows;
+6. report exactly one main Sbobino window;
+7. confirm the main window is opaque;
+8. validate the Windows updater artifact and signature.
 
-### Required platform now
+## Updater contract
 
-- `macOS Apple Silicon (arm64)`
+`latest.json` must contain exactly the supported native updater targets:
 
-### Required platform now
+- `darwin-aarch64`
+- `darwin-x86_64`
+- `windows-x86_64`
 
-- `macOS Intel x86_64`
+Each entry must reference the corresponding signed updater payload from the same release.
 
-### Required platform now
+## Promotion rule
 
-- `Windows x86_64`
+`promote_candidate_release.sh` fails closed if a mandatory proof is missing, malformed, mismatched, or not passed. Once all hosted proofs pass, promotion:
 
-## Test Environments
+1. marks the candidate stable;
+2. marks it as GitHub Latest;
+3. retains the current and immediately previous stable releases for rollback.
 
-We should maintain these validation environments:
-
-1. `AS-PRIMARY`
-   Apple Silicon Mac with normal developer/team usage. This machine validates the real upgrade path from the previous stable public release.
-
-2. `AS-THIRD`
-   A physically separate third-party Apple Silicon Mac used as the clean-room install gate.
-
-3. `INTEL-PRIMARY`
-   Intel Mac used for native Intel clean-room installation, runtime provisioning, warm restart, and diarization validation.
-
-Useful but optional:
-
-4. `AS-STRESS`
-   Apple Silicon Mac used for failure injection: flaky network, low disk, interrupted first launch, interrupted update.
-
-Recommended GitHub runner labels:
-
-- `AS-PRIMARY`: `self-hosted`, `macos`, `apple-silicon`, `as-primary`
-- `AS-THIRD`: `self-hosted`, `macos`, `apple-silicon`, `as-third`
-- `INTEL-PRIMARY`: `self-hosted`, `macos`, `x64`, `intel-primary`
-
-## Apple Silicon Matrix
-
-Every release must pass all of these scenarios.
-
-### A. Artifact integrity
-
-Purpose: prove the public GitHub release is internally coherent.
-
-Must pass:
-
-- `./scripts/release_readiness.sh <version>`
-- `./scripts/distribution_readiness.sh <version>`
-- manifest consistency for app/runtime/pyannote assets
-- runtime smoke check
-- pyannote asset smoke check
-
-Release blocker if any of these fail.
-
-### B. Clean-room install on third Mac
-
-Machine: `AS-THIRD`
-
-Preconditions:
-
-- no `/Applications/Sbobino.app`
-- no `~/Library/Application Support/com.sbobino.desktop`
-- no reliance on Homebrew or developer tools
-
-Steps:
-
-1. Download the exact DMG from the GitHub release.
-2. Install to `/Applications`.
-3. Launch via normal user flow.
-4. Complete first-launch setup.
-5. Open `Settings > Local Models`.
-
-Pass criteria:
-
-- app opens successfully
-- runtime installs without terminal actions
-- whisper models install successfully
-- pyannote runtime installs successfully
-- pyannote model installs successfully
-- `Settings > Local Models` reports pyannote `Ready`
-- user is never forced into manual repair
-
-### C. Warm restart
-
-Machine: `AS-THIRD`
-
-Steps:
-
-1. Quit the app after setup completes.
-2. Relaunch the app.
-3. Open the main UI and `Settings > Local Models`.
-
-Pass criteria:
-
-- app reaches the main UI without repeating first-launch setup
-- no heavy blocking inspection path on normal reopen
-- runtime remains ready
-- pyannote remains ready
-
-### D. Functional diarization smoke
-
-Machine: `AS-THIRD`
-
-Steps:
-
-1. Import a known short audio fixture with at least two speakers.
-2. Run transcription with speaker diarization enabled.
-
-Pass criteria:
-
-- transcription completes
-- diarization completes
-- speaker segments are assigned in the timeline
-- no pyannote runtime error is surfaced to the user
-
-### E. Update-path validation
-
-Machine: `AS-PRIMARY`
-
-Steps:
-
-1. Install the latest previous public version.
-2. Ensure runtime, models, and pyannote are already working.
-3. Update to the new release through the real shipped flow.
-4. Launch after update.
-5. Open `Settings > Local Models`.
-6. Run one diarized transcription.
-
-Pass criteria:
-
-- update completes cleanly
-- no manual repair is required
-- pyannote is preserved or auto-migrated
-- user can still use diarization the same way as before the update
-
-### F. Intel native validation
-
-Machine: `INTEL-PRIMARY`
-
-Steps:
-
-1. Download `Sbobino_<version>_x86_64.dmg` from the exact candidate release.
-2. Run `distribution_readiness.sh` against that public release.
-3. Install the app, complete first-launch setup, enable diarization, and relaunch it.
-
-Pass criteria:
-
-- remote asset integrity passes
-- bundle version and executable architecture are x86_64-native
-- first-launch runtime and Pyannote setup completes without Homebrew or terminal repair
-- warm restart and diarized transcription pass
-- report is `passed`
-
-### G. First-launch failure recovery
-
-Machine: `AS-STRESS` or controlled Apple Silicon test host
-
-Scenarios:
-
-- network interruption during runtime download
-- network interruption during pyannote download
-- interrupted app launch during staged pyannote install
-- low-disk rejection during install
-
-Pass criteria:
-
-- app does not get stranded in a permanently broken state
-- staged pyannote install rolls back safely
-- next launch can recover automatically or retry cleanly
-- user is not left with a half-installed runtime that requires manual filesystem cleanup
-
-## Exit Criteria For Stable Release
-
-A stable Apple Silicon release is allowed only if:
-
-1. `release_readiness.sh` passes.
-2. `distribution_readiness.sh` passes.
-3. `AS-PRIMARY` passes update-path validation, warm restart, and diarization smoke.
-4. `AS-THIRD` passes clean-room install, warm restart, and diarization smoke.
-5. `INTEL-PRIMARY` passes native Intel clean-room, warm-restart, and diarization validation.
-6. No mandatory scenario requires terminal repair or manual filesystem intervention.
-
-If any item fails, the release is not distributable.
-
-## Required Evidence Per Release
-
-Each release should produce a short validation record with:
-
-- version
-- release URL
-- machine class tested (`AS-PRIMARY`, `AS-THIRD`, `INTEL-PRIMARY`)
-- OS version
-- outcome of each scenario
-- timestamp
-- tester
-- blocking issue links if failed
-
-Minimum evidence for the release thread or release notes folder:
-
-- full `release_readiness.sh` success
-- full `distribution_readiness.sh` success
-- `release-readiness-proof.json` uploaded on the GitHub release with `status=passed`
-- `distribution-readiness-proof.json` uploaded on the GitHub release with `status=passed`
-- `AS-PRIMARY.validation-report.json` uploaded on the GitHub release with `status=passed`
-- `AS-THIRD.validation-report.json` uploaded on the GitHub release with `status=passed`
-- `INTEL-PRIMARY.validation-report.json` uploaded on the GitHub release with `status=passed`
-
-## Windows x86_64 Matrix
-
-### Windows x86_64
-
-The hosted `windows-2025` clean-room gate is mandatory for every candidate. Physical-machine validation can extend this baseline with:
-
-- `WIN-CLEAN-PRIMARY`
-- `WIN-THIRD-PC`
-- `WIN-UPGRADE-PC`
-
-Additional checks:
-
-- installer/uninstaller behavior
-- Defender/SmartScreen friction
-- path quoting
-- runtime extraction permissions
-- upgrade retention of runtime/model assets
-
-## Immediate Next Step For Sbobino
-
-The release bar is:
-
-1. local `release_readiness.sh`
-2. uploaded release `distribution_readiness.sh`
-3. `distribution-readiness-proof.json` uploaded to the prerelease
-4. clean-room validation on `AS-THIRD`
-5. upgrade validation from previous public version on `AS-PRIMARY`
-6. Intel native clean-room validation on `INTEL-PRIMARY`
-7. Windows native runtime, installer, launch, and public-asset validation on `windows-2025`
-8. only then manual stable promotion
-
-That gives us a real distribution process instead of a developer-machine check.
+Physical-machine validation may still be run as an optional diagnostic, but it is not part of the stable promotion contract.

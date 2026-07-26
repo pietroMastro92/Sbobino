@@ -12,8 +12,8 @@ This repository is the production-grade rewrite of the original Python Sbobino a
 - `docs/architecture.md`: architecture and dependency rules
 - `docs/release-and-migration.md`: release pipeline and migration plan
 - `docs/distribution-validation-plan.md`: native macOS and Windows clean-room distribution matrix
-- `docs/self-hosted-release-runners.md`: runner labels, machine preparation, and self-hosted validation requirements
-- `docs/first-real-candidate-runbook.md`: operational checklist for the first live candidate with GitHub Actions + self-hosted Macs
+- `docs/self-hosted-release-runners.md`: optional physical-machine diagnostics
+- `docs/first-real-candidate-runbook.md`: operational checklist for the GitHub Actions release flow
 - `docs/feature-migration-matrix.md`: feature-by-feature parity checklist
 - `THIRD_PARTY_NOTICES.md`: licenses and attribution for FFmpeg, whisper.cpp, pyannote, Hugging Face models, and related runtime components
 - `docs/github-release-template.md`: copy-paste text for GitHub Release notes (third-party disclaimer + links)
@@ -57,7 +57,7 @@ That folder now always includes:
 - `pyannote-runtime-windows-x86_64.zip`
 - `pyannote-model-community-1.zip`
 - `release-readiness-proof.json` (generated only when `release_readiness.sh` passed)
-- `AS-THIRD.validation-report.json` and `INTEL-PRIMARY.validation-report.json` are required before stable promotion and must be uploaded with `status=passed`
+- hosted distribution, portability, and Windows GUI proof assets are required before stable promotion and must be uploaded with `status=passed`
 
 Manual publish contract:
 1. build the release locally
@@ -65,26 +65,26 @@ Manual publish contract:
 3. upload the full asset set
 4. run `./scripts/distribution_readiness.sh <version>`
 5. write and upload `distribution-readiness-proof.json`
-6. test that exact GitHub release against the machine matrix in `docs/distribution-validation-plan.md`
-7. update and re-upload all machine validation reports
+6. run the native GitHub Actions distribution and portability matrix
+7. upload all hosted validation proof assets
 8. promote to stable only with `./scripts/promote_candidate_release.sh <version>`
 9. if it fails, retire that release and cut a new patch version
 
 Helper scripts:
 - `./scripts/publish_candidate_release.sh <version>` publishes a prerelease candidate and refuses publishing if readiness proof/checksums/manifests/templates are inconsistent
 - `./scripts/promote_candidate_release.sh <version>`
-- `./scripts/run_release_machine_validation.sh <machine-class> <version>` validates the exact public candidate on `AS-PRIMARY`, `AS-THIRD`, or `INTEL-PRIMARY`
+- `./scripts/run_release_machine_validation.sh <machine-class> <version>` remains available for optional physical-machine diagnostics
 - `./scripts/install_self_hosted_runner_macos.sh <machine-class>` installs and registers a macOS self-hosted runner with the right labels
 - `./scripts/preflight_self_hosted_runner.sh <machine-class>` checks whether a machine is truly ready to serve as a release runner
-- `./scripts/check_release_runner_matrix.sh` confirms the full GitHub runner matrix is online before dispatch
-- `./scripts/dispatch_release_candidate.sh v<version>` triggers the Release Candidate workflow only when the runner matrix is complete
+- `./scripts/check_release_runner_matrix.sh` checks optional physical diagnostic runners
+- `./scripts/dispatch_release_candidate.sh v<version>` triggers the GitHub-hosted Release Candidate workflow
 - `./scripts/watch_release_candidate.sh` watches the latest candidate run and summarizes the jobs at the end
 - `./scripts/retire_failed_candidate.sh <version>`
 
 Stable release policy:
 - never overwrite or “fix in place” a stable GitHub release
 - prerelease candidate validation is mandatory before stable promotion
-- mandatory assets for promotion include ARM64, Intel, and Windows distribution proofs, macOS portability proofs, `AS-THIRD.validation-report.json`, and `INTEL-PRIMARY.validation-report.json`
+- mandatory assets for promotion include ARM64, Intel, and Windows distribution proofs, both macOS portability proofs, and the Windows GUI smoke proof
 - the default promotion flow retains the latest two validated stable releases
 
 Set `SBOBINO_RELEASE_PROFILE=standalone-dev` only for internal/offline builds that intentionally embed bundled pyannote assets.

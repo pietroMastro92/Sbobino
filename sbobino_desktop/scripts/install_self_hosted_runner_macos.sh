@@ -5,12 +5,11 @@ usage() {
   cat >&2 <<'EOF'
 Usage: install_self_hosted_runner_macos.sh <machine-class> [repo-slug] [runner-root]
 
-Installs or refreshes a GitHub self-hosted runner for the Sbobino release matrix
-on the current macOS machine and registers it with the required labels.
+Installs or refreshes an optional GitHub self-hosted diagnostic runner on the
+current macOS machine and registers it with the requested labels.
 
 Supported machine classes:
   - AS-PRIMARY
-  - AS-THIRD
   - INTEL-PRIMARY
 
 Environment variables:
@@ -20,8 +19,7 @@ Environment variables:
   SBOBINO_RUNNER_EPHEMERAL      Set to 1 to configure the runner as ephemeral.
   SBOBINO_RUNNER_PATH           Override PATH exported by the LaunchAgent.
   SBOBINO_VALIDATION_FIXTURE_AUDIO
-                                 Optional validation fixture path. AS-THIRD
-                                 defaults to ~/Fixtures/as-third-diarization.wav.
+                                 Optional validation fixture path.
 EOF
 }
 
@@ -58,9 +56,6 @@ labels_for_machine() {
     AS-PRIMARY)
       echo "self-hosted,macos,apple-silicon,as-primary"
       ;;
-    AS-THIRD)
-      echo "self-hosted,macos,apple-silicon,as-third"
-      ;;
     INTEL-PRIMARY)
       echo "self-hosted,macos,x64,intel-primary"
       ;;
@@ -73,7 +68,7 @@ labels_for_machine() {
 
 expected_arch_for_machine() {
   case "$1" in
-    AS-PRIMARY|AS-THIRD)
+    AS-PRIMARY)
       echo "arm64"
       ;;
     INTEL-PRIMARY)
@@ -166,7 +161,7 @@ cat >"$PLIST_PATH" <<EOF
     <key>PATH</key>
     <string>$RUNNER_PATH</string>
     <key>SBOBINO_VALIDATION_FIXTURE_AUDIO</key>
-    <string>${SBOBINO_VALIDATION_FIXTURE_AUDIO:-$HOME/Fixtures/as-third-diarization.wav}</string>
+    <string>${SBOBINO_VALIDATION_FIXTURE_AUDIO:-}</string>
   </dict>
   <key>KeepAlive</key>
   <true/>
@@ -198,7 +193,4 @@ Self-hosted runner configured successfully.
 
 Next recommended step:
   ./scripts/preflight_self_hosted_runner.sh "$MACHINE_CLASS" "$REPO_SLUG"
-
-For AS-THIRD, make sure this fixture exists before running the VM gate:
-  ~/Fixtures/as-third-diarization.wav
 EOF

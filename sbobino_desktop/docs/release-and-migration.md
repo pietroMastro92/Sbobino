@@ -14,7 +14,7 @@
   - `macos-15-intel` -> `x86_64-apple-darwin` (Intel DMG + updater).
   - `windows-2025` -> `x86_64-pc-windows-msvc` (NSIS installer + updater).
 - Produces updater artifacts/signatures and publishes only a GitHub prerelease candidate.
-- Runs hosted integrity gates plus self-hosted machine validation on exact public assets before any stable promotion is allowed.
+- Runs native GitHub-hosted integrity, installation, portability, and GUI gates on exact public assets before stable promotion.
 - Production origin is the current public GitHub repository: `pietroMastro92/Sbobino`.
 - Default recommendation: prepare each release locally once per native architecture with `./scripts/prepare_local_release.sh <version>` and the same output directory, assemble the candidate only after both staging directories exist, then publish and validate the exact public assets before promotion.
 - Candidate validation is mandatory. If a prerelease fails validation on a third-party Mac, retire it and cut a new patch version instead of overwriting a stable release or reusing the same candidate.
@@ -42,9 +42,7 @@
   - `windows-distribution-readiness-proof.json`
   - `portability-smoke-report.json`
   - `intel-portability-smoke-report.json`
-  - `AS-PRIMARY.validation-report.json`
-  - `AS-THIRD.validation-report.json`
-  - `INTEL-PRIMARY.validation-report.json`
+  - `windows-gui-smoke-report.json`
 - `setup-manifest.json` is the single bootstrap contract for first-launch setup and repair. Runtime and pyannote manifests are no longer treated as independent entrypoints.
 
 ### Legal / attribution artifacts
@@ -78,8 +76,8 @@
   - upload the generated files from `dist/local-release/v<version>/`
   - run `./scripts/distribution_readiness.sh <version>`
   - generate and upload `distribution-readiness-proof.json`
-  - validate that GitHub prerelease on `AS-PRIMARY`, `AS-THIRD`, and `INTEL-PRIMARY`
-  - re-upload all machine validation report JSON assets with `status=passed`
+  - validate the public prerelease through the GitHub Actions native runner matrix
+  - upload every hosted proof JSON with `status=passed`
   - promote it only after it passes with `./scripts/promote_candidate_release.sh <version>`
   - if the release fails, delete/retire it with `./scripts/retire_failed_candidate.sh <version>` and cut a new patch version
   - the default `public` profile keeps pyannote out of the app bundle and installs it from release assets during first launch
@@ -134,7 +132,7 @@
 - Runs only after the full asset set is uploaded to a GitHub release.
 - Verifies HTTP availability, JSON parsing, `app_version` consistency, checksum integrity, updater tarball/signature wiring, and that `setup-manifest.json` points only to assets present in the same release.
 - A passed run must be captured as `distribution-readiness-proof.json` and uploaded back to the same prerelease candidate.
-- This gate validates artifact integrity only. Stable distribution additionally requires the Apple Silicon clean-room and upgrade scenarios in [`distribution-validation-plan.md`](distribution-validation-plan.md).
+- Stable distribution additionally requires the hosted native portability and installed-app smoke scenarios in [`distribution-validation-plan.md`](distribution-validation-plan.md).
 
 ## Stable Release Policy
 
@@ -142,9 +140,9 @@
 - Do not replace stable assets in place to repair a bad public release.
 - Keep the latest two stable GitHub releases available: the current stable and the immediately previous stable. This gives users a public rollback target if the newest stable release is later found to be bad.
 - `./scripts/promote_candidate_release.sh` enforces this retention after promotion. Override only with `SBOBINO_STABLE_RELEASE_RETENTION=<count>` when there is a deliberate operational reason to keep more stable releases.
-- A release is considered distributable only if the full Apple Silicon matrix in [`distribution-validation-plan.md`](distribution-validation-plan.md) is green on the exact public assets.
-- Stable promotion is blocked unless the release contains the ARM64 and Intel distribution/portability proofs plus `AS-THIRD.validation-report.json` and `INTEL-PRIMARY.validation-report.json`.
-- Both native platform gates and both machine validation reports must be marked `passed`.
+- A release is considered distributable only if the full GitHub Actions matrix in [`distribution-validation-plan.md`](distribution-validation-plan.md) is green on the exact public assets.
+- Stable promotion is blocked unless the release contains ARM64, Intel, and Windows distribution proofs, both macOS portability proofs, and the Windows GUI smoke proof.
+- Every hosted proof must be marked `passed`.
 - The supported correction path is:
   1. retire the failed public release
   2. cut a new patch version

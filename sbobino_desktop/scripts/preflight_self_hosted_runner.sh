@@ -26,38 +26,13 @@ validation_fixture_audio() {
     printf '%s\n' "$SBOBINO_VALIDATION_FIXTURE_AUDIO"
     return 0
   fi
-  case "$MACHINE_CLASS" in
-    AS-THIRD)
-      printf '%s\n' "$HOME/Fixtures/as-third-diarization.wav"
-      ;;
-    *)
-      printf '%s\n' ""
-      ;;
-  esac
-}
-
-validation_fixture_audio() {
-  if [[ -n "${SBOBINO_VALIDATION_FIXTURE_AUDIO:-}" ]]; then
-    printf '%s\n' "$SBOBINO_VALIDATION_FIXTURE_AUDIO"
-    return 0
-  fi
-  case "$MACHINE_CLASS" in
-    AS-THIRD)
-      printf '%s\n' "$HOME/Fixtures/as-third-diarization.wav"
-      ;;
-    *)
-      printf '%s\n' ""
-      ;;
-  esac
+  printf '%s\n' ""
 }
 
 labels_for_machine() {
   case "$1" in
     AS-PRIMARY)
       echo "self-hosted,macos,apple-silicon,as-primary"
-      ;;
-    AS-THIRD)
-      echo "self-hosted,macos,apple-silicon,as-third"
       ;;
     INTEL-PRIMARY)
       echo "self-hosted,macos,x64,intel-primary"
@@ -71,7 +46,7 @@ labels_for_machine() {
 
 expected_arch_for_machine() {
   case "$1" in
-    AS-PRIMARY|AS-THIRD)
+    AS-PRIMARY)
       echo "arm64"
       ;;
     INTEL-PRIMARY)
