@@ -9,8 +9,11 @@ $ProgressPreference = "SilentlyContinue"
 
 $PythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
 $PythonBase = (& $PythonCommand -c "import sys; print(sys.base_prefix)").Trim()
-$FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-10-13-44/ffmpeg-n7.1.5-1-g7d0e842004-win64-gpl-shared-7.1.zip"
-$FfmpegSha256 = "19e83b78bee19a0ad1b46ad154413d05491dfc1c51d05fe0aa5acfd2b2194890"
+# TorchCodec requires a shared FFmpeg build on Windows. BtbN prunes dated
+# autobuild releases, so source the validated FFmpeg 8 DLLs from Sbobino's
+# immutable v2.0.23 Windows speech runtime instead.
+$FfmpegUrl = "https://github.com/pietroMastro92/Sbobino/releases/download/v2.0.23/speech-runtime-windows-x86_64.zip"
+$FfmpegSha256 = "3a40b429a84de00bbfced1a26407e455edbc67133cd89c6429c67ba7fdbf5832"
 $TargetTriple = "x86_64-pc-windows-msvc"
 
 function Download-VerifiedArchive {
