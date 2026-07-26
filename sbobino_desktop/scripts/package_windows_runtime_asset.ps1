@@ -11,8 +11,11 @@ $WhisperUrl = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/
 $WhisperSha256 = "74f973345cb52ef5ba3ec9e7e7af8e48cc8c71722d1528603b80588a11f82e3e"
 $ParakeetUrl = "https://github.com/mudler/parakeet.cpp/releases/download/v0.4.0/parakeet-v0.4.0-bin-win-cpu-x64.zip"
 $ParakeetSha256 = "2880150a1bad2944baed46f2e6bb9f1bc55263a9f2bb85573785a7ec4fa35f27"
-$FfmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-07-10-13-44/ffmpeg-n8.1.2-22-g94138f6973-win64-gpl-shared-8.1.zip"
-$FfmpegSha256 = "f5a7056f9e7e09de12fa743ed9a1802f84f644b483ca9edcc4f1d2c0fb7252ea"
+# BtbN prunes dated autobuild releases, so a URL pinned to one of those tags is
+# not durable. Reuse the immutable, already validated Windows runtime from the
+# previous Sbobino release as the FFmpeg source for this patch release.
+$FfmpegUrl = "https://github.com/pietroMastro92/Sbobino/releases/download/v2.0.23/speech-runtime-windows-x86_64.zip"
+$FfmpegSha256 = "3a40b429a84de00bbfced1a26407e455edbc67133cd89c6429c67ba7fdbf5832"
 $TargetTriple = "x86_64-pc-windows-msvc"
 
 function Download-VerifiedArchive {
