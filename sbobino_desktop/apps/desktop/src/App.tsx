@@ -3522,8 +3522,6 @@ export function App({
   const [trimRegions, setTrimRegions] = useState<TrimRegion[]>([]);
   const [trimmedAudioDraft, setTrimmedAudioDraft] =
     useState<TrimmedAudioDraft | null>(null);
-  const [isStartingSpeakerDetection, setIsStartingSpeakerDetection] =
-    useState(false);
   const [trimRetranscriptionError, setTrimRetranscriptionError] = useState<
     string | null
   >(null);
@@ -8570,71 +8568,6 @@ export function App({
     await launchTranscriptionStart(request);
   }
 
-  async function onStartSpeakerDetectionForActiveArtifact(): Promise<void> {
-    if (!activeArtifact || isStartingSpeakerDetection) {
-      return;
-    }
-
-    setIsStartingSpeakerDetection(true);
-    setTrimRetranscriptionError(null);
-    try {
-      if (!settings?.transcription.speaker_diarization?.enabled) {
-        throw new Error(
-          t(
-            "detail.speakerDetectionDisabledHelp",
-            "Enable speaker diarization in Settings > Transcription before using speaker detection.",
-          ),
-        );
-      }
-
-      let inputPath = effectiveTrimmedAudioDraft?.path ?? detailAudioInputPath;
-      let title = effectiveTrimmedAudioDraft?.title ?? activeArtifact.title;
-
-      if (!inputPath) {
-        if (!activeArtifact.audio_available) {
-          throw new Error(
-            t(
-              "detail.speakerDetectionAudioUnavailable",
-              "Saved audio is required before speaker detection can run for this transcript.",
-            ),
-          );
-        }
-
-        const durationSeconds = transcriptSeconds;
-        if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
-          throw new Error(
-            t(
-              "detail.trimInvalidDuration",
-              "Trimmed audio duration is invalid. Apply the trim again before retranscribing.",
-            ),
-          );
-        }
-
-        const preparedAudio = await writeTrimmedAudio(
-          { artifactId: activeArtifact.id },
-          [{ start: 0, end: durationSeconds }],
-        );
-        inputPath = preparedAudio.path;
-        title = activeArtifact.title;
-      }
-
-      await onStartTranscription(inputPath, {
-        parentId: activeArtifact.id,
-        title,
-      });
-    } catch (speakerDetectionError) {
-      setTrimRetranscriptionError(
-        formatUiError(
-          "error.speakerDetectionStartFailed",
-          "Could not start speaker detection",
-          speakerDetectionError,
-        ),
-      );
-    } finally {
-      setIsStartingSpeakerDetection(false);
-    }
-  }
-
   useEffect(() => {
     if (
       shouldQueueTranscriptionStart({
@@ -13475,17 +13408,16 @@ export function App({
                 !isRealtimeDetailActive &&
                 speakerDetectionHasAudio,
             )}
-            isStartingSpeakerDetection={isStartingSpeakerDetection}
             speakerDetectionDisabled={
               !speakerDiarizationEnabled ||
-              isStartingSpeakerDetection ||
+              isArtifactDiarizationRunning ||
               Boolean(activeJobId)
             }
             speakerDetectionActionLabel={speakerDetectionActionLabel}
             speakerDetectionActionTitle={speakerDetectionActionLabel}
             speakerDetectionDescription={speakerDetectionDescription}
             onStartSpeakerDetection={() =>
-              void onStartSpeakerDetectionForActiveArtifact()
+              void onRunSpeakerDiarization()
             }
             showRetranscribe={Boolean(
               effectiveTrimmedAudioDraft && !activeJobId,
@@ -13599,23 +13531,17 @@ export function App({
                   ) : null}
                 </div>
               ) : null}
-              {(isTrimRetranscriptionStarting || isStartingSpeakerDetection) &&
-              !trimRetranscriptionError ? (
+              {isTrimRetranscriptionStarting && !trimRetranscriptionError ? (
                 <div
                   className="detail-inline-status"
                   role="status"
                   aria-live="polite"
                 >
                   <span>
-                    {isStartingSpeakerDetection
-                      ? t(
-                          "detail.preparingSpeakerDetection",
-                          "Preparing speaker detection...",
-                        )
-                      : t(
-                          "detail.preparingTrimmedRetranscription",
-                          "Preparing trimmed audio transcription...",
-                        )}
+                    {t(
+                      "detail.preparingTrimmedRetranscription",
+                      "Preparing trimmed audio transcription...",
+                    )}
                   </span>
                 </div>
               ) : null}

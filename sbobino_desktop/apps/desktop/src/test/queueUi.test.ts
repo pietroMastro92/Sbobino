@@ -108,17 +108,22 @@ describe("queue UI wiring", () => {
     expect(appSource).toContain("(!isTerminalQueueItem || Boolean(queueArtifactId))");
   });
 
-  it("starts speaker detection as a queued child transcription", () => {
-    const onStartSpeakerDetection = extractFunction(
+  it("routes speaker detection directly to pyannote without retranscribing", () => {
+    const onRunSpeakerDiarization = extractFunction(
       appSource,
-      "onStartSpeakerDetectionForActiveArtifact",
+      "onRunSpeakerDiarization",
     );
 
     expect(appSource).toContain("showSpeakerDetection={Boolean(");
     expect(appSource).toContain("detail.runSpeakerDetection");
     expect(appSource).toContain("detail.rerunSpeakerDetection");
-    expect(onStartSpeakerDetection).toContain("writeTrimmedAudio(");
-    expect(onStartSpeakerDetection).toContain("parentId: activeArtifact.id");
-    expect(onStartSpeakerDetection).toContain("await onStartTranscription(inputPath");
+    expect(appSource).toMatch(
+      /onStartSpeakerDetection=\{\(\) =>\s+void onRunSpeakerDiarization\(\)\s+\}/,
+    );
+    expect(onRunSpeakerDiarization).toContain(
+      "await runArtifactSpeakerDiarization(artifactId)",
+    );
+    expect(onRunSpeakerDiarization).not.toContain("onStartTranscription(");
+    expect(onRunSpeakerDiarization).not.toContain("writeTrimmedAudio(");
   });
 });

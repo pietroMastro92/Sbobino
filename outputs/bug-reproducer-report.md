@@ -1,0 +1,107 @@
+# Bug Reproducer
+
+## ✅ FIX_PROVEN — Bug reproduced and fix proven
+
+> The same focused speaker-detection routing test changed from failing to passing, and the complete frontend test suite plus production build passed.
+
+**Project:** Sbobino Desktop
+**Bug:** Live speaker detection launches Parakeet instead of Pyannote
+**Environment:** macOS Darwin 25.5.0 arm64, Node.js v26.5.0, npm 11.17.0, Sbobino v2.0.23 source
+**Generated:** 2026-07-26
+
+## Original report
+
+On macOS, pressing Run speaker detection for a saved live transcript displayed a Parakeet speech-to-text failure and attempted a very large Metal allocation, even though speaker detection is expected to use Pyannote. The shared frontend path made the defect applicable to all desktop platforms.
+
+| Contract | Expected | Actual |
+|---|---|---|
+| Observed behavior | Run speaker detection invokes the dedicated artifact speaker-diarization command, which prepares audio and assigns speakers with Pyannote without running speech-to-text again. | The toolbar invoked a legacy handler that called onStartTranscription, so the configured ASR engine, Parakeet in the supplied report, retranscribed the complete live recording. |
+
+## Minimal reproduction
+
+The focused queue UI wiring test loads the real App.tsx source and asserts that the visible speaker-detection callback invokes onRunSpeakerDiarization, whose implementation invokes runArtifactSpeakerDiarization and never calls the transcription path.
+
+**Confirming signal:** Before the fix, the callback assertion failed because App.tsx invoked onStartSpeakerDetectionForActiveArtifact instead of onRunSpeakerDiarization; the remaining ten focused tests passed.
+
+### Reproduction files approved at Gate 1
+
+- [queueUi.test.ts](/Users/pietromastro/.codex/worktrees/e01f/sbobino_tauri/sbobino_desktop/apps/desktop/src/test/queueUi.test.ts:111) — Gate 1 regression contract for direct Pyannote routing without retranscription.
+
+## Red to green evidence
+
+| Evidence | Before fix | After fix |
+|---|---:|---:|
+| Exit code | 1 | 0 |
+| Timed out | False | False |
+| Duration | 545 ms | 451 ms |
+| Same command | — | True |
+| Broader suite | — | passed |
+
+### Before — failing evidence
+
+```text
+FAIL src/test/queueUi.test.ts > queue UI wiring > routes speaker detection directly to pyannote without retranscribing
+AssertionError: expected App.tsx to match the onStartSpeakerDetection callback invoking onRunSpeakerDiarization().
+Test Files 1 failed (1)
+Tests 1 failed | 10 passed (11)
+```
+
+### After — fixed evidence
+
+```text
+PASS src/test/queueUi.test.ts
+Test Files 1 passed (1)
+Tests 11 passed (11)
+```
+
+## Root cause
+
+A later frontend change wired the toolbar to a duplicate legacy handler that prepared audio and called onStartTranscription. The already-existing dedicated onRunSpeakerDiarization handler and Pyannote backend were left unreachable from the visible button.
+
+## Approved fix
+
+Rewired the toolbar to onRunSpeakerDiarization, removed the duplicate retranscription-based speaker handler and its obsolete starting state, disabled the action while dedicated diarization is running, and kept the existing diarization progress path.
+
+**Why this is causal:** The changed callback is the only user interaction that selected the erroneous ASR path. It now reaches the existing Tauri command whose Rust implementation constructs the Pyannote diarization runtime.
+
+### Production files approved at Gate 2
+
+- [App.tsx](/Users/pietromastro/.codex/worktrees/e01f/sbobino_tauri/sbobino_desktop/apps/desktop/src/App.tsx:13419) — Gate 2 toolbar routing fix and removal of the obsolete ASR-based speaker handler.
+
+## Verification
+
+| Check | Status | Evidence |
+|---|---|---|
+| Focused regression | ✅ passed | Same command changed from 1 failed and 10 passed to all 11 passed. |
+| Complete frontend suite | ✅ passed | 30 test files and 153 tests passed. |
+| Production frontend build | ✅ passed | TypeScript and Vite production build completed. |
+| Diff validation | ✅ passed | git diff --check returned no errors. |
+
+## Reproduce
+
+```bash
+cd /Users/pietromastro/.codex/worktrees/e01f/sbobino_tauri/sbobino_desktop/apps/desktop && npm test -- src/test/queueUi.test.ts
+```
+```bash
+cd /Users/pietromastro/.codex/worktrees/e01f/sbobino_tauri/sbobino_desktop/apps/desktop && npm test
+```
+```bash
+cd /Users/pietromastro/.codex/worktrees/e01f/sbobino_tauri/sbobino_desktop/apps/desktop && npm run build
+```
+
+## Limitations
+
+- The supplied failure was physically observed on Apple Silicon macOS; Windows and macOS Intel are covered by the same frontend routing contract but were not physically exercised in this run.
+
+## Residual risks
+
+- Actual Pyannote model execution still depends on a correctly provisioned local runtime and saved artifact audio.
+
+## Notes
+
+- No backend, runtime, model, transcription-engine, platform-specific, or public API behavior was changed.
+- The fix is based on the current public v2.0.23 release tag.
+
+---
+
+Generated by `$bug-reproducer`. A fix is proven only by the same red-to-green reproducer plus relevant broader checks.

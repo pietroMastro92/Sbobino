@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "status": "FIX_PROVEN",
+  "reason": "The same focused speaker-detection routing test changed from failing to passing, and the complete frontend test suite plus production build passed.",
+  "reproduction": "confirmed",
+  "full_suite": "passed",
+  "same_command": true,
+  "before": {
+    "command": "npm test -- src/test/queueUi.test.ts",
+    "exit_code": 1,
+    "timed_out": false,
+    "duration_ms": 545,
+    "stdout": "FAIL src/test/queueUi.test.ts > queue UI wiring > routes speaker detection directly to pyannote without retranscribing\nAssertionError: expected App.tsx to match the onStartSpeakerDetection callback invoking onRunSpeakerDiarization().\nTest Files 1 failed (1)\nTests 1 failed | 10 passed (11)",
+    "stderr": ""
+  },
+  "after": {
+    "command": "npm test -- src/test/queueUi.test.ts",
+    "exit_code": 0,
+    "timed_out": false,
+    "duration_ms": 451,
+    "stdout": "PASS src/test/queueUi.test.ts\nTest Files 1 passed (1)\nTests 11 passed (11)",
+    "stderr": ""
+  }
+}
