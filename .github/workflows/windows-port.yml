@@ -39,6 +39,10 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Validate Windows PowerShell source contracts
+        shell: bash
+        run: bash ../../scripts/check_windows_powershell_source.sh
+
       - name: Build portable Windows speech runtime and Tauri sidecars
         shell: pwsh
         run: |

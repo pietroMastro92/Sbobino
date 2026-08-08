@@ -111,7 +111,7 @@ function Invoke-VsCommand {
     $quotedVsDevCmd = '"' + $vsDevCmd.Replace('"', '\"') + '"'
     & cmd.exe /d /s /c "$quotedVsDevCmd -arch=x64 -host_arch=x64 >nul && $CommandLine"
     if ($LASTEXITCODE -ne 0) {
-        throw "Visual Studio command failed with exit code $LASTEXITCODE: $CommandLine"
+        throw "Visual Studio command failed with exit code ${LASTEXITCODE}: $CommandLine"
     }
 }
 
