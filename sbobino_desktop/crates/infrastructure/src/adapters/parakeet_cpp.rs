@@ -138,13 +138,24 @@ struct WorkerMemoryStats {
     peak_rss_bytes: u64,
     limit_bytes: u64,
     #[cfg(windows)]
-    job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
+    // Store the non-owning job handle as an integer so the async worker state
+    // remains Send. The owning WindowsWorkerJobGuard keeps the actual HANDLE
+    // alive for the duration of the worker future.
+    job_handle: Option<usize>,
 }
 
 #[cfg(windows)]
 struct WindowsWorkerJobGuard {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
+
+// SAFETY: a Windows HANDLE is a process-wide kernel-object handle, so moving
+// this guard between threads does not invalidate the handle or transfer any
+// thread-affine state. The guard owns the handle exclusively; all operations
+// on it are performed through shared/unique references within the worker
+// future, and Drop closes it exactly once.
+#[cfg(windows)]
+unsafe impl Send for WindowsWorkerJobGuard {}
 
 #[cfg(windows)]
 impl WindowsWorkerJobGuard {
@@ -637,6 +648,7 @@ impl ParakeetCppEngine {
         if let Some(job_handle) = stats.job_handle {
             // A failed query is fail-closed: report the ceiling so the caller
             // terminates the job instead of continuing without a guard.
+            let job_handle = job_handle as windows_sys::Win32::Foundation::HANDLE;
             let rss = WindowsWorkerJobGuard::peak_memory_bytes_for_handle(job_handle)
                 .unwrap_or(stats.limit_bytes);
             stats.peak_rss_bytes = stats.peak_rss_bytes.max(rss);
@@ -669,6 +681,9 @@ impl ParakeetCppEngine {
         child: &mut tokio::process::Child,
         process_group: Option<i32>,
     ) {
+        #[cfg(not(unix))]
+        let _ = process_group;
+
         #[cfg(unix)]
         if let Some(process_group) = process_group {
             unsafe {
@@ -2511,7 +2526,10 @@ impl ParakeetCppEngine {
             peak_rss_bytes: 0,
             limit_bytes: self.worker_rss_limit_bytes(),
             #[cfg(windows)]
-            job_handle: process_group_guard.job.as_ref().map(|job| job.handle),
+            job_handle: process_group_guard
+                .job
+                .as_ref()
+                .map(|job| job.handle as usize),
         };
         let stdout = child.stdout.take().ok_or_else(|| {
             ApplicationError::SpeechToText("parakeet-batch-json stdout was unavailable".to_string())
@@ -3245,6 +3263,9 @@ mod tests {
 
     use super::{AudioChunk, ParakeetCppEngine};
 
+    #[cfg(windows)]
+    use super::{WindowsWorkerJobGuard, WorkerMemoryStats};
+
     #[test]
     fn parakeet_metal_safety_env_keeps_metal_enabled() {
         let env = ParakeetCppEngine::safe_metal_environment();
@@ -3261,6 +3282,15 @@ mod tests {
     fn windows_batch_worker_routing_fails_closed_without_cli_fallback() {
         assert!(ParakeetCppEngine::allows_long_file_cli_fallback(false));
         assert!(!ParakeetCppEngine::allows_long_file_cli_fallback(true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_worker_job_guard_is_send_for_guarded_async_worker() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<WindowsWorkerJobGuard>();
+        assert_send::<WorkerMemoryStats>();
     }
 
     #[test]
