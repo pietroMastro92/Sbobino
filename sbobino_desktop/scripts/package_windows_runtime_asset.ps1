@@ -115,6 +115,50 @@ function Invoke-VsCommand {
     }
 }
 
+function Find-CMakeVisualStudioGenerator {
+    $cmake = Get-Command "cmake.exe" -ErrorAction SilentlyContinue
+    if (-not $cmake) {
+        throw "CMake was not found on PATH while discovering a Visual Studio generator"
+    }
+
+    $capabilitiesOutput = @(& $cmake.Source -E capabilities)
+    if ($LASTEXITCODE -ne 0 -or $capabilitiesOutput.Count -eq 0) {
+        throw "cmake -E capabilities failed while discovering a Visual Studio generator"
+    }
+
+    try {
+        $capabilities = ($capabilitiesOutput -join "`n") | ConvertFrom-Json
+    }
+    catch {
+        throw "cmake -E capabilities returned invalid JSON while discovering a Visual Studio generator: $($_.Exception.Message)"
+    }
+
+    $visualStudioGenerators = @(
+        @(
+            foreach ($generator in @($capabilities.generators)) {
+                $match = [regex]::Match(
+                    [string]$generator.name,
+                    '^Visual Studio (?<version>\d+) (?<year>\d{4})$'
+                )
+                if ($match.Success -and $generator.platformSupport) {
+                    [pscustomobject]@{
+                        Name = [string]$generator.name
+                        Version = [int]$match.Groups['version'].Value
+                        Year = [int]$match.Groups['year'].Value
+                    }
+                }
+            }
+        ) | Sort-Object Version, Year -Descending
+    )
+
+    if ($visualStudioGenerators.Count -eq 0) {
+        $available = @($capabilities.generators | ForEach-Object { [string]$_.name }) -join ", "
+        throw "CMake exposes no supported Visual Studio generator; available generators: $available"
+    }
+
+    return $visualStudioGenerators[0].Name
+}
+
 function Checkout-ParakeetSource {
     param([string]$Destination)
 
@@ -143,7 +187,8 @@ function Build-ParakeetSharedLibrary {
     )
 
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
-    $generator = Quote-CmdArg "Visual Studio 17 2022"
+    $generatorName = Find-CMakeVisualStudioGenerator
+    $generator = Quote-CmdArg $generatorName
     $sourceArg = Quote-CmdArg $SourceDir
     $buildArg = Quote-CmdArg $BuildDir
     Invoke-VsCommand ("cmake.exe -S {0} -B {1} -G {2} -A x64 -DCMAKE_BUILD_TYPE=Release -DPARAKEET_SHARED=ON -DPARAKEET_BUILD_CLI=ON -DPARAKEET_BUILD_SERVER=OFF -DPARAKEET_BUILD_TESTS=OFF -DGGML_NATIVE=OFF -DPARAKEET_GGML_METAL=OFF -DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=ON" -f `

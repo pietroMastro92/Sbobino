@@ -47,4 +47,42 @@ if [[ -n "$ambiguous" ]]; then
   exit 1
 fi
 
+hardcoded_generator=$(
+  grep -EnH 'Visual Studio [0-9]+ [0-9]{4}' "${files[@]}" || true
+)
+if [[ -n "$hardcoded_generator" ]]; then
+  printf 'hardcoded Visual Studio generator (discover via cmake -E capabilities):\n%s\n' \
+    "$hardcoded_generator" >&2
+  exit 1
+fi
+
+package_script=""
+if [[ "$(basename -- "${files[0]}")" == "package_windows_runtime_asset.ps1" ]]; then
+  package_script="${files[0]}"
+fi
+
+if [[ -n "$package_script" ]]; then
+  for required in \
+    'function Find-CMakeVisualStudioGenerator' \
+    '-E capabilities' \
+    'Sort-Object Version, Year -Descending' \
+    '$generatorName = Find-CMakeVisualStudioGenerator' \
+    'ConvertFrom-Json' \
+    'platformSupport' \
+    "Version = [int]\$match.Groups['version'].Value" \
+    "Year = [int]\$match.Groups['year'].Value" \
+    '$visualStudioGenerators.Count -eq 0' \
+    'CMake exposes no supported Visual Studio generator'; do
+    if ! grep -Fq -- "$required" "$package_script"; then
+      printf 'missing CMake Visual Studio generator discovery contract: %s\n' "$required" >&2
+      exit 1
+    fi
+  done
+  regex_literal="'^Visual Studio (?<version>\d+) (?<year>\d{4})\$'"
+  if ! grep -Fq -- "$regex_literal" "$package_script"; then
+    printf 'missing exact Visual Studio generator name regex contract\n' >&2
+    exit 1
+  fi
+fi
+
 printf 'Windows PowerShell source contract passed for %d files.\n' "${#files[@]}"
