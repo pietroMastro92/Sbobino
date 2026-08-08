@@ -66,6 +66,9 @@ jobs:
       - name: Hydrate native Pyannote assets
         run: ../../scripts/setup_bundled_pyannote.sh --force
 
+      - name: Validate macOS runtime source contracts
+        run: ../../scripts/check_macos_runtime_source.sh
+
       - name: Inject updater public key
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ secrets.TAURI_UPDATER_PUBLIC_KEY }}

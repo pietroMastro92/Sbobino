@@ -319,6 +319,9 @@ build_parakeet_binary() {
     cp "$dylib" "$TARGET_LIB/$(basename "$dylib")"
   done < <(find "$build_root" -type f -name 'lib*.dylib' -print)
   clang++ -std=c++17 \
+    -arch "$RUNTIME_ARCH" \
+    -mmacosx-version-min="$MACOS_DEPLOYMENT_TARGET" \
+    -isysroot "$SDKROOT" \
     -I"$source_root/include" \
     "$SCRIPT_DIR/parakeet_batch_json.cpp" \
     -L"$TARGET_LIB" \
