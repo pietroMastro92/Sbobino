@@ -47,6 +47,10 @@ pub struct TimelineV2Segment {
     #[serde(default)]
     pub speaker_label: Option<String>,
     #[serde(default)]
+    pub language_code: Option<String>,
+    #[serde(default)]
+    pub language_confidence: Option<f32>,
+    #[serde(default)]
     pub words: Vec<TimelineV2Word>,
 }
 
@@ -71,6 +75,7 @@ pub struct PreparedTimelineSegment {
     pub end_seconds: Option<f32>,
     pub speaker_id: Option<String>,
     pub speaker_label: Option<String>,
+    pub language_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -151,7 +156,7 @@ impl PreparedTranscriptContext {
                 }
             })
             .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| right.0.cmp(&left.0));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
 
         let mut excerpts = Vec::new();
         let mut used = 0usize;
@@ -242,6 +247,7 @@ pub fn parse_timeline_context_segments(
             let speaker_id = normalize_optional_text(segment.speaker_id);
             let speaker_label =
                 normalize_optional_text(segment.speaker_label).or_else(|| speaker_id.clone());
+            let language_code = normalize_optional_text(segment.language_code);
 
             Some(PreparedTimelineSegment {
                 source_index,
@@ -251,6 +257,7 @@ pub fn parse_timeline_context_segments(
                 end_seconds,
                 speaker_id,
                 speaker_label,
+                language_code,
             })
         })
         .collect()
@@ -291,6 +298,11 @@ fn render_timeline_context_segment(
             prefix.push_str(speaker_label);
             prefix.push_str(": ");
         }
+    }
+    if let Some(language_code) = segment.language_code.as_deref() {
+        prefix.push_str("[source_language=");
+        prefix.push_str(language_code);
+        prefix.push_str("] ");
     }
 
     format!("{prefix}{}", segment.text.trim())

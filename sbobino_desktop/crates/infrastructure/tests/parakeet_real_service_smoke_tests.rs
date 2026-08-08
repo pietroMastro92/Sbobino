@@ -207,6 +207,55 @@ fn assert_timeline_has_word_timestamp(artifact: &TranscriptArtifact) {
     );
 }
 
+fn assert_detected_language_contract(
+    artifact: &TranscriptArtifact,
+    expected_detected_language: &str,
+) {
+    assert_eq!(
+        artifact
+            .metadata
+            .get("preferred_language")
+            .map(String::as_str),
+        Some("auto"),
+        "service smoke should preserve automatic language as the requested preference"
+    );
+    assert_eq!(
+        artifact
+            .metadata
+            .get("language_detection_version")
+            .map(String::as_str),
+        Some("1"),
+        "service smoke should persist the current language-detection contract version"
+    );
+    let metadata_language = artifact.metadata.get("language").map(String::as_str);
+    assert_eq!(
+        metadata_language,
+        Some(expected_detected_language),
+        "service smoke should persist the detected processing language, not the auto preference"
+    );
+    assert_eq!(
+        artifact.processing_language.as_deref(),
+        metadata_language,
+        "artifact processing language should match persisted detected metadata"
+    );
+
+    let detected_languages = artifact
+        .metadata
+        .get("detected_languages")
+        .expect("service smoke should persist detected_languages metadata");
+    let detected_languages: Value = serde_json::from_str(detected_languages)
+        .expect("detected_languages metadata should be valid JSON");
+    let detected_languages = detected_languages
+        .as_array()
+        .expect("detected_languages metadata should be a JSON array");
+    assert!(
+        detected_languages.iter().any(|summary| {
+            summary.get("code").and_then(Value::as_str) == Some(expected_detected_language)
+        }),
+        "detected_languages metadata should include {expected_detected_language}, got {detected_languages:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires real parakeet-cli, GGUF model, ffmpeg, and spoken audio env vars"]
 async fn parakeet_service_real_smoke_persists_metadata() {
@@ -215,6 +264,8 @@ async fn parakeet_service_real_smoke_persists_metadata() {
     let audio_path = required_env("SBOBINO_PARAKEET_AUDIO");
     let model_filename =
         optional_env("SBOBINO_PARAKEET_MODEL").unwrap_or_else(|| DEFAULT_REAL_SMOKE_MODEL.into());
+    let expected_detected_language = optional_env("SBOBINO_PARAKEET_EXPECTED_DETECTED_LANGUAGE")
+        .unwrap_or_else(|| "it".to_string());
     let model = parakeet_model_for_filename(&model_filename);
 
     assert!(
@@ -279,20 +330,22 @@ async fn parakeet_service_real_smoke_persists_metadata() {
         !artifact.raw_transcript.trim().is_empty(),
         "service smoke produced an empty raw transcript"
     );
-    let emitted = emitted.lock().expect("emit lock poisoned");
-    let preview_delta_count = emitted
-        .iter()
-        .filter(|delta| delta.starts_with("\u{001F}REPLACE:"))
-        .count();
-    assert!(
-        preview_delta_count >= 2,
-        "expected at least two progressive service deltas before final Parakeet transcript, got {preview_delta_count}"
-    );
-    assert_eq!(
-        emitted.last().map(String::as_str),
-        Some(artifact.raw_transcript.as_str()),
-        "final service delta should match persisted raw transcript"
-    );
+    {
+        let emitted = emitted.lock().expect("emit lock poisoned");
+        let preview_delta_count = emitted
+            .iter()
+            .filter(|delta| delta.starts_with("\u{001F}REPLACE:"))
+            .count();
+        assert!(
+            preview_delta_count >= 2,
+            "expected at least two progressive service deltas before final Parakeet transcript, got {preview_delta_count}"
+        );
+        assert_eq!(
+            emitted.last().map(String::as_str),
+            Some(artifact.raw_transcript.as_str()),
+            "final service delta should match persisted raw transcript"
+        );
+    }
     assert_eq!(artifact.processing_engine.as_deref(), Some("parakeet_cpp"));
     assert_eq!(
         artifact.processing_model.as_deref(),
@@ -302,10 +355,7 @@ async fn parakeet_service_real_smoke_persists_metadata() {
         artifact.metadata.get("model").map(String::as_str),
         Some(model_filename.as_str())
     );
-    assert_eq!(
-        artifact.metadata.get("language").map(String::as_str),
-        Some("auto")
-    );
+    assert_detected_language_contract(&artifact, &expected_detected_language);
     assert_timeline_has_word_timestamp(&artifact);
 
     let persisted = repo
@@ -321,4 +371,23 @@ async fn parakeet_service_real_smoke_persists_metadata() {
         persisted[0].processing_model.as_deref(),
         Some(model_filename.as_str())
     );
+    assert_detected_language_contract(&persisted[0], &expected_detected_language);
+    assert_eq!(
+        persisted[0].processing_language, artifact.processing_language,
+        "persisted artifact should preserve the detected processing language"
+    );
+    for metadata_key in [
+        "language",
+        "preferred_language",
+        "language_detection_version",
+        "detected_languages",
+        "timeline_v2",
+    ] {
+        assert_eq!(
+            persisted[0].metadata.get(metadata_key),
+            artifact.metadata.get(metadata_key),
+            "persisted artifact should preserve {metadata_key} metadata"
+        );
+    }
+    assert_timeline_has_word_timestamp(&persisted[0]);
 }

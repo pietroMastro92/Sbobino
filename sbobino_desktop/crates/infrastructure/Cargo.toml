@@ -1,6 +1,6 @@
 [package]
 name = "sbobino-infrastructure"
-version = "2.0.24"
+version = "2.0.25"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -20,12 +20,27 @@ tokio-util.workspace = true
 tracing.workspace = true
 hound.workspace = true
 ring.workspace = true
+lingua = { version = "1.8.0", default-features = false, features = [
+    "bulgarian", "croatian", "czech", "danish", "dutch", "english", "estonian",
+    "finnish", "french", "german", "greek", "hungarian", "italian", "latvian",
+    "lithuanian", "polish", "portuguese", "romanian", "slovak", "slovene",
+    "spanish", "swedish", "russian", "ukrainian",
+] }
 tempfile = "3.13"
 sbobino-domain = { path = "../domain" }
 sbobino-application = { path = "../application" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 regex = "1"

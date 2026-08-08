@@ -14,7 +14,7 @@ use tracing::{instrument, warn};
 
 use sbobino_domain::{
     constrain_transcript_edit, minimize_transcript_repetitions, ArtifactKind, JobProgress,
-    JobStage, SpeakerTurn, TimedSegment, TranscriptArtifact, TranscriptionEngine,
+    JobStage, LanguageCode, SpeakerTurn, TimedSegment, TranscriptArtifact, TranscriptionEngine,
     TranscriptionOutput,
 };
 
@@ -34,6 +34,12 @@ const AUTO_IMPORT_GENERATE_PRESET_OUTPUT_METADATA_KEY: &str = "auto_import_gener
 const AUTO_POST_SUMMARY_STATUS_METADATA_KEY: &str = "auto_post_summary_status";
 const AUTO_POST_FAQS_STATUS_METADATA_KEY: &str = "auto_post_faqs_status";
 const AUTO_POST_PRESET_OUTPUT_STATUS_METADATA_KEY: &str = "auto_post_preset_output_status";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceLanguageOptimizationGroup {
+    language_code: String,
+    text: String,
+}
 
 #[derive(Clone)]
 pub struct TranscriptionService {
@@ -191,7 +197,7 @@ impl TranscriptionService {
                     self.speech_engine.transcribe(
                         &wav_path,
                         request.speech_model_filename(),
-                        request.language.as_whisper_code(),
+                        &request.language_policy(),
                         &request.whisper_options,
                         total_audio_seconds,
                         emit_delta.clone(),
@@ -278,14 +284,19 @@ impl TranscriptionService {
                     None,
                 );
 
+                let ai_language = if request.language.is_auto() {
+                    transcription_output
+                        .dominant_language_code()
+                        .unwrap_or_else(|| "en".to_string())
+                } else {
+                    request.language.as_code().to_string()
+                };
+                let optimization_groups =
+                    Self::language_optimization_groups(&transcription_output, &raw_transcript);
                 match self
                     .run_cancellable(
                         &cancellation_token,
-                        self.run_ai_post_processing(
-                            &raw_transcript,
-                            request.language.as_whisper_code(),
-                            &request,
-                        ),
+                        self.run_ai_post_processing(&optimization_groups, &ai_language, &request),
                     )
                     .await
                 {
@@ -327,13 +338,20 @@ impl TranscriptionService {
             );
 
             let mut metadata = request.metadata.clone();
+            let processing_language = transcription_output.processing_language_code();
             metadata.insert(
                 "model".to_string(),
                 request.speech_model_filename().to_string(),
             );
+            metadata.insert("language".to_string(), processing_language.clone());
             metadata.insert(
-                "language".to_string(),
-                request.language.as_whisper_code().to_string(),
+                "preferred_language".to_string(),
+                request.language.as_code().to_string(),
+            );
+            metadata.insert("language_detection_version".to_string(), "1".to_string());
+            metadata.insert(
+                "detected_languages".to_string(),
+                transcription_output.detected_languages_json(),
             );
             metadata.insert(
                 "timeline_v2".to_string(),
@@ -400,7 +418,7 @@ impl TranscriptionService {
             artifact.parent_artifact_id = request.parent_id.clone();
             artifact.processing_engine = Some(request.engine.as_str().to_string());
             artifact.processing_model = Some(request.speech_model_filename().to_string());
-            artifact.processing_language = Some(request.language.as_whisper_code().to_string());
+            artifact.processing_language = Some(processing_language);
             artifact.whisper_options_json = serde_json::to_string(&request.whisper_options).ok();
             artifact.ai_provider_snapshot_json = Some(
                 serde_json::json!({
@@ -468,10 +486,15 @@ impl TranscriptionService {
 
     async fn run_ai_post_processing(
         &self,
-        raw_transcript: &str,
-        language_code: &str,
+        optimization_groups: &[SourceLanguageOptimizationGroup],
+        summary_language_code: &str,
         request: &RunTranscriptionRequest,
     ) -> Result<(String, SummaryFaq, bool, BTreeMap<String, String>), ApplicationError> {
+        let safety_source = optimization_groups
+            .iter()
+            .map(|group| group.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let generate_summary =
             metadata_bool(request, AUTO_IMPORT_GENERATE_SUMMARY_METADATA_KEY, true);
         let generate_faqs = metadata_bool(request, AUTO_IMPORT_GENERATE_FAQS_METADATA_KEY, true);
@@ -483,7 +506,12 @@ impl TranscriptionService {
         let mut last_retryable_error: Option<ApplicationError> = None;
 
         for enhancer in self.ordered_enhancers() {
-            let optimized = match enhancer.optimize(raw_transcript, language_code).await {
+            let optimized = match Self::optimize_language_groups(
+                enhancer.as_ref(),
+                optimization_groups,
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(error) if is_retryable_ai_provider_error(&error) => {
                     last_retryable_error = Some(error);
@@ -492,14 +520,15 @@ impl TranscriptionService {
                 Err(error) => return Err(error),
             };
 
-            let constrained_optimized = constrain_transcript_edit(raw_transcript, &optimized);
-            let has_optimized_transcript = constrained_optimized != raw_transcript;
+            let optimized = Self::strip_language_service_markers(&optimized);
+            let constrained_optimized = constrain_transcript_edit(&safety_source, &optimized);
+            let has_optimized_transcript = constrained_optimized != safety_source;
 
             let mut summary_faq = if generate_summary || generate_faqs {
                 match summarize_and_faq_adaptive(
                     enhancer.as_ref(),
                     &constrained_optimized,
-                    language_code,
+                    summary_language_code,
                 )
                 .await
                 {
@@ -522,6 +551,8 @@ impl TranscriptionService {
                     faqs: String::new(),
                 }
             };
+            summary_faq.summary = Self::strip_language_service_markers(&summary_faq.summary);
+            summary_faq.faqs = Self::strip_language_service_markers(&summary_faq.faqs);
             if !generate_summary {
                 summary_faq.summary.clear();
             }
@@ -534,7 +565,7 @@ impl TranscriptionService {
                     .generate_preset_outputs(
                         enhancer.as_ref(),
                         &constrained_optimized,
-                        language_code,
+                        summary_language_code,
                         request,
                     )
                     .await
@@ -548,6 +579,9 @@ impl TranscriptionService {
             } else {
                 BTreeMap::new()
             };
+            for value in generated_outputs.values_mut() {
+                *value = Self::strip_language_service_markers(value);
+            }
             generated_outputs.insert(
                 AUTO_POST_SUMMARY_STATUS_METADATA_KEY.to_string(),
                 if !generate_summary {
@@ -773,6 +807,114 @@ impl TranscriptionService {
             .iter()
             .map(|segment| segment.text.trim())
             .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+
+    fn normalize_source_language(language: Option<&str>) -> String {
+        let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
+            return "auto".to_string();
+        };
+        if language.eq_ignore_ascii_case("auto") || language.eq_ignore_ascii_case("und") {
+            return "auto".to_string();
+        }
+        LanguageCode::try_from_code(language)
+            .map(|code| {
+                if code.is_auto() {
+                    "auto".to_string()
+                } else {
+                    code.as_code().to_string()
+                }
+            })
+            .unwrap_or_else(|_| "auto".to_string())
+    }
+
+    fn normalize_source_text(value: &str) -> String {
+        value.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn language_optimization_groups(
+        transcription_output: &TranscriptionOutput,
+        fallback_text: &str,
+    ) -> Vec<SourceLanguageOptimizationGroup> {
+        let fallback_text = fallback_text.trim();
+        if fallback_text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut groups = Vec::<SourceLanguageOptimizationGroup>::new();
+        for segment in &transcription_output.segments {
+            let text = segment.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let language = Self::normalize_source_language(segment.language_code.as_deref());
+            let append_to_previous = groups
+                .last()
+                .is_some_and(|previous| previous.language_code == language);
+            if append_to_previous {
+                if let Some(previous) = groups.last_mut() {
+                    previous.text.push('\n');
+                    previous.text.push_str(text);
+                }
+            } else {
+                groups.push(SourceLanguageOptimizationGroup {
+                    language_code: language,
+                    text: text.to_string(),
+                });
+            }
+        }
+
+        let grouped_text = groups
+            .iter()
+            .map(|group| group.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !groups.is_empty()
+            && Self::normalize_source_text(&grouped_text)
+                == Self::normalize_source_text(fallback_text)
+        {
+            return groups;
+        }
+
+        vec![SourceLanguageOptimizationGroup {
+            language_code: "auto".to_string(),
+            text: fallback_text.to_string(),
+        }]
+    }
+
+    async fn optimize_language_groups(
+        enhancer: &dyn TranscriptEnhancer,
+        groups: &[SourceLanguageOptimizationGroup],
+    ) -> Result<String, ApplicationError> {
+        let mut optimized_groups = Vec::with_capacity(groups.len());
+        for group in groups {
+            let optimized = enhancer.optimize(&group.text, &group.language_code).await?;
+            let optimized = Self::strip_language_service_markers(&optimized);
+            let constrained = constrain_transcript_edit(&group.text, &optimized);
+            optimized_groups.push(if constrained.trim().is_empty() {
+                group.text.clone()
+            } else {
+                constrained
+            });
+        }
+        Ok(optimized_groups.join("\n").trim().to_string())
+    }
+
+    fn strip_language_service_markers(value: &str) -> String {
+        let mut cleaned = value.to_string();
+        while let Some(start) = cleaned.find("[source_language=") {
+            let Some(relative_end) = cleaned[start..].find(']') else {
+                break;
+            };
+            let end = start + relative_end + 1;
+            cleaned.replace_range(start..end, "");
+        }
+        cleaned
+            .lines()
+            .map(str::trim_end)
             .collect::<Vec<_>>()
             .join("\n")
             .trim()

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::DomainError;
+use crate::{DomainError, LanguageCode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactChatMessage {
@@ -123,6 +123,13 @@ pub struct TimedSegment {
     // Hook for future diarization support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker_label: Option<String>,
+    /// ISO 639-1/BCP-47 primary language subtag detected for this utterance.
+    /// `None` is intentional when the engine cannot determine the language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_code: Option<String>,
+    /// Engine/classifier confidence for `language_code` when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_confidence: Option<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<TimedWord>,
 }
@@ -143,6 +150,15 @@ pub struct TranscriptionOutput {
     pub segments: Vec<TimedSegment>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct DetectedLanguageSummary {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    pub duration_seconds: f32,
+    pub character_count: usize,
+}
+
 impl TranscriptionOutput {
     pub fn from_text(text: impl Into<String>) -> Self {
         Self {
@@ -153,6 +169,94 @@ impl TranscriptionOutput {
 
     pub fn timeline_v2_metadata_json(&self) -> String {
         timeline_v2_json_from_segments(&self.segments)
+    }
+
+    /// Aggregate confirmed segment labels without inventing labels for legacy
+    /// artifacts or segments whose language is unknown.
+    pub fn detected_language_summaries(&self) -> Vec<DetectedLanguageSummary> {
+        let mut by_code = BTreeMap::<String, DetectedLanguageSummary>::new();
+        for segment in &self.segments {
+            let Some(code) = segment.language_code.as_deref() else {
+                continue;
+            };
+            let code = LanguageCode::try_from_code(code)
+                .map(|normalized| normalized.as_code().to_string())
+                .unwrap_or_else(|_| code.trim().to_ascii_lowercase());
+            if code.is_empty() || code == "auto" || code == "und" {
+                continue;
+            }
+            let duration_seconds = match (segment.start_seconds, segment.end_seconds) {
+                (Some(start), Some(end)) if start.is_finite() && end.is_finite() && end > start => {
+                    end - start
+                }
+                _ => 0.0,
+            };
+            let entry = by_code
+                .entry(code.clone())
+                .or_insert_with(|| DetectedLanguageSummary {
+                    code,
+                    confidence: None,
+                    duration_seconds: 0.0,
+                    character_count: 0,
+                });
+            entry.duration_seconds += duration_seconds;
+            entry.character_count += segment
+                .text
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .count();
+            if let Some(confidence) = segment
+                .language_confidence
+                .filter(|value| value.is_finite())
+            {
+                entry.confidence = Some(match entry.confidence {
+                    Some(previous) => (previous + confidence) / 2.0,
+                    None => confidence,
+                });
+            }
+        }
+        by_code.into_values().collect()
+    }
+
+    pub fn detected_languages_json(&self) -> String {
+        serde_json::to_string(&self.detected_language_summaries())
+            .unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Return the dominant language weighted by confirmed duration, falling
+    /// back to character count when timestamps are unavailable.
+    pub fn dominant_language_code(&self) -> Option<String> {
+        let summaries = self.detected_language_summaries();
+        let has_confirmed_duration = summaries
+            .iter()
+            .any(|summary| summary.duration_seconds > 0.0);
+        summaries
+            .iter()
+            .max_by(|left, right| {
+                let left_weight = if has_confirmed_duration {
+                    left.duration_seconds
+                } else {
+                    left.character_count as f32
+                };
+                let right_weight = if has_confirmed_duration {
+                    right.duration_seconds
+                } else {
+                    right.character_count as f32
+                };
+                left_weight
+                    .partial_cmp(&right_weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|summary| summary.code.clone())
+    }
+
+    pub fn processing_language_code(&self) -> String {
+        let summaries = self.detected_language_summaries();
+        match summaries.as_slice() {
+            [] => "und".to_string(),
+            [summary] => summary.code.clone(),
+            _ => "mixed".to_string(),
+        }
     }
 }
 
@@ -183,6 +287,17 @@ fn timeline_v2_json_from_segments(segments: &[TimedSegment]) -> String {
         if let Some(speaker_label) = segment.speaker_label.as_deref() {
             output.push_str(",\"speaker_label\":");
             push_json_string(&mut output, speaker_label);
+        }
+        if let Some(language_code) = segment.language_code.as_deref() {
+            output.push_str(",\"language_code\":");
+            push_json_string(&mut output, language_code);
+        }
+        if let Some(language_confidence) = segment
+            .language_confidence
+            .filter(|value| value.is_finite())
+        {
+            output.push_str(",\"language_confidence\":");
+            output.push_str(&format_json_number(language_confidence));
         }
 
         output.push_str(",\"words\":[");
@@ -247,6 +362,63 @@ fn format_json_number(value: f32) -> String {
         rendered.push('0');
     }
     rendered
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::{TimedSegment, TranscriptionOutput};
+
+    #[test]
+    fn aggregates_duration_and_marks_mixed_language() {
+        let output = TranscriptionOutput {
+            text: "Ciao hello".to_string(),
+            segments: vec![
+                TimedSegment {
+                    text: "Ciao".to_string(),
+                    start_seconds: Some(0.0),
+                    end_seconds: Some(2.0),
+                    language_code: Some("it".to_string()),
+                    language_confidence: Some(0.9),
+                    ..TimedSegment::default()
+                },
+                TimedSegment {
+                    text: "hello".to_string(),
+                    start_seconds: Some(2.0),
+                    end_seconds: Some(3.0),
+                    language_code: Some("en".to_string()),
+                    language_confidence: Some(0.8),
+                    ..TimedSegment::default()
+                },
+            ],
+        };
+
+        assert_eq!(output.processing_language_code(), "mixed");
+        assert_eq!(output.dominant_language_code().as_deref(), Some("it"));
+        assert!(output.detected_languages_json().contains("\"it\""));
+        assert!(output.timeline_v2_metadata_json().contains("language_code"));
+    }
+
+    #[test]
+    fn unknown_segments_do_not_receive_a_legacy_badge() {
+        let output = TranscriptionOutput::from_text("legacy");
+        assert_eq!(output.processing_language_code(), "und");
+        assert_eq!(output.detected_languages_json(), "[]");
+        assert!(!output.timeline_v2_metadata_json().contains("language_code"));
+    }
+
+    #[test]
+    fn aggregates_normalized_primary_language_codes() {
+        let output = TranscriptionOutput {
+            text: "Ciao".to_string(),
+            segments: vec![TimedSegment {
+                text: "Ciao".to_string(),
+                language_code: Some("it-IT".to_string()),
+                ..TimedSegment::default()
+            }],
+        };
+        assert_eq!(output.processing_language_code(), "it");
+        assert!(output.detected_languages_json().contains("\"code\":\"it\""));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

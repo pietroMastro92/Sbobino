@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use sbobino_domain::{
     ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel,
-    TranscriptionEngine, WhisperOptions,
+    TranscriptionEngine, TranscriptionLanguagePolicy, WhisperOptions,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +25,12 @@ pub struct RunTranscriptionRequest {
 }
 
 impl RunTranscriptionRequest {
+    pub fn language_policy(&self) -> TranscriptionLanguagePolicy {
+        TranscriptionLanguagePolicy {
+            preferred_language: self.language.clone(),
+            adaptive_detection: true,
+        }
+    }
     pub fn speech_model_filename(&self) -> &'static str {
         match self.engine {
             TranscriptionEngine::WhisperCpp => self.model.ggml_filename(),
@@ -63,4 +69,8 @@ pub struct RealtimeDelta {
     pub start_seconds: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_seconds: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_confidence: Option<f32>,
 }

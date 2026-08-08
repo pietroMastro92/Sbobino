@@ -9,8 +9,11 @@ $ProgressPreference = "SilentlyContinue"
 
 $WhisperUrl = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-bin-x64.zip"
 $WhisperSha256 = "74f973345cb52ef5ba3ec9e7e7af8e48cc8c71722d1528603b80588a11f82e3e"
-$ParakeetUrl = "https://github.com/mudler/parakeet.cpp/releases/download/v0.4.0/parakeet-v0.4.0-bin-win-cpu-x64.zip"
+$ParakeetVersion = "0.4.0"
+$ParakeetUrl = "https://github.com/mudler/parakeet.cpp/releases/download/v$ParakeetVersion/parakeet-v$ParakeetVersion-bin-win-cpu-x64.zip"
 $ParakeetSha256 = "2880150a1bad2944baed46f2e6bb9f1bc55263a9f2bb85573785a7ec4fa35f27"
+$ParakeetSourceUrl = "https://github.com/mudler/parakeet.cpp.git"
+$ParakeetSourceRef = "fa5aeef1e3d353679cbd374a426fee28387deb6e"
 # BtbN prunes dated autobuild releases, so a URL pinned to one of those tags is
 # not durable. Reuse the immutable, already validated Windows runtime from the
 # previous Sbobino release as the FFmpeg source for this patch release.
@@ -82,11 +85,78 @@ function Find-VsTool {
     return $matches[0]
 }
 
+function Find-VsDevCmd {
+    $onPath = Get-Command "VsDevCmd.bat" -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path -PathType Leaf $vswhere)) {
+        throw "Visual Studio locator was not found at '$vswhere'"
+    }
+    $installationPath = @(& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+    if ($installationPath.Count -eq 0) {
+        throw "could not locate a Visual Studio installation with x64 C++ tools"
+    }
+    $vsDevCmd = Join-Path $installationPath[0] "Common7\Tools\VsDevCmd.bat"
+    if (-not (Test-Path -PathType Leaf $vsDevCmd)) {
+        throw "Visual Studio developer command file was not found at '$vsDevCmd'"
+    }
+    return $vsDevCmd
+}
+
+function Invoke-VsCommand {
+    param([string]$CommandLine)
+
+    $vsDevCmd = Find-VsDevCmd
+    $quotedVsDevCmd = '"' + $vsDevCmd.Replace('"', '\"') + '"'
+    & cmd.exe /d /s /c "$quotedVsDevCmd -arch=x64 -host_arch=x64 >nul && $CommandLine"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Visual Studio command failed with exit code $LASTEXITCODE: $CommandLine"
+    }
+}
+
+function Checkout-ParakeetSource {
+    param([string]$Destination)
+
+    & git clone --no-checkout --filter=blob:none --recurse-submodules $ParakeetSourceUrl $Destination
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to clone pinned Parakeet source from $ParakeetSourceUrl"
+    }
+    & git -C $Destination checkout --detach $ParakeetSourceRef
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to checkout pinned Parakeet source ref $ParakeetSourceRef"
+    }
+    & git -C $Destination submodule update --init --recursive
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to initialize pinned Parakeet source submodules"
+    }
+    $resolved = (& git -C $Destination rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $resolved -ne $ParakeetSourceRef) {
+        throw "pinned Parakeet source resolved to '$resolved', expected '$ParakeetSourceRef'"
+    }
+}
+
+function Build-ParakeetSharedLibrary {
+    param(
+        [string]$SourceDir,
+        [string]$BuildDir
+    )
+
+    New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+    $generator = Quote-CmdArg "Visual Studio 17 2022"
+    $sourceArg = Quote-CmdArg $SourceDir
+    $buildArg = Quote-CmdArg $BuildDir
+    Invoke-VsCommand ("cmake.exe -S {0} -B {1} -G {2} -A x64 -DCMAKE_BUILD_TYPE=Release -DPARAKEET_SHARED=ON -DPARAKEET_BUILD_CLI=ON -DPARAKEET_BUILD_SERVER=OFF -DPARAKEET_BUILD_TESTS=OFF -DGGML_NATIVE=OFF -DPARAKEET_GGML_METAL=OFF -DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=ON" -f `
+        $sourceArg, $buildArg, $generator)
+    Invoke-VsCommand ("cmake.exe --build {0} --config Release --target parakeet" -f $buildArg)
+}
+
 function Copy-VcRuntimeDependencies {
     param([string]$Destination)
 
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    $redistRoots = @(& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Redist.14.Latest -find "VC\Redist\MSVC\*\x64")
+    $redistRoots = @(& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Redist.14.Latest -find "VC\Redist\MSVC\*\x64") |
+        Sort-Object
     if ($redistRoots.Count -eq 0) {
         throw "could not locate the x64 Visual C++ redistributable directories"
     }
@@ -95,8 +165,10 @@ function Copy-VcRuntimeDependencies {
     foreach ($redistRoot in $redistRoots) {
         foreach ($component in @("Microsoft.VC*.CRT", "Microsoft.VC*.OpenMP")) {
             Get-ChildItem -Path $redistRoot -Directory -Filter $component -ErrorAction SilentlyContinue |
+                Sort-Object FullName |
                 ForEach-Object {
                     Get-ChildItem -Path $_.FullName -File -Filter "*.dll" |
+                        Sort-Object Name, FullName |
                         ForEach-Object {
                             Copy-Item $_.FullName (Join-Path $Destination $_.Name) -Force
                             $copied[$_.Name.ToLowerInvariant()] = $true
@@ -125,7 +197,7 @@ function Assert-AppLocalDependencies {
         "crypt32.dll", "d2d1.dll", "dwrite.dll", "gdi32.dll", "imm32.dll",
         "iphlpapi.dll", "kernel32.dll", "msvcrt.dll", "ncrypt.dll", "ntdll.dll",
         "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "secur32.dll", "setupapi.dll",
-        "shell32.dll", "shlwapi.dll", "user32.dll", "usp10.dll", "version.dll",
+        "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll", "usp10.dll", "version.dll",
         "winmm.dll", "ws2_32.dll"
     )
     $system = @{}
@@ -151,9 +223,63 @@ function Assert-AppLocalDependencies {
     }
 }
 
+function Quote-CmdArg {
+    param([string]$Value)
+    return '"' + $Value.Replace('"', '\"') + '"'
+}
+
+function Build-ParakeetBatchWorker {
+    param(
+        [string]$SourcePath,
+        [string]$IncludeDir,
+        [string]$ParakeetDll,
+        [string]$BuildDir,
+        [string]$OutputPath
+    )
+
+    New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+    $dumpbin = Find-VsTool "dumpbin.exe"
+    $exports = @(& $dumpbin /nologo /exports $ParakeetDll 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw "dumpbin export audit failed for '$ParakeetDll'"
+    }
+
+    $requiredExports = @(
+        "parakeet_capi_load",
+        "parakeet_capi_free",
+        "parakeet_capi_transcribe_pcm_batch_json_lang",
+        "parakeet_capi_free_string",
+        "parakeet_capi_last_error"
+    )
+    foreach ($name in $requiredExports) {
+        if (-not ($exports | Where-Object { $_ -match "\s$name\s*$" })) {
+            throw "Parakeet DLL '$ParakeetDll' does not export required C-API symbol '$name'"
+        }
+    }
+
+    $defPath = Join-Path $BuildDir "parakeet.def"
+    @(
+        "LIBRARY parakeet.dll"
+        "EXPORTS"
+        $requiredExports
+    ) | Set-Content -Encoding ASCII $defPath
+
+    $importLib = Join-Path $BuildDir "parakeet.lib"
+    $objectPath = Join-Path $BuildDir "parakeet_batch_json.obj"
+    Invoke-VsCommand ("lib.exe /nologo /def:{0} /machine:x64 /out:{1}" -f `
+        (Quote-CmdArg $defPath), (Quote-CmdArg $importLib))
+    Invoke-VsCommand ("cl.exe /nologo /std:c++17 /EHsc /MD /O2 /W4 /I{0} /c {1} /Fo{2}" -f `
+        (Quote-CmdArg $IncludeDir), (Quote-CmdArg $SourcePath), (Quote-CmdArg $objectPath))
+    Invoke-VsCommand ("link.exe /nologo /machine:x64 /subsystem:console /out:{0} {1} {2}" -f `
+        (Quote-CmdArg $OutputPath), (Quote-CmdArg $objectPath), (Quote-CmdArg $importLib))
+    Assert-X64Pe $OutputPath
+}
+
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("sbobino-runtime-" + [guid]::NewGuid())
 $downloads = Join-Path $stage "downloads"
 $extract = Join-Path $stage "extract"
+$parakeetSource = Join-Path $stage "parakeet-source"
+$parakeetBuild = Join-Path $stage "parakeet-build"
 $runtimeRoot = Join-Path $stage "runtime"
 $binDir = Join-Path $runtimeRoot "bin"
 $libDir = Join-Path $runtimeRoot "lib"
@@ -180,12 +306,36 @@ try {
     Copy-Item (Find-OneFile $parakeetExtract "parakeet-cli.exe") (Join-Path $binDir "parakeet-cli.exe")
     Copy-Item (Find-OneFile $ffmpegExtract "ffmpeg.exe") (Join-Path $binDir "ffmpeg.exe")
 
+    # The official v0.4.0 Windows archive intentionally contains only the CLI
+    # and server executables. Build the shared C-API library from the exact
+    # pinned upstream source instead of depending on a non-existent "lib"
+    # archive, then link the batch worker against the resulting import library.
+    Checkout-ParakeetSource $parakeetSource
+    Build-ParakeetSharedLibrary $parakeetSource $parakeetBuild
+    $parakeetDll = Find-OneFile $parakeetBuild "parakeet.dll"
+    $parakeetHeader = Find-OneFile $parakeetSource "parakeet_capi.h"
+    Copy-Item $parakeetDll (Join-Path $binDir "parakeet.dll")
+    # Keep the C-API library in runtime/lib for the desktop app while the
+    # loader also resolves a copy next to the worker on Windows.
+    Copy-Item $parakeetDll (Join-Path $libDir "parakeet.dll")
+
+    $workerBuildDir = Join-Path $stage "parakeet-worker-build"
+    $workerPath = Join-Path $binDir "parakeet-batch-json.exe"
+    Build-ParakeetBatchWorker `
+        (Join-Path $PSScriptRoot "parakeet_batch_json.cpp") `
+        (Split-Path -Parent $parakeetHeader) `
+        (Join-Path $binDir "parakeet.dll") `
+        $workerBuildDir `
+        $workerPath
+
     # Windows resolves dependencies from the executable directory before PATH.
     # Keep every native dependency app-local so clean machines do not need a
     # preinstalled VC++ runtime and never display one missing-DLL dialog per tool.
     Get-ChildItem -Path $whisperExtract -Recurse -File -Filter "*.dll" |
+        Sort-Object Name, FullName |
         ForEach-Object { Copy-Item $_.FullName (Join-Path $binDir $_.Name) -Force }
     Get-ChildItem -Path $ffmpegExtract -Recurse -File -Filter "*.dll" |
+        Sort-Object Name, FullName |
         ForEach-Object { Copy-Item $_.FullName (Join-Path $binDir $_.Name) -Force }
     Copy-VcRuntimeDependencies $binDir
     "Native DLLs are deployed app-local in runtime/bin on Windows." |
@@ -195,11 +345,12 @@ try {
         "runtime_arch=$TargetTriple"
         "whisper_cpp_version=1.8.4"
         "parakeet_cpp_version=0.4.0"
+        "parakeet_cpp_source_ref=$ParakeetSourceRef"
         "ffmpeg_version=8.1"
         "parakeet_backend=cpu"
     ) | Set-Content -Encoding UTF8 (Join-Path $binDir "runtime-manifest.txt")
 
-    foreach ($binary in @("ffmpeg.exe", "whisper-cli.exe", "whisper-stream.exe", "parakeet-cli.exe")) {
+    foreach ($binary in @("ffmpeg.exe", "whisper-cli.exe", "whisper-stream.exe", "parakeet-cli.exe", "parakeet-batch-json.exe")) {
         Assert-X64Pe (Join-Path $binDir $binary)
     }
     Get-ChildItem -Path $binDir -File -Filter "*.dll" |
@@ -230,6 +381,7 @@ try {
             "whisperkit-cli" = "whisper-cli.exe"
             "whisper-stream" = "whisper-stream.exe"
             "parakeet-cli" = "parakeet-cli.exe"
+            "parakeet-batch-json" = "parakeet-batch-json.exe"
         }
         foreach ($name in $sidecars.Keys) {
             Copy-Item (Join-Path $binDir $sidecars[$name]) `

@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum LanguageCode {
     #[default]
     Auto,
@@ -15,6 +14,7 @@ pub enum LanguageCode {
     Pt,
     Zh,
     Ja,
+    Custom(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -28,7 +28,31 @@ pub enum AppLanguage {
 }
 
 impl LanguageCode {
-    pub fn as_whisper_code(&self) -> &str {
+    pub fn from_code(value: &str) -> Self {
+        Self::try_from_code(value).unwrap_or_default()
+    }
+
+    pub fn try_from_code(value: &str) -> Result<Self, String> {
+        let normalized = normalize_language_code(value)?;
+        Ok(match normalized.as_str() {
+            "auto" => Self::Auto,
+            "en" => Self::En,
+            "it" => Self::It,
+            "fr" => Self::Fr,
+            "de" => Self::De,
+            "es" => Self::Es,
+            "pt" => Self::Pt,
+            "zh" => Self::Zh,
+            "ja" => Self::Ja,
+            _ => Self::Custom(normalized),
+        })
+    }
+
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn as_code(&self) -> &str {
         match self {
             Self::Auto => "auto",
             Self::En => "en",
@@ -39,8 +63,149 @@ impl LanguageCode {
             Self::Pt => "pt",
             Self::Zh => "zh",
             Self::Ja => "ja",
+            Self::Custom(value) => value.as_str(),
         }
     }
+
+    pub fn as_whisper_code(&self) -> &str {
+        self.as_code()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptionLanguagePolicy {
+    #[serde(default)]
+    pub preferred_language: LanguageCode,
+    #[serde(default = "default_true")]
+    pub adaptive_detection: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for TranscriptionLanguagePolicy {
+    fn default() -> Self {
+        Self {
+            preferred_language: LanguageCode::Auto,
+            adaptive_detection: true,
+        }
+    }
+}
+
+impl Serialize for LanguageCode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_code())
+    }
+}
+
+impl<'de> Deserialize<'de> for LanguageCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from_code(&value).map_err(D::Error::custom)
+    }
+}
+
+fn normalize_language_code(value: &str) -> Result<String, String> {
+    let normalized = value.trim().replace('_', "-").to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err("language code cannot be empty".to_string());
+    }
+    if normalized == "auto" {
+        return Ok(normalized);
+    }
+
+    let subtags = normalized.split('-').collect::<Vec<_>>();
+    let primary = subtags.first().copied().unwrap_or_default();
+    if !(2..=3).contains(&primary.len())
+        || !primary
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+        || subtags.iter().skip(1).any(|subtag| {
+            !(2..=8).contains(&subtag.len())
+                || !subtag
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+    {
+        return Err(format!("invalid language code: {value}"));
+    }
+
+    Ok(primary.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptionLanguageOption {
+    pub code: String,
+    pub whisper: bool,
+    pub parakeet_tdt: bool,
+    pub nemotron: bool,
+}
+
+pub fn transcription_language_catalog() -> Vec<TranscriptionLanguageOption> {
+    const WHISPER_CODES: &[&str] = &[
+        "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv",
+        "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no",
+        "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr",
+        "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw",
+        "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu",
+        "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl",
+        "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su", "yue",
+    ];
+    const TDT_CODES: &[&str] = &[
+        "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt",
+        "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk",
+    ];
+    const NEMOTRON_CODES: &[&str] = &[
+        "en", "es", "fr", "it", "pt", "nl", "de", "tr", "ru", "ar", "hi", "ja", "ko", "vi", "uk",
+        "pl", "sv", "cs", "nb", "da", "bg", "fi", "hr", "sk", "zh", "hu", "ro", "et", "el", "lt",
+        "lv", "mt", "sl", "he", "th", "nn",
+    ];
+
+    let mut catalog = BTreeMap::<String, TranscriptionLanguageOption>::new();
+    for code in WHISPER_CODES {
+        catalog.insert(
+            (*code).to_string(),
+            TranscriptionLanguageOption {
+                code: (*code).to_string(),
+                whisper: true,
+                parakeet_tdt: false,
+                nemotron: false,
+            },
+        );
+    }
+    for code in TDT_CODES {
+        let entry =
+            catalog
+                .entry((*code).to_string())
+                .or_insert_with(|| TranscriptionLanguageOption {
+                    code: (*code).to_string(),
+                    whisper: false,
+                    parakeet_tdt: false,
+                    nemotron: false,
+                });
+        entry.parakeet_tdt = true;
+    }
+    for code in NEMOTRON_CODES {
+        let entry =
+            catalog
+                .entry((*code).to_string())
+                .or_insert_with(|| TranscriptionLanguageOption {
+                    code: (*code).to_string(),
+                    whisper: false,
+                    parakeet_tdt: false,
+                    nemotron: false,
+                });
+        entry.nemotron = true;
+    }
+
+    catalog.into_values().collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1040,4 +1205,37 @@ fn default_automatic_import_extensions() -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::*;
+
+    #[test]
+    fn language_codes_are_normalized_and_round_trip() {
+        assert_eq!(LanguageCode::from_code("it-IT").as_code(), "it");
+        assert_eq!(LanguageCode::from_code("EN_us").as_code(), "en");
+        assert!(LanguageCode::try_from_code("not-a-code").is_err());
+        assert_eq!(LanguageCode::from_code("auto"), LanguageCode::Auto);
+    }
+
+    #[test]
+    fn catalog_is_the_union_of_engine_capabilities() {
+        let catalog = transcription_language_catalog();
+        assert!(catalog.iter().any(|entry| entry.code == "it"
+            && entry.whisper
+            && entry.parakeet_tdt
+            && entry.nemotron));
+        assert!(catalog
+            .iter()
+            .any(|entry| entry.code == "yue" && entry.whisper));
+        assert!(catalog.iter().all(|entry| !entry.code.is_empty()));
+    }
+
+    #[test]
+    fn adaptive_policy_defaults_to_auto_detection() {
+        let policy = TranscriptionLanguagePolicy::default();
+        assert!(policy.adaptive_detection);
+        assert_eq!(policy.preferred_language, LanguageCode::Auto);
+    }
 }

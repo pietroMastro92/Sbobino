@@ -363,13 +363,15 @@ async fn scan_automatic_import_inner(
     let finished_at = Utc::now().to_rfc3339();
     persist_scan_state(
         &state,
-        &settings,
-        &source_summaries,
-        &scan_collection.quarantined_items,
-        &scan_collection.successful_paths,
-        &reason,
-        trigger,
-        &finished_at,
+        ScanStatePersistence {
+            settings: &settings,
+            source_summaries: &source_summaries,
+            quarantined_updates: &scan_collection.quarantined_items,
+            successful_paths: &scan_collection.successful_paths,
+            reason: &reason,
+            trigger,
+            finished_at: &finished_at,
+        },
     )
     .await?;
 
@@ -483,16 +485,29 @@ fn collect_candidates(settings: &AppSettings) -> ScanCollection {
     output
 }
 
+struct ScanStatePersistence<'a> {
+    settings: &'a AppSettings,
+    source_summaries: &'a BTreeMap<String, SourceScanSummary>,
+    quarantined_updates: &'a [PendingQuarantineItem],
+    successful_paths: &'a HashSet<String>,
+    reason: &'a str,
+    trigger: &'a str,
+    finished_at: &'a str,
+}
+
 async fn persist_scan_state(
     state: &AppState,
-    settings: &AppSettings,
-    source_summaries: &BTreeMap<String, SourceScanSummary>,
-    quarantined_updates: &[PendingQuarantineItem],
-    successful_paths: &HashSet<String>,
-    reason: &str,
-    trigger: &str,
-    finished_at: &str,
+    persistence: ScanStatePersistence<'_>,
 ) -> Result<(), CommandError> {
+    let ScanStatePersistence {
+        settings,
+        source_summaries,
+        quarantined_updates,
+        successful_paths,
+        reason,
+        trigger,
+        finished_at,
+    } = persistence;
     let mut automation = settings.automation.clone();
     let mut next_statuses = Vec::with_capacity(automation.watched_sources.len());
 
@@ -1026,29 +1041,32 @@ mod tests {
         fs::write(root.join("lecture.m4a"), b"audio").expect("write audio");
         fs::write(root.join("notes.txt"), b"text").expect("write note");
 
-        let mut settings = AppSettings::default();
-        settings.automation = AutomaticImportSettings {
-            enabled: true,
-            run_scan_on_app_start: true,
-            scan_interval_minutes: 15,
-            allowed_extensions: vec!["m4a".to_string()],
-            watched_sources: vec![AutomaticImportSource {
-                id: "source_a".to_string(),
-                label: "Lectures".to_string(),
-                folder_path: root.to_string_lossy().to_string(),
+        let settings = AppSettings {
+            automation: AutomaticImportSettings {
                 enabled: true,
-                preset: AutomaticImportPreset::Lecture,
-                model: SpeechModel::Small,
-                language: LanguageCode::It,
-                workspace_id: Some("uni".to_string()),
-                recursive: true,
-                enable_ai_post_processing: false,
-                post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(),
-            }],
-            excluded_folders: Vec::new(),
-            source_statuses: Vec::new(),
-            recent_activity: Vec::new(),
-            quarantined_items: Vec::new(),
+                run_scan_on_app_start: true,
+                scan_interval_minutes: 15,
+                allowed_extensions: vec!["m4a".to_string()],
+                watched_sources: vec![AutomaticImportSource {
+                    id: "source_a".to_string(),
+                    label: "Lectures".to_string(),
+                    folder_path: root.to_string_lossy().to_string(),
+                    enabled: true,
+                    preset: AutomaticImportPreset::Lecture,
+                    model: SpeechModel::Small,
+                    language: LanguageCode::It,
+                    workspace_id: Some("uni".to_string()),
+                    recursive: true,
+                    enable_ai_post_processing: false,
+                    post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(
+                    ),
+                }],
+                excluded_folders: Vec::new(),
+                source_statuses: Vec::new(),
+                recent_activity: Vec::new(),
+                quarantined_items: Vec::new(),
+            },
+            ..AppSettings::default()
         };
 
         let scan = collect_candidates(&settings);
@@ -1071,29 +1089,32 @@ mod tests {
         let root = temp.path();
         fs::write(root.join("italian.m4a"), b"audio").expect("write audio");
 
-        let mut settings = AppSettings::default();
-        settings.automation = AutomaticImportSettings {
-            enabled: true,
-            run_scan_on_app_start: true,
-            scan_interval_minutes: 15,
-            allowed_extensions: vec!["m4a".to_string()],
-            watched_sources: vec![AutomaticImportSource {
-                id: "source_auto".to_string(),
-                label: "Italian Auto".to_string(),
-                folder_path: root.to_string_lossy().to_string(),
+        let settings = AppSettings {
+            automation: AutomaticImportSettings {
                 enabled: true,
-                preset: AutomaticImportPreset::General,
-                model: SpeechModel::LargeTurbo,
-                language: LanguageCode::Auto,
-                workspace_id: None,
-                recursive: true,
-                enable_ai_post_processing: false,
-                post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(),
-            }],
-            excluded_folders: Vec::new(),
-            source_statuses: Vec::new(),
-            recent_activity: Vec::new(),
-            quarantined_items: Vec::new(),
+                run_scan_on_app_start: true,
+                scan_interval_minutes: 15,
+                allowed_extensions: vec!["m4a".to_string()],
+                watched_sources: vec![AutomaticImportSource {
+                    id: "source_auto".to_string(),
+                    label: "Italian Auto".to_string(),
+                    folder_path: root.to_string_lossy().to_string(),
+                    enabled: true,
+                    preset: AutomaticImportPreset::General,
+                    model: SpeechModel::LargeTurbo,
+                    language: LanguageCode::Auto,
+                    workspace_id: None,
+                    recursive: true,
+                    enable_ai_post_processing: false,
+                    post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(
+                    ),
+                }],
+                excluded_folders: Vec::new(),
+                source_statuses: Vec::new(),
+                recent_activity: Vec::new(),
+                quarantined_items: Vec::new(),
+            },
+            ..AppSettings::default()
         };
 
         let scan = collect_candidates(&settings);

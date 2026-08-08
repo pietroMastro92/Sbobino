@@ -55,6 +55,8 @@ pub struct RuntimeTranscriptionFactory {
     runtime_source_policy: RuntimeSourcePolicy,
 }
 
+pub type SpeakerDiarizationRuntime = (Arc<dyn AudioTranscoder>, Arc<dyn SpeakerDiarizationEngine>);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeHealthMode {
     Full,
@@ -535,7 +537,7 @@ impl RuntimeTranscriptionFactory {
 
     pub fn build_speaker_diarization_runtime(
         &self,
-    ) -> Result<Option<(Arc<dyn AudioTranscoder>, Arc<dyn SpeakerDiarizationEngine>)>, String> {
+    ) -> Result<Option<SpeakerDiarizationRuntime>, String> {
         let settings = self.load_settings()?;
         let ffmpeg_path = self
             .resolve_transcription_binary_details(&settings.transcription.ffmpeg_path, "ffmpeg")
@@ -1747,24 +1749,33 @@ impl RuntimeTranscriptionFactory {
 
     fn managed_pyannote_python_candidates(&self) -> Vec<PathBuf> {
         let runtime_dir = self.managed_pyannote_runtime_dir();
-        #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
-        let mut candidates = vec![
-            self.managed_pyannote_python_dir()
-                .join("bin")
-                .join("python3"),
-            self.managed_pyannote_python_dir()
-                .join("bin")
-                .join("python"),
-            runtime_dir.join("venv").join("bin").join("python3"),
-            runtime_dir.join("venv").join("bin").join("python"),
-        ];
         #[cfg(target_os = "windows")]
         {
-            candidates.insert(0, self.managed_pyannote_python_dir().join("python.exe"));
-            candidates.insert(1, self.managed_pyannote_python_dir().join("python3.exe"));
-            candidates.push(runtime_dir.join("venv").join("Scripts").join("python.exe"));
+            vec![
+                self.managed_pyannote_python_dir().join("python.exe"),
+                self.managed_pyannote_python_dir().join("python3.exe"),
+                self.managed_pyannote_python_dir()
+                    .join("bin")
+                    .join("python3"),
+                self.managed_pyannote_python_dir()
+                    .join("bin")
+                    .join("python"),
+                runtime_dir.join("venv").join("Scripts").join("python.exe"),
+            ]
         }
-        candidates
+        #[cfg(not(target_os = "windows"))]
+        {
+            vec![
+                self.managed_pyannote_python_dir()
+                    .join("bin")
+                    .join("python3"),
+                self.managed_pyannote_python_dir()
+                    .join("bin")
+                    .join("python"),
+                runtime_dir.join("venv").join("bin").join("python3"),
+                runtime_dir.join("venv").join("bin").join("python"),
+            ]
+        }
     }
 
     fn install_bundled_pyannote_override_if_available(&self) -> Result<(), String> {
@@ -3130,16 +3141,18 @@ fn pyannote_runtime_layout_is_usable(runtime_dir: &Path) -> bool {
     }
 
     let python_dir = runtime_dir.join("python");
-    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
-    let mut python_candidates = vec![
+    #[cfg(target_os = "windows")]
+    let python_candidates = [
+        python_dir.join("python.exe"),
+        python_dir.join("python3.exe"),
         python_dir.join("bin").join("python3"),
         python_dir.join("bin").join("python"),
     ];
-    #[cfg(target_os = "windows")]
-    {
-        python_candidates.insert(0, python_dir.join("python.exe"));
-        python_candidates.insert(1, python_dir.join("python3.exe"));
-    }
+    #[cfg(not(target_os = "windows"))]
+    let python_candidates = [
+        python_dir.join("bin").join("python3"),
+        python_dir.join("bin").join("python"),
+    ];
     let python_ready = python_candidates
         .iter()
         .any(|candidate| is_runnable_binary_file(candidate));

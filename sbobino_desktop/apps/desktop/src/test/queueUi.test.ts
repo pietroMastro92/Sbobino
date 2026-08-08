@@ -126,4 +126,41 @@ describe("queue UI wiring", () => {
     expect(onRunSpeakerDiarization).not.toContain("onStartTranscription(");
     expect(onRunSpeakerDiarization).not.toContain("writeTrimmedAudio(");
   });
+
+  it("registers live speaker detection before stop and consumes only the matching saved artifact", () => {
+    const onToggleRealtimeSpeakerDetection = extractFunction(
+      appSource,
+      "onToggleRealtimeSpeakerDetection",
+    );
+    const onStopRealtime = extractFunction(appSource, "onStopRealtime");
+    const renderRealtime = extractFunction(appSource, "renderRealtime");
+
+    expect(onToggleRealtimeSpeakerDetection).toContain(
+      "speaker_diarization?.enabled",
+    );
+    expect(onToggleRealtimeSpeakerDetection).toContain(
+      "realtimeSpeakerDetectionRequestedRef.current",
+    );
+    const registrationIndex = onStopRealtime.indexOf(
+      "registerRealtimeSpeakerDetectionBeforeStop(",
+    );
+    const stopInvocationIndex = onStopRealtime.indexOf("await stopRealtime(");
+    const catchIndex = onStopRealtime.indexOf("catch (stopError)");
+    const rollbackIndex = onStopRealtime.indexOf(
+      "rollbackRealtimeSpeakerDetectionStop(",
+    );
+    expect(registrationIndex).toBeGreaterThan(-1);
+    expect(stopInvocationIndex).toBeGreaterThan(registrationIndex);
+    expect(catchIndex).toBeGreaterThan(stopInvocationIndex);
+    expect(rollbackIndex).toBeGreaterThan(catchIndex);
+    expect(appSource).toContain("subscribeRealtimeSaved((artifact) => {");
+    expect(appSource).toContain("consumeRealtimeSavedSpeakerDetection(");
+    expect(appSource).toContain("speakerDetection.matchedPendingJob");
+    expect(appSource).toContain("if (!artifact.audio_available)");
+    expect(appSource).toContain("runArtifactSpeakerDiarization(artifact.id)");
+    expect(renderRealtime).toContain(
+      "realtime-toolbar-button--speaker",
+    );
+    expect(renderRealtime).toContain('aria-pressed={realtimeSpeakerDetectionIsQueued}');
+  });
 });

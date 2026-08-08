@@ -26,13 +26,63 @@ pub fn normalize_transcript_segments(
         return merge_timed_segments(cleaned_segments);
     }
 
+    // Model-provided language markers are utterance boundaries. Keep them
+    // intact instead of letting the plain-text sentence splitter merge short
+    // neighbouring pieces and lose their per-language metadata.
+    if cleaned_segments
+        .iter()
+        .any(|segment| segment.language_code.is_some())
+    {
+        return infer_timings_for_language_marked_segments(cleaned_segments, total_audio_seconds);
+    }
+
     let normalized_text = cleaned_segments
         .iter()
         .map(|segment| segment.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
 
-    infer_segments_from_text(&normalized_text, total_audio_seconds)
+    let mut inferred = infer_segments_from_text(&normalized_text, total_audio_seconds);
+    for segment in &mut inferred {
+        if let Some(source) = cleaned_segments
+            .iter()
+            .find(|source| source.text.trim() == segment.text.trim())
+        {
+            segment.language_code = source.language_code.clone();
+            segment.language_confidence = source.language_confidence;
+        }
+    }
+    inferred
+}
+
+fn infer_timings_for_language_marked_segments(
+    mut segments: Vec<TimedSegment>,
+    total_audio_seconds: Option<f32>,
+) -> Vec<TimedSegment> {
+    let Some(total) = total_audio_seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+    else {
+        return segments;
+    };
+
+    let weights = segments
+        .iter()
+        .map(|segment| segment.text.split_whitespace().count().max(1) as f32)
+        .collect::<Vec<_>>();
+    let total_weight = weights.iter().sum::<f32>().max(1.0);
+    let mut cursor = 0.0_f32;
+
+    for (index, segment) in segments.iter_mut().enumerate() {
+        let duration = if index + 1 == weights.len() {
+            (total - cursor).max(0.0)
+        } else {
+            total * (weights[index] / total_weight)
+        };
+        segment.start_seconds = Some(cursor);
+        cursor = (cursor + duration).min(total);
+        segment.end_seconds = Some(cursor);
+    }
+
+    segments
 }
 
 fn sanitize_segments(segments: &[TimedSegment]) -> Vec<TimedSegment> {
@@ -63,6 +113,8 @@ fn sanitize_segments(segments: &[TimedSegment]) -> Vec<TimedSegment> {
                 end_seconds,
                 speaker_id: segment.speaker_id.clone(),
                 speaker_label: segment.speaker_label.clone(),
+                language_code: segment.language_code.clone(),
+                language_confidence: segment.language_confidence,
                 words,
             })
         })
@@ -122,6 +174,19 @@ fn merge_timed_segments(segments: Vec<TimedSegment>) -> Vec<TimedSegment> {
 }
 
 fn should_break_before_next(current: &TimedSegment, next: &TimedSegment) -> bool {
+    match (
+        current.language_code.as_deref(),
+        next.language_code.as_deref(),
+    ) {
+        (Some(current_language), Some(next_language))
+            if !current_language.eq_ignore_ascii_case(next_language) =>
+        {
+            return true;
+        }
+        (Some(_), None) | (None, Some(_)) => return true,
+        _ => {}
+    }
+
     let current_text = current.text.trim();
     let current_chars = current_text.chars().count();
     let combined_chars = current_chars + 1 + next.text.trim().chars().count();
@@ -164,6 +229,8 @@ fn merge_two_segments(left: TimedSegment, right: TimedSegment) -> TimedSegment {
         end_seconds,
         speaker_id,
         speaker_label,
+        language_code: left.language_code.or(right.language_code),
+        language_confidence: left.language_confidence.or(right.language_confidence),
         words,
     }
 }
@@ -209,6 +276,8 @@ fn infer_segments_from_text(
             end_seconds,
             speaker_id: None,
             speaker_label: None,
+            language_code: None,
+            language_confidence: None,
             words: Vec::new(),
         });
     }
@@ -436,5 +505,59 @@ mod tests {
             normalized.last().and_then(|segment| segment.end_seconds),
             Some(9.0)
         );
+    }
+
+    #[test]
+    fn keeps_adjacent_confirmed_language_changes_separate() {
+        let segments = vec![
+            TimedSegment {
+                text: "Ciao a tutti.".to_string(),
+                start_seconds: Some(0.0),
+                end_seconds: Some(1.0),
+                language_code: Some("it".to_string()),
+                ..TimedSegment::default()
+            },
+            TimedSegment {
+                text: "Hello everyone.".to_string(),
+                start_seconds: Some(1.0),
+                end_seconds: Some(2.0),
+                language_code: Some("en".to_string()),
+                ..TimedSegment::default()
+            },
+        ];
+
+        let normalized = normalize_transcript_segments("", &segments, Some(2.0));
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].language_code.as_deref(), Some("it"));
+        assert_eq!(normalized[1].language_code.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn preserves_untimed_language_marker_boundaries_when_inferring_timing() {
+        let segments = vec![
+            TimedSegment {
+                text: "Ciao".to_string(),
+                language_code: Some("it".to_string()),
+                ..TimedSegment::default()
+            },
+            TimedSegment {
+                text: "Hello".to_string(),
+                language_code: Some("en".to_string()),
+                ..TimedSegment::default()
+            },
+        ];
+
+        let normalized = normalize_transcript_segments("", &segments, Some(4.0));
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].text, "Ciao");
+        assert_eq!(normalized[0].language_code.as_deref(), Some("it"));
+        assert_eq!(normalized[0].start_seconds, Some(0.0));
+        assert_eq!(normalized[0].end_seconds, Some(2.0));
+        assert_eq!(normalized[1].text, "Hello");
+        assert_eq!(normalized[1].language_code.as_deref(), Some("en"));
+        assert_eq!(normalized[1].start_seconds, Some(2.0));
+        assert_eq!(normalized[1].end_seconds, Some(4.0));
     }
 }

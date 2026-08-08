@@ -1,7 +1,8 @@
 use std::fs;
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 use tempfile::tempdir;
+use tokio::sync::{Mutex, MutexGuard};
 
 use sbobino_application::SettingsRepository;
 use sbobino_domain::{LanguageCode, RemoteServiceConfig, RemoteServiceKind, SpeechModel};
@@ -11,16 +12,14 @@ fn enable_local_secure_storage_for_tests() {
     std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
 }
 
-fn secure_storage_test_guard() -> MutexGuard<'static, ()> {
+async fn secure_storage_test_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    LOCK.get_or_init(|| Mutex::new(())).lock().await
 }
 
 #[tokio::test]
 async fn load_creates_default_settings_when_file_is_missing() {
-    let _guard = secure_storage_test_guard();
+    let _guard = secure_storage_test_guard().await;
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("config").join("settings.json");
@@ -39,7 +38,7 @@ async fn load_creates_default_settings_when_file_is_missing() {
 
 #[tokio::test]
 async fn save_then_load_round_trips_settings() {
-    let _guard = secure_storage_test_guard();
+    let _guard = secure_storage_test_guard().await;
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
@@ -72,7 +71,7 @@ async fn save_then_load_round_trips_settings() {
 
 #[tokio::test]
 async fn save_then_load_persists_new_ai_provider_secrets() {
-    let _guard = secure_storage_test_guard();
+    let _guard = secure_storage_test_guard().await;
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
@@ -107,7 +106,7 @@ async fn save_then_load_persists_new_ai_provider_secrets() {
 
 #[tokio::test]
 async fn redacted_ai_updates_keep_secrets_until_explicitly_cleared() {
-    let _guard = secure_storage_test_guard();
+    let _guard = secure_storage_test_guard().await;
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
@@ -162,7 +161,7 @@ async fn redacted_ai_updates_keep_secrets_until_explicitly_cleared() {
 
 #[tokio::test]
 async fn save_then_load_preserves_structured_transcription_settings() {
-    let _guard = secure_storage_test_guard();
+    let _guard = secure_storage_test_guard().await;
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
@@ -198,7 +197,7 @@ async fn save_then_load_preserves_structured_transcription_settings() {
 
 #[tokio::test]
 async fn save_then_load_preserves_automatic_import_and_workspace_settings() {
-    let _guard = secure_storage_test_guard();
+    let _guard = secure_storage_test_guard().await;
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
@@ -264,7 +263,7 @@ async fn save_then_load_preserves_automatic_import_and_workspace_settings() {
 
 #[tokio::test]
 async fn load_backfills_legacy_automatic_import_source_model_and_language() {
-    let _guard = secure_storage_test_guard();
+    let _guard = secure_storage_test_guard().await;
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");

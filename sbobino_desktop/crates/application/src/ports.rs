@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use sbobino_domain::{
     AppSettings, ArtifactChatMessage, ArtifactKind, SpeakerTurn, TranscriptArtifact,
-    TranscriptionOutput, WhisperOptions,
+    TranscriptionLanguagePolicy, TranscriptionOutput, WhisperOptions,
 };
 
 use crate::{dto::SummaryFaq, ApplicationError};
@@ -21,7 +21,7 @@ pub trait SpeechToTextEngine: Send + Sync {
         &self,
         input_wav: &Path,
         model_filename: &str,
-        language_code: &str,
+        language_policy: &TranscriptionLanguagePolicy,
         options: &WhisperOptions,
         total_audio_seconds: Option<f32>,
         emit_partial: std::sync::Arc<dyn Fn(String) + Send + Sync>,
@@ -59,6 +59,18 @@ pub trait TranscriptEnhancer: Send + Sync {
 
     fn summary_direct_prompt_char_budget(&self) -> usize {
         14_000
+    }
+
+    fn prefers_single_pass_optimize(&self) -> bool {
+        false
+    }
+
+    fn optimize_chunk_concurrency_limit(&self) -> usize {
+        3
+    }
+
+    fn optimize_direct_prompt_char_budget(&self) -> usize {
+        3_200
     }
 
     fn emotion_direct_prompt_char_budget(&self) -> usize {

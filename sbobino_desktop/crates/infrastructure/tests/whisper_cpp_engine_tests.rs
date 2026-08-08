@@ -6,10 +6,17 @@ use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
-use sbobino_domain::WhisperOptions;
+use sbobino_domain::{LanguageCode, TranscriptionLanguagePolicy, WhisperOptions};
 use sbobino_infrastructure::adapters::whisper_cpp::WhisperCppEngine;
 
 const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
+
+fn transcription_policy(code: &str) -> TranscriptionLanguagePolicy {
+    TranscriptionLanguagePolicy {
+        preferred_language: LanguageCode::from_code(code),
+        adaptive_detection: true,
+    }
+}
 
 fn write_executable_script(path: &Path, content: &str) {
     std::fs::write(path, content).expect("failed to write script");
@@ -57,7 +64,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(move |line: String| {
@@ -120,7 +127,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(|_line: String| {}),
@@ -166,7 +173,7 @@ exit 2
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(|_line: String| {}),
@@ -238,7 +245,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(move |line: String| {
@@ -317,7 +324,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(move |line: String| {
@@ -405,7 +412,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &options,
             None,
             Arc::new(|_line: String| {}),
@@ -488,7 +495,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(move |line: String| {
@@ -571,7 +578,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(|_line: String| {}),
@@ -658,7 +665,7 @@ exit 1
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(|_line: String| {}),
@@ -723,7 +730,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(move |line: String| {
@@ -786,7 +793,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             Some(120.0),
             Arc::new(|_line: String| {}),
@@ -844,7 +851,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "it",
+            &transcription_policy("it"),
             &WhisperOptions::default(),
             Some(10.0),
             Arc::new(|_line: String| {}),
@@ -944,7 +951,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "it",
+            &transcription_policy("it"),
             &WhisperOptions {
                 translate_to_english: true,
                 no_context: true,
@@ -1020,7 +1027,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(move |line: String| {
@@ -1076,10 +1083,17 @@ if [ -n "$out" ]; then
   printf "hello world\n" > "${out}.txt"
   cat > "${out}.json" <<'EOF'
 {
+  "result": {
+    "language": "it",
+    "probability": 0.77,
+    "confidence": 0.88
+  },
   "transcription": [
     {
       "offsets": { "from": 0, "to": 1200 },
       "text": "hello world",
+      "probability": 0.66,
+      "confidence": 0.55,
       "tokens": [
         {
           "text": "hello",
@@ -1110,7 +1124,7 @@ exit 0
         .transcribe(
             &input_wav,
             "ggml-base.bin",
-            "en",
+            &transcription_policy("en"),
             &WhisperOptions::default(),
             None,
             Arc::new(|_line: String| {}),
@@ -1126,6 +1140,8 @@ exit 0
     assert_eq!(segment.text, "hello world");
     assert_eq!(segment.start_seconds, Some(0.0));
     assert_eq!(segment.end_seconds, Some(1.2));
+    assert_eq!(segment.language_code.as_deref(), Some("it"));
+    assert_eq!(segment.language_confidence, None);
     assert_eq!(segment.words.len(), 2);
     assert_eq!(segment.words[0].text, "hello");
     assert_eq!(segment.words[0].start_seconds, Some(0.0));
@@ -1135,4 +1151,93 @@ exit 0
     assert_eq!(segment.words[1].start_seconds, Some(0.6));
     assert_eq!(segment.words[1].end_seconds, Some(1.2));
     assert_eq!(segment.words[1].confidence, Some(0.42));
+}
+
+#[tokio::test]
+async fn transcribe_preserves_explicit_language_probability_without_token_aliases() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    std::fs::write(&input_wav, b"RIFF....WAVE").expect("failed to create input wav");
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-of" ]; then
+    shift
+    out="$1"
+  fi
+  shift
+done
+
+if [ -n "$out" ]; then
+  printf "ciao mondo\n" > "${out}.txt"
+  cat > "${out}.json" <<'EOF'
+{
+  "result": {
+    "language": "it",
+    "language_probability": 0.73,
+    "probability": 0.99,
+    "confidence": 0.88
+  },
+  "transcription": [
+    {
+      "offsets": { "from": 0, "to": 1000 },
+      "text": "ciao mondo",
+      "probability": 0.21,
+      "confidence": 0.12,
+      "tokens": [
+        {
+          "text": "ciao",
+          "offsets": { "from": 0, "to": 450 },
+          "p": 0.31
+        },
+        {
+          "text": "mondo",
+          "offsets": { "from": 500, "to": 1000 },
+          "p": 0.41
+        }
+      ]
+    }
+  ]
+}
+EOF
+fi
+exit 0
+"#,
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            &transcription_policy("en"),
+            &WhisperOptions::default(),
+            None,
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("transcription should succeed");
+
+    let segment = transcript
+        .segments
+        .first()
+        .expect("explicit language fixture should produce one segment");
+    assert_eq!(segment.language_code.as_deref(), Some("it"));
+    assert_eq!(segment.language_confidence, Some(0.73));
+    assert_eq!(segment.words[0].confidence, Some(0.31));
+    assert_eq!(segment.words[1].confidence, Some(0.41));
 }

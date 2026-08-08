@@ -156,6 +156,10 @@ pub fn collapse_consecutive_repeated_segments(segments: &[TimedSegment]) -> Vec<
                 if previous.speaker_label.is_none() {
                     previous.speaker_label = next.speaker_label.clone();
                 }
+                if previous.language_code.is_none() {
+                    previous.language_code = next.language_code.clone();
+                    previous.language_confidence = next.language_confidence;
+                }
                 continue;
             }
         }
@@ -171,6 +175,14 @@ fn should_collapse_segment_pair(left: &TimedSegment, right: &TimedSegment) -> bo
         || !is_substantive_duplicate_candidate(&right.text)
     {
         return false;
+    }
+    if let (Some(left_language), Some(right_language)) = (
+        normalized_optional(left.language_code.as_deref()),
+        normalized_optional(right.language_code.as_deref()),
+    ) {
+        if left_language != right_language {
+            return false;
+        }
     }
 
     if duplicate_key(&left.text) != duplicate_key(&right.text) {

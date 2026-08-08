@@ -48,6 +48,27 @@ jobs:
             -OutputZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
             -SidecarDir (Join-Path $PWD "src-tauri\binaries")
 
+      - name: Cache pinned Parakeet readiness model
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/parakeet-readiness-model
+          key: parakeet-readiness-tdt-0.6b-v3-q4-k-993d73feb4206dadda865ab25bd64b50c48dc4d013c3bf6126a721f28b1d5ee8
+
+      - name: Download pinned Parakeet readiness model
+        shell: pwsh
+        run: |
+          $modelRoot = Join-Path $env:RUNNER_TEMP "parakeet-readiness-model"
+          $model = Join-Path $modelRoot "tdt-0.6b-v3-q4_k.gguf"
+          New-Item -ItemType Directory -Force $modelRoot | Out-Null
+          $expected = "993d73feb4206dadda865ab25bd64b50c48dc4d013c3bf6126a721f28b1d5ee8"
+          if (-not (Test-Path -PathType Leaf $model) -or
+              (Get-FileHash -Algorithm SHA256 $model).Hash.ToLowerInvariant() -ne $expected) {
+            Invoke-WebRequest -Uri "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/bf0af9f425fa01809cadec671b3cb672709d13e9/tdt-0.6b-v3-q4_k.gguf?download=true" -OutFile $model
+          }
+          if ((Get-FileHash -Algorithm SHA256 $model).Hash.ToLowerInvariant() -ne $expected) {
+            throw "pinned Parakeet readiness model checksum mismatch"
+          }
+
       - name: Compile all Windows Rust tests
         run: cargo test --workspace --target x86_64-pc-windows-msvc --no-run
         working-directory: sbobino_desktop
@@ -121,7 +142,8 @@ jobs:
           $version = (Get-Content package.json | ConvertFrom-Json).version
           ../../scripts/windows_release_readiness.ps1 `
             -Version $version `
-            -StagingDir (Join-Path $env:RUNNER_TEMP "sbobino-windows")
+            -StagingDir (Join-Path $env:RUNNER_TEMP "sbobino-windows") `
+            -ParakeetModelPath (Join-Path $env:RUNNER_TEMP "parakeet-readiness-model\tdt-0.6b-v3-q4_k.gguf")
 
       - name: Smoke install and launch NSIS package
         shell: pwsh

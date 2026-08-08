@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Child;
@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
+use sbobino_domain::{LanguageCode, TimedSegment};
 
 #[cfg(target_os = "windows")]
 use crate::background_process::std_background_command;
@@ -29,11 +30,16 @@ struct StreamState {
     paused: bool,
     running: bool,
     session_dir: Option<PathBuf>,
+    segments: Vec<TimedSegment>,
+    language_detections: Vec<(String, f32)>,
+    session_started_at: Option<Instant>,
+    last_segment_end_seconds: f32,
 }
 
 #[derive(Debug, Clone)]
 pub struct WhisperStreamStopResult {
     pub transcript: String,
+    pub segments: Vec<TimedSegment>,
     pub saved_audio_path: Option<PathBuf>,
 }
 
@@ -191,6 +197,48 @@ impl WhisperStreamEngine {
             )
     }
 
+    fn parse_language_detection(text: &str) -> Option<(String, f32)> {
+        let marker = "auto-detected language:";
+        let start = text.to_ascii_lowercase().find(marker)? + marker.len();
+        let remainder = text[start..].trim();
+        let code = remainder.split_whitespace().next()?.trim();
+        let code = LanguageCode::try_from_code(code)
+            .ok()
+            .filter(|language| !language.is_auto() && language.as_code() != "und")?
+            .as_code()
+            .to_string();
+        let probability = remainder
+            .split_once("p =")
+            .or_else(|| remainder.split_once("p="))
+            .and_then(|(_, value)| value.trim().trim_start_matches('(').split(')').next())
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        Some((code, probability))
+    }
+
+    fn confirmed_language(state: &StreamState) -> Option<(String, f32)> {
+        let last = state
+            .language_detections
+            .iter()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>();
+        if last.len() < 2 || last[0].0 != last[1].0 {
+            return None;
+        }
+        let mean = (last[0].1 + last[1].1) / 2.0;
+        (mean >= 0.60).then(|| (last[0].0.clone(), mean))
+    }
+
+    fn elapsed_seconds(state: &StreamState) -> f32 {
+        state
+            .session_started_at
+            .map(|started| started.elapsed().as_secs_f32())
+            .unwrap_or(state.last_segment_end_seconds)
+    }
+
     fn should_store_diagnostic(text: &str) -> bool {
         let lower = text.to_ascii_lowercase();
         lower.contains("failed")
@@ -224,7 +272,27 @@ impl WhisperStreamEngine {
         }
 
         let preview = state.preview.trim().to_string();
-        let _ = Self::commit_line(state, preview);
+        if Self::commit_line(state, preview.clone()).is_some() {
+            let end = Self::elapsed_seconds(state).max(state.last_segment_end_seconds);
+            let start = state.last_segment_end_seconds.min(end);
+            let (language_code, language_confidence) = Self::confirmed_language(state)
+                .map(|(code, confidence)| (Some(code), Some(confidence)))
+                .unwrap_or((None, None));
+            if language_code.is_some() {
+                state.language_detections.clear();
+            }
+            state.segments.push(TimedSegment {
+                text: preview,
+                start_seconds: Some(start),
+                end_seconds: Some(end),
+                speaker_id: None,
+                speaker_label: None,
+                language_code,
+                language_confidence,
+                words: Vec::new(),
+            });
+            state.last_segment_end_seconds = end;
+        }
     }
 
     fn spawn_reader_task<R>(
@@ -247,6 +315,17 @@ impl WhisperStreamEngine {
                     let is_preview = raw_line.contains("[2K]") || raw_line.contains("\u{001b}[2K");
                     let cleaned = Self::clean_line(&raw_line);
                     if cleaned.is_empty() {
+                        return;
+                    }
+
+                    if let Some((language, probability)) = Self::parse_language_detection(&cleaned)
+                    {
+                        let mut state = shared_state.lock().await;
+                        state.language_detections.push((language, probability));
+                        if state.language_detections.len() > 8 {
+                            let excess = state.language_detections.len() - 8;
+                            state.language_detections.drain(0..excess);
+                        }
                         return;
                     }
 
@@ -284,16 +363,41 @@ impl WhisperStreamEngine {
                             text: cleaned,
                             start_seconds: None,
                             end_seconds: None,
+                            language_code: None,
+                            language_confidence: None,
                         });
                         return;
                     }
 
                     if let Some(kind) = Self::commit_line(&mut state, cleaned.clone()) {
+                        let detected_language = Self::confirmed_language(&state);
+                        if detected_language.is_some() {
+                            state.language_detections.clear();
+                        }
+                        let end_seconds = Self::elapsed_seconds(&state)
+                            .max(state.last_segment_end_seconds + 0.001);
+                        let start_seconds = state.last_segment_end_seconds.min(end_seconds);
+                        let (language_code, language_confidence) = detected_language
+                            .map(|(code, confidence)| (Some(code), Some(confidence)))
+                            .unwrap_or((None, None));
+                        state.segments.push(TimedSegment {
+                            text: cleaned.clone(),
+                            start_seconds: Some(start_seconds),
+                            end_seconds: Some(end_seconds),
+                            speaker_id: None,
+                            speaker_label: None,
+                            language_code: language_code.clone(),
+                            language_confidence,
+                            words: Vec::new(),
+                        });
+                        state.last_segment_end_seconds = end_seconds;
                         emit_delta(RealtimeDelta {
                             kind,
                             text: cleaned,
-                            start_seconds: None,
-                            end_seconds: None,
+                            start_seconds: Some(start_seconds),
+                            end_seconds: Some(end_seconds),
+                            language_code,
+                            language_confidence,
                         });
                     }
                 };
@@ -385,10 +489,8 @@ impl WhisperStreamEngine {
             .stderr(std::process::Stdio::piped())
             .current_dir(&session_dir);
 
-        let language_code = language_code.trim();
-        if !language_code.is_empty() {
-            command.arg("-l").arg(language_code);
-        }
+        let _preferred_language = language_code;
+        command.arg("-l").arg("auto");
 
         if let Some(bin_dir) = self.runtime_bin_dir() {
             let lib_dir = self.runtime_lib_dir().filter(|path| path.is_dir());
@@ -427,6 +529,10 @@ impl WhisperStreamEngine {
         state.running = true;
         state.paused = false;
         state.session_dir = Some(session_dir);
+        state.segments.clear();
+        state.language_detections.clear();
+        state.session_started_at = Some(Instant::now());
+        state.last_segment_end_seconds = 0.0;
         drop(state);
 
         let reader_tasks = vec![
@@ -521,11 +627,15 @@ impl WhisperStreamEngine {
 
         let session_dir = state.session_dir.take();
         let consolidated = state.lines.join("\n");
+        let segments = state.segments.clone();
+        state.session_started_at = None;
+        state.language_detections.clear();
         drop(state);
         let saved_audio_path = Self::await_saved_audio_path(session_dir.as_deref()).await;
 
         Ok(WhisperStreamStopResult {
             transcript: consolidated,
+            segments,
             saved_audio_path,
         })
     }
@@ -559,6 +669,9 @@ impl WhisperStreamEngine {
             .map(ToString::to_string)
             .collect();
         state.preview.clear();
+        state.segments.clear();
+        state.language_detections.clear();
+        state.last_segment_end_seconds = 0.0;
     }
 
     pub async fn snapshot_text(&self) -> String {
@@ -575,5 +688,36 @@ impl WhisperStreamEngine {
         state.preview.clear();
         state.diagnostics.clear();
         state.session_dir = None;
+        state.segments.clear();
+        state.language_detections.clear();
+        state.session_started_at = None;
+        state.last_segment_end_seconds = 0.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StreamState, WhisperStreamEngine};
+
+    #[test]
+    fn language_detection_requires_two_agreeing_windows() {
+        let mut state = StreamState::default();
+        state.language_detections.push(("it".to_string(), 0.7));
+        assert!(WhisperStreamEngine::confirmed_language(&state).is_none());
+        state.language_detections.push(("it".to_string(), 0.8));
+        assert_eq!(
+            WhisperStreamEngine::confirmed_language(&state),
+            Some(("it".to_string(), 0.75))
+        );
+        state.language_detections.push(("en".to_string(), 0.9));
+        assert!(WhisperStreamEngine::confirmed_language(&state).is_none());
+    }
+
+    #[test]
+    fn parses_fragmented_whisper_language_log() {
+        let parsed = WhisperStreamEngine::parse_language_detection(
+            "whisper_full_with_state: auto-detected language: en (p = 0.83)",
+        );
+        assert_eq!(parsed, Some(("en".to_string(), 0.83)));
     }
 }

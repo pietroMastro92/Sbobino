@@ -22,6 +22,29 @@ use crate::{error::CommandError, state::AppState};
 const REALTIME_INPUT_PATH: &str = "realtime://microphone";
 const REALTIME_SOURCE_LABEL: &str = "Live microphone";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParakeetLiveLibraryPlatform {
+    MacOs,
+    Windows,
+}
+
+impl ParakeetLiveLibraryPlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::MacOs
+        }
+    }
+
+    fn library_filename(self) -> &'static str {
+        match self {
+            Self::MacOs => "libparakeet.dylib",
+            Self::Windows => "parakeet.dll",
+        }
+    }
+}
+
 fn resolve_realtime_engine(
     state: &AppState,
 ) -> Result<sbobino_infrastructure::adapters::whisper_stream::WhisperStreamEngine, CommandError> {
@@ -87,30 +110,59 @@ fn resolve_parakeet_live_runtime_paths(
 }
 
 pub(crate) fn resolve_parakeet_live_library_path(parakeet_cli_path: impl AsRef<Path>) -> PathBuf {
+    resolve_parakeet_live_library_path_for_platform(
+        parakeet_cli_path,
+        ParakeetLiveLibraryPlatform::current(),
+    )
+}
+
+fn resolve_parakeet_live_library_path_for_platform(
+    parakeet_cli_path: impl AsRef<Path>,
+    platform: ParakeetLiveLibraryPlatform,
+) -> PathBuf {
     let cli_path = parakeet_cli_path.as_ref();
     let Some(bin_dir) = cli_path.parent() else {
-        return PathBuf::from("libparakeet.dylib");
+        return PathBuf::from(platform.library_filename());
     };
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
-        // Managed install layout: <root>/bin/parakeet-cli -> <root>/lib/libparakeet.dylib
-        candidates.push(bin_dir.join("../lib/libparakeet.dylib"));
-        if let Some(parent) = bin_dir.parent() {
-            candidates.push(parent.join("lib/libparakeet.dylib"));
-            candidates.push(parent.join("libparakeet.dylib"));
-            candidates.push(parent.join("../lib/libparakeet.dylib"));
+    match platform {
+        ParakeetLiveLibraryPlatform::Windows => {
+            // Windows packages the DLL both beside the CLI and under runtime/lib.
+            candidates.push(bin_dir.join("parakeet.dll"));
+            if bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
+                candidates.push(bin_dir.join("../lib/parakeet.dll"));
+                if let Some(parent) = bin_dir.parent() {
+                    candidates.push(parent.join("lib/parakeet.dll"));
+                    candidates.push(parent.join("parakeet.dll"));
+                    candidates.push(parent.join("../lib/parakeet.dll"));
+                }
+            } else if let Some(parent) = bin_dir.parent() {
+                candidates.push(parent.join("lib/parakeet.dll"));
+                candidates.push(parent.join("parakeet.dll"));
+            }
         }
-    } else {
-        candidates.push(bin_dir.join("libparakeet.dylib"));
-        if let Some(parent) = bin_dir.parent() {
-            candidates.push(parent.join("lib/libparakeet.dylib"));
-            candidates.push(parent.join("libparakeet.dylib"));
+        ParakeetLiveLibraryPlatform::MacOs => {
+            if bin_dir.file_name().and_then(|name| name.to_str()) == Some("bin") {
+                // Managed install layout: <root>/bin/parakeet-cli -> <root>/lib/libparakeet.dylib
+                candidates.push(bin_dir.join("../lib/libparakeet.dylib"));
+                if let Some(parent) = bin_dir.parent() {
+                    candidates.push(parent.join("lib/libparakeet.dylib"));
+                    candidates.push(parent.join("libparakeet.dylib"));
+                    candidates.push(parent.join("../lib/libparakeet.dylib"));
+                }
+            } else {
+                candidates.push(bin_dir.join("libparakeet.dylib"));
+                if let Some(parent) = bin_dir.parent() {
+                    candidates.push(parent.join("lib/libparakeet.dylib"));
+                    candidates.push(parent.join("libparakeet.dylib"));
+                }
+            }
         }
     }
     if let Some(parent) = cli_path.parent() {
-        candidates.push(parent.join("libparakeet.dylib"));
+        candidates.push(parent.join(platform.library_filename()));
         if let Some(grandparent) = parent.parent() {
-            candidates.push(grandparent.join("lib/libparakeet.dylib"));
+            candidates.push(grandparent.join("lib").join(platform.library_filename()));
         }
     }
     let mut seen: Vec<PathBuf> = Vec::new();
@@ -130,22 +182,12 @@ pub(crate) fn resolve_parakeet_live_library_path(parakeet_cli_path: impl AsRef<P
     // message that points to the expected path.
     seen.into_iter()
         .next()
-        .unwrap_or_else(|| bin_dir.join("libparakeet.dylib"))
+        .unwrap_or_else(|| bin_dir.join(platform.library_filename()))
 }
 
 pub(crate) fn parakeet_live_target_lang(language: LanguageCode) -> &'static str {
-    match language {
-        LanguageCode::Auto => "auto",
-        LanguageCode::En => "en",
-        LanguageCode::It => "it",
-        LanguageCode::Fr => "fr",
-        LanguageCode::De => "de",
-        LanguageCode::Es => "es",
-        LanguageCode::Pt => "pt",
-        LanguageCode::Zh => "zh",
-        // Nemotron's locale dictionary uses ja-JP, not bare ja.
-        LanguageCode::Ja => "ja-JP",
-    }
+    let _preferred_language = language;
+    "auto"
 }
 
 pub(crate) fn select_parakeet_live_model(
@@ -299,9 +341,23 @@ fn emit_realtime_progress(
 fn build_realtime_artifact(
     input: RealtimeArtifactInput,
 ) -> Result<TranscriptArtifact, ApplicationError> {
+    let transcription_output = TranscriptionOutput {
+        text: input.transcript.clone(),
+        segments: input.segments.clone(),
+    };
+    let processing_language = transcription_output.processing_language_code();
     let mut metadata = BTreeMap::new();
     metadata.insert("kind".to_string(), "realtime".to_string());
-    metadata.insert("language".to_string(), input.language_code.clone());
+    metadata.insert("language".to_string(), processing_language.clone());
+    metadata.insert(
+        "preferred_language".to_string(),
+        input.language_code.clone(),
+    );
+    metadata.insert("language_detection_version".to_string(), "1".to_string());
+    metadata.insert(
+        "detected_languages".to_string(),
+        transcription_output.detected_languages_json(),
+    );
     metadata.insert("model".to_string(), input.model_filename.clone());
     if let Some(elapsed_seconds) = input.elapsed_seconds {
         metadata.insert("duration_seconds".to_string(), elapsed_seconds.to_string());
@@ -317,11 +373,7 @@ fn build_realtime_artifact(
     if !input.segments.is_empty() {
         metadata.insert(
             "timeline_v2".to_string(),
-            TranscriptionOutput {
-                text: input.transcript.clone(),
-                segments: input.segments.clone(),
-            }
-            .timeline_v2_metadata_json(),
+            transcription_output.timeline_v2_metadata_json(),
         );
     }
 
@@ -352,7 +404,7 @@ fn build_realtime_artifact(
     artifact.audio_duration_seconds = input.elapsed_seconds.map(|value| value as f32);
     artifact.processing_engine = Some(input.processing_engine);
     artifact.processing_model = Some(input.model_filename);
-    artifact.processing_language = Some(input.language_code);
+    artifact.processing_language = Some(processing_language);
     if let Some(path) = input.saved_audio_path.as_ref() {
         artifact.set_source_external_path(path.to_string_lossy().to_string());
     }
@@ -393,7 +445,18 @@ mod artifact_tests {
             artifact.processing_model.as_deref(),
             Some("ggml-large-v3-turbo.bin")
         );
-        assert_eq!(artifact.processing_language.as_deref(), Some("it"));
+        assert_eq!(artifact.processing_language.as_deref(), Some("und"));
+        assert_eq!(
+            artifact
+                .metadata
+                .get("preferred_language")
+                .map(String::as_str),
+            Some("it")
+        );
+        assert_eq!(
+            artifact.metadata.get("language").map(String::as_str),
+            Some("und")
+        );
         assert_eq!(artifact.audio_duration_seconds, Some(3725.0));
         assert_eq!(
             artifact
@@ -442,6 +505,8 @@ mod artifact_tests {
                 end_seconds: Some(2.5),
                 speaker_id: None,
                 speaker_label: None,
+                language_code: None,
+                language_confidence: None,
                 words: Vec::new(),
             }],
             saved_audio_path: None,
@@ -534,10 +599,9 @@ pub async fn start_realtime(
 
     *state.realtime.active_job_id.lock().await = Some(job_id.clone());
     *state.realtime.session_name.lock().await = Some(session_title.clone());
-    *state.realtime.language_code.lock().await = match engine_kind.clone() {
-        TranscriptionEngine::WhisperCpp => language.as_whisper_code().to_string(),
-        TranscriptionEngine::ParakeetCpp => parakeet_live_target_lang(language.clone()).to_string(),
-    };
+    // Persist the user's preference separately from the engine's runtime flag.
+    // Both live engines are started in automatic detection mode.
+    *state.realtime.language_code.lock().await = language.as_code().to_string();
     *state.realtime.active_engine.lock().await = engine_kind.clone();
     *state.realtime.model.lock().await = Some(model.clone());
     *state.realtime.language.lock().await = Some(language.clone());
@@ -803,7 +867,7 @@ impl RealtimeEngineHandle {
                 let result = engine.stop().await?;
                 Ok(RealtimeStopResult {
                     transcript: result.transcript,
-                    segments: Vec::new(),
+                    segments: result.segments,
                     saved_audio_path: result.saved_audio_path,
                 })
             }
@@ -1169,7 +1233,10 @@ mod tests {
         std::fs::write(&lib, b"lib").expect("lib");
 
         assert_eq!(
-            resolve_parakeet_live_library_path(&cli),
+            resolve_parakeet_live_library_path_for_platform(
+                &cli,
+                ParakeetLiveLibraryPlatform::MacOs,
+            ),
             lib.canonicalize().expect("canonical lib")
         );
     }
@@ -1187,7 +1254,10 @@ mod tests {
         std::fs::write(&lib, b"lib").expect("lib");
 
         assert_eq!(
-            resolve_parakeet_live_library_path(&cli),
+            resolve_parakeet_live_library_path_for_platform(
+                &cli,
+                ParakeetLiveLibraryPlatform::MacOs,
+            ),
             lib.canonicalize().expect("canonical lib")
         );
     }
@@ -1203,8 +1273,43 @@ mod tests {
         std::fs::write(&lib, b"lib").expect("lib");
 
         assert_eq!(
-            resolve_parakeet_live_library_path(&cli),
+            resolve_parakeet_live_library_path_for_platform(
+                &cli,
+                ParakeetLiveLibraryPlatform::MacOs,
+            ),
             lib.canonicalize().expect("canonical lib")
+        );
+    }
+
+    #[test]
+    fn parakeet_live_library_resolution_supports_windows_packaged_runtime_layout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let bin_dir = temp.path().join("runtime/bin");
+        let lib_dir = temp.path().join("runtime/lib");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        std::fs::create_dir_all(&lib_dir).expect("lib dir");
+        let cli = bin_dir.join("parakeet-cli.exe");
+        let bin_lib = bin_dir.join("parakeet.dll");
+        std::fs::write(&cli, b"cli").expect("cli");
+        std::fs::write(&bin_lib, b"lib").expect("bin lib");
+
+        assert_eq!(
+            resolve_parakeet_live_library_path_for_platform(
+                &cli,
+                ParakeetLiveLibraryPlatform::Windows,
+            ),
+            bin_lib.canonicalize().expect("canonical bin lib")
+        );
+
+        std::fs::remove_file(&bin_lib).expect("remove bin lib");
+        let lib = lib_dir.join("parakeet.dll");
+        std::fs::write(&lib, b"lib").expect("runtime lib");
+        assert_eq!(
+            resolve_parakeet_live_library_path_for_platform(
+                &cli,
+                ParakeetLiveLibraryPlatform::Windows,
+            ),
+            lib.canonicalize().expect("canonical runtime lib")
         );
     }
 
@@ -1216,7 +1321,10 @@ mod tests {
         let cli = bin_dir.join("parakeet-cli");
         std::fs::write(&cli, b"cli").expect("cli");
 
-        let resolved = resolve_parakeet_live_library_path(&cli);
+        let resolved = resolve_parakeet_live_library_path_for_platform(
+            &cli,
+            ParakeetLiveLibraryPlatform::MacOs,
+        );
 
         assert!(
             resolved.ends_with("lib/libparakeet.dylib"),
@@ -1224,5 +1332,16 @@ mod tests {
             resolved.display()
         );
         assert!(!resolved.exists());
+
+        let windows_resolved = resolve_parakeet_live_library_path_for_platform(
+            &cli,
+            ParakeetLiveLibraryPlatform::Windows,
+        );
+        assert!(
+            windows_resolved.ends_with("parakeet.dll"),
+            "{}",
+            windows_resolved.display()
+        );
+        assert!(!windows_resolved.exists());
     }
 }

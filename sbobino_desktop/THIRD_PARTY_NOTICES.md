@@ -19,6 +19,7 @@ Versions below match the **default** values in the packaging scripts at the time
 | **Python** (embedded stdlib + venv layout for pyannote) | `3.11.x` from build host (`PYTHON_VERSION=3.11`) | [`scripts/setup_bundled_pyannote.sh`](scripts/setup_bundled_pyannote.sh) |
 | **pyannote.audio** (pip pin in bundled runtime) | `4.0.4` | Same script — `pip install "pyannote.audio==4.0.4"` (pulls PyTorch and other dependencies under their respective licenses) |
 | **Speaker diarization pipeline (weights + config)** | Latest `main` at clone time (no commit pin in script) | Same script — default `https://huggingface.co/pyannote-community/speaker-diarization-community-1` |
+| **Noto Sans** (embedded PDF export font) | Google Fonts variable font from `ofl/notosans` | [`apps/desktop/src-tauri/assets/fonts/NotoSans[wdth,wght].ttf`](apps/desktop/src-tauri/assets/fonts/NotoSans%5Bwdth%2Cwght%5D.ttf); full OFL text is bundled from [`apps/desktop/src-tauri/resources/licenses/NotoSans-OFL.txt`](apps/desktop/src-tauri/resources/licenses/NotoSans-OFL.txt) |
 
 When you cut a release, **update this file** if you change any of the above pins, URLs, or checksums.
 
@@ -34,6 +35,7 @@ When you cut a release, **update this file** if you change any of the above pins
 | Python | [python.org](https://www.python.org/) | PSF License Agreement | [https://docs.python.org/3/license.html](https://docs.python.org/3/license.html) |
 | pyannote.audio | [pyannote/pyannote-audio](https://github.com/pyannote/pyannote-audio) | MIT (verify on the release you install) | Repository `LICENSE` |
 | PyTorch, torchcodec, and other pip dependencies | PyTorch / respective authors | Mostly BSD-style and similar permissive licenses; **verify** with `pip show` / upstream repos for the exact wheels you ship | [PyTorch](https://github.com/pytorch/pytorch), [torchcodec](https://github.com/pytorch/torchcodec) |
+| Noto Sans | [Google Fonts / Noto Sans](https://github.com/google/fonts/tree/main/ofl/notosans) | SIL Open Font License 1.1 | Bundled [`NotoSans-OFL.txt`](apps/desktop/src-tauri/resources/licenses/NotoSans-OFL.txt) |
 | **Diarization model** `pyannote-community/speaker-diarization-community-1` | [Hugging Face model card](https://huggingface.co/pyannote-community/speaker-diarization-community-1) | **CC-BY-4.0** (stated in model card metadata) | Model card + [CC BY 4.0 legal text](https://creativecommons.org/licenses/by/4.0/legalcode) |
 | **Parakeet GGUF ASR models** `mudler/parakeet-cpp-gguf` | [Hugging Face model card](https://huggingface.co/mudler/parakeet-cpp-gguf) | **CC-BY-4.0** (stated in model card metadata; weights are derived from NVIDIA Parakeet models) | Model card + [CC BY 4.0 legal text](https://creativecommons.org/licenses/by/4.0/legalcode) |
 | Rust crates (e.g. Tauri, SQLite via `rusqlite`, `ring`, etc.) | crates.io / respective repos | Per-crate licenses in `Cargo.toml` and `Cargo.lock` | Regenerate or inspect with `cargo license` (third-party tool) if needed |

@@ -16,7 +16,7 @@ use sbobino_application::{
 use sbobino_domain::{
     ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel,
     SpeakerTurn, SpeechModel, TimedSegment, TranscriptArtifact, TranscriptionEngine,
-    TranscriptionOutput, WhisperOptions,
+    TranscriptionLanguagePolicy, TranscriptionOutput, WhisperOptions,
 };
 
 const HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY: &str = "has_optimized_transcript";
@@ -46,7 +46,7 @@ impl SpeechToTextEngine for MockSpeechEngine {
         &self,
         _input_wav: &Path,
         _model_filename: &str,
-        _language_code: &str,
+        _language_policy: &TranscriptionLanguagePolicy,
         _options: &WhisperOptions,
         _total_audio_seconds: Option<f32>,
         _emit_partial: Arc<dyn Fn(String) + Send + Sync>,
@@ -76,7 +76,7 @@ impl SpeechToTextEngine for RecordingSpeechEngine {
         &self,
         _input_wav: &Path,
         model_filename: &str,
-        language_code: &str,
+        language_policy: &TranscriptionLanguagePolicy,
         _options: &WhisperOptions,
         _total_audio_seconds: Option<f32>,
         _emit_partial: Arc<dyn Fn(String) + Send + Sync>,
@@ -87,7 +87,7 @@ impl SpeechToTextEngine for RecordingSpeechEngine {
             .expect("recording speech calls lock poisoned")
             .push(RecordingSpeechCall {
                 model_filename: model_filename.to_string(),
-                language_code: language_code.to_string(),
+                language_code: language_policy.preferred_language.as_code().to_string(),
             });
 
         Ok(TranscriptionOutput {
@@ -98,6 +98,8 @@ impl SpeechToTextEngine for RecordingSpeechEngine {
                 end_seconds: Some(1.0),
                 speaker_id: None,
                 speaker_label: None,
+                language_code: None,
+                language_confidence: None,
                 words: Vec::new(),
             }],
         })
@@ -123,19 +125,26 @@ impl SpeakerDiarizationEngine for MockSpeakerDiarizer {
 #[derive(Default)]
 struct MockEnhancer {
     optimize_calls: Mutex<usize>,
+    optimize_inputs: Mutex<Vec<(String, String)>>,
     summarize_calls: Mutex<usize>,
+    summarize_languages: Mutex<Vec<String>>,
+    prompts: Mutex<Vec<String>>,
     fail_optimize: bool,
     fail_summarize: bool,
 }
 
 #[async_trait]
 impl TranscriptEnhancer for MockEnhancer {
-    async fn optimize(&self, text: &str, _language_code: &str) -> Result<String, ApplicationError> {
+    async fn optimize(&self, text: &str, language_code: &str) -> Result<String, ApplicationError> {
         let mut optimize_calls = self
             .optimize_calls
             .lock()
             .expect("enhancer optimize lock poisoned");
         *optimize_calls += 1;
+        self.optimize_inputs
+            .lock()
+            .expect("enhancer optimize inputs lock poisoned")
+            .push((text.to_string(), language_code.to_string()));
         if self.fail_optimize {
             return Err(ApplicationError::PostProcessing(
                 "optimize failed".to_string(),
@@ -147,13 +156,17 @@ impl TranscriptEnhancer for MockEnhancer {
     async fn summarize_and_faq(
         &self,
         text: &str,
-        _language_code: &str,
+        language_code: &str,
     ) -> Result<SummaryFaq, ApplicationError> {
         let mut summarize_calls = self
             .summarize_calls
             .lock()
             .expect("enhancer summarize lock poisoned");
         *summarize_calls += 1;
+        self.summarize_languages
+            .lock()
+            .expect("enhancer summarize languages lock poisoned")
+            .push(language_code.to_string());
         if self.fail_summarize {
             return Err(ApplicationError::PostProcessing(
                 "summary failed".to_string(),
@@ -166,6 +179,10 @@ impl TranscriptEnhancer for MockEnhancer {
     }
 
     async fn ask(&self, prompt: &str) -> Result<String, ApplicationError> {
+        self.prompts
+            .lock()
+            .expect("enhancer prompt lock poisoned")
+            .push(prompt.to_string());
         let transcript = prompt
             .split("Transcript:\n")
             .nth(1)
@@ -1090,6 +1107,171 @@ async fn run_file_transcription_persists_diarization_failure_metadata() {
 }
 
 #[tokio::test]
+async fn automatic_ai_optimizes_contiguous_source_language_groups_separately() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("mixed.wav");
+    tokio::fs::write(&input_path, b"fake wav content")
+        .await
+        .expect("failed to create wav file");
+
+    let enhancer = Arc::new(MockEnhancer::default());
+    let repo = Arc::new(InMemoryArtifactRepository::default());
+    let service = TranscriptionService::new(
+        Arc::new(MockTranscoder::default()),
+        Arc::new(MockSpeechEngine {
+            transcript: "ciao mondo\ncome stai\nhello world".to_string(),
+            segments: vec![
+                TimedSegment {
+                    text: "ciao mondo".to_string(),
+                    language_code: Some("it-IT".to_string()),
+                    ..TimedSegment::default()
+                },
+                TimedSegment {
+                    text: "come stai".to_string(),
+                    language_code: Some("it".to_string()),
+                    ..TimedSegment::default()
+                },
+                TimedSegment {
+                    text: "hello world".to_string(),
+                    language_code: Some("en-US".to_string()),
+                    ..TimedSegment::default()
+                },
+            ],
+        }),
+        enhancer.clone(),
+        repo,
+    );
+
+    let artifact = service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-mixed-language".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Small,
+                engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: true,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("mixed-language transcription should succeed");
+
+    assert_eq!(
+        *enhancer
+            .optimize_inputs
+            .lock()
+            .expect("optimize input lock poisoned"),
+        vec![
+            ("ciao mondo\ncome stai".to_string(), "it".to_string()),
+            ("hello world".to_string(), "en".to_string()),
+        ]
+    );
+    let summary_prompts = enhancer
+        .prompts
+        .lock()
+        .expect("summary prompt lock poisoned");
+    assert!(summary_prompts
+        .iter()
+        .any(|prompt| prompt.contains("Generate in language en:")));
+    assert!(!summary_prompts
+        .iter()
+        .any(|prompt| prompt.contains("Generate in language it:")));
+    assert!(!artifact.optimized_transcript.contains("[source_language="));
+    assert!(artifact
+        .optimized_transcript
+        .find("optimized::ciao")
+        .is_some());
+    assert!(artifact
+        .optimized_transcript
+        .find("optimized::hello")
+        .is_some());
+    assert!(
+        artifact
+            .optimized_transcript
+            .find("optimized::ciao")
+            .expect("Italian group output")
+            < artifact
+                .optimized_transcript
+                .find("optimized::hello")
+                .expect("English group output")
+    );
+}
+
+#[tokio::test]
+async fn automatic_ai_falls_back_to_complete_auto_group_for_partial_segments() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("partial-segments.wav");
+    tokio::fs::write(&input_path, b"fake wav content")
+        .await
+        .expect("failed to create wav file");
+
+    let enhancer = Arc::new(MockEnhancer::default());
+    let service = TranscriptionService::new(
+        Arc::new(MockTranscoder::default()),
+        Arc::new(MockSpeechEngine {
+            transcript: "ciao\nhello\nextra".to_string(),
+            segments: vec![
+                TimedSegment {
+                    text: "ciao".to_string(),
+                    language_code: Some("it".to_string()),
+                    ..TimedSegment::default()
+                },
+                TimedSegment {
+                    text: "hello".to_string(),
+                    language_code: Some("en".to_string()),
+                    ..TimedSegment::default()
+                },
+            ],
+        }),
+        enhancer.clone(),
+        Arc::new(InMemoryArtifactRepository::default()),
+    );
+
+    let artifact = service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-partial-segments".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Small,
+                engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: true,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("partial segment transcription should succeed");
+
+    assert_eq!(
+        *enhancer
+            .optimize_inputs
+            .lock()
+            .expect("optimize input lock poisoned"),
+        vec![("ciao\nhello\nextra".to_string(), "auto".to_string())]
+    );
+    assert!(artifact.optimized_transcript.contains("extra"));
+}
+
+#[tokio::test]
 async fn run_file_transcription_keeps_raw_transcript_when_ai_fails() {
     let temp = tempdir().expect("failed to create temp dir");
     let input_path = temp.path().join("meeting.wav");
@@ -1378,7 +1560,7 @@ impl SpeechToTextEngine for ProgressReplayEngine {
         &self,
         _input_wav: &Path,
         _model_filename: &str,
-        _language_code: &str,
+        _language_policy: &TranscriptionLanguagePolicy,
         _options: &WhisperOptions,
         _total_audio_seconds: Option<f32>,
         _emit_partial: Arc<dyn Fn(String) + Send + Sync>,

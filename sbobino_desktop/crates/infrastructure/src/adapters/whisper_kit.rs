@@ -19,7 +19,7 @@ use tracing::warn;
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
 use sbobino_domain::{
     collapse_consecutive_repeated_segments, minimize_transcript_repetitions, TimedSegment,
-    TranscriptionOutput, WhisperOptions,
+    TranscriptionLanguagePolicy, TranscriptionOutput, WhisperOptions,
 };
 
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
@@ -297,6 +297,8 @@ impl WhisperKitEngine {
             end_seconds,
             speaker_id: None,
             speaker_label: None,
+            language_code: None,
+            language_confidence: None,
             words: Vec::new(),
         })
     }
@@ -1084,7 +1086,7 @@ impl SpeechToTextEngine for WhisperKitEngine {
         &self,
         input_wav: &Path,
         model_filename: &str,
-        language_code: &str,
+        _language_policy: &TranscriptionLanguagePolicy,
         options: &WhisperOptions,
         _total_audio_seconds: Option<f32>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
@@ -1094,7 +1096,10 @@ impl SpeechToTextEngine for WhisperKitEngine {
             .transcribe_with_server(
                 input_wav,
                 model_filename,
-                language_code,
+                // Keep the legacy WhisperKit adapter adaptive as well.  The
+                // selected language is persisted as an AI preference, never
+                // sent as a transcription constraint.
+                "auto",
                 options,
                 emit_partial.clone(),
                 emit_progress_seconds.clone(),
@@ -1107,7 +1112,7 @@ impl SpeechToTextEngine for WhisperKitEngine {
                 self.transcribe_with_cli(
                     input_wav,
                     model_filename,
-                    language_code,
+                    "auto",
                     options,
                     emit_partial,
                     emit_progress_seconds,

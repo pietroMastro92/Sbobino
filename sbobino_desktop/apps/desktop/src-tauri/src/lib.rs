@@ -23,9 +23,10 @@ use crate::commands::artifacts::{
     analyze_artifact_emotions, cancel_artifact_speaker_diarization, chat_artifact,
     delete_artifacts, empty_deleted_artifacts, export_artifact, generate_artifact_pack,
     get_artifact, hard_delete_artifacts, list_artifact_chat, list_artifacts,
-    list_deleted_artifacts, list_recent_artifacts, optimize_artifact, read_artifact_audio,
-    read_audio_file, rename_artifact, restore_artifacts, run_artifact_speaker_diarization,
-    summarize_artifact, update_artifact, update_artifact_timeline, write_trimmed_audio,
+    list_deleted_artifacts, list_recent_artifacts, optimize_artifact, preview_artifact_export,
+    read_artifact_audio, read_audio_file, rename_artifact, restore_artifacts,
+    run_artifact_speaker_diarization, summarize_artifact, update_artifact,
+    update_artifact_timeline, write_trimmed_audio,
 };
 use crate::commands::automatic_import::{
     clear_automatic_import_quarantine_item, retry_automatic_import_quarantine_item,
@@ -48,8 +49,9 @@ use crate::commands::runtime::{
 };
 use crate::commands::settings::{
     delete_prompt, get_ai_capability_status, get_ai_providers, get_settings, get_settings_snapshot,
-    list_ai_service_models, list_gemini_models, list_prompts, reset_prompts, save_prompt,
-    test_ai_service, test_prompt, update_ai_providers, update_settings, update_settings_partial,
+    list_ai_service_models, list_gemini_models, list_prompts, list_transcription_languages,
+    reset_prompts, save_prompt, test_ai_service, test_prompt, update_ai_providers, update_settings,
+    update_settings_partial,
 };
 use crate::commands::transcription::{cancel_transcription, start_transcription};
 use crate::commands::updates::check_updates;
@@ -138,7 +140,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             #[cfg(target_os = "macos")]
-            setup_macos_app_menu(&app.handle())
+            setup_macos_app_menu(app.handle())
                 .map_err(|error| std::io::Error::other(format!("menu setup failure: {error}")))?;
 
             #[cfg(target_os = "macos")]
@@ -205,6 +207,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
+            list_transcription_languages,
             update_settings,
             get_settings_snapshot,
             update_settings_partial,
@@ -239,6 +242,7 @@ pub fn run() {
             hard_delete_artifacts,
             empty_deleted_artifacts,
             export_artifact,
+            preview_artifact_export,
             export_app_backup,
             chat_artifact,
             summarize_artifact,

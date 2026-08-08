@@ -7,7 +7,15 @@ export type LanguageCode =
   | "es"
   | "pt"
   | "zh"
-  | "ja";
+  | "ja"
+  | (string & {});
+
+export type TranscriptionLanguageOption = {
+  code: string;
+  whisper: boolean;
+  parakeet_tdt: boolean;
+  nemotron: boolean;
+};
 
 export type AppLanguage = "en" | "it" | "es" | "de";
 
@@ -503,6 +511,8 @@ export type TimelineV2Segment = {
   end_seconds?: number;
   speaker_id?: string;
   speaker_label?: string;
+  language_code?: string;
+  language_confidence?: number;
   words?: TimelineV2Word[];
 };
 
@@ -539,6 +549,8 @@ export type RealtimeDelta = {
   text: string;
   start_seconds?: number | null;
   end_seconds?: number | null;
+  language_code?: string | null;
+  language_confidence?: number | null;
 };
 
 export type RealtimeStatusEvent = {

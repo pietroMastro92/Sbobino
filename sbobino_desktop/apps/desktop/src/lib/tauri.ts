@@ -40,6 +40,7 @@ import type {
   UpdateAiProvidersPayload,
   UpdateCheckResponse,
   UpdateSettingsPartialPayload,
+  TranscriptionLanguageOption,
 } from "../types";
 import type { InitialSetupReport } from "./initialSetup";
 const MENU_CHECK_UPDATES_EVENT = "app://menu-check-updates";
@@ -50,6 +51,10 @@ export async function fetchSettings(): Promise<AppSettings> {
 
 export async function fetchSettingsSnapshot(): Promise<AppSettings> {
   return invoke<AppSettings>("get_settings_snapshot");
+}
+
+export async function listTranscriptionLanguages(): Promise<TranscriptionLanguageOption[]> {
+  return invoke<TranscriptionLanguageOption[]>("list_transcription_languages");
 }
 
 export async function saveSettings(settings: AppSettings): Promise<AppSettings> {
@@ -250,10 +255,20 @@ export async function emptyDeletedArtifacts(): Promise<{ deleted: number }> {
   return invoke<{ deleted: number }>("empty_deleted_artifacts");
 }
 
-export async function exportArtifact(payload: {
+export type ArtifactExportFormat =
+  | "txt"
+  | "docx"
+  | "html"
+  | "pdf"
+  | "json"
+  | "srt"
+  | "vtt"
+  | "csv"
+  | "md";
+
+export type ArtifactExportPayload = {
   id: string;
-  format: "txt" | "docx" | "html" | "pdf" | "json" | "srt" | "vtt" | "csv" | "md";
-  destination_path: string;
+  format: ArtifactExportFormat;
   language?: "en" | "it" | "es" | "de";
   style?: "transcript" | "subtitles" | "segments";
   options?: {
@@ -264,12 +279,29 @@ export async function exportArtifact(payload: {
   segments?: Array<{
     time: string;
     line: string;
+    startSeconds?: number | null;
+    endSeconds?: number | null;
     speakerId?: string | null;
     speakerLabel?: string | null;
   }>;
   content_override?: string;
-}): Promise<{ path: string }> {
+  summary_override?: string;
+  faqs_override?: string;
+};
+
+export async function exportArtifact(
+  payload: ArtifactExportPayload & { destination_path: string },
+): Promise<{ path: string }> {
   return invoke<{ path: string }>("export_artifact", { payload });
+}
+
+export async function previewArtifactExport(
+  payload: ArtifactExportPayload,
+): Promise<{ content: string; mode: "exact" | "document" }> {
+  return invoke<{ content: string; mode: "exact" | "document" }>(
+    "preview_artifact_export",
+    { payload },
+  );
 }
 
 export async function exportAppBackup(payload: {

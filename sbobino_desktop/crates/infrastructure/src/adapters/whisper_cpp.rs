@@ -15,8 +15,8 @@ use tokio::time::{timeout, Duration};
 
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
 use sbobino_domain::{
-    collapse_consecutive_repeated_segments, minimize_transcript_repetitions, TimedSegment,
-    TimedWord, TranscriptionOutput, WhisperOptions,
+    collapse_consecutive_repeated_segments, minimize_transcript_repetitions, LanguageCode,
+    TimedSegment, TimedWord, TranscriptionLanguagePolicy, TranscriptionOutput, WhisperOptions,
 };
 
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
@@ -27,6 +27,16 @@ const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
 const PROCESS_WAIT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const PROCESS_IDLE_TIMEOUT_MIN: Duration = Duration::from_secs(900);
 const PROCESS_IDLE_TIMEOUT_MAX: Duration = Duration::from_secs(3600);
+const WHISPER_SAMPLE_RATE: usize = 16_000;
+const WHISPER_SILENCE_SPLIT_SECONDS: f32 = 0.5;
+const WHISPER_MIN_UTTERANCE_SECONDS: f32 = 1.5;
+const WHISPER_MAX_UTTERANCE_SECONDS: f32 = 15.0;
+const WHISPER_MARGIN_SECONDS: f32 = 0.2;
+const WHISPER_OVERLAP_SECONDS: f32 = 0.4;
+
+fn frame_sample_count() -> usize {
+    WHISPER_SAMPLE_RATE / 50
+}
 
 #[derive(Debug, Clone)]
 pub struct WhisperCppEngine {
@@ -51,7 +61,17 @@ enum ParsedCliEvent {
 #[derive(Debug, Deserialize, Default)]
 struct WhisperCliJsonOutput {
     #[serde(default)]
+    result: Option<WhisperCliJsonResult>,
+    #[serde(default)]
     transcription: Vec<WhisperCliJsonSegment>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WhisperCliJsonResult {
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default, alias = "language_probability")]
+    language_confidence: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -63,6 +83,10 @@ struct WhisperCliJsonSegment {
     tokens: Vec<WhisperCliJsonToken>,
     #[serde(default)]
     speaker: Option<String>,
+    #[serde(default, alias = "lang", alias = "language_code")]
+    language: Option<String>,
+    #[serde(default, alias = "language_probability")]
+    language_confidence: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -80,6 +104,13 @@ struct WhisperCliJsonToken {
     offsets: Option<WhisperCliJsonOffsets>,
     #[serde(default)]
     p: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct WhisperAudioChunk {
+    path: PathBuf,
+    start_seconds: f32,
+    end_seconds: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +132,248 @@ impl WhisperCppEngine {
             binary_path,
             models_dir,
         }
+    }
+
+    fn normalize_detected_language(value: &str) -> Option<String> {
+        LanguageCode::try_from_code(value)
+            .ok()
+            .filter(|code| !code.is_auto() && code.as_code() != "und")
+            .map(|code| code.as_code().to_string())
+    }
+
+    fn wav_samples(input_wav: &Path) -> Result<Vec<i16>, ApplicationError> {
+        let mut reader = hound::WavReader::open(input_wav).map_err(|error| {
+            ApplicationError::SpeechToText(format!(
+                "failed to read 16 kHz WAV for adaptive Whisper chunking: {error}"
+            ))
+        })?;
+        let spec = reader.spec();
+        if spec.channels != 1 || spec.sample_rate as usize != WHISPER_SAMPLE_RATE {
+            return Err(ApplicationError::SpeechToText(format!(
+                "adaptive Whisper chunking expects mono {} Hz WAV (got {} channels at {} Hz)",
+                WHISPER_SAMPLE_RATE, spec.channels, spec.sample_rate
+            )));
+        }
+
+        match spec.sample_format {
+            hound::SampleFormat::Int => reader
+                .samples::<i16>()
+                .map(|sample| sample.map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    ApplicationError::SpeechToText(format!(
+                        "failed to decode WAV samples for adaptive Whisper chunking: {error}"
+                    ))
+                }),
+            hound::SampleFormat::Float => reader
+                .samples::<f32>()
+                .map(|sample| {
+                    sample
+                        .map(|value| (value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    ApplicationError::SpeechToText(format!(
+                        "failed to decode float WAV samples for adaptive Whisper chunking: {error}"
+                    ))
+                }),
+        }
+    }
+
+    fn sample_rms(samples: &[i16]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let sum = samples
+            .iter()
+            .map(|sample| {
+                let value = *sample as f32 / i16::MAX as f32;
+                value * value
+            })
+            .sum::<f32>();
+        (sum / samples.len() as f32).sqrt()
+    }
+
+    fn speech_ranges(samples: &[i16]) -> Vec<(usize, usize)> {
+        if samples.is_empty() {
+            return Vec::new();
+        }
+        let frame_len = WHISPER_SAMPLE_RATE / 50; // 20 ms
+        let frame_rms = samples
+            .chunks(frame_len)
+            .map(Self::sample_rms)
+            .collect::<Vec<_>>();
+        let max_rms = frame_rms.iter().copied().fold(0.0_f32, f32::max);
+        let threshold = (max_rms * 0.08).max(0.006);
+        let silence_frames = (WHISPER_SILENCE_SPLIT_SECONDS * 50.0) as usize;
+        let mut ranges = Vec::<(usize, usize)>::new();
+        let mut start_frame = None;
+        let mut last_speech_frame = 0usize;
+        let mut silent = 0usize;
+        for (frame, rms) in frame_rms.iter().copied().enumerate() {
+            if rms >= threshold {
+                if start_frame.is_none() {
+                    start_frame = Some(frame);
+                }
+                last_speech_frame = frame;
+                silent = 0;
+            } else if start_frame.is_some() {
+                silent += 1;
+                if silent >= silence_frames {
+                    let start = start_frame.take().unwrap_or(frame) * frame_len;
+                    let end = ((last_speech_frame + 1) * frame_len).min(samples.len());
+                    if end > start {
+                        ranges.push((start, end));
+                    }
+                    silent = 0;
+                }
+            }
+        }
+        if let Some(start_frame) = start_frame {
+            let start = start_frame * frame_len;
+            if samples.len() > start {
+                ranges.push((start, samples.len()));
+            }
+        }
+        ranges
+    }
+
+    fn merge_short_speech_ranges(
+        mut ranges: Vec<(usize, usize)>,
+        sample_count: usize,
+    ) -> Vec<(usize, usize)> {
+        if ranges.len() < 2 {
+            return ranges;
+        }
+        let minimum = (WHISPER_MIN_UTTERANCE_SECONDS * WHISPER_SAMPLE_RATE as f32) as usize;
+        let mut index = 0usize;
+        while index < ranges.len() {
+            if ranges[index].1.saturating_sub(ranges[index].0) >= minimum {
+                index += 1;
+                continue;
+            }
+            if index > 0 {
+                let end = ranges[index].1;
+                ranges[index - 1].1 = end;
+                ranges.remove(index);
+                index = index.saturating_sub(1);
+            } else if index + 1 < ranges.len() {
+                let start = ranges[index].0;
+                ranges[index + 1].0 = start;
+                ranges.remove(index);
+            } else {
+                break;
+            }
+        }
+        if ranges.is_empty() {
+            vec![(0, sample_count)]
+        } else {
+            ranges
+        }
+    }
+
+    fn split_long_range(samples: &[i16], start: usize, end: usize) -> Vec<(usize, usize)> {
+        let max_len = (WHISPER_MAX_UTTERANCE_SECONDS * WHISPER_SAMPLE_RATE as f32) as usize;
+        let overlap = (WHISPER_OVERLAP_SECONDS * WHISPER_SAMPLE_RATE as f32) as usize;
+        if end.saturating_sub(start) <= max_len {
+            return vec![(start, end)];
+        }
+        let mut output = Vec::new();
+        let mut cursor = start;
+        while end.saturating_sub(cursor) > max_len {
+            let target = cursor + max_len;
+            let window = WHISPER_SAMPLE_RATE.min(max_len / 4);
+            let search_start = target
+                .saturating_sub(window)
+                .max(cursor + frame_sample_count());
+            let search_end = (target + window).min(end.saturating_sub(frame_sample_count()));
+            let mut cut = target;
+            let mut best_rms = f32::INFINITY;
+            let mut candidate = search_start;
+            while candidate <= search_end {
+                let candidate_end = (candidate + frame_sample_count()).min(end);
+                let rms = Self::sample_rms(&samples[candidate..candidate_end]);
+                if rms < best_rms {
+                    best_rms = rms;
+                    cut = candidate;
+                }
+                candidate += frame_sample_count();
+            }
+            let chunk_end = cut.min(end);
+            if chunk_end <= cursor {
+                break;
+            }
+            output.push((cursor, chunk_end));
+            cursor = cut.saturating_sub(overlap);
+        }
+        if cursor < end {
+            output.push((cursor, end));
+        }
+        output
+    }
+
+    fn write_whisper_chunks(
+        input_wav: &Path,
+    ) -> Result<(tempfile::TempDir, Vec<WhisperAudioChunk>), ApplicationError> {
+        let samples = Self::wav_samples(input_wav)?;
+        let speech = Self::speech_ranges(&samples);
+        let base_ranges = if speech.is_empty() {
+            vec![(0, samples.len())]
+        } else {
+            Self::merge_short_speech_ranges(speech, samples.len())
+        };
+        let margin = (WHISPER_MARGIN_SECONDS * WHISPER_SAMPLE_RATE as f32) as usize;
+        let ranges = base_ranges
+            .into_iter()
+            .flat_map(|(start, end)| {
+                let start = start.saturating_sub(margin);
+                let end = (end + margin).min(samples.len());
+                Self::split_long_range(&samples, start, end)
+            })
+            .filter(|(start, end)| end > start)
+            .collect::<Vec<_>>();
+        let temp_dir = tempfile::tempdir().map_err(|error| {
+            ApplicationError::SpeechToText(format!(
+                "failed to create Whisper chunk directory: {error}"
+            ))
+        })?;
+        let mut chunks = Vec::with_capacity(ranges.len());
+        for (index, (start, end)) in ranges.into_iter().enumerate() {
+            let path = temp_dir.path().join(format!("chunk-{index:04}.wav"));
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: WHISPER_SAMPLE_RATE as u32,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&path, spec).map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "failed to create Whisper chunk {}: {error}",
+                    path.display()
+                ))
+            })?;
+            for sample in &samples[start..end] {
+                writer.write_sample(*sample).map_err(|error| {
+                    ApplicationError::SpeechToText(format!(
+                        "failed to write Whisper chunk {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            }
+            writer.finalize().map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "failed to finalize Whisper chunk {}: {error}",
+                    path.display()
+                ))
+            })?;
+            chunks.push(WhisperAudioChunk {
+                path,
+                start_seconds: start as f32 / WHISPER_SAMPLE_RATE as f32,
+                end_seconds: end as f32 / WHISPER_SAMPLE_RATE as f32,
+            });
+        }
+        Ok((temp_dir, chunks))
     }
 
     fn model_path(&self, model_filename: &str) -> PathBuf {
@@ -323,6 +596,8 @@ impl WhisperCppEngine {
             end_seconds,
             speaker_id: None,
             speaker_label: None,
+            language_code: None,
+            language_confidence: None,
             words,
         };
 
@@ -398,6 +673,79 @@ impl WhisperCppEngine {
             .join("\n")
     }
 
+    fn offset_segments(segments: &mut [TimedSegment], offset_seconds: f32) {
+        if !offset_seconds.is_finite() || offset_seconds.abs() < f32::EPSILON {
+            return;
+        }
+        for segment in segments {
+            if let Some(start) = segment.start_seconds.as_mut() {
+                *start += offset_seconds;
+            }
+            if let Some(end) = segment.end_seconds.as_mut() {
+                *end += offset_seconds;
+            }
+            for word in &mut segment.words {
+                if let Some(start) = word.start_seconds.as_mut() {
+                    *start += offset_seconds;
+                }
+                if let Some(end) = word.end_seconds.as_mut() {
+                    *end += offset_seconds;
+                }
+            }
+        }
+    }
+
+    fn deduplicate_overlapping_segments(mut segments: Vec<TimedSegment>) -> Vec<TimedSegment> {
+        segments.sort_by(|left, right| {
+            left.start_seconds
+                .unwrap_or(f32::MAX)
+                .partial_cmp(&right.start_seconds.unwrap_or(f32::MAX))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut output = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let duplicate_index = output.iter().enumerate().rev().take(3).find_map(
+                |(index, previous): (usize, &TimedSegment)| {
+                    let same_text = previous
+                        .text
+                        .trim()
+                        .eq_ignore_ascii_case(segment.text.trim());
+                    let overlap = match (
+                        previous.start_seconds,
+                        previous.end_seconds,
+                        segment.start_seconds,
+                        segment.end_seconds,
+                    ) {
+                        (Some(previous_start), Some(previous_end), Some(start), Some(end)) => {
+                            previous_start < end && start < previous_end
+                        }
+                        _ => false,
+                    };
+                    let confirmed_language_conflict = matches!(
+                        (&previous.language_code, &segment.language_code),
+                        (Some(previous), Some(current))
+                            if !previous.eq_ignore_ascii_case(current)
+                    );
+                    (same_text && overlap && !confirmed_language_conflict).then_some(index)
+                },
+            );
+            if let Some(index) = duplicate_index {
+                // Keep a model-confirmed label when the overlapping copy was
+                // only partially annotated. Never collapse two confirmed,
+                // different languages (the language boundary is meaningful).
+                if output[index].language_code.is_none() {
+                    output[index].language_code = segment.language_code.clone();
+                }
+                if output[index].language_confidence.is_none() {
+                    output[index].language_confidence = segment.language_confidence;
+                }
+            } else {
+                output.push(segment);
+            }
+        }
+        output
+    }
+
     fn milliseconds_to_seconds(value: Option<i64>) -> Option<f32> {
         value.and_then(|milliseconds| {
             if milliseconds < 0 {
@@ -416,6 +764,16 @@ impl WhisperCppEngine {
                 "failed to parse whisper-cli JSON output: {error}"
             ))
         })?;
+        let detected_language = parsed
+            .result
+            .as_ref()
+            .and_then(|result| result.language.as_deref())
+            .and_then(Self::normalize_detected_language);
+        let result_language_confidence = parsed
+            .result
+            .as_ref()
+            .and_then(|result| result.language_confidence)
+            .filter(|value| value.is_finite());
 
         Ok(parsed
             .transcription
@@ -461,12 +819,25 @@ impl WhisperCppEngine {
                     })
                     .collect::<Vec<_>>();
 
+                let language_confidence = segment
+                    .language_confidence
+                    .or(result_language_confidence)
+                    .filter(|value| value.is_finite());
+
+                let language_code = segment
+                    .language
+                    .as_deref()
+                    .and_then(Self::normalize_detected_language)
+                    .or_else(|| detected_language.clone());
+
                 Some(TimedSegment {
                     text,
                     start_seconds,
                     end_seconds,
                     speaker_id: speaker_label.clone(),
                     speaker_label,
+                    language_code,
+                    language_confidence,
                     words,
                 })
             })
@@ -691,11 +1062,8 @@ impl WhisperCppEngine {
             .arg(options.word_threshold.to_string())
             .arg("-sns");
 
-        command.arg("-l").arg(if language_code.trim().is_empty() {
-            "auto"
-        } else {
-            language_code
-        });
+        let _preferred_language = language_code;
+        command.arg("-l").arg("auto");
 
         if options.translate_to_english {
             command.arg("-tr");
@@ -739,6 +1107,273 @@ impl WhisperCppEngine {
             .arg(output_base)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_whisper_cli_batch_attempt(
+        &self,
+        chunks: &[WhisperAudioChunk],
+        model_path: &Path,
+        language_code: &str,
+        options: &WhisperOptions,
+        total_audio_seconds: Option<f32>,
+        emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+        mode: WhisperCliExecutionMode,
+    ) -> Result<TranscriptionOutput, WhisperCliAttemptError> {
+        if chunks.is_empty() {
+            return Err(WhisperCliAttemptError {
+                message: "adaptive Whisper chunker produced no input chunks".to_string(),
+                stderr_output: String::new(),
+                status: None,
+            });
+        }
+        let output_prefix = format!(
+            "sbobino-whisper-batch-{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0),
+            OUTPUT_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let output_bases = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, _)| std::env::temp_dir().join(format!("{output_prefix}-{index:04}")))
+            .collect::<Vec<_>>();
+
+        let mut command = tokio_background_command(&self.binary_path);
+        Self::configure_command_environment(&mut command, &self.binary_path);
+        Self::append_cli_flags(
+            &mut command,
+            &chunks[0].path,
+            model_path,
+            language_code,
+            options,
+            &output_bases[0],
+            mode,
+        );
+        // whisper-cli v1.8.4 loads the model once, then loops over all
+        // positional input files.  A matching -of is accepted for each file,
+        // so adaptive chunks keep one model context while retaining offsets.
+        for (index, chunk) in chunks.iter().enumerate().skip(1) {
+            command
+                .arg("-of")
+                .arg(&output_bases[index])
+                .arg(&chunk.path);
+        }
+
+        let mut child = command.spawn().map_err(|error| WhisperCliAttemptError {
+            message: format!(
+                "whisper-cli failed to start at '{}': {error}. Configure Whisper CLI path in Settings > Local Models.",
+                self.binary_path
+            ),
+            stderr_output: String::new(),
+            status: None,
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| WhisperCliAttemptError {
+            message: "missing whisper-cli stdout pipe".to_string(),
+            stderr_output: String::new(),
+            status: None,
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| WhisperCliAttemptError {
+            message: "missing whisper-cli stderr pipe".to_string(),
+            stderr_output: String::new(),
+            status: None,
+        })?;
+
+        let collected = Arc::new(Mutex::new(TranscriptCollector::default()));
+        let last_activity_at_ms = Arc::new(AtomicU64::new(Self::clock_now_millis()));
+        let suppress_progress: Arc<dyn Fn(f32) + Send + Sync> = Arc::new(|_| {});
+        let stdout_task = tokio::spawn(Self::consume_stream(
+            stdout,
+            collected.clone(),
+            emit_partial.clone(),
+            suppress_progress.clone(),
+            total_audio_seconds,
+            last_activity_at_ms.clone(),
+        ));
+        let stderr_task = tokio::spawn(Self::consume_stream(
+            stderr,
+            collected.clone(),
+            emit_partial.clone(),
+            suppress_progress,
+            total_audio_seconds,
+            last_activity_at_ms.clone(),
+        ));
+        let status = Self::wait_for_child_with_idle_timeout(
+            &mut child,
+            total_audio_seconds,
+            last_activity_at_ms,
+        )
+        .await
+        .map_err(|error| WhisperCliAttemptError {
+            message: error.to_string(),
+            stderr_output: String::new(),
+            status: None,
+        })?;
+        let _ = stdout_task.await;
+        let stderr_lines = stderr_task
+            .await
+            .map_err(|error| WhisperCliAttemptError {
+                message: format!("stderr reader task failed: {error}"),
+                stderr_output: String::new(),
+                status: Some(status),
+            })?
+            .map_err(|error| WhisperCliAttemptError {
+                message: error.to_string(),
+                stderr_output: String::new(),
+                status: Some(status),
+            })?;
+        let stderr_output = stderr_lines.join("\n");
+        if !status.success() {
+            return Err(WhisperCliAttemptError {
+                message: format!("whisper-cli failed: {}", stderr_output.trim()),
+                stderr_output,
+                status: Some(status),
+            });
+        }
+
+        let mut all_segments = Vec::<TimedSegment>::new();
+        let mut text_parts = Vec::<String>::new();
+        let mut missing = Vec::<usize>::new();
+        for (index, (chunk, output_base)) in chunks.iter().zip(output_bases.iter()).enumerate() {
+            let json_path = output_base.with_extension("json");
+            let txt_path = output_base.with_extension("txt");
+            let parsed = match fs::read_to_string(&json_path).await {
+                Ok(content) => Self::parse_segments_from_output_json(&content)
+                    .ok()
+                    .filter(|segments| !segments.is_empty()),
+                Err(_) => None,
+            };
+            let text_content = fs::read_to_string(&txt_path).await.ok();
+            let text_content = text_content
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string);
+            let mut segments = if let Some(segments) = parsed {
+                segments
+            } else if let Some(text) = text_content.as_deref() {
+                // A compatible CLI may be configured to emit TXT without
+                // JSON. The text is still a valid, non-lossy chunk result;
+                // retain it and leave language/timestamps undetermined.
+                vec![TimedSegment {
+                    text: text.to_string(),
+                    start_seconds: Some(chunk.start_seconds),
+                    end_seconds: Some(chunk.end_seconds),
+                    speaker_id: None,
+                    speaker_label: None,
+                    language_code: None,
+                    language_confidence: None,
+                    words: Vec::new(),
+                }]
+            } else {
+                missing.push(index);
+                Vec::new()
+            };
+            Self::offset_segments(&mut segments, chunk.start_seconds);
+            if let Some(text) = text_content {
+                text_parts.push(text);
+            }
+            all_segments.extend(segments);
+            emit_progress_seconds(
+                total_audio_seconds
+                    .filter(|total| total.is_finite() && *total > 0.0)
+                    .map(|total| chunk.end_seconds.min(total))
+                    .unwrap_or(chunk.end_seconds),
+            );
+            let _ = fs::remove_file(json_path).await;
+            let _ = fs::remove_file(txt_path).await;
+        }
+        if !missing.is_empty() {
+            // Retry every missing interval once in an isolated invocation.
+            // This costs one extra model load only for the failed interval,
+            // while guaranteeing that a partial batch cannot silently drop
+            // audio.
+            for index in missing.iter().copied() {
+                let chunk = &chunks[index];
+                let retry_start_seconds = chunk.start_seconds;
+                let retry_end_seconds = chunk.end_seconds;
+                let batch_progress = emit_progress_seconds.clone();
+                let retry_progress: Arc<dyn Fn(f32) + Send + Sync> = Arc::new(move |seconds| {
+                    batch_progress(
+                        (retry_start_seconds + seconds)
+                            .min(retry_end_seconds)
+                            .max(retry_start_seconds),
+                    );
+                });
+                match self
+                    .run_whisper_cli_attempt(
+                        &chunk.path,
+                        model_path,
+                        language_code,
+                        options,
+                        Some(chunk.end_seconds - chunk.start_seconds),
+                        emit_partial.clone(),
+                        retry_progress,
+                        mode,
+                    )
+                    .await
+                {
+                    Ok(mut recovered) => {
+                        Self::offset_segments(&mut recovered.segments, chunk.start_seconds);
+                        all_segments.extend(recovered.segments);
+                        if !recovered.text.trim().is_empty() {
+                            text_parts.push(recovered.text);
+                        }
+                    }
+                    Err(retry_error) => {
+                        return Err(WhisperCliAttemptError {
+                            message: format!(
+                                "whisper-cli did not produce output for adaptive chunk {} ({:.2}-{:.2}s) after isolated retry: {}",
+                                index + 1,
+                                chunk.start_seconds,
+                                chunk.end_seconds,
+                                retry_error.message
+                            ),
+                            stderr_output: if retry_error.stderr_output.trim().is_empty() {
+                                stderr_output.clone()
+                            } else {
+                                retry_error.stderr_output
+                            },
+                            status: retry_error.status.or(Some(status)),
+                        });
+                    }
+                }
+            }
+        }
+        all_segments = Self::deduplicate_overlapping_segments(all_segments);
+        let transcript = if !all_segments.is_empty() {
+            Self::join_segment_text(&all_segments)
+        } else if text_parts.is_empty() {
+            String::new()
+        } else {
+            text_parts.join("\n")
+        };
+        let transcript = minimize_transcript_repetitions(&transcript);
+        if transcript.trim().is_empty() {
+            return Err(WhisperCliAttemptError {
+                message: "whisper-cli produced empty output for adaptive chunks".to_string(),
+                stderr_output,
+                status: Some(status),
+            });
+        }
+        emit_progress_seconds(total_audio_seconds.unwrap_or_else(|| {
+            chunks
+                .last()
+                .map(|chunk| chunk.end_seconds)
+                .unwrap_or_default()
+        }));
+        Ok(TranscriptionOutput {
+            text: transcript.clone(),
+            segments: normalize_transcript_segments(
+                &transcript,
+                &all_segments,
+                total_audio_seconds,
+            ),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -947,6 +1582,58 @@ impl WhisperCppEngine {
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<TranscriptionOutput, ApplicationError> {
+        // The converter normally hands us a mono 16 kHz WAV.  If that
+        // invariant is unavailable (for example in an older imported job),
+        // retain the proven single-file path rather than dropping audio.
+        let adaptive_chunks = Self::write_whisper_chunks(input_wav).ok();
+        if let Some((chunk_dir, chunks)) = adaptive_chunks {
+            if chunks.len() > 1 {
+                let _chunk_dir = chunk_dir;
+                match self
+                    .run_whisper_cli_batch_attempt(
+                        &chunks,
+                        model_path,
+                        language_code,
+                        options,
+                        total_audio_seconds,
+                        emit_partial.clone(),
+                        emit_progress_seconds.clone(),
+                        WhisperCliExecutionMode::Default,
+                    )
+                    .await
+                {
+                    Ok(output) => return Ok(output),
+                    Err(error) if Self::should_retry_with_cpu_fallback(&error) => {
+                        emit_partial("Whisper fallback CPU-safe mode...".to_string());
+                        emit_progress_seconds(0.0);
+                        let mut fallback_options = options.clone();
+                        fallback_options.processors = 1;
+                        return self
+                            .run_whisper_cli_batch_attempt(
+                                &chunks,
+                                model_path,
+                                language_code,
+                                &fallback_options,
+                                total_audio_seconds,
+                                emit_partial,
+                                emit_progress_seconds,
+                                WhisperCliExecutionMode::CpuFallback,
+                            )
+                            .await
+                            .map_err(|retry_error| {
+                                let summary =
+                                    Self::summarize_stderr_for_user(&retry_error.stderr_output);
+                                ApplicationError::SpeechToText(format!(
+                                    "Whisper retry in CPU-safe mode failed: {summary}"
+                                ))
+                            });
+                    }
+                    Err(error) => {
+                        return Err(ApplicationError::SpeechToText(error.message));
+                    }
+                }
+            }
+        }
         match self
             .run_whisper_cli_attempt(
                 input_wav,
@@ -1082,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    fn append_cli_flags_passes_explicit_language() {
+    fn append_cli_flags_ignores_preference_and_always_uses_auto() {
         let mut command = Command::new("whisper-cli");
         WhisperCppEngine::append_cli_flags(
             &mut command,
@@ -1101,10 +1788,40 @@ mod tests {
             .collect::<Vec<_>>();
         let language_flag = args
             .windows(2)
-            .any(|pair| pair[0] == "-l" && pair[1] == "it");
+            .any(|pair| pair[0] == "-l" && pair[1] == "auto");
         assert!(
             language_flag,
-            "expected whisper-cli args to contain -l it: {args:?}"
+            "expected whisper-cli args to contain -l auto: {args:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_chunker_splits_long_speech_and_keeps_overlap() {
+        let mut samples = vec![0_i16; 16_000 * 2];
+        samples.extend(std::iter::repeat_n(12_000_i16, 16_000 * 18));
+        let ranges = WhisperCppEngine::split_long_range(&samples, 0, samples.len());
+        assert!(ranges.len() >= 2);
+        assert!(ranges.windows(2).all(|pair| pair[1].0 < pair[0].1));
+        assert!(ranges.iter().all(|(start, end)| end > start));
+    }
+
+    #[test]
+    fn overlapping_whisper_segments_are_deduplicated() {
+        let first = sbobino_domain::TimedSegment {
+            text: "same sentence".to_string(),
+            start_seconds: Some(0.0),
+            end_seconds: Some(2.0),
+            ..sbobino_domain::TimedSegment::default()
+        };
+        let duplicate = sbobino_domain::TimedSegment {
+            text: "Same sentence".to_string(),
+            start_seconds: Some(1.8),
+            end_seconds: Some(3.0),
+            ..sbobino_domain::TimedSegment::default()
+        };
+        assert_eq!(
+            WhisperCppEngine::deduplicate_overlapping_segments(vec![first, duplicate]).len(),
+            1
         );
     }
 }
@@ -1115,7 +1832,7 @@ impl SpeechToTextEngine for WhisperCppEngine {
         &self,
         input_wav: &Path,
         model_filename: &str,
-        language_code: &str,
+        language_policy: &TranscriptionLanguagePolicy,
         options: &WhisperOptions,
         total_audio_seconds: Option<f32>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
@@ -1125,7 +1842,7 @@ impl SpeechToTextEngine for WhisperCppEngine {
         self.transcribe_with_cli(
             input_wav,
             &model_path,
-            language_code,
+            language_policy.preferred_language.as_code(),
             options,
             total_audio_seconds,
             emit_partial,

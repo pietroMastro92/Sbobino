@@ -454,12 +454,31 @@ pub async fn get_realtime_start_readiness(
             .runtime_health_preflight()
             .map_err(|e| CommandError::new("runtime_health", e))?;
         let models_dir = PathBuf::from(&health.parakeet_models_dir_resolved);
-        let selected_parakeet_model = select_parakeet_live_model(
+        let selected_parakeet_model = match select_parakeet_live_model(
             &models_dir,
-            requested_parakeet_model,
+            requested_parakeet_model.clone(),
             selected_language.clone(),
-        )
-        .map_err(|e| CommandError::new("runtime_health", e.message))?;
+        ) {
+            Ok(model) => model,
+            Err(error) => {
+                let model_filename = requested_parakeet_model.gguf_filename().to_string();
+                return Ok(RealtimeStartReadinessResponse {
+                    allowed: false,
+                    reason_code: "parakeet_realtime_model_missing".to_string(),
+                    message: error.message,
+                    engine: "parakeet_cpp".to_string(),
+                    model_filename: model_filename.clone(),
+                    model_path: models_dir
+                        .join(model_filename)
+                        .to_string_lossy()
+                        .to_string(),
+                    ffmpeg_resolved: health.ffmpeg_resolved,
+                    whisper_stream_resolved: health.whisper_stream_resolved,
+                    parakeet_cli_resolved: health.parakeet_cli_resolved,
+                    input_device_name: None,
+                });
+            }
+        };
         let model_filename = selected_parakeet_model.gguf_filename().to_string();
         let model_path_buf = models_dir.join(&model_filename);
         let model_path = model_path_buf.to_string_lossy().to_string();

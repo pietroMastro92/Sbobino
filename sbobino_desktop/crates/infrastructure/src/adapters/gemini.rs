@@ -146,6 +146,14 @@ impl TranscriptEnhancer for GeminiEnhancer {
         18_000
     }
 
+    fn optimize_direct_prompt_char_budget(&self) -> usize {
+        12_000
+    }
+
+    fn optimize_chunk_concurrency_limit(&self) -> usize {
+        3
+    }
+
     fn emotion_direct_prompt_char_budget(&self) -> usize {
         12_000
     }
@@ -211,7 +219,7 @@ Output: 'Dobbiamo comprendere a fondo i requisiti del progetto software prima di
 fn optimize_language_instruction(language_code: &str) -> &str {
     let normalized = language_code.trim();
     if normalized.is_empty() || normalized == "auto" {
-        "the same language as the transcript"
+        "the same language as the transcript; preserve each contiguous source-language group, never translate or merge across a language change"
     } else {
         normalized
     }

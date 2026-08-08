@@ -5487,6 +5487,13 @@ body.sidebar-resizing {
   line-height: 1.52;
 }
 
+.export-preview-error {
+  margin: 14px 0 0;
+  color: var(--danger);
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
 .export-preview-title {
   margin: 0 0 8px;
   font-size: 1.2rem;

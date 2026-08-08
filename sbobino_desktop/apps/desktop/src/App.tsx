@@ -84,6 +84,7 @@ import {
   fetchRuntimeHealth,
   fetchRuntimeStatus,
   fetchSettingsSnapshot,
+  listTranscriptionLanguages,
   generateArtifactPack,
   getArtifact,
   hardDeleteArtifacts,
@@ -96,6 +97,7 @@ import {
   openSettingsWindow,
   pauseRealtime,
   planPyannoteBackgroundAction,
+  previewArtifactExport,
   provisioningCancel,
   provisioningDownloadModel,
   provisioningInstallPyannote,
@@ -162,6 +164,13 @@ import {
   getArtifactDiarizationUiState,
   normalizeJobFailureMessage,
 } from "./lib/diarizationUi";
+import {
+  consumeRealtimeSavedSpeakerDetection,
+  finalizeQueuedRealtimeSpeakerDetectionStop,
+  registerRealtimeSpeakerDetectionBeforeStop,
+  rollbackRealtimeSpeakerDetectionStop,
+  type RealtimeSpeakerDetectionTracking,
+} from "./lib/realtimeSpeakerDetection";
 import { loadInitialAppBootstrapData } from "./lib/appBootstrap";
 import {
   deriveUpdateUiState,
@@ -211,6 +220,11 @@ import {
   upsertQueueItem,
 } from "./lib/transcriptionQueue";
 import { stripAnsi } from "./lib/ansiText";
+import {
+  ArtifactExportFlowError,
+  runArtifactExportFlow,
+} from "./lib/artifactExportFlow";
+import { buildExportFileName } from "./lib/exportFileName";
 import { buildConfidenceTranscript } from "./lib/whisperConfidence";
 import { useAppStore } from "./state/useAppStore";
 import type {
@@ -249,6 +263,7 @@ import type {
   TimelineV2,
   TimelineV2Segment,
   TranscriptionEngine,
+  TranscriptionLanguageOption,
   TranscriptionSettings,
   TranscriptionStartPreflight,
   TranscriptArtifact,
@@ -270,7 +285,11 @@ import type {
 } from "./components/chat/chatTypes";
 import { buildChatClipboardText } from "./components/chat/chatUtils";
 import { ConfidenceTranscript } from "./components/ConfidenceTranscript";
-import { ExportSheet, type ExportRequest } from "./components/ExportSheet";
+import {
+  ExportSheet,
+  type ExportPreview,
+  type ExportRequest,
+} from "./components/ExportSheet";
 import { LiveMicrophoneWaveform } from "./components/LiveMicrophoneWaveform";
 import { ModelManagerSheet } from "./components/ModelManagerSheet";
 import { LoadingAnimation } from "./components/LoadingAnimation";
@@ -287,6 +306,7 @@ import {
   PRIVACY_POLICY_SUMMARY,
   PRIVACY_POLICY_VERSION,
 } from "./legal/privacyPolicy";
+import { formatImproveTextError } from "./lib/improveTextError";
 import { shouldStartWindowDrag } from "./lib/windowDrag";
 import {
   aiActionsAvailable,
@@ -514,6 +534,8 @@ type DetailSegment = {
   speakerLabel: string | null;
   startSeconds: number | null;
   endSeconds: number | null;
+  languageCode: string | null;
+  languageConfidence: number | null;
   seekSeconds: number;
 };
 
@@ -595,17 +617,38 @@ type TranscriptionJobSnapshot = {
   workspaceId: string | null;
 };
 
+const supportedTranscriptionLanguageCodes = [
+  "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu", "ta", "no", "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr", "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su", "yue",
+] as const;
+
 const languageOptions: Array<{ value: LanguageCode; label: string }> = [
-  { value: "auto", label: "Auto Detect" },
-  { value: "en", label: "English" },
-  { value: "it", label: "Italian" },
-  { value: "fr", label: "French" },
-  { value: "de", label: "German" },
-  { value: "es", label: "Spanish" },
-  { value: "pt", label: "Portuguese" },
-  { value: "zh", label: "Chinese" },
-  { value: "ja", label: "Japanese" },
+  { value: "auto", label: "Auto — preferita per l'AI" },
+  ...supportedTranscriptionLanguageCodes.map((code) => ({
+    value: code as LanguageCode,
+    label: code.toUpperCase(),
+  })),
 ];
+
+const fallbackTranscriptionLanguageCatalog: TranscriptionLanguageOption[] =
+  supportedTranscriptionLanguageCodes.map((code) => ({
+    code,
+    whisper: true,
+    parakeet_tdt: false,
+    nemotron: false,
+  }));
+
+const transcriptionLanguageNames: Record<string, string> = {
+  en: "English",
+  it: "Italiano",
+  fr: "Français",
+  de: "Deutsch",
+  es: "Español",
+  pt: "Português",
+  zh: "中文",
+  ja: "日本語",
+  nl: "Nederlands",
+  ru: "Русский",
+};
 
 const modelOptions: Array<{ value: SpeechModel; label: string }> = [
   { value: "tiny", label: "Tiny" },
@@ -1454,6 +1497,13 @@ function parseTimelineV2Segments(
       const speakerId =
         parseNonEmptyText((segment as { speaker_id?: unknown }).speaker_id) ??
         (speakerLabel ? normalizeSpeakerColorKey(speakerLabel) : null);
+      const languageCode =
+        parseNonEmptyText((segment as { language_code?: unknown }).language_code)?.toLowerCase() ?? null;
+      const languageConfidence =
+        typeof (segment as { language_confidence?: unknown }).language_confidence === "number" &&
+        Number.isFinite((segment as { language_confidence?: number }).language_confidence)
+          ? (segment as { language_confidence: number }).language_confidence
+          : null;
 
       return [
         {
@@ -1464,6 +1514,8 @@ function parseTimelineV2Segments(
           speakerLabel,
           startSeconds: resolvedStartSeconds,
           endSeconds: resolvedEndSeconds,
+          languageCode,
+          languageConfidence,
           seekSeconds: anchorSeconds,
         },
       ];
@@ -1808,6 +1860,12 @@ function realtimeSegmentFromDelta(delta: RealtimeDelta): TimelineV2Segment | nul
     text,
     start_seconds: startSeconds,
     end_seconds: endSeconds,
+    language_code: delta.language_code ?? undefined,
+    language_confidence:
+      typeof delta.language_confidence === "number" &&
+      Number.isFinite(delta.language_confidence)
+        ? delta.language_confidence
+        : undefined,
     words: [],
   };
 }
@@ -1926,7 +1984,11 @@ function formatSpeechModelLabel(model: string, fallback?: string): string {
 
 function formatLanguageLabel(language: LanguageCode): string {
   const option = languageOptions.find((entry) => entry.value === language);
-  return t(`lang.${language}`, option?.label ?? language);
+  const fallback =
+    transcriptionLanguageNames[language] ??
+    option?.label ??
+    (language === "auto" ? "Auto" : language.toUpperCase());
+  return t(`lang.${language}`, fallback);
 }
 
 function formatParakeetModelLabel(model: string, fallback?: string): string {
@@ -3135,6 +3197,10 @@ export function App({
     initialStandaloneSettingsPane,
   );
   const [settingsQuery, setSettingsQuery] = useState("");
+  const [transcriptionLanguageCatalog, setTranscriptionLanguageCatalog] =
+    useState<TranscriptionLanguageOption[]>(fallbackTranscriptionLanguageCatalog);
+  const [transcriptionLanguageSearch, setTranscriptionLanguageSearch] =
+    useState("");
   const [showModelManager, setShowModelManager] = useState(false);
   const [detailMode, setDetailMode] = useState<DetailMode>("transcript");
   const [inspectorMode, setInspectorMode] = useState<InspectorMode>("details");
@@ -3181,6 +3247,23 @@ export function App({
     const updateWindowWidth = () => setWindowWidth(window.innerWidth);
     window.addEventListener("resize", updateWindowWidth);
     return () => window.removeEventListener("resize", updateWindowWidth);
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    void listTranscriptionLanguages()
+      .then((catalog) => {
+        if (!disposed && catalog.length > 0) {
+          setTranscriptionLanguageCatalog(catalog);
+        }
+      })
+      .catch(() => {
+        // Browser previews and older desktop runtimes use the bundled
+        // fallback catalog until the command becomes available.
+      });
+    return () => {
+      disposed = true;
+    };
   }, []);
 
   const toggleArtifactExpansion = useCallback(
@@ -3361,6 +3444,8 @@ export function App({
     null,
   );
   const [realtimeElapsedSeconds, setRealtimeElapsedSeconds] = useState(0);
+  const [realtimeSpeakerDetectionRequested, setRealtimeSpeakerDetectionRequested] =
+    useState(false);
   const [isStoppingRealtime, setIsStoppingRealtime] = useState(false);
 
   const [provisioning, setProvisioning] = useState<{
@@ -3698,6 +3783,9 @@ export function App({
   );
   const focusedJobIdRef = useRef<string | null>(focusedJobId);
   const activeRealtimeJobIdRef = useRef<string | null>(activeRealtimeJobId);
+  const realtimeSpeakerDetectionRequestedRef = useRef(false);
+  const pendingRealtimeSpeakerDetectionJobIdRef = useRef<string | null>(null);
+  const realtimeSpeakerDiarizationEnabledRef = useRef(false);
   const activeJobDeltaSequenceRef = useRef<number>(-1);
   const activeJobPreviewTextareaRef = useRef<HTMLDivElement>(null);
   const realtimeTranscriptTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -3717,6 +3805,9 @@ export function App({
   const settingsSaveSequenceRef = useRef(0);
   const summaryAutostartedArtifactIdsRef = useRef<Set<string>>(new Set());
   const automaticImportStartupScanTriggeredRef = useRef(false);
+  realtimeSpeakerDiarizationEnabledRef.current = Boolean(
+    settings?.transcription.speaker_diarization?.enabled,
+  );
   const clearStartupWatchdog = useCallback(() => {
     if (startupWatchdogRef.current !== null) {
       window.clearTimeout(startupWatchdogRef.current);
@@ -4844,6 +4935,12 @@ export function App({
         setQueueItems((previous) =>
           upsertQueueItem(previous, queueEvent),
         );
+        if (
+          (event.stage === "cancelled" || event.stage === "failed") &&
+          pendingRealtimeSpeakerDetectionJobIdRef.current === event.job_id
+        ) {
+          clearRealtimeSpeakerDetectionRequest();
+        }
         if (event.job_id === activeJobIdRef.current) {
           clearStartupWatchdog();
           setProgress(queueEvent);
@@ -5046,6 +5143,11 @@ export function App({
           payload.job_id,
           resolvedFailureMessage,
         );
+        if (
+          pendingRealtimeSpeakerDetectionJobIdRef.current === payload.job_id
+        ) {
+          clearRealtimeSpeakerDetectionRequest();
+        }
         const failedContext = pendingTranscriptionContextRef.current.get(
           payload.job_id,
         );
@@ -5245,6 +5347,41 @@ export function App({
 
       const uRealtimeSaved = await subscribeRealtimeSaved((artifact) => {
         prependArtifact(artifact);
+
+        const speakerDetection = consumeRealtimeSavedSpeakerDetection(
+          readRealtimeSpeakerDetectionTracking(),
+          artifact.job_id,
+        );
+        if (!speakerDetection.matchedPendingJob) {
+          return;
+        }
+        applyRealtimeSpeakerDetectionTracking(speakerDetection.tracking);
+
+        if (!realtimeSpeakerDiarizationEnabledRef.current) {
+          return;
+        }
+
+        if (!artifact.audio_available) {
+          setError(
+            t(
+              "detail.speakerDetectionAudioUnavailable",
+              "Saved audio is required before speaker detection can run for this transcript.",
+            ),
+          );
+          return;
+        }
+
+        void runArtifactSpeakerDiarization(artifact.id).catch(
+          (speakerDetectionError) => {
+            setError(
+              formatUiError(
+                "error.runSpeakerDiarizationFailed",
+                "Failed to start speaker detection",
+                speakerDetectionError,
+              ),
+            );
+          },
+        );
       });
       if (unmounted) {
         uRealtimeSaved();
@@ -9742,53 +9879,15 @@ export function App({
     return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
-  async function onExport(payload: ExportRequest): Promise<boolean> {
-    if (!activeArtifact) return false;
-
-    let artifactForExport = activeArtifact;
-    const hasDraftChanges =
-      hasTranscriptDraftChanges ||
-      draftSummary !== activeArtifact.summary ||
-      draftFaqs !== activeArtifact.faqs;
-
-    if (hasDraftChanges) {
-      try {
-        const updated = await updateArtifact({
-          id: activeArtifact.id,
-          optimized_transcript: optimizedTranscriptForPersistence,
-          summary: draftSummary,
-          faqs: draftFaqs,
-        });
-        if (updated) {
-          artifactForExport = updated;
-          upsertArtifact(updated);
-          setActiveArtifact(updated);
-        }
-      } catch (syncError) {
-        setError(
-          formatUiError(
-            "error.copyBeforeExportSync",
-            "Could not sync changes before export",
-            syncError,
-          ),
-        );
-        return false;
+  const onPreviewExport = useCallback(
+    async (payload: ExportRequest): Promise<ExportPreview> => {
+      if (!activeArtifact) {
+        throw new Error("No active artifact is available for export preview.");
       }
-    }
 
-    const destination = await save({
-      defaultPath: `${artifactForExport.title.replace(/\s+/g, "_")}.${payload.format}`,
-    });
-
-    if (!destination) {
-      return false;
-    }
-
-    try {
-      await exportArtifact({
-        id: artifactForExport.id,
+      return previewArtifactExport({
+        id: activeArtifact.id,
         format: payload.format,
-        destination_path: destination,
         language,
         style: payload.style,
         options: {
@@ -9798,15 +9897,147 @@ export function App({
         },
         segments: payload.segments,
         content_override: payload.contentOverride,
+        summary_override: draftSummary,
+        faqs_override: draftFaqs,
       });
+    },
+    [activeArtifact, draftFaqs, draftSummary, language],
+  );
+
+  async function onExport(payload: ExportRequest): Promise<boolean> {
+    if (!activeArtifact) return false;
+
+    const hasDraftChanges =
+      hasTranscriptDraftChanges ||
+      draftSummary !== activeArtifact.summary ||
+      draftFaqs !== activeArtifact.faqs;
+
+    try {
+      const result = await runArtifactExportFlow({
+        artifact: activeArtifact,
+        chooseDestination: () =>
+          save({
+            defaultPath: buildExportFileName(activeArtifact.title, payload.format),
+            filters: [
+              {
+                name: `${payload.format.toUpperCase()} file`,
+                extensions: [payload.format],
+              },
+            ],
+          }),
+        syncArtifact: hasDraftChanges
+          ? () =>
+              updateArtifact({
+                id: activeArtifact.id,
+                optimized_transcript: optimizedTranscriptForPersistence,
+                summary: draftSummary,
+                faqs: draftFaqs,
+              })
+          : undefined,
+        onArtifactSynced: (updated) => {
+          upsertArtifact(updated);
+          setActiveArtifact(updated);
+        },
+        writeArtifact: (artifactForExport, destination) =>
+          exportArtifact({
+            id: artifactForExport.id,
+            format: payload.format,
+            destination_path: destination,
+            language,
+            style: payload.style,
+            options: {
+              include_timestamps: payload.options.includeTimestamps,
+              grouping: payload.options.grouping,
+              include_speaker_names: payload.options.includeSpeakerNames,
+            },
+            segments: payload.segments,
+            content_override: payload.contentOverride,
+            summary_override: artifactForExport.summary,
+            faqs_override: artifactForExport.faqs,
+          }).then(() => undefined),
+      });
+
+      if (result.status === "cancelled") {
+        return false;
+      }
+      if (result.status === "sync_not_found") {
+        setError(
+          t("error.artifactNotFoundSaving", "Artifact not found while saving."),
+        );
+        return false;
+      }
+
       setError(null);
       return true;
-    } catch (exportError) {
-      setError(
-        formatUiError("error.exportFailed", "Export failed", exportError),
-      );
-      throw exportError;
+    } catch (flowError) {
+      if (flowError instanceof ArtifactExportFlowError) {
+        const errorDetails = flowError.originalError;
+        if (flowError.phase === "destination") {
+          setError(
+            formatUiError(
+              "error.exportDestinationFailed",
+              "Could not choose an export destination",
+              errorDetails,
+            ),
+          );
+        } else if (flowError.phase === "sync") {
+          setError(
+            formatUiError(
+              "error.copyBeforeExportSync",
+              "Could not sync changes before export",
+              errorDetails,
+            ),
+          );
+        } else {
+          setError(
+            formatUiError("error.exportFailed", "Export failed", errorDetails),
+          );
+        }
+      } else {
+        setError(formatUiError("error.exportFailed", "Export failed", flowError));
+      }
+      return false;
     }
+  }
+
+  function readRealtimeSpeakerDetectionTracking(): RealtimeSpeakerDetectionTracking {
+    return {
+      requested: realtimeSpeakerDetectionRequestedRef.current,
+      pendingJobId: pendingRealtimeSpeakerDetectionJobIdRef.current,
+    };
+  }
+
+  function applyRealtimeSpeakerDetectionTracking(
+    tracking: RealtimeSpeakerDetectionTracking,
+  ): void {
+    realtimeSpeakerDetectionRequestedRef.current = tracking.requested;
+    pendingRealtimeSpeakerDetectionJobIdRef.current = tracking.pendingJobId;
+    setRealtimeSpeakerDetectionRequested(tracking.requested);
+  }
+
+  function clearRealtimeSpeakerDetectionRequest(): void {
+    applyRealtimeSpeakerDetectionTracking({
+      requested: false,
+      pendingJobId: null,
+    });
+  }
+
+  function onToggleRealtimeSpeakerDetection(): void {
+    if (!settings?.transcription.speaker_diarization?.enabled) {
+      setError(
+        t(
+          "detail.speakerDetectionDisabledHelp",
+          "Enable speaker diarization in Settings > Transcription before using speaker detection.",
+        ),
+      );
+      return;
+    }
+
+    applyRealtimeSpeakerDetectionTracking({
+      requested: !realtimeSpeakerDetectionRequestedRef.current,
+      pendingJobId: null,
+    });
+    setError(null);
   }
 
   async function onStartRealtime(): Promise<void> {
@@ -9946,14 +10177,20 @@ export function App({
   }
 
   async function onStopRealtime(saveResult: boolean): Promise<void> {
+    const stoppingJobId = activeRealtimeJobIdRef.current;
     setIsStoppingRealtime(true);
     try {
       const currentLiveTranscript = [...realtimeFinalLines, realtimePreviewText]
         .filter((line) => line.trim().length > 0)
         .join("\n")
         .trim();
-      const stoppingJobId = activeRealtimeJobIdRef.current;
       const elapsedSeconds = Math.max(0, Math.round(realtimeElapsedSeconds));
+      applyRealtimeSpeakerDetectionTracking(
+        registerRealtimeSpeakerDetectionBeforeStop(
+          readRealtimeSpeakerDetectionTracking(),
+          { saveResult, activeJobId: stoppingJobId },
+        ),
+      );
       const result = await stopRealtime(
         saveResult,
         draftTitle,
@@ -9961,6 +10198,12 @@ export function App({
       );
       const realtimeJobId = result.job_id ?? stoppingJobId;
       if (result.queued && realtimeJobId) {
+        applyRealtimeSpeakerDetectionTracking(
+          finalizeQueuedRealtimeSpeakerDetectionStop(
+            readRealtimeSpeakerDetectionTracking(),
+            { saveResult, jobId: realtimeJobId },
+          ),
+        );
         const nextProgress: JobProgress = {
           job_id: realtimeJobId,
           stage: saveResult ? "persisting" : "cancelled",
@@ -9995,6 +10238,7 @@ export function App({
       }
 
       if (saveResult && currentLiveTranscript) {
+        clearRealtimeSpeakerDetectionRequest();
         setError(
           t(
             "error.realtimeSaveIncomplete",
@@ -10006,6 +10250,7 @@ export function App({
         setActiveDetailContext(null);
         setSection("home");
       }
+      clearRealtimeSpeakerDetectionRequest();
       setRealtimePreview("");
       setRealtimeFinalLines([]);
       setRealtimeSegments([]);
@@ -10016,6 +10261,12 @@ export function App({
       setActiveRealtimeJobId(null);
       setError(null);
     } catch (stopError) {
+      applyRealtimeSpeakerDetectionTracking(
+        rollbackRealtimeSpeakerDetectionStop(
+          readRealtimeSpeakerDetectionTracking(),
+          stoppingJobId,
+        ),
+      );
       setError(
         formatUiError(
           "error.realtimeStopFailed",
@@ -10289,17 +10540,14 @@ export function App({
       setTranscriptViewMode("optimized");
       setError(null);
     } catch (optimizeError) {
-      const code = formatAppErrorCode(optimizeError);
-      if (code === "missing_ai_provider" || code === "missing_api_key") {
-        setError(
-          t(
-            "error.improveConfigureProvider",
-            "Improve text failed: configure an AI provider in Settings > AI Services.",
-          ),
-        );
-      } else {
-        setError(t("error.improveFailed", "Improve text failed"));
-      }
+      setError(
+        formatImproveTextError(
+          optimizeError,
+          t,
+          formatUiError,
+          formatAppErrorCode,
+        ),
+      );
     } finally {
       setIsImprovingText(false);
     }
@@ -12161,6 +12409,23 @@ export function App({
                   </span>
                 </div>
               ) : null}
+              {(activeArtifact?.metadata?.language_detection_version === "1" ||
+                Boolean(realtimeTimelineV2Json)) ? (
+                <div style={{ marginBottom: "8px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                  <span
+                    className="kind-chip"
+                    aria-label={
+                      segment.languageCode
+                        ? `Spoken language ${segment.languageCode}`
+                        : t("detail.languageUndetermined", "Language undetermined")
+                    }
+                  >
+                    {segment.languageCode
+                      ? formatLanguageLabel(segment.languageCode as LanguageCode)
+                      : t("detail.languageUndetermined", "Language undetermined")}
+                  </span>
+                </div>
+              ) : null}
               <p style={{ fontSize: `${fontSize}px` }}>{segment.line}</p>
               <small>{segment.time}</small>
             </article>
@@ -12813,9 +13078,7 @@ export function App({
               setSummaryLanguage(event.target.value as LanguageCode)
             }
           >
-            {languageOptions
-              .filter((option) => option.value !== "auto")
-              .map((option) => (
+            {languageOptions.map((option) => (
                 <option key={option.value} value={option.value}>
                   {t(`lang.${option.value}`, option.label)}
                 </option>
@@ -12975,9 +13238,7 @@ export function App({
               setEmotionLanguage(event.target.value as LanguageCode)
             }
           >
-            {languageOptions
-              .filter((option) => option.value !== "auto")
-              .map((option) => (
+            {languageOptions.map((option) => (
                 <option key={option.value} value={option.value}>
                   {t(`lang.${option.value}`, option.label)}
                 </option>
@@ -13043,6 +13304,13 @@ export function App({
     const primaryModelValue = transcriptionSettings
       ? selectedPrimaryTranscriptionModel(transcriptionSettings)
       : "base";
+    const detectedLanguageCodes = Array.from(
+      new Set(
+        detailSegments
+          .map((segment) => segment.languageCode)
+          .filter((code): code is string => Boolean(code)),
+      ),
+    );
 
     return (
       <div className="inspector-body">
@@ -13113,6 +13381,18 @@ export function App({
               <span>{t("metadata.words")}</span>
               <strong>{transcriptWordCount}</strong>
             </div>
+            {activeArtifact.metadata?.language_detection_version === "1" ? (
+              <div className="property-line">
+                <span>{t("metadata.detectedLanguages", "Detected languages")}</span>
+                <strong>
+                  {detectedLanguageCodes.length > 0
+                    ? detectedLanguageCodes
+                        .map((code) => formatLanguageLabel(code as LanguageCode))
+                        .join(", ")
+                    : t("detail.languageUndetermined", "Language undetermined")}
+                </strong>
+              </div>
+            ) : null}
             {artifactWorkspaceId(activeArtifact) ? (
               <div className="property-line">
                 <span>{t("metadata.workspace", "Workspace")}</span>
@@ -13644,6 +13924,26 @@ export function App({
 
   function renderRealtime(): JSX.Element {
     const combinedText = realtimeFinalLines.join("\n");
+    const realtimeSpeakerDiarizationEnabled = Boolean(
+      settings?.transcription.speaker_diarization?.enabled,
+    );
+    const realtimeSpeakerDetectionIsQueued =
+      realtimeSpeakerDiarizationEnabled && realtimeSpeakerDetectionRequested;
+    const realtimeSpeakerDetectionLabel = realtimeSpeakerDetectionIsQueued
+      ? t("detail.speakerDetectionQueued", "Speaker detection queued")
+      : t("detail.runSpeakerDetection", "Run speaker detection");
+    const realtimeSpeakerDetectionDescription =
+      realtimeSpeakerDiarizationEnabled
+        ? t(
+            "realtime.speakerDetectionEnabledHelp",
+            "Runs speaker detection with the configured pyannote runtime after this live recording is saved.",
+          )
+        : t(
+            "detail.speakerDetectionDisabledHelp",
+            "Enable speaker diarization in Settings > Transcription before using speaker detection.",
+          );
+    const realtimeSpeakerDetectionDescriptionId =
+      "realtime-speaker-detection-description";
 
     return (
       <div className="view-body">
@@ -13697,6 +13997,30 @@ export function App({
                 <span className="detail-action-label">
                   {t("realtime.stopAndSave", "Stop & Save")}
                 </span>
+              </span>
+            </button>
+            <button
+              className="realtime-toolbar-button realtime-toolbar-button--speaker"
+              type="button"
+              onClick={onToggleRealtimeSpeakerDetection}
+              disabled={!realtimeSpeakerDiarizationEnabled || isStoppingRealtime}
+              aria-label={realtimeSpeakerDetectionLabel}
+              aria-pressed={realtimeSpeakerDetectionIsQueued}
+              aria-describedby={realtimeSpeakerDetectionDescriptionId}
+              title={realtimeSpeakerDetectionDescription}
+              data-tooltip={realtimeSpeakerDetectionDescription}
+            >
+              <span className="button-content">
+                <Users size={14} aria-hidden="true" focusable="false" />
+                <span className="detail-action-label">
+                  {realtimeSpeakerDetectionLabel}
+                </span>
+              </span>
+              <span
+                id={realtimeSpeakerDetectionDescriptionId}
+                className="sr-only"
+              >
+                {realtimeSpeakerDetectionDescription}
               </span>
             </button>
           </div>
@@ -15018,6 +15342,32 @@ export function App({
       settings.transcription.speaker_diarization ??
       getDefaultSpeakerDiarizationSettings();
     const pyannoteHealth = runtimeHealth?.pyannote ?? null;
+    const normalizedLanguageSearch = transcriptionLanguageSearch.trim().toLowerCase();
+    const searchableLanguageOptions = [
+      {
+        value: "auto" as LanguageCode,
+        label: t("settings.transcription.languageAuto", "Auto — detected per utterance"),
+        compatibility: "AI preference",
+      },
+      ...transcriptionLanguageCatalog.map((entry) => {
+        const capabilities = [
+          entry.whisper ? "Whisper" : null,
+          entry.parakeet_tdt ? "Parakeet TDT" : null,
+          entry.nemotron ? "Nemotron" : null,
+        ].filter(Boolean).join(" · ");
+        return {
+          value: entry.code as LanguageCode,
+          label: transcriptionLanguageNames[entry.code] ?? entry.code.toUpperCase(),
+          compatibility: capabilities,
+        };
+      }),
+    ].filter((option) => {
+      if (!normalizedLanguageSearch) return true;
+      if (option.value === settings.transcription.language) return true;
+      return `${option.label} ${option.value} ${option.compatibility}`
+        .toLowerCase()
+        .includes(normalizedLanguageSearch);
+    });
 
     return (
       <div className="settings-stack">
@@ -15112,21 +15462,43 @@ export function App({
           <div className="settings-row settings-row-block">
             <div>
               <strong>
-                {t("settings.transcription.language", "Default language")}
+                {t("settings.transcription.language", "Preferred language")}
               </strong>
+              <small>
+                {t(
+                  "settings.transcription.languageCompatibility",
+                  "Detection stays automatic; this preference is used for AI output. Compatibility follows the installed model.",
+                )}
+              </small>
             </div>
-            <select
-              value={settings.transcription.language}
-              onChange={(event) => {
-                void onChangeLanguage(event.target.value as LanguageCode);
-              }}
-            >
-              {languageOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {t(`lang.${option.value}`, option.label)}
-                </option>
-              ))}
-            </select>
+            <div className="settings-control-stack">
+              <input
+                type="search"
+                value={transcriptionLanguageSearch}
+                placeholder={t(
+                  "settings.transcription.languageSearch",
+                  "Search languages...",
+                )}
+                aria-label={t(
+                  "settings.transcription.languageSearch",
+                  "Search languages...",
+                )}
+                onChange={(event) => setTranscriptionLanguageSearch(event.target.value)}
+              />
+              <select
+                value={settings.transcription.language}
+                onChange={(event) => {
+                  void onChangeLanguage(event.target.value as LanguageCode);
+                }}
+              >
+                {searchableLanguageOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {t(`lang.${option.value}`, option.label)}
+                    {option.compatibility ? ` — ${option.compatibility}` : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
           <div className="settings-row">
@@ -18282,16 +18654,8 @@ export function App({
         transcriptText={exportPreviewText}
         segments={segmentsAlignedWithVisibleTranscript ? detailSegments : []}
         segmentsAlignedWithTranscript={segmentsAlignedWithVisibleTranscript}
-        title={activeArtifact?.title ?? ""}
-        summary={draftSummary}
-        faqs={draftFaqs}
-        derivedSections={artifactGeneratedSections(activeArtifact, t).map(
-          (section) => ({
-            title: section.title,
-            body: section.body,
-          }),
-        )}
         onClose={() => setShowExportSheet(false)}
+        onPreview={onPreviewExport}
         onExport={onExport}
       />
     </main>

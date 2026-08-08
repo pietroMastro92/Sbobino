@@ -9,7 +9,8 @@ use chrono::Utc;
 use docx_rs::{Docx, Paragraph, Run};
 use futures_util::stream::{self, StreamExt};
 use printpdf::{
-    ops::PdfPage, text::TextItem, units::Pt, BuiltinFont, Color, Mm, Op, PdfDocument, Rgb,
+    matrix::TextMatrix, ops::PdfPage, text::TextItem, units::Pt, Color, FontId, Mm, Op, ParsedFont,
+    PdfDocument, Rgb,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,8 +24,9 @@ use sbobino_application::{
 };
 use sbobino_domain::{
     constrain_transcript_edit, merge_optimized_transcript_sections,
-    minimize_transcript_repetitions, ArtifactChatMessage, ArtifactKind, PromptTask, TimedSegment,
-    TimedWord, TranscriptArtifact, TranscriptionOutput,
+    minimize_transcript_repetitions, AppLanguage, ArtifactChatMessage, ArtifactKind,
+    DetectedLanguageSummary, LanguageCode, PromptTask, TimedSegment, TimedWord, TranscriptArtifact,
+    TranscriptionOutput,
 };
 
 use crate::{
@@ -41,6 +43,14 @@ use crate::{
 };
 
 const MIN_TRIMMED_AUDIO_DURATION_SECONDS: f64 = 1.5;
+const PDF_LEFT_X: f32 = 28.0;
+const PDF_TITLE_Y: f32 = 810.0;
+const PDF_BODY_START_Y: f32 = 780.0;
+const PDF_NEW_PAGE_BODY_START_Y: f32 = 810.0;
+const PDF_BOTTOM_Y: f32 = 42.0;
+const PDF_LINE_HEIGHT: f32 = 14.0;
+const PDF_BODY_MAX_CHARS: usize = 96;
+const NOTO_SANS_FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/NotoSans[wdth,wght].ttf");
 const SPEAKER_COLOR_PALETTE: &[&str] = &[
     "#4F7CFF", "#EC6A5E", "#27A376", "#D88B15", "#1293A5", "#C85F39", "#5F8D3D", "#B04A64",
     "#6C7A2D",
@@ -64,6 +74,74 @@ fn default_summary_key_points_only() -> bool {
 
 fn default_emotion_speaker_dynamics() -> bool {
     true
+}
+
+fn app_language_code(language: &AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::En => "en",
+        AppLanguage::It => "it",
+        AppLanguage::Es => "es",
+        AppLanguage::De => "de",
+    }
+}
+
+/// Resolve an AI output preference without reanalysing legacy artifacts.  A
+/// requested code wins; Auto uses the language metadata already produced by
+/// transcription, then the interface language as the final fallback.
+fn resolve_ai_output_language(
+    artifact: &TranscriptArtifact,
+    requested: &str,
+    interface_language: &str,
+) -> String {
+    let requested = requested.trim();
+    if !requested.is_empty() && !requested.eq_ignore_ascii_case("auto") {
+        return LanguageCode::try_from_code(requested)
+            .map(|code| code.as_code().to_string())
+            .unwrap_or_else(|_| requested.to_ascii_lowercase());
+    }
+
+    if let Some(raw) = artifact.metadata.get("detected_languages") {
+        if let Ok(summaries) = serde_json::from_str::<Vec<DetectedLanguageSummary>>(raw) {
+            let has_duration = summaries
+                .iter()
+                .any(|summary| summary.duration_seconds > 0.0);
+            if let Some(dominant) = summaries.iter().max_by(|left, right| {
+                let left_weight = if has_duration {
+                    left.duration_seconds
+                } else {
+                    left.character_count as f32
+                };
+                let right_weight = if has_duration {
+                    right.duration_seconds
+                } else {
+                    right.character_count as f32
+                };
+                left_weight
+                    .partial_cmp(&right_weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                return dominant.code.clone();
+            }
+        }
+    }
+
+    if let Some(processing_language) = artifact
+        .metadata
+        .get("language")
+        .map(String::as_str)
+        .filter(|language| {
+            !language.is_empty()
+                && !language.eq_ignore_ascii_case("auto")
+                && !language.eq_ignore_ascii_case("mixed")
+                && !language.eq_ignore_ascii_case("und")
+        })
+    {
+        return processing_language.to_ascii_lowercase();
+    }
+
+    LanguageCode::try_from_code(interface_language)
+        .map(|code| code.as_code().to_string())
+        .unwrap_or_else(|_| "en".to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,7 +271,7 @@ pub struct GenerateArtifactPackPayload {
 const CHAT_CONTEXT_BUDGETS: &[(usize, usize)] = &[(8, 7600), (6, 5200), (4, 3400), (2, 2000)];
 const CHAT_CHUNK_TARGET_CHARS: usize = 900;
 const CHAT_CHUNK_OVERLAP_WORDS: usize = 24;
-const OPTIMIZE_CHUNK_TARGET_CHARS: usize = 2600;
+const OPTIMIZE_CHUNK_TARGET_CHAR_BUDGETS: &[usize] = &[2600, 1800, 1200, 800, 550];
 const OPTIMIZE_CHUNK_OVERLAP_WORDS: usize = 28;
 const OPTIMIZE_CHUNK_CONCURRENCY_LIMIT: usize = 3;
 #[cfg(test)]
@@ -210,6 +288,8 @@ const LOW_CONFIDENCE_CONTEXT_RADIUS_WORDS: usize = 3;
 const MAX_LOW_CONFIDENCE_PROMPT_SPANS: usize = 10;
 const SUMMARY_CONTEXT_OVERFLOW_MESSAGE: &str =
     "Exceeded model context window size. The app now uses chunked retrieval, but this request is still too large. Try a shorter custom prompt or fewer summary constraints.";
+const OPTIMIZE_CONTEXT_OVERFLOW_MESSAGE: &str =
+    "Exceeded model context window size while optimizing the transcript. The app retried with smaller chunks, but this transcript is still too large for the selected AI provider. Try a provider with a larger context window or optimize a shorter section.";
 const STUDY_PACK_METADATA_KEY: &str = "study_pack_v1";
 const MEETING_PACK_METADATA_KEY: &str = "meeting_intelligence_v1";
 
@@ -219,6 +299,12 @@ struct LowConfidenceSpan {
     excerpt: String,
     avg_confidence: f32,
     time_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceLanguageOptimizationGroup {
+    language_code: String,
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,7 +326,7 @@ pub struct DeleteArtifactsPayload {
     pub ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
     Txt,
@@ -266,6 +352,14 @@ pub enum ExportStyle {
 pub struct ExportSegment {
     pub time: String,
     pub line: String,
+    #[serde(
+        default,
+        alias = "startSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub start_seconds: Option<f64>,
+    #[serde(default, alias = "endSeconds", skip_serializing_if = "Option::is_none")]
+    pub end_seconds: Option<f64>,
     #[serde(default, alias = "speakerId")]
     pub speaker_id: Option<String>,
     #[serde(default, alias = "speakerLabel")]
@@ -309,6 +403,34 @@ pub struct ExportArtifactPayload {
     pub options: Option<ExportOptions>,
     pub segments: Option<Vec<ExportSegment>>,
     pub content_override: Option<String>,
+    pub summary_override: Option<String>,
+    pub faqs_override: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PreviewArtifactExportPayload {
+    pub id: String,
+    pub format: ExportFormat,
+    pub language: Option<String>,
+    pub style: Option<ExportStyle>,
+    pub options: Option<ExportOptions>,
+    pub segments: Option<Vec<ExportSegment>>,
+    pub content_override: Option<String>,
+    pub summary_override: Option<String>,
+    pub faqs_override: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportPreviewMode {
+    Exact,
+    Document,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExportPreviewResponse {
+    pub content: String,
+    pub mode: ExportPreviewMode,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +450,65 @@ struct ExportDocumentSection {
 struct ExportStyledLine {
     text: String,
     speaker_color: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExportPreparationInput {
+    id: String,
+    format: ExportFormat,
+    language: Option<String>,
+    style: Option<ExportStyle>,
+    options: Option<ExportOptions>,
+    segments: Option<Vec<ExportSegment>>,
+    content_override: Option<String>,
+    summary_override: Option<String>,
+    faqs_override: Option<String>,
+}
+
+#[derive(Debug)]
+struct PreparedArtifactExport {
+    artifact: TranscriptArtifact,
+    format: ExportFormat,
+    language: &'static str,
+    style: ExportStyle,
+    options: ExportOptions,
+    grouping: ExportGrouping,
+    transcription: String,
+    summary: String,
+    faqs: String,
+    segments: Vec<ExportSegment>,
+    content: String,
+    document: ExportDocument,
+}
+
+impl ExportPreparationInput {
+    fn from_export_payload(payload: &ExportArtifactPayload) -> Self {
+        Self {
+            id: payload.id.clone(),
+            format: payload.format,
+            language: payload.language.clone(),
+            style: payload.style,
+            options: payload.options.clone(),
+            segments: payload.segments.clone(),
+            content_override: payload.content_override.clone(),
+            summary_override: payload.summary_override.clone(),
+            faqs_override: payload.faqs_override.clone(),
+        }
+    }
+
+    fn from_preview_payload(payload: &PreviewArtifactExportPayload) -> Self {
+        Self {
+            id: payload.id.clone(),
+            format: payload.format,
+            language: payload.language.clone(),
+            style: payload.style,
+            options: payload.options.clone(),
+            segments: payload.segments.clone(),
+            content_override: payload.content_override.clone(),
+            summary_override: payload.summary_override.clone(),
+            faqs_override: payload.faqs_override.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -888,6 +1069,8 @@ fn timeline_segments_for_diarization(
             end_seconds: segment.end_seconds.filter(|value| value.is_finite()),
             speaker_id: None,
             speaker_label: None,
+            language_code: segment.language_code,
+            language_confidence: segment.language_confidence,
             words: segment
                 .words
                 .into_iter()
@@ -1033,14 +1216,46 @@ pub async fn export_artifact(
     payload: ExportArtifactPayload,
 ) -> Result<ExportArtifactResponse, CommandError> {
     let destination_path = Path::new(&payload.destination_path);
+    let prepared = prepare_artifact_export(
+        state.inner(),
+        ExportPreparationInput::from_export_payload(&payload),
+    )
+    .await?;
+    write_prepared_artifact_export(destination_path, &prepared)?;
+
+    Ok(ExportArtifactResponse {
+        path: destination_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn preview_artifact_export(
+    state: State<'_, AppState>,
+    payload: PreviewArtifactExportPayload,
+) -> Result<ExportPreviewResponse, CommandError> {
+    let prepared = prepare_artifact_export(
+        state.inner(),
+        ExportPreparationInput::from_preview_payload(&payload),
+    )
+    .await?;
+    render_prepared_artifact_preview(&prepared)
+}
+
+async fn prepare_artifact_export(
+    state: &AppState,
+    input: ExportPreparationInput,
+) -> Result<PreparedArtifactExport, CommandError> {
+    let style = input.style.unwrap_or(ExportStyle::Transcript);
+    validate_export_combination(style, input.format)?;
+
     let artifact = state
         .artifact_service
-        .get(&payload.id)
+        .get(&input.id)
         .await
         .map_err(CommandError::from)?
         .ok_or_else(|| CommandError::new("not_found", "artifact not found"))?;
 
-    let base_transcription = payload
+    let base_transcription = input
         .content_override
         .as_ref()
         .map(|value| value.trim().to_string())
@@ -1060,19 +1275,26 @@ pub async fn export_artifact(
         ));
     }
 
-    let style = payload.style.unwrap_or(ExportStyle::Transcript);
-    let options = payload.options.unwrap_or_default();
+    let options = input.options.unwrap_or_default();
     let grouping = options.grouping.unwrap_or(ExportGrouping::None);
-    let language = normalize_export_language(payload.language.as_deref());
+    let language = normalize_export_language(input.language.as_deref());
+    let summary = input
+        .summary_override
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|| artifact.summary.trim().to_string());
+    let faqs = input
+        .faqs_override
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|| artifact.faqs.trim().to_string());
     let settings = state
         .settings_service
         .snapshot()
         .await
         .map_err(CommandError::from)?;
     let speaker_colors = settings.transcription.speaker_diarization.speaker_colors;
-    let segments = match payload.segments {
+    let segments = match input.segments {
         Some(entries) if !entries.is_empty() => entries,
-        Some(_) if payload.content_override.is_some() => {
+        Some(_) if input.content_override.is_some() => {
             build_segments_from_text(&base_transcription)
         }
         _ => build_export_segments(&artifact, &base_transcription),
@@ -1088,8 +1310,8 @@ pub async fn export_artifact(
         language,
         &artifact.title,
         &base_transcription,
-        &artifact.summary,
-        &artifact.faqs,
+        &summary,
+        &faqs,
         &artifact.metadata,
         &segments,
         style,
@@ -1098,54 +1320,140 @@ pub async fn export_artifact(
         &speaker_colors,
     );
 
-    match payload.format {
+    Ok(PreparedArtifactExport {
+        artifact,
+        format: input.format,
+        language,
+        style,
+        options,
+        grouping,
+        transcription: base_transcription,
+        summary,
+        faqs,
+        segments,
+        content: export_content,
+        document: export_document,
+    })
+}
+
+fn validate_export_combination(
+    style: ExportStyle,
+    format: ExportFormat,
+) -> Result<(), CommandError> {
+    let supported = match style {
+        ExportStyle::Transcript => matches!(
+            format,
+            ExportFormat::Txt
+                | ExportFormat::Docx
+                | ExportFormat::Html
+                | ExportFormat::Pdf
+                | ExportFormat::Md
+        ),
+        ExportStyle::Subtitles => matches!(format, ExportFormat::Srt | ExportFormat::Vtt),
+        ExportStyle::Segments => matches!(
+            format,
+            ExportFormat::Txt
+                | ExportFormat::Csv
+                | ExportFormat::Docx
+                | ExportFormat::Html
+                | ExportFormat::Pdf
+                | ExportFormat::Md
+                | ExportFormat::Json
+        ),
+    };
+
+    if supported {
+        Ok(())
+    } else {
+        Err(CommandError::new(
+            "invalid_export",
+            format!("format {format:?} is not available for style {style:?}"),
+        ))
+    }
+}
+
+fn render_prepared_artifact_preview(
+    prepared: &PreparedArtifactExport,
+) -> Result<ExportPreviewResponse, CommandError> {
+    let (content, mode) = match prepared.format {
+        ExportFormat::Txt => (
+            render_plain_text_document(&prepared.document),
+            ExportPreviewMode::Exact,
+        ),
+        ExportFormat::Md => (markdown_export_content(prepared), ExportPreviewMode::Exact),
+        ExportFormat::Srt => (prepared.content.clone(), ExportPreviewMode::Exact),
+        ExportFormat::Vtt => (
+            build_vtt_content(
+                &prepared.segments,
+                &prepared.transcription,
+                prepared.options.include_speaker_names,
+            ),
+            ExportPreviewMode::Exact,
+        ),
+        ExportFormat::Csv => (
+            render_csv_content(
+                prepared.language,
+                &prepared.segments,
+                prepared.options.include_speaker_names,
+            ),
+            ExportPreviewMode::Exact,
+        ),
+        ExportFormat::Json => (render_json_content(prepared)?, ExportPreviewMode::Exact),
+        ExportFormat::Docx | ExportFormat::Html | ExportFormat::Pdf => (
+            render_plain_text_document(&prepared.document),
+            ExportPreviewMode::Document,
+        ),
+    };
+
+    Ok(ExportPreviewResponse { content, mode })
+}
+
+fn markdown_export_content(prepared: &PreparedArtifactExport) -> String {
+    if prepared.style == ExportStyle::Subtitles {
+        build_markdown_subtitles_content(
+            &prepared.segments,
+            &prepared.transcription,
+            prepared.options.include_speaker_names,
+        )
+    } else {
+        render_markdown_document(&prepared.document)
+    }
+}
+
+fn write_prepared_artifact_export(
+    destination_path: &Path,
+    prepared: &PreparedArtifactExport,
+) -> Result<(), CommandError> {
+    match prepared.format {
         ExportFormat::Txt => export_txt(
             destination_path,
-            &render_plain_text_document(&export_document),
+            &render_plain_text_document(&prepared.document),
         )?,
-        ExportFormat::Docx => export_docx(destination_path, &export_document)?,
-        ExportFormat::Html => export_html(destination_path, language, &export_document)?,
-        ExportFormat::Pdf => export_pdf(destination_path, &export_document)?,
-        ExportFormat::Json => export_json(
+        ExportFormat::Docx => export_docx(destination_path, &prepared.document)?,
+        ExportFormat::Html => export_html(destination_path, prepared.language, &prepared.document)?,
+        ExportFormat::Pdf => export_pdf(destination_path, &prepared.document)?,
+        ExportFormat::Json => export_txt(destination_path, &render_json_content(prepared)?)?,
+        ExportFormat::Csv => export_txt(
             destination_path,
-            &artifact,
-            &export_document,
-            style,
-            grouping,
-            options.include_timestamps,
-            options.include_speaker_names,
-            &segments,
-            &export_content,
+            &render_csv_content(
+                prepared.language,
+                &prepared.segments,
+                prepared.options.include_speaker_names,
+            ),
         )?,
-        ExportFormat::Csv => {
-            export_csv(destination_path, &segments, options.include_speaker_names)?
-        }
-        ExportFormat::Md => {
-            let content = if style == ExportStyle::Subtitles {
-                build_markdown_subtitles_content(
-                    &segments,
-                    &base_transcription,
-                    options.include_speaker_names,
-                )
-            } else {
-                render_markdown_document(&export_document)
-            };
-            export_md(destination_path, &content)?
-        }
-        ExportFormat::Srt => export_txt(destination_path, &export_content)?,
+        ExportFormat::Md => export_md(destination_path, &markdown_export_content(prepared))?,
+        ExportFormat::Srt => export_txt(destination_path, &prepared.content)?,
         ExportFormat::Vtt => export_txt(
             destination_path,
             &build_vtt_content(
-                &segments,
-                &base_transcription,
-                options.include_speaker_names,
+                &prepared.segments,
+                &prepared.transcription,
+                prepared.options.include_speaker_names,
             ),
         )?,
     }
 
-    Ok(ExportArtifactResponse {
-        path: destination_path.to_string_lossy().to_string(),
-    })
+    Ok(())
 }
 
 #[tauri::command]
@@ -1397,20 +1705,12 @@ pub async fn optimize_artifact(
         ));
     }
 
-    let language_code = artifact
-        .metadata
-        .get("language")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("")
-        .to_string();
-
     let settings = state
         .settings_service
         .snapshot()
         .await
         .map_err(CommandError::from)?;
+    let optimization_groups = manual_optimization_groups(&artifact, &text);
     let optimize_prompt_override = build_confidence_aware_optimize_prompt(
         &artifact,
         settings.prompt_for_task(PromptTask::Optimize),
@@ -1422,13 +1722,19 @@ pub async fn optimize_artifact(
         .map_err(|e| CommandError::new("runtime_factory", e))?;
 
     if enhancers.is_empty() {
-        return Ok(text);
+        let reason = state
+            .runtime_factory
+            .ai_capability_status()
+            .ok()
+            .and_then(|status| status.unavailable_reason);
+        return Err(missing_ai_provider_command_error(reason.as_deref()));
     }
 
     run_with_enhancer_fallback(&enhancers, "optimize transcript", |enhancer| {
-        let text = text.clone();
-        let language_code = language_code.clone();
-        Box::pin(async move { optimize_with_rag(enhancer, &text, &language_code).await })
+        let optimization_groups = optimization_groups.clone();
+        Box::pin(
+            async move { optimize_source_language_groups(enhancer, &optimization_groups).await },
+        )
     })
     .await
     .map_err(CommandError::from)
@@ -1445,6 +1751,17 @@ pub async fn summarize_artifact(
         .await
         .map_err(CommandError::from)?
         .ok_or_else(|| CommandError::new("not_found", "artifact not found"))?;
+
+    let settings = state
+        .settings_service
+        .snapshot()
+        .await
+        .map_err(CommandError::from)?;
+    let output_language = resolve_ai_output_language(
+        &artifact,
+        &payload.language,
+        app_language_code(&settings.general.app_language),
+    );
 
     let enhancers = state
         .runtime_factory
@@ -1467,7 +1784,7 @@ pub async fn summarize_artifact(
         ));
     }
 
-    let instructions = build_summary_instructions(&payload);
+    let instructions = build_summary_instructions(&payload, &output_language);
 
     run_with_enhancer_fallback(&enhancers, "summarize transcript", |enhancer| {
         let transcript = prepared.ai_transcript.clone();
@@ -1492,6 +1809,17 @@ pub async fn generate_artifact_pack(
         .map_err(CommandError::from)?
         .ok_or_else(|| CommandError::new("not_found", "artifact not found"))?;
 
+    let settings = state
+        .settings_service
+        .snapshot()
+        .await
+        .map_err(CommandError::from)?;
+    let output_language = resolve_ai_output_language(
+        &artifact,
+        &payload.language,
+        app_language_code(&settings.general.app_language),
+    );
+
     let enhancers = state
         .runtime_factory
         .build_enhancer_candidates()
@@ -1515,7 +1843,7 @@ pub async fn generate_artifact_pack(
 
     let instructions = build_generated_pack_instructions(
         payload.kind,
-        &payload.language,
+        &output_language,
         payload.context.include_timestamps,
         payload.context.include_speakers,
     );
@@ -1627,6 +1955,121 @@ fn build_artifact_context_transcript(
     context: ArtifactAiContextOptions,
 ) -> String {
     PreparedTranscriptContext::from_artifact(artifact, context).ai_transcript
+}
+
+fn normalize_source_language(language: Option<&str>) -> String {
+    let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "auto".to_string();
+    };
+    if language.eq_ignore_ascii_case("auto") || language.eq_ignore_ascii_case("und") {
+        return "auto".to_string();
+    }
+    LanguageCode::try_from_code(language)
+        .map(|code| {
+            if code.is_auto() {
+                "auto".to_string()
+            } else {
+                code.as_code().to_string()
+            }
+        })
+        .unwrap_or_else(|_| "auto".to_string())
+}
+
+fn contiguous_source_language_groups(
+    segments: impl IntoIterator<Item = (Option<String>, String)>,
+) -> Vec<SourceLanguageOptimizationGroup> {
+    let mut groups = Vec::<SourceLanguageOptimizationGroup>::new();
+    for (language, text) in segments {
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let language_code = normalize_source_language(language.as_deref());
+        if let Some(previous) = groups.last_mut() {
+            if previous.language_code == language_code {
+                previous.text.push('\n');
+                previous.text.push_str(text);
+                continue;
+            }
+        }
+        groups.push(SourceLanguageOptimizationGroup {
+            language_code,
+            text: text.to_string(),
+        });
+    }
+    groups
+}
+
+fn normalized_timeline_match_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn manual_optimization_groups(
+    artifact: &TranscriptArtifact,
+    submitted_text: &str,
+) -> Vec<SourceLanguageOptimizationGroup> {
+    let submitted_text = submitted_text.trim();
+    if submitted_text.is_empty() {
+        return Vec::new();
+    }
+
+    let timeline_segments = parse_timeline_context_segments(artifact);
+    let timeline_text = timeline_segments
+        .iter()
+        .map(|segment| segment.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let timeline_matches = !timeline_segments.is_empty()
+        && normalized_timeline_match_text(&timeline_text)
+            == normalized_timeline_match_text(submitted_text);
+    if !timeline_matches {
+        return vec![SourceLanguageOptimizationGroup {
+            language_code: "auto".to_string(),
+            text: submitted_text.to_string(),
+        }];
+    }
+
+    contiguous_source_language_groups(
+        timeline_segments
+            .into_iter()
+            .map(|segment| (segment.language_code, segment.text)),
+    )
+}
+
+fn strip_language_service_markers(value: &str) -> String {
+    let mut cleaned = value.to_string();
+    while let Some(start) = cleaned.find("[source_language=") {
+        let Some(relative_end) = cleaned[start..].find(']') else {
+            break;
+        };
+        let end = start + relative_end + 1;
+        cleaned.replace_range(start..end, "");
+    }
+    cleaned
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+async fn optimize_source_language_groups(
+    enhancer: &dyn TranscriptEnhancer,
+    groups: &[SourceLanguageOptimizationGroup],
+) -> Result<String, ApplicationError> {
+    let mut optimized_groups = Vec::with_capacity(groups.len());
+    for group in groups {
+        let optimized = optimize_with_rag(enhancer, &group.text, &group.language_code).await?;
+        let optimized = strip_language_service_markers(&optimized);
+        let constrained = constrain_transcript_edit(&group.text, &optimized);
+        optimized_groups.push(if constrained.trim().is_empty() {
+            group.text.clone()
+        } else {
+            constrained
+        });
+    }
+    Ok(optimized_groups.join("\n").trim().to_string())
 }
 
 fn build_confidence_aware_optimize_prompt(
@@ -1990,18 +2433,19 @@ fn build_chat_context_candidates(
         .collect()
 }
 
-fn build_summary_instructions(payload: &SummarizeArtifactPayload) -> String {
+fn build_summary_instructions(payload: &SummarizeArtifactPayload, output_language: &str) -> String {
     let mut lines = vec![
         format!(
             "Write a detailed, self-contained brief in {}.",
-            language_display_name(&payload.language)
+            language_display_name(output_language)
         ),
         format!(
             "The entire output must be in {}.",
-            language_display_name(&payload.language)
+            language_display_name(output_language)
         ),
         "Produce only the final summary text. Do not add meta-commentary about the summarization process.".to_string(),
         "Assume the reader has not listened to the recording. The summary must stand on its own and preserve the substance of the discussion.".to_string(),
+        "Preserve every source-language boundary in the transcript; never merge content across a language change.".to_string(),
     ];
 
     match (payload.sections, payload.bullet_points) {
@@ -2116,6 +2560,7 @@ fn build_generated_pack_instructions(
              - In Probable Exam Questions, include short model answers.\n\
              - In Flashcards, format each item as `Q:` followed by `A:`.\n\
              - If the transcript does not support a section, write `Not enough evidence.` under that heading.\n\
+             - Preserve every source-language boundary in the transcript; never merge content across a language change.\n\
              - {timestamp_rule}\n\
              - {speaker_rule}"
         ),
@@ -2132,6 +2577,7 @@ fn build_generated_pack_instructions(
              - Where owners or deadlines are explicit, capture them.\n\
              - If an item is uncertain, mark it clearly as tentative.\n\
              - If the transcript does not support a section, write `Not enough evidence.` under that heading.\n\
+             - Preserve every source-language boundary in the transcript; never merge content across a language change.\n\
              - {timestamp_rule}\n\
              - {speaker_rule}"
         ),
@@ -2172,57 +2618,70 @@ async fn optimize_with_rag(
         ));
     }
 
-    let chunks = chunk_text_by_words(
-        &cleaned,
-        OPTIMIZE_CHUNK_TARGET_CHARS,
-        OPTIMIZE_CHUNK_OVERLAP_WORDS,
-    );
+    let cleaned_char_count = cleaned.chars().count();
+    let direct_prompt_budget = enhancer.optimize_direct_prompt_char_budget();
+    let should_try_direct = cleaned_char_count <= direct_prompt_budget
+        && (enhancer.prefers_single_pass_optimize()
+            || direct_prompt_budget >= OPTIMIZE_CHUNK_TARGET_CHAR_BUDGETS[0]);
 
-    if chunks.is_empty() {
-        return Err(ApplicationError::Validation(
-            "cannot optimize an empty transcript".to_string(),
-        ));
-    }
-
-    if chunks.len() == 1 {
-        return enhancer
-            .optimize(&cleaned, language_code)
-            .await
-            .map(|optimized| constrain_transcript_edit(&cleaned, &optimized));
+    if should_try_direct {
+        match enhancer.optimize(&cleaned, language_code).await {
+            Ok(optimized) => return Ok(constrain_transcript_edit(&cleaned, &optimized)),
+            Err(error) if is_context_window_error(&error) => {}
+            Err(error) => return Err(error),
+        }
     }
 
     let concurrency_limit = enhancer
-        .summary_chunk_concurrency_limit()
+        .optimize_chunk_concurrency_limit()
         .clamp(1, OPTIMIZE_CHUNK_CONCURRENCY_LIMIT);
-    let chunk_concurrency = chunks.len().clamp(1, concurrency_limit);
 
-    let current_sections = stream::iter(chunks.into_iter())
-        .map(|chunk| async move {
-            enhancer
-                .optimize(&chunk, language_code)
-                .await
-                .map(|optimized| constrain_transcript_edit(&chunk, &optimized))
-        })
-        .buffered(chunk_concurrency)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    for target_chars in OPTIMIZE_CHUNK_TARGET_CHAR_BUDGETS {
+        let chunks = chunk_text_by_words(&cleaned, *target_chars, OPTIMIZE_CHUNK_OVERLAP_WORDS);
+        if chunks.is_empty() {
+            return Err(ApplicationError::Validation(
+                "cannot optimize an empty transcript".to_string(),
+            ));
+        }
 
-    let stitched = merge_optimized_transcript_sections(
-        &current_sections,
-        (OPTIMIZE_CHUNK_OVERLAP_WORDS / 2).max(4),
-    );
-    if stitched.trim().is_empty() {
-        return Ok(cleaned);
+        let chunk_concurrency = chunks.len().clamp(1, concurrency_limit);
+        let results = stream::iter(chunks)
+            .map(|chunk| async move {
+                enhancer
+                    .optimize(&chunk, language_code)
+                    .await
+                    .map(|optimized| constrain_transcript_edit(&chunk, &optimized))
+            })
+            .buffered(chunk_concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        if results
+            .iter()
+            .any(|result| matches!(result, Err(error) if is_context_window_error(error)))
+        {
+            continue;
+        }
+
+        let current_sections = results.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let stitched = merge_optimized_transcript_sections(
+            &current_sections,
+            (OPTIMIZE_CHUNK_OVERLAP_WORDS / 2).max(4),
+        );
+        if stitched.trim().is_empty() {
+            return Ok(cleaned);
+        }
+
+        let reduced = constrain_transcript_edit(&cleaned, &stitched);
+        if reduced.trim().is_empty() {
+            return Ok(cleaned);
+        }
+        return Ok(reduced);
     }
 
-    let reduced = constrain_transcript_edit(&cleaned, &stitched);
-    if reduced.trim().is_empty() {
-        Ok(cleaned)
-    } else {
-        Ok(reduced)
-    }
+    Err(ApplicationError::PostProcessing(
+        OPTIMIZE_CONTEXT_OVERFLOW_MESSAGE.to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -2830,16 +3289,12 @@ fn render_export_segment_line(segment: &ExportSegment, include_speaker_names: bo
     }
 }
 
-fn export_csv(
-    path: &Path,
+fn render_csv_content(
+    language: &str,
     segments: &[ExportSegment],
     include_speaker_names: bool,
-) -> Result<(), CommandError> {
-    let header = if include_speaker_names {
-        "Start Timestamp;End Timestamp;Transcript;Speaker"
-    } else {
-        "Start Timestamp;End Timestamp;Transcript"
-    };
+) -> String {
+    let header = localized_export_csv_header(language, include_speaker_names);
     let rows = if segments.is_empty() {
         vec![if include_speaker_names {
             "00:00;00:00;\"\";\"\"".to_string()
@@ -2847,30 +3302,31 @@ fn export_csv(
             "00:00;00:00;\"\"".to_string()
         }]
     } else {
+        let timings = resolve_segment_timings(segments);
         segments
             .iter()
-            .map(|segment| {
-                let start_seconds = parse_timestamp_to_seconds(&segment.time);
-                let end_time = format_mm_ss_u32(start_seconds + 11);
+            .zip(timings)
+            .map(|(segment, timing)| {
                 let base = format!(
-                    "{};{};\"{}\"",
-                    segment.time,
-                    end_time,
-                    segment.line.replace('"', "\"\"")
+                    "{};{};{}",
+                    format_mm_ss_millis(timing.start_millis),
+                    format_mm_ss_millis(timing.end_millis),
+                    quote_csv_cell(segment.line.trim()),
                 );
                 if !include_speaker_names {
                     return base;
                 }
-                let speaker = normalized_export_speaker_label(segment)
-                    .unwrap_or_default()
-                    .replace('"', "\"\"");
-                format!("{base};\"{speaker}\"")
+                let speaker = normalized_export_speaker_label(segment).unwrap_or_default();
+                format!("{base};{}", quote_csv_cell(speaker))
             })
             .collect::<Vec<_>>()
     };
 
-    std::fs::write(path, format!("{header}\n{}", rows.join("\n")))
-        .map_err(|e| CommandError::new("export", format!("failed to export csv: {e}")))
+    format!("{header}\n{}", rows.join("\n"))
+}
+
+fn quote_csv_cell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn export_docx(path: &Path, document: &ExportDocument) -> Result<(), CommandError> {
@@ -2951,31 +3407,10 @@ fn export_html(path: &Path, language: &str, document: &ExportDocument) -> Result
         .map_err(|e| CommandError::new("export", format!("failed to export html: {e}")))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn export_json(
-    path: &Path,
-    artifact: &TranscriptArtifact,
-    document: &ExportDocument,
-    style: ExportStyle,
-    grouping: ExportGrouping,
-    include_timestamps: bool,
-    include_speaker_names: bool,
-    segments: &[ExportSegment],
-    content: &str,
-) -> Result<(), CommandError> {
-    let serialized_segments = if include_speaker_names {
-        segments.to_vec()
-    } else {
-        segments
-            .iter()
-            .map(|segment| ExportSegment {
-                time: segment.time.clone(),
-                line: segment.line.clone(),
-                speaker_id: None,
-                speaker_label: None,
-            })
-            .collect::<Vec<_>>()
-    };
+fn render_json_content(prepared: &PreparedArtifactExport) -> Result<String, CommandError> {
+    let serialized_segments =
+        resolved_export_segments(&prepared.segments, prepared.options.include_speaker_names);
+    let artifact = &prepared.artifact;
     let payload = json!({
         "id": artifact.id,
         "job_id": artifact.job_id,
@@ -2985,54 +3420,57 @@ fn export_json(
         "source_origin": artifact.source_origin,
         "created_at": artifact.created_at.to_rfc3339(),
         "updated_at": artifact.updated_at.to_rfc3339(),
-        "style": style,
+        "style": prepared.style,
         "options": {
-            "include_timestamps": include_timestamps,
-            "grouping": grouping,
-            "include_speaker_names": include_speaker_names
+            "include_timestamps": prepared.options.include_timestamps,
+            "grouping": prepared.grouping,
+            "include_speaker_names": prepared.options.include_speaker_names
         },
-        "document_title": document.title,
-        "sections": document.sections.iter().map(|section| {
+        "document_title": prepared.document.title,
+        "sections": prepared.document.sections.iter().map(|section| {
             json!({
                 "title": section.title,
                 "content": section.body,
             })
         }).collect::<Vec<_>>(),
-        "content": content,
-        "summary": artifact.summary,
-        "faqs": artifact.faqs,
+        "content": prepared.content,
+        "summary": prepared.summary,
+        "faqs": prepared.faqs,
         "segments": serialized_segments,
         "metadata": artifact.metadata,
     });
 
-    let serialized = serde_json::to_string_pretty(&payload)
-        .map_err(|e| CommandError::new("export", format!("failed to encode json export: {e}")))?;
-
-    std::fs::write(path, serialized)
-        .map_err(|e| CommandError::new("export", format!("failed to export json: {e}")))
+    serde_json::to_string_pretty(&payload)
+        .map_err(|e| CommandError::new("export", format!("failed to encode json export: {e}")))
 }
 
 fn export_pdf(path: &Path, document: &ExportDocument) -> Result<(), CommandError> {
     let mut doc = PdfDocument::new(&document.title);
+    let font = load_pdf_font(&mut doc)?;
     let mut pages = Vec::new();
-    let mut ops = start_pdf_page_ops(Some(&document.title));
-    let mut y = 780.0_f32;
-    let body_lines = render_document_body_lines(document);
+    let (mut ops, mut y) = start_pdf_page_ops(Some(&document.title), &font);
     let colored_lines = render_document_body_styled_lines(document);
 
-    if body_lines.is_empty() {
-        write_pdf_line(&mut ops, "No content available for export.", y, None);
+    if colored_lines.is_empty() {
+        write_pdf_line(&mut ops, "No content available for export.", y, None, &font);
     } else {
         for line in colored_lines {
-            if y < 42.0 {
-                ops.push(Op::EndTextSection);
-                pages.push(PdfPage::new(Mm(210.0), Mm(297.0), ops));
-                ops = start_pdf_page_ops(None);
-                y = 810.0;
-            }
+            for wrapped_line in wrap_pdf_text_line(&line.text, PDF_BODY_MAX_CHARS) {
+                if y < PDF_BOTTOM_Y {
+                    ops.push(Op::EndTextSection);
+                    pages.push(PdfPage::new(Mm(210.0), Mm(297.0), ops));
+                    (ops, y) = start_pdf_page_ops(None, &font);
+                }
 
-            write_pdf_line(&mut ops, &line.text, y, line.speaker_color.as_deref());
-            y -= 14.0;
+                write_pdf_line(
+                    &mut ops,
+                    &wrapped_line,
+                    y,
+                    line.speaker_color.as_deref(),
+                    &font,
+                );
+                y -= PDF_LINE_HEIGHT;
+            }
         }
     }
 
@@ -3058,45 +3496,57 @@ fn export_pdf(path: &Path, document: &ExportDocument) -> Result<(), CommandError
         .map_err(|e| CommandError::new("export", format!("failed to write pdf: {e}")))
 }
 
-fn start_pdf_page_ops(title: Option<&str>) -> Vec<Op> {
-    let mut ops = vec![Op::StartTextSection];
-
-    if let Some(title) = title {
-        ops.push(Op::SetFontSizeBuiltinFont {
-            size: Pt(20.0),
-            font: BuiltinFont::HelveticaBold,
-        });
-        ops.push(Op::SetTextCursor {
-            pos: printpdf::graphics::Point {
-                x: Pt(28.0),
-                y: Pt(810.0),
-            },
-        });
-        ops.push(Op::WriteTextBuiltinFont {
-            items: vec![TextItem::Text(title.to_string())],
-            font: BuiltinFont::HelveticaBold,
-        });
-
-        ops.push(Op::SetFontSizeBuiltinFont {
-            size: Pt(11.0),
-            font: BuiltinFont::Helvetica,
-        });
-    } else {
-        ops.push(Op::SetFontSizeBuiltinFont {
-            size: Pt(11.0),
-            font: BuiltinFont::Helvetica,
-        });
-    }
-
-    ops
+fn load_pdf_font(doc: &mut PdfDocument) -> Result<FontId, CommandError> {
+    let mut warnings = Vec::new();
+    let font = ParsedFont::from_bytes(NOTO_SANS_FONT_BYTES, 0, &mut warnings).ok_or_else(|| {
+        CommandError::new(
+            "export",
+            "failed to parse the bundled Noto Sans font for PDF export",
+        )
+    })?;
+    Ok(doc.add_font(&font))
 }
 
-fn write_pdf_line(ops: &mut Vec<Op>, line: &str, y: f32, speaker_color: Option<&str>) {
-    ops.push(Op::SetTextCursor {
-        pos: printpdf::graphics::Point {
-            x: Pt(28.0),
-            y: Pt(y),
-        },
+fn start_pdf_page_ops(title: Option<&str>, font: &FontId) -> (Vec<Op>, f32) {
+    let mut ops = vec![Op::StartTextSection];
+    let mut body_y = PDF_NEW_PAGE_BODY_START_Y;
+
+    if let Some(title) = title {
+        ops.push(Op::SetFontSize {
+            size: Pt(20.0),
+            font: font.clone(),
+        });
+        let mut title_y = PDF_TITLE_Y;
+        for title_line in wrap_pdf_text_line(title, 72) {
+            ops.push(Op::SetTextMatrix {
+                matrix: TextMatrix::Translate(Pt(PDF_LEFT_X), Pt(title_y)),
+            });
+            ops.push(Op::WriteText {
+                items: vec![TextItem::Text(title_line)],
+                font: font.clone(),
+            });
+            title_y -= 24.0;
+        }
+        body_y = (title_y - 6.0).min(PDF_BODY_START_Y);
+    }
+
+    ops.push(Op::SetFontSize {
+        size: Pt(11.0),
+        font: font.clone(),
+    });
+
+    (ops, body_y)
+}
+
+fn write_pdf_line(
+    ops: &mut Vec<Op>,
+    line: &str,
+    y: f32,
+    speaker_color: Option<&str>,
+    font: &FontId,
+) {
+    ops.push(Op::SetTextMatrix {
+        matrix: TextMatrix::Translate(Pt(PDF_LEFT_X), Pt(y)),
     });
     if let Some((red, green, blue)) = speaker_color.and_then(parse_hex_rgb) {
         ops.push(Op::SetFillColor {
@@ -3112,10 +3562,57 @@ fn write_pdf_line(ops: &mut Vec<Op>, line: &str, y: f32, speaker_color: Option<&
             col: Color::Rgb(Rgb::new(0.12, 0.14, 0.19, None)),
         });
     }
-    ops.push(Op::WriteTextBuiltinFont {
+    ops.push(Op::WriteText {
         items: vec![TextItem::Text(line.to_string())],
-        font: BuiltinFont::Helvetica,
+        font: font.clone(),
     });
+}
+
+fn wrap_pdf_text_line(line: &str, max_chars: usize) -> Vec<String> {
+    if line.trim().is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+
+    for word in line.split_whitespace() {
+        if word.chars().count() > max_chars {
+            if !current.is_empty() {
+                wrapped.push(current);
+                current = String::new();
+            }
+            let chars = word.chars().collect::<Vec<_>>();
+            wrapped.extend(
+                chars
+                    .chunks(max_chars)
+                    .map(|chunk| chunk.iter().collect::<String>()),
+            );
+            continue;
+        }
+
+        let next_len = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+
+        if next_len > max_chars && !current.is_empty() {
+            wrapped.push(current);
+            current = word.to_string();
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+
+    if !current.is_empty() {
+        wrapped.push(current);
+    }
+
+    wrapped
 }
 
 fn normalize_export_language(value: Option<&str>) -> &'static str {
@@ -3130,7 +3627,7 @@ fn normalize_export_language(value: Option<&str>) -> &'static str {
 fn localized_export_fallback_title(language: &str) -> &'static str {
     match language {
         "it" => "Trascrizione",
-        "es" => "Transcripcion",
+        "es" => "Transcripción",
         "de" => "Transkript",
         _ => "Transcript",
     }
@@ -3145,7 +3642,7 @@ fn localized_export_document_title(language: &str, title: &str) -> String {
 
     match language {
         "it" => format!("Trascrizione di {title}"),
-        "es" => format!("Transcripcion de {title}"),
+        "es" => format!("Transcripción de {title}"),
         "de" => format!("Transkript von {title}"),
         _ => format!("Transcript of {title}"),
     }
@@ -3161,7 +3658,7 @@ fn localized_export_primary_section_title(language: &str, style: ExportStyle) ->
         },
         _ => match language {
             "it" => "Trascrizione",
-            "es" => "Transcripcion",
+            "es" => "Transcripción",
             "de" => "Transkript",
             _ => "Transcript",
         },
@@ -3181,8 +3678,21 @@ fn localized_export_faq_title(language: &str) -> &'static str {
     match language {
         "it" => "Domande frequenti",
         "es" => "Preguntas frecuentes",
-        "de" => "Haeufige Fragen",
+        "de" => "Häufige Fragen",
         _ => "FAQs",
+    }
+}
+
+fn localized_export_csv_header(language: &str, include_speaker_names: bool) -> &'static str {
+    match (language, include_speaker_names) {
+        ("it", true) => "Timestamp inizio;Timestamp fine;Trascrizione;Speaker",
+        ("it", false) => "Timestamp inizio;Timestamp fine;Trascrizione",
+        ("es", true) => "Marca de tiempo inicial;Marca de tiempo final;Transcripción;Hablante",
+        ("es", false) => "Marca de tiempo inicial;Marca de tiempo final;Transcripción",
+        ("de", true) => "Start-Zeitstempel;End-Zeitstempel;Transkript;Sprecher",
+        ("de", false) => "Start-Zeitstempel;End-Zeitstempel;Transkript",
+        (_, true) => "Start Timestamp;End Timestamp;Transcript;Speaker",
+        (_, false) => "Start Timestamp;End Timestamp;Transcript",
     }
 }
 
@@ -3282,10 +3792,9 @@ fn build_primary_section_styled_lines(
             .collect::<Vec<_>>(),
         ExportStyle::Subtitles => segments
             .iter()
+            .zip(resolve_segment_timings(segments))
             .enumerate()
-            .flat_map(|(index, segment)| {
-                let start_seconds = parse_timestamp_to_seconds(&segment.time);
-                let end_seconds = start_seconds + 11;
+            .flat_map(|(index, (segment, timing))| {
                 let mut cue_lines = vec![
                     ExportStyledLine {
                         text: (index + 1).to_string(),
@@ -3294,8 +3803,8 @@ fn build_primary_section_styled_lines(
                     ExportStyledLine {
                         text: format!(
                             "{} --> {}",
-                            format_srt_time(start_seconds),
-                            format_srt_time(end_seconds)
+                            format_srt_time(timing.start_millis),
+                            format_srt_time(timing.end_millis)
                         ),
                         speaker_color: None,
                     },
@@ -3406,27 +3915,6 @@ fn render_markdown_document(document: &ExportDocument) -> String {
     blocks.join("\n\n")
 }
 
-fn render_document_body_lines(document: &ExportDocument) -> Vec<String> {
-    let mut lines = Vec::new();
-
-    for (index, section) in document.sections.iter().enumerate() {
-        if index == 0 {
-            lines.push(String::new());
-        } else {
-            lines.push(String::new());
-            lines.push(String::new());
-        }
-        lines.push(section.title.clone());
-        if let Some(styled_lines) = &section.styled_lines {
-            lines.extend(styled_lines.iter().map(|line| line.text.clone()));
-        } else {
-            lines.extend(section.body.lines().map(|line| line.to_string()));
-        }
-    }
-
-    lines
-}
-
 fn render_document_body_styled_lines(document: &ExportDocument) -> Vec<ExportStyledLine> {
     let mut lines = Vec::new();
 
@@ -3477,6 +3965,8 @@ fn build_export_segments(artifact: &TranscriptArtifact, transcription: &str) -> 
             Some(ExportSegment {
                 time,
                 line: text.to_string(),
+                start_seconds: segment.start_seconds.map(f64::from),
+                end_seconds: segment.end_seconds.map(f64::from),
                 speaker_id: segment.speaker_id,
                 speaker_label: segment.speaker_label,
             })
@@ -3503,6 +3993,8 @@ fn build_segments_from_text(transcription: &str) -> Vec<ExportSegment> {
             ExportSegment {
                 time: format!("{:02}:{:02}", mm, ss),
                 line: line.to_string(),
+                start_seconds: Some(f64::from(seconds)),
+                end_seconds: Some(f64::from(seconds + 4)),
                 speaker_id: None,
                 speaker_label: None,
             }
@@ -3510,41 +4002,113 @@ fn build_segments_from_text(transcription: &str) -> Vec<ExportSegment> {
         .collect()
 }
 
-fn format_mm_ss_u32(total_seconds: u32) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedSegmentTiming {
+    start_millis: u64,
+    end_millis: u64,
+}
+
+fn valid_segment_seconds(value: Option<f64>) -> Option<f64> {
+    value.filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+}
+
+fn segment_start_seconds(segment: &ExportSegment) -> f64 {
+    valid_segment_seconds(segment.start_seconds)
+        .unwrap_or_else(|| parse_timestamp_to_seconds(&segment.time))
+}
+
+fn seconds_to_millis(seconds: f64) -> u64 {
+    (seconds.max(0.0) * 1000.0).round() as u64
+}
+
+fn resolve_segment_timings(segments: &[ExportSegment]) -> Vec<ResolvedSegmentTiming> {
+    let starts = segments
+        .iter()
+        .map(segment_start_seconds)
+        .collect::<Vec<_>>();
+
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            let start = starts[index];
+            let explicit_end = valid_segment_seconds(segment.end_seconds)
+                .filter(|end_seconds| *end_seconds > start);
+            let next_start = starts
+                .get(index + 1)
+                .copied()
+                .filter(|next_seconds| *next_seconds > start);
+            let end = explicit_end.or(next_start).unwrap_or(start + 4.0);
+            let start_millis = seconds_to_millis(start);
+            let end_millis = seconds_to_millis(end).max(start_millis.saturating_add(1));
+            ResolvedSegmentTiming {
+                start_millis,
+                end_millis,
+            }
+        })
+        .collect()
+}
+
+fn resolved_export_segments(
+    segments: &[ExportSegment],
+    include_speaker_names: bool,
+) -> Vec<ExportSegment> {
+    segments
+        .iter()
+        .zip(resolve_segment_timings(segments))
+        .map(|(segment, timing)| ExportSegment {
+            time: segment.time.clone(),
+            line: segment.line.clone(),
+            start_seconds: Some(timing.start_millis as f64 / 1000.0),
+            end_seconds: Some(timing.end_millis as f64 / 1000.0),
+            speaker_id: include_speaker_names
+                .then(|| segment.speaker_id.clone())
+                .flatten(),
+            speaker_label: include_speaker_names
+                .then(|| segment.speaker_label.clone())
+                .flatten(),
+        })
+        .collect()
+}
+
+fn format_mm_ss_millis(total_millis: u64) -> String {
+    let total_seconds = total_millis / 1000;
     let mm = total_seconds / 60;
     let ss = total_seconds % 60;
     format!("{:02}:{:02}", mm, ss)
 }
 
-fn parse_timestamp_to_seconds(value: &str) -> u32 {
+fn parse_timestamp_to_seconds(value: &str) -> f64 {
     let mut parts = value.trim().split(':').collect::<Vec<_>>();
     if parts.len() < 2 || parts.len() > 3 {
-        return 0;
+        return 0.0;
     }
 
     if parts.len() == 2 {
         parts.insert(0, "0");
     }
 
-    let hh = parts[0].parse::<u32>().unwrap_or(0);
-    let mm = parts[1].parse::<u32>().unwrap_or(0);
-    let ss = parts[2].parse::<u32>().unwrap_or(0);
+    let hh = parts[0].parse::<f64>().unwrap_or(0.0);
+    let mm = parts[1].parse::<f64>().unwrap_or(0.0);
+    let ss = parts[2].parse::<f64>().unwrap_or(0.0);
 
-    hh * 3600 + mm * 60 + ss
+    (hh * 3600.0 + mm * 60.0 + ss).max(0.0)
 }
 
-fn format_srt_time(seconds: u32) -> String {
-    let hh = seconds / 3600;
-    let mm = (seconds % 3600) / 60;
-    let ss = seconds % 60;
-    format!("{:02}:{:02}:{:02},000", hh, mm, ss)
+fn format_srt_time(total_millis: u64) -> String {
+    let hh = total_millis / 3_600_000;
+    let mm = (total_millis % 3_600_000) / 60_000;
+    let ss = (total_millis % 60_000) / 1000;
+    let millis = total_millis % 1000;
+    format!("{:02}:{:02}:{:02},{:03}", hh, mm, ss, millis)
 }
 
-fn format_vtt_time(seconds: u32) -> String {
-    let hh = seconds / 3600;
-    let mm = (seconds % 3600) / 60;
-    let ss = seconds % 60;
-    format!("{:02}:{:02}:{:02}.000", hh, mm, ss)
+fn format_vtt_time(total_millis: u64) -> String {
+    let hh = total_millis / 3_600_000;
+    let mm = (total_millis % 3_600_000) / 60_000;
+    let ss = (total_millis % 60_000) / 1000;
+    let millis = total_millis % 1000;
+    format!("{:02}:{:02}:{:02}.{:03}", hh, mm, ss, millis)
 }
 
 fn build_markdown_subtitles_content(
@@ -3580,13 +4144,12 @@ fn build_vtt_content(
 
     let cues = segments
         .iter()
-        .map(|segment| {
-            let start_seconds = parse_timestamp_to_seconds(&segment.time);
-            let end_seconds = start_seconds + 11;
+        .zip(resolve_segment_timings(segments))
+        .map(|(segment, timing)| {
             format!(
                 "{} --> {}\n{}",
-                format_vtt_time(start_seconds),
-                format_vtt_time(end_seconds),
+                format_vtt_time(timing.start_millis),
+                format_vtt_time(timing.end_millis),
                 render_export_segment_line(segment, include_speaker_names)
             )
         })
@@ -3613,15 +4176,14 @@ fn build_export_content(
 
             segments
                 .iter()
+                .zip(resolve_segment_timings(segments))
                 .enumerate()
-                .map(|(index, segment)| {
-                    let start_seconds = parse_timestamp_to_seconds(&segment.time);
-                    let end_seconds = start_seconds + 11;
+                .map(|(index, (segment, timing))| {
                     format!(
                         "{}\n{} --> {}\n{}",
                         index + 1,
-                        format_srt_time(start_seconds),
-                        format_srt_time(end_seconds),
+                        format_srt_time(timing.start_millis),
+                        format_srt_time(timing.end_millis),
                         render_export_segment_line(segment, include_speaker_names)
                     )
                 })
@@ -3682,6 +4244,7 @@ fn escape_html(value: &str) -> String {
 mod tests {
     use std::{
         collections::BTreeMap,
+        io::Read,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
@@ -3701,11 +4264,13 @@ mod tests {
         build_direct_summary_prompt, build_export_content, build_export_document,
         build_export_segments, build_summary_instructions, build_summary_synthesis_prompt,
         chunk_text_by_words, extract_low_confidence_spans, is_context_window_error,
-        optimize_with_rag, render_markdown_document, render_plain_text_document, run_cancellable,
-        summarize_with_rag, timeline_segments_for_diarization, trimmed_audio_output_metadata,
-        validate_trimmed_audio_output, ApplicationError, ArtifactAiContextOptions,
-        ArtifactChatMessage, ArtifactKind, ExportStyle, SummarizeArtifactPayload,
-        TranscriptArtifact, TranscriptEnhancer, MIN_TRIMMED_AUDIO_DURATION_SECONDS,
+        manual_optimization_groups, optimize_source_language_groups, optimize_with_rag,
+        render_markdown_document, render_plain_text_document, resolve_ai_output_language,
+        run_cancellable, summarize_with_rag, timeline_segments_for_diarization,
+        trimmed_audio_output_metadata, validate_trimmed_audio_output, ApplicationError,
+        ArtifactAiContextOptions, ArtifactChatMessage, ArtifactKind, ExportStyle,
+        SourceLanguageOptimizationGroup, SummarizeArtifactPayload, TranscriptArtifact,
+        TranscriptEnhancer, MIN_TRIMMED_AUDIO_DURATION_SECONDS,
     };
 
     struct TrackingEnhancer {
@@ -3714,8 +4279,11 @@ mod tests {
         active_calls: AtomicUsize,
         max_active_calls: AtomicUsize,
         prompts: Mutex<Vec<String>>,
+        optimize_languages: Mutex<Vec<String>>,
         prefer_single_pass: bool,
         chunk_concurrency_limit: usize,
+        optimize_context_limit_chars: Option<usize>,
+        optimize_direct_prompt_char_budget: usize,
         fail_direct_attempts: AtomicUsize,
         hallucinate_optimize: bool,
         hallucinate_merge: bool,
@@ -3735,13 +4303,29 @@ mod tests {
                 active_calls: AtomicUsize::new(0),
                 max_active_calls: AtomicUsize::new(0),
                 prompts: Mutex::new(Vec::new()),
+                optimize_languages: Mutex::new(Vec::new()),
                 prefer_single_pass,
                 chunk_concurrency_limit,
+                optimize_context_limit_chars: None,
+                optimize_direct_prompt_char_budget: 3_200,
                 fail_direct_attempts: AtomicUsize::new(fail_direct_attempts),
                 hallucinate_optimize: false,
                 hallucinate_merge: false,
                 hallucinate_long: false,
                 substantial_rewrite_optimize: false,
+            }
+        }
+
+        fn with_optimize_context_limit(
+            prefer_single_pass: bool,
+            chunk_concurrency_limit: usize,
+            optimize_direct_prompt_char_budget: usize,
+            optimize_context_limit_chars: usize,
+        ) -> Self {
+            Self {
+                optimize_context_limit_chars: Some(optimize_context_limit_chars),
+                optimize_direct_prompt_char_budget,
+                ..Self::new(prefer_single_pass, chunk_concurrency_limit, 0)
             }
         }
 
@@ -3824,9 +4408,21 @@ mod tests {
         async fn optimize(
             &self,
             text: &str,
-            _language_code: &str,
+            language_code: &str,
         ) -> Result<String, ApplicationError> {
             self.optimize_calls.fetch_add(1, Ordering::SeqCst);
+            self.optimize_languages
+                .lock()
+                .expect("optimize language lock poisoned")
+                .push(language_code.to_string());
+            if self
+                .optimize_context_limit_chars
+                .is_some_and(|limit| text.chars().count() > limit)
+            {
+                return Err(ApplicationError::PostProcessing(
+                    "Foundation bridge error: Exceeded model context window size".to_string(),
+                ));
+            }
             if self.hallucinate_optimize {
                 if self.hallucinate_long {
                     Ok(format!(
@@ -3907,17 +4503,23 @@ mod tests {
         fn summary_chunk_concurrency_limit(&self) -> usize {
             self.chunk_concurrency_limit
         }
+
+        fn prefers_single_pass_optimize(&self) -> bool {
+            self.prefer_single_pass
+        }
+
+        fn optimize_chunk_concurrency_limit(&self) -> usize {
+            self.chunk_concurrency_limit
+        }
+
+        fn optimize_direct_prompt_char_budget(&self) -> usize {
+            self.optimize_direct_prompt_char_budget
+        }
     }
 
     impl Default for TrackingEnhancer {
         fn default() -> Self {
-            Self {
-                hallucinate_optimize: false,
-                hallucinate_merge: false,
-                hallucinate_long: false,
-                substantial_rewrite_optimize: false,
-                ..Self::new(false, 3, 0)
-            }
+            Self::new(false, 3, 0)
         }
     }
 
@@ -3935,7 +4537,7 @@ mod tests {
         let mut tokens: Vec<String> = Vec::new();
         for word in lowered.split_whitespace() {
             let stripped = word.trim_end_matches(|c: char| !c.is_alphanumeric());
-            if filler_words.iter().any(|filler| stripped == *filler) {
+            if filler_words.contains(&stripped) {
                 continue;
             }
             tokens.push(word.to_string());
@@ -3995,6 +4597,146 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn auto_ai_language_uses_detected_duration_then_interface_fallback() {
+        let mut artifact = sample_artifact("Ciao hello");
+        artifact.metadata.insert(
+            "detected_languages".to_string(),
+            json!([
+                {"code": "it", "duration_seconds": 8.0, "character_count": 10},
+                {"code": "en", "duration_seconds": 2.0, "character_count": 40}
+            ])
+            .to_string(),
+        );
+        assert_eq!(resolve_ai_output_language(&artifact, "auto", "de"), "it");
+
+        let legacy = sample_artifact("legacy transcript");
+        assert_eq!(resolve_ai_output_language(&legacy, "auto", "de"), "de");
+        assert_eq!(resolve_ai_output_language(&legacy, "it-IT", "de"), "it");
+    }
+
+    #[tokio::test]
+    async fn manual_optimization_preserves_contiguous_timeline_language_groups() {
+        let submitted = "ciao mondo\ncome stai\nhello world";
+        let mut artifact = sample_artifact(submitted);
+        artifact.metadata.insert(
+            "timeline_v2".to_string(),
+            json!({
+                "version": 2,
+                "segments": [
+                    {"text": "ciao mondo", "language_code": "it-IT"},
+                    {"text": "come stai", "language_code": "it"},
+                    {"text": "hello world", "language_code": "en-US"}
+                ]
+            })
+            .to_string(),
+        );
+
+        let groups = manual_optimization_groups(&artifact, submitted);
+        assert_eq!(
+            groups,
+            vec![
+                SourceLanguageOptimizationGroup {
+                    language_code: "it".to_string(),
+                    text: "ciao mondo\ncome stai".to_string(),
+                },
+                SourceLanguageOptimizationGroup {
+                    language_code: "en".to_string(),
+                    text: "hello world".to_string(),
+                },
+            ]
+        );
+
+        let enhancer = TrackingEnhancer::default();
+        let optimized = optimize_source_language_groups(&enhancer, &groups)
+            .await
+            .expect("manual groups should optimize");
+        assert_eq!(
+            *enhancer
+                .optimize_languages
+                .lock()
+                .expect("optimize language lock poisoned"),
+            vec!["it".to_string(), "en".to_string()]
+        );
+        assert_eq!(optimized, submitted);
+        assert!(!optimized.contains("[source_language="));
+    }
+
+    #[tokio::test]
+    async fn manual_optimization_uses_auto_for_unmatched_edited_text() {
+        let mut artifact = sample_artifact("ciao mondo\nhello world");
+        artifact.metadata.insert(
+            "timeline_v2".to_string(),
+            json!({
+                "version": 2,
+                "segments": [
+                    {"text": "ciao mondo", "language_code": "it"},
+                    {"text": "hello world", "language_code": "en"}
+                ]
+            })
+            .to_string(),
+        );
+        let submitted = "user edited transcript with different wording";
+        let groups = manual_optimization_groups(&artifact, submitted);
+        assert_eq!(
+            groups,
+            vec![SourceLanguageOptimizationGroup {
+                language_code: "auto".to_string(),
+                text: submitted.to_string(),
+            }]
+        );
+
+        let enhancer = TrackingEnhancer::default();
+        optimize_source_language_groups(&enhancer, &groups)
+            .await
+            .expect("unmatched manual text should optimize");
+        assert_eq!(
+            *enhancer
+                .optimize_languages
+                .lock()
+                .expect("optimize language lock poisoned"),
+            vec!["auto".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_optimization_uses_auto_for_case_only_timeline_edit() {
+        let mut artifact = sample_artifact("Ciao mondo\nHello world");
+        artifact.metadata.insert(
+            "timeline_v2".to_string(),
+            json!({
+                "version": 2,
+                "segments": [
+                    {"text": "Ciao mondo", "language_code": "it"},
+                    {"text": "Hello world", "language_code": "en"}
+                ]
+            })
+            .to_string(),
+        );
+        let submitted = "ciao mondo\nhello world";
+        let groups = manual_optimization_groups(&artifact, submitted);
+        assert_eq!(
+            groups,
+            vec![SourceLanguageOptimizationGroup {
+                language_code: "auto".to_string(),
+                text: submitted.to_string(),
+            }]
+        );
+
+        let enhancer = TrackingEnhancer::default();
+        let optimized = optimize_source_language_groups(&enhancer, &groups)
+            .await
+            .expect("case-only edit should optimize");
+        assert_eq!(optimized, submitted);
+        assert_eq!(
+            *enhancer
+                .optimize_languages
+                .lock()
+                .expect("optimize language lock poisoned"),
+            vec!["auto".to_string()]
+        );
     }
 
     fn sample_artifact_with_timeline(text: &str) -> TranscriptArtifact {
@@ -4230,6 +4972,267 @@ mod tests {
     }
 
     #[test]
+    fn prepared_raw_transcript_is_previewed_and_written_exactly_once() {
+        let mut artifact = sample_artifact("Clean edited transcript.");
+        artifact.title = "Meeting".to_string();
+        artifact.summary = "Short summary.".to_string();
+
+        let document = build_export_document(
+            "en",
+            &artifact.title,
+            &artifact.raw_transcript,
+            &artifact.summary,
+            &artifact.faqs,
+            &artifact.metadata,
+            &[],
+            ExportStyle::Transcript,
+            false,
+            false,
+            &BTreeMap::new(),
+        );
+        let prepared = super::PreparedArtifactExport {
+            artifact: artifact.clone(),
+            format: super::ExportFormat::Txt,
+            language: "en",
+            style: ExportStyle::Transcript,
+            options: super::ExportOptions::default(),
+            grouping: super::ExportGrouping::None,
+            transcription: artifact.raw_transcript.clone(),
+            summary: artifact.summary.clone(),
+            faqs: artifact.faqs.clone(),
+            segments: Vec::new(),
+            content: artifact.raw_transcript.clone(),
+            document,
+        };
+        let preview =
+            super::render_prepared_artifact_preview(&prepared).expect("preview should render");
+        let temp = tempdir().expect("tempdir");
+        let destination = temp.path().join("transcript.txt");
+        super::write_prepared_artifact_export(&destination, &prepared)
+            .expect("export should write");
+        let exported = std::fs::read_to_string(destination).expect("exported text");
+
+        assert_eq!(preview.content, exported);
+        assert_eq!(exported.matches("Transcript of Meeting").count(), 1);
+        assert_eq!(exported.matches("Clean edited transcript.").count(), 1);
+        assert_eq!(exported.matches("Summary\nShort summary.").count(), 1);
+    }
+
+    #[test]
+    fn subtitle_fallback_ends_at_the_next_segment_start() {
+        let segments = vec![
+            super::ExportSegment {
+                time: "00:00".to_string(),
+                line: "One.".to_string(),
+                start_seconds: None,
+                end_seconds: None,
+                speaker_id: None,
+                speaker_label: None,
+            },
+            super::ExportSegment {
+                time: "00:05".to_string(),
+                line: "Two.".to_string(),
+                start_seconds: None,
+                end_seconds: None,
+                speaker_id: None,
+                speaker_label: None,
+            },
+        ];
+
+        let content =
+            build_export_content("One. Two.", &segments, ExportStyle::Subtitles, true, false);
+
+        assert!(content.contains("00:00:00,000 --> 00:00:05,000"));
+        assert!(content.contains("00:00:05,000 --> 00:00:09,000"));
+        assert!(!content.contains("00:00:11,000"));
+    }
+
+    #[test]
+    fn subtitle_explicit_end_preserves_fractional_overlap() {
+        let segments = vec![
+            super::ExportSegment {
+                time: "00:00".to_string(),
+                line: "Overlapping first cue.".to_string(),
+                start_seconds: Some(0.125),
+                end_seconds: Some(8.5),
+                speaker_id: None,
+                speaker_label: None,
+            },
+            super::ExportSegment {
+                time: "00:05".to_string(),
+                line: "Second cue.".to_string(),
+                start_seconds: Some(5.0),
+                end_seconds: Some(6.25),
+                speaker_id: None,
+                speaker_label: None,
+            },
+        ];
+
+        let srt = build_export_content(
+            "Overlapping first cue. Second cue.",
+            &segments,
+            ExportStyle::Subtitles,
+            true,
+            false,
+        );
+        let vtt = super::build_vtt_content(&segments, "", false);
+
+        assert!(srt.contains("00:00:00,125 --> 00:00:08,500"));
+        assert!(srt.contains("00:00:05,000 --> 00:00:06,250"));
+        assert!(vtt.contains("00:00:00.125 --> 00:00:08.500"));
+    }
+
+    #[test]
+    fn csv_is_localized_escaped_and_uses_resolved_bounds() {
+        let segments = vec![super::ExportSegment {
+            time: "01:00".to_string(),
+            line: "He said \"yes\"".to_string(),
+            start_seconds: Some(60.25),
+            end_seconds: Some(62.75),
+            speaker_id: Some("speaker_1".to_string()),
+            speaker_label: Some("A \"B\"".to_string()),
+        }];
+
+        let csv = super::render_csv_content("it", &segments, true);
+
+        assert!(csv.starts_with("Timestamp inizio;Timestamp fine;Trascrizione;Speaker\n"));
+        assert!(csv.contains("01:00;01:02;\"He said \"\"yes\"\"\";\"A \"\"B\"\"\""));
+        assert!(!csv.contains("00:71"));
+    }
+
+    #[test]
+    fn rich_json_preview_matches_written_output_and_adds_resolved_bounds() {
+        let mut artifact = sample_artifact("He said yes.");
+        artifact.title = "Meeting".to_string();
+        artifact.summary = "Persisted summary".to_string();
+        let segments = vec![super::ExportSegment {
+            time: "00:00".to_string(),
+            line: "He said yes.".to_string(),
+            start_seconds: Some(0.125),
+            end_seconds: Some(2.75),
+            speaker_id: Some("speaker_1".to_string()),
+            speaker_label: Some("Alice".to_string()),
+        }];
+        let document = build_export_document(
+            "en",
+            &artifact.title,
+            &artifact.raw_transcript,
+            "Draft summary",
+            "",
+            &artifact.metadata,
+            &segments,
+            ExportStyle::Segments,
+            true,
+            true,
+            &BTreeMap::new(),
+        );
+        let prepared = super::PreparedArtifactExport {
+            artifact,
+            format: super::ExportFormat::Json,
+            language: "en",
+            style: ExportStyle::Segments,
+            options: super::ExportOptions {
+                include_timestamps: true,
+                grouping: Some(super::ExportGrouping::None),
+                include_speaker_names: true,
+            },
+            grouping: super::ExportGrouping::None,
+            transcription: "He said yes.".to_string(),
+            summary: "Draft summary".to_string(),
+            faqs: String::new(),
+            content: "[00:00] Alice: He said yes.".to_string(),
+            segments,
+            document,
+        };
+
+        let preview =
+            super::render_prepared_artifact_preview(&prepared).expect("JSON preview should render");
+        let temp = tempdir().expect("tempdir");
+        let destination = temp.path().join("segments.json");
+        super::write_prepared_artifact_export(&destination, &prepared)
+            .expect("JSON export should write");
+        let written = std::fs::read_to_string(destination).expect("JSON output");
+        let payload: serde_json::Value = serde_json::from_str(&written).expect("rich JSON object");
+
+        assert_eq!(preview.content, written);
+        assert!(payload.is_object());
+        assert_eq!(payload["summary"], "Draft summary");
+        assert_eq!(payload["segments"][0]["start_seconds"], 0.125);
+        assert_eq!(payload["segments"][0]["end_seconds"], 2.75);
+        assert_eq!(payload["document_title"], "Transcript of Meeting");
+    }
+
+    #[test]
+    fn export_format_validation_matches_the_ui_matrix() {
+        assert!(super::validate_export_combination(
+            ExportStyle::Transcript,
+            super::ExportFormat::Pdf,
+        )
+        .is_ok());
+        assert!(super::validate_export_combination(
+            ExportStyle::Subtitles,
+            super::ExportFormat::Vtt,
+        )
+        .is_ok());
+        assert!(super::validate_export_combination(
+            ExportStyle::Segments,
+            super::ExportFormat::Json,
+        )
+        .is_ok());
+        assert!(super::validate_export_combination(
+            ExportStyle::Transcript,
+            super::ExportFormat::Json,
+        )
+        .is_err());
+        assert!(super::validate_export_combination(
+            ExportStyle::Subtitles,
+            super::ExportFormat::Pdf,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn pdf_wraps_embeds_unicode_font_and_paginates() {
+        let temp = tempdir().expect("tempdir");
+        let destination = temp.path().join("unicode-long.pdf");
+        let unicode_line =
+            "Città naïve Überprüfung Ελληνικά Кириллица: una riga lunga mantiene ogni parola.";
+        let body = std::iter::repeat_n(unicode_line, 180)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let document = super::ExportDocument {
+            title: "Trascrizione Unicode".to_string(),
+            sections: vec![super::ExportDocumentSection {
+                title: "Trascrizione".to_string(),
+                body,
+                styled_lines: None,
+            }],
+        };
+
+        super::export_pdf(&destination, &document).expect("PDF export");
+        let bytes = std::fs::read(&destination).expect("PDF bytes");
+        let serialized = String::from_utf8_lossy(&bytes);
+        let pdf = lopdf::Document::load_mem(&bytes).expect("parse generated PDF");
+        let pages = pdf.get_pages().keys().copied().collect::<Vec<_>>();
+
+        assert!(bytes.starts_with(b"%PDF"));
+        assert!(serialized.contains("/ToUnicode"));
+        assert!(pages.len() >= 2);
+        assert!(include_str!("../../resources/licenses/NotoSans-OFL.txt")
+            .contains("SIL OPEN FONT LICENSE Version 1.1"));
+    }
+
+    #[test]
+    fn pdf_line_wrapper_does_not_drop_words() {
+        let line = "This transcript line is intentionally long so the PDF renderer wraps it into multiple visual lines without dropping words.";
+        let wrapped = super::wrap_pdf_text_line(line, 36);
+
+        assert!(wrapped.len() > 1);
+        assert!(wrapped.iter().all(|part| part.chars().count() <= 36));
+        assert_eq!(wrapped.join(" "), line);
+    }
+
+    #[test]
     fn export_document_localizes_title_and_includes_summary_and_faqs() {
         let mut artifact = sample_artifact("Linea uno");
         artifact.title = "Riunione team".to_string();
@@ -4239,6 +5242,8 @@ mod tests {
         let segments = vec![super::ExportSegment {
             time: "00:00".to_string(),
             line: "Linea uno".to_string(),
+            start_seconds: None,
+            end_seconds: None,
             speaker_id: None,
             speaker_label: None,
         }];
@@ -4298,6 +5303,24 @@ mod tests {
             true,
             true,
         );
+        let prepared = super::PreparedArtifactExport {
+            artifact: artifact.clone(),
+            format: super::ExportFormat::Json,
+            language: "en",
+            style: ExportStyle::Segments,
+            options: super::ExportOptions {
+                include_timestamps: true,
+                grouping: Some(super::ExportGrouping::None),
+                include_speaker_names: true,
+            },
+            grouping: super::ExportGrouping::None,
+            transcription: artifact.raw_transcript.clone(),
+            summary: artifact.summary.clone(),
+            faqs: artifact.faqs.clone(),
+            segments: segments.clone(),
+            content: export_content.clone(),
+            document: document.clone(),
+        };
 
         let txt_path = temp.path().join("transcript.txt");
         super::export_txt(&txt_path, &render_plain_text_document(&document)).expect("txt export");
@@ -4312,7 +5335,8 @@ mod tests {
             .contains("## Segments"));
 
         let csv_path = temp.path().join("segments.csv");
-        super::export_csv(&csv_path, &segments, true).expect("csv export");
+        super::export_txt(&csv_path, &super::render_csv_content("en", &segments, true))
+            .expect("csv export");
         assert!(std::fs::read_to_string(&csv_path)
             .expect("csv contents")
             .contains("Transcript;Speaker"));
@@ -4322,18 +5346,14 @@ mod tests {
         assert!(std::fs::read_to_string(&html_path)
             .expect("html contents")
             .contains("<!doctype html>"));
+        assert!(std::fs::read_to_string(&html_path)
+            .expect("html contents")
+            .contains("<span style=\"color:#123456\">[00:12] Alice:"));
 
         let json_path = temp.path().join("transcript.json");
-        super::export_json(
+        super::export_txt(
             &json_path,
-            &artifact,
-            &document,
-            ExportStyle::Segments,
-            super::ExportGrouping::None,
-            true,
-            true,
-            &segments,
-            &export_content,
+            &super::render_json_content(&prepared).expect("json rendering"),
         )
         .expect("json export");
         let json_payload =
@@ -4343,7 +5363,17 @@ mod tests {
 
         let docx_path = temp.path().join("transcript.docx");
         super::export_docx(&docx_path, &document).expect("docx export");
-        assert!(std::fs::metadata(&docx_path).expect("docx metadata").len() > 0);
+        let mut archive =
+            zip::ZipArchive::new(std::fs::File::open(&docx_path).expect("open generated DOCX"))
+                .expect("DOCX zip archive");
+        let mut document_xml = String::new();
+        archive
+            .by_name("word/document.xml")
+            .expect("DOCX document XML")
+            .read_to_string(&mut document_xml)
+            .expect("read DOCX document XML");
+        assert!(document_xml.contains("Alice opens the meeting."));
+        assert!(document_xml.contains("Short summary"));
 
         let pdf_path = temp.path().join("transcript.pdf");
         super::export_pdf(&pdf_path, &document).expect("pdf export");
@@ -4363,7 +5393,7 @@ mod tests {
         .expect("srt export");
         assert!(std::fs::read_to_string(&srt_path)
             .expect("srt contents")
-            .contains("00:00:12,000 --> 00:00:23,000"));
+            .contains("00:00:12,400 --> 00:00:24,900"));
 
         let vtt_path = temp.path().join("subtitles.vtt");
         super::export_txt(
@@ -4378,19 +5408,22 @@ mod tests {
 
     #[test]
     fn summary_instructions_keep_required_controls_even_with_custom_prompt() {
-        let instructions = build_summary_instructions(&SummarizeArtifactPayload {
-            id: "artifact-1".to_string(),
-            language: "it".to_string(),
-            context: ArtifactAiContextOptions {
-                include_timestamps: false,
-                include_speakers: true,
+        let instructions = build_summary_instructions(
+            &SummarizeArtifactPayload {
+                id: "artifact-1".to_string(),
+                language: "it".to_string(),
+                context: ArtifactAiContextOptions {
+                    include_timestamps: false,
+                    include_speakers: true,
+                },
+                sections: true,
+                bullet_points: false,
+                action_items: true,
+                key_points_only: true,
+                custom_prompt: Some("Focus on hiring decisions.".to_string()),
             },
-            sections: true,
-            bullet_points: false,
-            action_items: true,
-            key_points_only: true,
-            custom_prompt: Some("Focus on hiring decisions.".to_string()),
-        });
+            "it",
+        );
 
         assert!(instructions.contains("The entire output must be in Italian."));
         assert!(instructions.contains("Do not include timestamps in the final summary."));
@@ -4400,19 +5433,22 @@ mod tests {
 
     #[test]
     fn summary_instructions_default_to_detailed_prose() {
-        let instructions = build_summary_instructions(&SummarizeArtifactPayload {
-            id: "artifact-2".to_string(),
-            language: "en".to_string(),
-            context: ArtifactAiContextOptions {
-                include_timestamps: false,
-                include_speakers: false,
+        let instructions = build_summary_instructions(
+            &SummarizeArtifactPayload {
+                id: "artifact-2".to_string(),
+                language: "en".to_string(),
+                context: ArtifactAiContextOptions {
+                    include_timestamps: false,
+                    include_speakers: false,
+                },
+                sections: true,
+                bullet_points: false,
+                action_items: true,
+                key_points_only: false,
+                custom_prompt: None,
             },
-            sections: true,
-            bullet_points: false,
-            action_items: true,
-            key_points_only: false,
-            custom_prompt: None,
-        });
+            "en",
+        );
 
         assert!(instructions.contains("Write a detailed, self-contained brief in English."));
         assert!(instructions.contains("cover all major topics with supporting details, technical explanations, examples, numbers"));
@@ -4511,6 +5547,35 @@ mod tests {
         assert!(enhancer.optimize_calls.load(Ordering::SeqCst) > 1);
         assert_eq!(enhancer.ask_calls.load(Ordering::SeqCst), 0);
         assert!(!optimized.contains("[Section"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_retries_smaller_chunks_after_context_window() {
+        let enhancer = TrackingEnhancer::with_optimize_context_limit(true, 1, 5_500, 1_300);
+        let transcript =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(230);
+
+        let optimized = optimize_with_rag(&enhancer, &transcript, "en")
+            .await
+            .expect("optimization should retry with smaller chunks and succeed");
+
+        assert!(!optimized.trim().is_empty());
+        assert!(enhancer.optimize_calls.load(Ordering::SeqCst) > 2);
+        assert!(!optimized.contains("[Section"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optimize_with_rag_returns_specific_overflow_after_all_chunk_budgets_fail() {
+        let enhancer = TrackingEnhancer::with_optimize_context_limit(true, 1, 5_500, 20);
+        let transcript =
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu ".repeat(20);
+
+        let error = optimize_with_rag(&enhancer, &transcript, "en")
+            .await
+            .expect_err("optimization should fail after exhausting smaller chunks");
+
+        assert!(matches!(error, ApplicationError::PostProcessing(_)));
+        assert!(error.to_string().contains("optimizing the transcript"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

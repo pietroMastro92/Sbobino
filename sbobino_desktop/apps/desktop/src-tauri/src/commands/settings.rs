@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 
 use sbobino_domain::{
-    AiProvider, AiSettings, AppSettings, AutomaticImportSettings, GeneralSettings, LanguageCode,
-    OrganizationSettings, PromptSettings, PromptTask, PromptTemplate, TranscriptionSettings,
+    transcription_language_catalog, AiProvider, AiSettings, AppSettings, AutomaticImportSettings,
+    GeneralSettings, LanguageCode, OrganizationSettings, PromptSettings, PromptTask,
+    PromptTemplate, TranscriptionLanguageOption, TranscriptionSettings,
 };
 
 use crate::{
@@ -197,6 +198,12 @@ pub async fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, Com
         .await
         .map(|settings| settings.redacted_clone())
         .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn list_transcription_languages() -> Result<Vec<TranscriptionLanguageOption>, CommandError>
+{
+    Ok(transcription_language_catalog())
 }
 
 #[tauri::command]

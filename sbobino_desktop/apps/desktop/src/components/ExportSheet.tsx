@@ -10,6 +10,8 @@ export type ExportGrouping = "none" | "speaker_paragraphs";
 export type ExportSegment = {
   time: string;
   line: string;
+  startSeconds?: number | null;
+  endSeconds?: number | null;
   speakerId?: string | null;
   speakerLabel?: string | null;
 };
@@ -28,16 +30,18 @@ export type ExportRequest = {
   contentOverride?: string;
 };
 
+export type ExportPreview = {
+  content: string;
+  mode: "exact" | "document";
+};
+
 type ExportSheetProps = {
   open: boolean;
   transcriptText: string;
   segments: ExportSegment[];
   segmentsAlignedWithTranscript?: boolean;
-  title?: string;
-  summary?: string;
-  faqs?: string;
-  derivedSections?: Array<{ title: string; body: string }>;
   onClose: () => void;
+  onPreview: (payload: ExportRequest) => Promise<ExportPreview>;
   onExport: (payload: ExportRequest) => Promise<boolean>;
 };
 
@@ -133,294 +137,13 @@ function getStyleItems(
   ];
 }
 
-function parseMmSsToSeconds(value: string): number {
-  const [mmRaw, ssRaw] = value.split(":");
-  const mm = Number(mmRaw);
-  const ss = Number(ssRaw);
-  if (Number.isNaN(mm) || Number.isNaN(ss)) {
-    return 0;
-  }
-  return mm * 60 + ss;
-}
-
-function formatSrtTime(seconds: number): string {
-  const hh = String(Math.floor(seconds / 3600)).padStart(2, "0");
-  const mm = String(Math.floor((seconds % 3600) / 60)).padStart(2, "0");
-  const ss = String(seconds % 60).padStart(2, "0");
-  return `${hh}:${mm}:${ss},000`;
-}
-
-function formatVttTime(seconds: number): string {
-  const hh = String(Math.floor(seconds / 3600)).padStart(2, "0");
-  const mm = String(Math.floor((seconds % 3600) / 60)).padStart(2, "0");
-  const ss = String(seconds % 60).padStart(2, "0");
-  return `${hh}:${mm}:${ss}.000`;
-}
-
-export function buildPreviewContent(params: {
-  transcriptText: string;
-  segments: ExportSegment[];
-  style: ExportStyle;
-  format: ExportFormat;
-  includeTimestamps: boolean;
-  includeSpeakerNames: boolean;
-  language: "en" | "it" | "es" | "de";
-  title: string;
-  summary?: string;
-  faqs?: string;
-  derivedSections?: Array<{ title: string; body: string }>;
-}): string {
-  const {
-    transcriptText,
-    segments,
-    style,
-    format,
-    includeTimestamps,
-    includeSpeakerNames,
-    language,
-    title,
-    summary = "",
-    faqs = "",
-    derivedSections = [],
-  } = params;
-  const normalizedTranscript = transcriptText.trim();
-
-  const localizedDocumentTitle = (rawTitle: string): string => {
-    const fallbackTitle = (() => {
-      switch (language) {
-        case "it":
-          return "Trascrizione";
-        case "es":
-          return "Transcripción";
-        case "de":
-          return "Transkript";
-        default:
-          return "Transcript";
-      }
-    })();
-    const baseTitle = rawTitle.trim() || title.trim() || fallbackTitle;
-    switch (language) {
-      case "it":
-        return `Trascrizione di ${baseTitle}`;
-      case "es":
-        return `Transcripción de ${baseTitle}`;
-      case "de":
-        return `Transkript von ${baseTitle}`;
-      default:
-        return `Transcript of ${baseTitle}`;
-    }
-  };
-
-  const localizedCsvHeader = (): string => {
-    switch (language) {
-      case "it":
-        return "Timestamp inizio;Timestamp fine;Trascrizione";
-      case "es":
-        return "Marca de tiempo inicial;Marca de tiempo final;Transcripción";
-      case "de":
-        return "Start-Zeitstempel;End-Zeitstempel;Transkript";
-      default:
-        return "Start Timestamp;End Timestamp;Transcript";
-    }
-  };
-
-  const localizedPrimarySectionTitle = (): string => {
-    if (style === "segments") {
-      switch (language) {
-        case "it":
-          return "Segmenti";
-        case "es":
-          return "Segmentos";
-        case "de":
-          return "Segmente";
-        default:
-          return "Segments";
-      }
-    }
-    switch (language) {
-      case "it":
-        return "Trascrizione";
-      case "es":
-        return "Transcripción";
-      case "de":
-        return "Transkript";
-      default:
-        return "Transcript";
-    }
-  };
-
-  const localizedSummaryTitle = (): string => {
-    switch (language) {
-      case "it":
-        return "Riassunto";
-      case "es":
-        return "Resumen";
-      case "de":
-        return "Zusammenfassung";
-      default:
-        return "Summary";
-    }
-  };
-
-  const localizedFaqTitle = (): string => {
-    switch (language) {
-      case "it":
-        return "Domande frequenti";
-      case "es":
-        return "Preguntas frecuentes";
-      case "de":
-        return "Haeufige Fragen";
-      default:
-        return "FAQs";
-    }
-  };
-
-  const buildDocumentPreview = (body: string): string => {
-    const sections = [
-      `${localizedPrimarySectionTitle()}\n${body.trim()}`,
-      summary.trim() ? `${localizedSummaryTitle()}\n${summary.trim()}` : "",
-      faqs.trim() ? `${localizedFaqTitle()}\n${faqs.trim()}` : "",
-      ...derivedSections
-        .filter((section) => section.body.trim())
-        .map((section) => `${section.title.trim()}\n${section.body.trim()}`),
-    ].filter(Boolean);
-
-    return [localizedDocumentTitle(title), ...sections].join("\n\n");
-  };
-
-  const withSpeakerPrefix = (segment: ExportSegment): string => {
-    const line = segment.line.trim();
-    const speakerLabel = segment.speakerLabel?.trim();
-    if (!includeSpeakerNames || !speakerLabel) {
-      return line;
-    }
-    return `${speakerLabel}: ${line}`;
-  };
-
-  // ── Subtitles ──
-  if (style === "subtitles") {
-    if (format === "srt") {
-      if (segments.length === 0) return normalizedTranscript;
-      return segments
-        .map((segment, index) => {
-          const startSeconds = parseMmSsToSeconds(segment.time);
-          const endSeconds = startSeconds + 11;
-          return `${index + 1}\n${formatSrtTime(startSeconds)} --> ${formatSrtTime(endSeconds)}\n${withSpeakerPrefix(segment)}`;
-        })
-        .join("\n\n");
-    }
-    if (format === "vtt") {
-      if (segments.length === 0) return `WEBVTT\n\n${normalizedTranscript}`;
-      const cues = segments
-        .map((segment) => {
-          const startSeconds = parseMmSsToSeconds(segment.time);
-          const endSeconds = startSeconds + 11;
-          return `${formatVttTime(startSeconds)} --> ${formatVttTime(endSeconds)}\n${withSpeakerPrefix(segment)}`;
-        })
-        .join("\n\n");
-      return `WEBVTT\n\n${cues}`;
-    }
-    if (format === "md") {
-      if (segments.length === 0) return normalizedTranscript;
-      return segments
-        .map((segment) => `${withSpeakerPrefix(segment)}\n${segment.time}`)
-        .join("\n\n");
-    }
-    return normalizedTranscript;
-  }
-
-  // ── Segments ──
-  if (style === "segments") {
-    if (format === "json") {
-      if (segments.length === 0) {
-        return JSON.stringify([{ text: normalizedTranscript }], null, 2);
-      }
-      const arr = segments.map((segment) => {
-        const startSeconds = parseMmSsToSeconds(segment.time);
-        const endStr = String(startSeconds + 11).padStart(2, "0");
-        return {
-          text: withSpeakerPrefix(segment),
-          timestamp: `${segment.time}-00:${endStr}`,
-          ...(includeSpeakerNames && segment.speakerLabel?.trim()
-            ? { speaker_label: segment.speakerLabel.trim() }
-            : {}),
-        };
-      });
-      return JSON.stringify(arr, null, 2);
-    }
-
-    if (format === "csv") {
-      const header = includeSpeakerNames
-        ? `${localizedCsvHeader()};Speaker`
-        : localizedCsvHeader();
-      if (segments.length === 0) return `${header}\n00:00;00:00;"${normalizedTranscript}"`;
-      const rows = segments.map((segment) => {
-        const startSeconds = parseMmSsToSeconds(segment.time);
-        const endSeconds = startSeconds + 11;
-        const endMm = String(Math.floor(endSeconds / 60)).padStart(2, "0");
-        const endSs = String(endSeconds % 60).padStart(2, "0");
-        const base = `${segment.time};${endMm}:${endSs};"${segment.line.trim()}"`;
-        if (!includeSpeakerNames) {
-          return base;
-        }
-        return `${base};"${(segment.speakerLabel?.trim() ?? "").replace(/"/g, "\"\"")}"`;
-      });
-      return `${header}\n${rows.join("\n")}`;
-    }
-
-    if (format === "html" || format === "pdf" || format === "md") {
-      if (segments.length === 0) {
-        return buildDocumentPreview(normalizedTranscript);
-      }
-      const body = segments
-        .map((segment) =>
-          includeTimestamps ? `[${segment.time}] ${withSpeakerPrefix(segment)}` : withSpeakerPrefix(segment),
-        )
-        .join("\n");
-      return buildDocumentPreview(body);
-    }
-
-    // txt, docx
-    if (segments.length === 0) return buildDocumentPreview(normalizedTranscript);
-    const body = segments
-      .map((segment) => `[${segment.time}] ${withSpeakerPrefix(segment)}`)
-      .join("\n");
-    return buildDocumentPreview(body);
-  }
-
-  // ── Transcript ──
-  if (format === "json") {
-    return JSON.stringify([{ text: normalizedTranscript }], null, 2);
-  }
-
-  if (format === "html" || format === "pdf") {
-    if (!includeTimestamps || segments.length === 0) {
-      return buildDocumentPreview(normalizedTranscript);
-    }
-    return buildDocumentPreview(
-      segments.map((segment) => `[${segment.time}] ${segment.line.trim()}`).join("\n"),
-    );
-  }
-
-  // txt, docx, md
-  if (!includeTimestamps || segments.length === 0) {
-    return buildDocumentPreview(normalizedTranscript);
-  }
-  return buildDocumentPreview(
-    segments.map((segment) => `[${segment.time}] ${segment.line.trim()}`).join("\n"),
-  );
-}
-
 export function ExportSheet({
   open,
   transcriptText,
   segments,
   segmentsAlignedWithTranscript = true,
-  title = "",
-  summary = "",
-  faqs = "",
-  derivedSections = [],
   onClose,
+  onPreview,
   onExport,
 }: ExportSheetProps): JSX.Element | null {
   const [format, setFormat] = useState<ExportFormat>("txt");
@@ -429,8 +152,15 @@ export function ExportSheet({
   const [showSpeakerNames, setShowSpeakerNames] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const [previewState, setPreviewState] = useState<{
+    status: "idle" | "loading" | "ready" | "error";
+    content: string;
+    mode: ExportPreview["mode"];
+  }>({ status: "idle", content: "", mode: "exact" });
+  const [exportError, setExportError] = useState<string | null>(null);
   const { t, language } = useTranslation();
   const prevStyleRef = useRef(style);
+  const previewRequestIdRef = useRef(0);
   const exportSegments = useMemo(
     () => (segmentsAlignedWithTranscript ? segments : []),
     [segments, segmentsAlignedWithTranscript],
@@ -479,34 +209,73 @@ export function ExportSheet({
     }
   }, [showSpeakerNames, speakerNamesAvailable]);
 
-  const exportContent = useMemo(() => {
-    return buildPreviewContent({
-      transcriptText,
-      segments: exportSegments,
-      style,
+  const exportRequest = useMemo<ExportRequest>(
+    () => ({
       format,
-      includeTimestamps,
-      includeSpeakerNames: showSpeakerNames,
-      language,
-      title,
-      summary,
-      faqs,
-      derivedSections,
-    });
-  }, [derivedSections, exportSegments, faqs, includeTimestamps, showSpeakerNames, language, style, format, summary, transcriptText, title]);
+      style,
+      options: {
+        includeTimestamps,
+        grouping: "none",
+        includeSpeakerNames: showSpeakerNames,
+      },
+      segments: exportSegments,
+      contentOverride: transcriptText,
+    }),
+    [exportSegments, format, includeTimestamps, showSpeakerNames, style, transcriptText],
+  );
 
-  const preview = useMemo(() => {
-    const normalized = exportContent.trim();
+  useEffect(() => {
+    if (!open) {
+      previewRequestIdRef.current += 1;
+      setPreviewState({ status: "idle", content: "", mode: "exact" });
+      return;
+    }
+
+    const requestId = previewRequestIdRef.current + 1;
+    previewRequestIdRef.current = requestId;
+    setPreviewState((previous) => ({ ...previous, status: "loading" }));
+    setExportError(null);
+
+    void onPreview(exportRequest).then(
+      (result) => {
+        if (previewRequestIdRef.current !== requestId) return;
+        setPreviewState({
+          status: "ready",
+          content: result.content,
+          mode: result.mode,
+        });
+      },
+      () => {
+        if (previewRequestIdRef.current !== requestId) return;
+        setPreviewState({ status: "error", content: "", mode: "exact" });
+      },
+    );
+
+    return () => {
+      if (previewRequestIdRef.current === requestId) {
+        previewRequestIdRef.current += 1;
+      }
+    };
+  }, [exportRequest, onPreview, open]);
+
+  const preview = (() => {
+    if (previewState.status === "loading") {
+      return t("export.previewLoading", "Preparing preview...");
+    }
+    if (previewState.status === "error") {
+      return t("export.previewFailed", "Could not generate the export preview.");
+    }
+    const normalized = previewState.content.trim();
     if (!normalized) {
       return t("export.noContent", "No content available for export.");
     }
     return normalized;
-  }, [exportContent, t]);
+  })();
 
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !isExporting) {
         event.preventDefault();
         onClose();
       }
@@ -516,7 +285,7 @@ export function ExportSheet({
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [onClose, open]);
+  }, [isExporting, onClose, open]);
 
   useEffect(() => {
     if (copyState === "idle") return;
@@ -533,29 +302,24 @@ export function ExportSheet({
   }
 
   async function onConfirm(): Promise<void> {
+    if (previewState.status !== "ready") return;
     setIsExporting(true);
+    setExportError(null);
     try {
-      const didExport = await onExport({
-        format,
-        style,
-        options: {
-          includeTimestamps,
-          grouping: "none",
-          includeSpeakerNames: showSpeakerNames,
-        },
-        segments: exportSegments,
-        contentOverride: exportContent,
-      });
+      const didExport = await onExport(exportRequest);
       if (didExport) {
         onClose();
       }
+    } catch {
+      setExportError(t("export.exportFailed", "Export failed. Please try again."));
     } finally {
       setIsExporting(false);
     }
   }
 
   async function onCopyContent(): Promise<void> {
-    const didCopy = await copyTextToClipboard(exportContent);
+    if (previewState.status !== "ready") return;
+    const didCopy = await copyTextToClipboard(previewState.content);
     setCopyState(didCopy ? "copied" : "failed");
   }
 
@@ -571,9 +335,10 @@ export function ExportSheet({
       : copyState === "failed"
         ? t("export.copyFailed", "Copy failed")
         : t("export.copy", "Copy");
+  const previewReady = previewState.status === "ready";
 
   return (
-    <div className="sheet-overlay" onClick={onClose}>
+    <div className="sheet-overlay" onClick={isExporting ? undefined : onClose}>
       <section
         className="export-sheet"
         role="dialog"
@@ -600,8 +365,17 @@ export function ExportSheet({
               </div>
             </div>
           </header>
-          <div className="export-preview-body">
+          <div
+            className="export-preview-body"
+            aria-busy={previewState.status === "loading"}
+            aria-live="polite"
+          >
             <pre>{preview}</pre>
+            {exportError ? (
+              <p className="export-preview-error" role="alert">
+                {exportError}
+              </p>
+            ) : null}
           </div>
         </div>
 
@@ -618,7 +392,7 @@ export function ExportSheet({
                       setStyle(item.value);
                     }
                   }}
-                  disabled={!item.value || item.disabled}
+                  disabled={!item.value || item.disabled || isExporting}
                 >
                   <span className="format-card-top">
                     <span className="format-card-icon">{item.icon}</span>
@@ -646,6 +420,7 @@ export function ExportSheet({
                   key={item.value}
                   className={format === item.value ? "format-card active" : "format-card"}
                   onClick={() => setFormat(item.value)}
+                  disabled={isExporting}
                 >
                   <span className="format-card-top">
                     <span className="format-card-icon">{item.icon}</span>
@@ -668,7 +443,7 @@ export function ExportSheet({
                       type="checkbox"
                       checked={includeTimestamps}
                       onChange={(event) => setIncludeTimestamps(event.target.checked)}
-                      disabled={!segmentsAlignedWithTranscript}
+                      disabled={!segmentsAlignedWithTranscript || isExporting}
                     />
                   </label>
                 </>
@@ -682,7 +457,7 @@ export function ExportSheet({
                       type="checkbox"
                       checked={showSpeakerNames}
                       onChange={(event) => setShowSpeakerNames(event.target.checked)}
-                      disabled={!speakerNamesAvailable}
+                      disabled={!speakerNamesAvailable || isExporting}
                     />
                   </label>
                   <p className="export-option-note">
@@ -702,7 +477,7 @@ export function ExportSheet({
                       type="checkbox"
                       checked={showSpeakerNames}
                       onChange={(event) => setShowSpeakerNames(event.target.checked)}
-                      disabled={!speakerNamesAvailable}
+                      disabled={!speakerNamesAvailable || isExporting}
                     />
                   </label>
                   <p className="export-option-note">
@@ -717,6 +492,7 @@ export function ExportSheet({
                       type="checkbox"
                       checked={includeTimestamps}
                       onChange={(event) => setIncludeTimestamps(event.target.checked)}
+                      disabled={isExporting}
                     />
                   </label>
                 </>
@@ -728,14 +504,18 @@ export function ExportSheet({
             <button
               className={`secondary-button export-copy-button ${copyState === "idle" ? "" : `is-${copyState}`}`}
               onClick={() => void onCopyContent()}
-              disabled={isExporting}
+              disabled={isExporting || !previewReady}
               title={copyButtonLabel}
               aria-label={copyButtonLabel}
             >
               {copyState === "copied" ? <Check size={14} /> : copyState === "failed" ? <X size={14} /> : <Copy size={14} />}
               <span aria-live="polite">{copyButtonLabel}</span>
             </button>
-            <button className="primary-button" onClick={() => void onConfirm()} disabled={isExporting}>
+            <button
+              className="primary-button"
+              onClick={() => void onConfirm()}
+              disabled={isExporting || !previewReady}
+            >
               <Download size={14} />
               {isExporting ? t("export.exporting", "Exporting...") : t("export.export", "Export")}
             </button>
