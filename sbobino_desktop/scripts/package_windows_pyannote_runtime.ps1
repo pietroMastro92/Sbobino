@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$OutputZip,
-    [string]$ModelDir = ""
+    [string]$ModelDir = "",
+    [string]$FfmpegArchivePath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,11 +10,11 @@ $ProgressPreference = "SilentlyContinue"
 
 $PythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
 $PythonBase = (& $PythonCommand -c "import sys; print(sys.base_prefix)").Trim()
-# TorchCodec requires a shared FFmpeg build on Windows. BtbN prunes dated
-# autobuild releases, so source the validated FFmpeg 8 DLLs from Sbobino's
-# immutable v2.0.23 Windows speech runtime instead.
-$FfmpegUrl = "https://github.com/pietroMastro92/Sbobino/releases/download/v2.0.23/speech-runtime-windows-x86_64.zip"
-$FfmpegSha256 = "3a40b429a84de00bbfced1a26407e455edbc67133cd89c6429c67ba7fdbf5832"
+# TorchCodec requires a shared FFmpeg build on Windows. Hosted packaging passes
+# the speech runtime produced and verified earlier in the same job. Keep the
+# retained previous stable asset as a verified standalone-script fallback.
+$FfmpegUrl = "https://github.com/pietroMastro92/Sbobino/releases/download/v2.0.25/speech-runtime-windows-x86_64.zip"
+$FfmpegSha256 = "a0dadc1a7a58008a4c45b9c612a1c58ecc2a85baa6eefecad083f78c746a8c83"
 $TargetTriple = "x86_64-pc-windows-msvc"
 
 function Download-VerifiedArchive {
@@ -75,11 +76,21 @@ try {
         $env:PYTHONPATH = $previousPythonPath
     }
 
-    $ffmpegArchive = Join-Path $stage "ffmpeg.zip"
+    $ffmpegArchive = $FfmpegArchivePath
+    if (-not $ffmpegArchive) {
+        $ffmpegArchive = Join-Path $stage "ffmpeg.zip"
+        Download-VerifiedArchive $FfmpegUrl $ffmpegArchive $FfmpegSha256
+    }
+    elseif (-not (Test-Path -PathType Leaf $ffmpegArchive)) {
+        throw "Windows speech runtime archive was not found at '$ffmpegArchive'"
+    }
     $ffmpegExtract = Join-Path $stage "ffmpeg"
-    Download-VerifiedArchive $FfmpegUrl $ffmpegArchive $FfmpegSha256
     Expand-Archive -Path $ffmpegArchive -DestinationPath $ffmpegExtract
-    Get-ChildItem -Path $ffmpegExtract -Recurse -File -Filter "*.dll" |
+    $ffmpegDlls = @(Get-ChildItem -Path $ffmpegExtract -Recurse -File -Filter "*.dll")
+    if ($ffmpegDlls.Count -eq 0) {
+        throw "Windows speech runtime archive contains no FFmpeg DLLs"
+    }
+    $ffmpegDlls |
         ForEach-Object { Copy-Item $_.FullName (Join-Path $runtimeRoot "DLLs\$($_.Name)") -Force }
 
     Get-ChildItem -Path $runtimeRoot -Directory -Recurse -Filter "__pycache__" |

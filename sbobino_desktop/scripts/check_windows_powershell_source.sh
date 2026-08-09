@@ -9,6 +9,7 @@ if (( $# > 0 )); then
 else
   files=(
     "$repo_root/sbobino_desktop/scripts/package_windows_runtime_asset.ps1"
+    "$repo_root/sbobino_desktop/scripts/package_windows_pyannote_runtime.ps1"
     "$repo_root/sbobino_desktop/scripts/windows_release_readiness.ps1"
     "$repo_root/.github/workflows/release.yml"
     "$repo_root/.github/workflows/windows-port.yml"
@@ -83,6 +84,23 @@ if [[ -n "$package_script" ]]; then
     printf 'missing exact Visual Studio generator name regex contract\n' >&2
     exit 1
   fi
+fi
+
+if (( $# == 0 )); then
+  pyannote_script="$repo_root/sbobino_desktop/scripts/package_windows_pyannote_runtime.ps1"
+  if ! grep -Fq -- '$ffmpegArchive = $FfmpegArchivePath' "$pyannote_script"; then
+    printf 'Windows Pyannote packaging must reuse the staged speech runtime archive\n' >&2
+    exit 1
+  fi
+  for workflow in \
+    "$repo_root/.github/workflows/release.yml" \
+    "$repo_root/.github/workflows/windows-port.yml"; do
+    if ! grep -Fq -- '-FfmpegArchivePath' "$workflow"; then
+      printf 'Windows workflow does not pass the staged speech runtime to Pyannote: %s\n' \
+        "$workflow" >&2
+      exit 1
+    fi
+  done
 fi
 
 printf 'Windows PowerShell source contract passed for %d files.\n' "${#files[@]}"

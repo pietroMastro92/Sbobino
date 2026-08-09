@@ -253,7 +253,8 @@ jobs:
         run: |
           ../../scripts/package_windows_pyannote_runtime.ps1 `
             -OutputZip (Join-Path $env:RUNNER_TEMP "sbobino-windows\pyannote-runtime-windows-x86_64.zip") `
-            -ModelDir (Join-Path $env:RUNNER_TEMP "pyannote-community-1")
+            -ModelDir (Join-Path $env:RUNNER_TEMP "pyannote-community-1") `
+            -FfmpegArchivePath (Join-Path $env:RUNNER_TEMP "sbobino-windows\speech-runtime-windows-x86_64.zip")
 
       - name: Inject updater public key
         shell: bash
