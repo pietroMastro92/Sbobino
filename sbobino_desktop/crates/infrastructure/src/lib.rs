@@ -669,10 +669,17 @@ impl RuntimeTranscriptionFactory {
                 continue;
             }
 
-            if let Some(candidate) =
-                self.build_enhancer_candidate_from_spec(&settings, &spec, &overrides)?
-            {
-                candidates.push(candidate);
+            match self.build_enhancer_candidate_from_spec(&settings, &spec, &overrides) {
+                Ok(Some(candidate)) => candidates.push(candidate),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        provider_key = %spec.key,
+                        provider = %spec.label,
+                        error = %error,
+                        "skipping unavailable AI enhancer candidate"
+                    );
+                }
             }
         }
 
@@ -5104,6 +5111,51 @@ mod tests {
         factory
             .build_service()
             .expect("service should build with parakeet cli and model");
+    }
+
+    #[test]
+    fn build_service_ignores_incomplete_active_remote_ai_service() {
+        let (_temp, factory) = build_factory();
+        let mut settings = AppSettings::default();
+        settings.ai.active_provider = AiProvider::None;
+        settings.ai.providers.foundation_apple.enabled = false;
+        settings.ai.active_remote_service_id = Some("remote-google".to_string());
+        settings.ai.remote_services = vec![RemoteServiceConfig {
+            id: "remote-google".to_string(),
+            kind: RemoteServiceKind::Google,
+            label: "Google".to_string(),
+            enabled: true,
+            api_key: None,
+            has_api_key: false,
+            model: Some("gemini-2.5-flash".to_string()),
+            base_url: None,
+        }];
+        persist_settings(&factory, &settings);
+        prepare_managed_runtime(
+            &factory,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+        );
+
+        factory
+            .build_service()
+            .expect("incomplete AI configuration must not block ASR service construction");
+
+        let candidates = factory
+            .build_enhancer_candidates()
+            .expect("unavailable AI candidates should be skipped");
+        assert!(candidates.is_empty());
+
+        let status = factory
+            .ai_capability_status()
+            .expect("AI capability status should return an unavailable result");
+        assert!(!status.available);
+        assert!(!status.fallback_available);
+        assert!(status
+            .unavailable_reason
+            .expect("unavailable reason should be present")
+            .contains("No usable AI provider"));
     }
 
     #[cfg(target_os = "macos")]

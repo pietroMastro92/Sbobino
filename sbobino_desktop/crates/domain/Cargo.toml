@@ -1,6 +1,6 @@
 [package]
 name = "sbobino-domain"
-version = "2.0.25"
+version = "2.0.26"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

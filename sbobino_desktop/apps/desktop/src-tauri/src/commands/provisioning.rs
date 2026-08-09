@@ -1,11 +1,17 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::Duration;
 
 use chrono::Utc;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, State};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -111,6 +117,57 @@ const PARAKEET_MODEL_CATALOG: [(&str, &str, &str); 2] = [
     ),
 ];
 const LOCAL_RELEASE_ASSETS_DIR_ENV: &str = "SBOBINO_LOCAL_RELEASE_ASSETS_DIR";
+const MODEL_DOWNLOAD_MAX_ATTEMPTS: usize = 3;
+const MODEL_DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const MODEL_DOWNLOAD_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
+const MODEL_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
+static DOWNLOAD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+type ProvisioningSlot = Arc<Mutex<Option<CancellationToken>>>;
+
+struct ProvisioningSlotGuard {
+    slot: ProvisioningSlot,
+}
+
+struct ProvisioningDownloadBatch {
+    models_dir: PathBuf,
+    missing_models: Vec<String>,
+    missing_encoders: Vec<(String, String)>,
+    model_base_url: &'static str,
+    model_asset_kind: &'static str,
+}
+
+impl Drop for ProvisioningSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.slot.try_lock() {
+            *active = None;
+            return;
+        }
+
+        let slot = self.slot.clone();
+        tauri::async_runtime::spawn(async move {
+            *slot.lock().await = None;
+        });
+    }
+}
+
+async fn acquire_provisioning_slot(
+    slot: ProvisioningSlot,
+) -> Result<(CancellationToken, ProvisioningSlotGuard), CommandError> {
+    let mut active = slot.lock().await;
+    if active.is_some() {
+        return Err(CommandError::new(
+            "provisioning_busy",
+            "Another provisioning operation is already running. Wait for it to finish or cancel it before starting a new one.",
+        ));
+    }
+
+    let cancel_token = CancellationToken::new();
+    *active = Some(cancel_token.clone());
+    drop(active);
+
+    Ok((cancel_token, ProvisioningSlotGuard { slot }))
+}
 
 #[derive(Debug, Clone)]
 struct PyannoteAssetSelection {
@@ -1024,17 +1081,20 @@ pub async fn provisioning_start(
         return Ok(ProvisioningStartResponse { started: false });
     }
 
-    let cancel_token = CancellationToken::new();
-    *state.provisioning.cancel_token.lock().await = Some(cancel_token.clone());
+    let (cancel_token, slot_guard) =
+        acquire_provisioning_slot(state.provisioning.cancel_token.clone()).await?;
 
     spawn_provisioning_download(
         app,
-        models_dir,
-        missing_models,
-        missing_encoders,
-        MODEL_BASE_URL,
-        "whisper_model",
+        ProvisioningDownloadBatch {
+            models_dir,
+            missing_models,
+            missing_encoders,
+            model_base_url: MODEL_BASE_URL,
+            model_asset_kind: "whisper_model",
+        },
         cancel_token,
+        slot_guard,
     );
 
     Ok(ProvisioningStartResponse { started: true })
@@ -1092,16 +1152,19 @@ pub async fn provisioning_download_model(
             return Ok(ProvisioningStartResponse { started: false });
         }
 
-        let cancel_token = CancellationToken::new();
-        *state.provisioning.cancel_token.lock().await = Some(cancel_token.clone());
+        let (cancel_token, slot_guard) =
+            acquire_provisioning_slot(state.provisioning.cancel_token.clone()).await?;
         spawn_provisioning_download(
             app,
-            parakeet_models_dir,
-            vec![(*model_file).to_string()],
-            Vec::new(),
-            PARAKEET_MODEL_BASE_URL,
-            "parakeet_model",
+            ProvisioningDownloadBatch {
+                models_dir: parakeet_models_dir,
+                missing_models: vec![(*model_file).to_string()],
+                missing_encoders: Vec::new(),
+                model_base_url: PARAKEET_MODEL_BASE_URL,
+                model_asset_kind: "parakeet_model",
+            },
             cancel_token,
+            slot_guard,
         );
         return Ok(ProvisioningStartResponse { started: true });
     }
@@ -1137,17 +1200,20 @@ pub async fn provisioning_download_model(
         return Ok(ProvisioningStartResponse { started: false });
     }
 
-    let cancel_token = CancellationToken::new();
-    *state.provisioning.cancel_token.lock().await = Some(cancel_token.clone());
+    let (cancel_token, slot_guard) =
+        acquire_provisioning_slot(state.provisioning.cancel_token.clone()).await?;
 
     spawn_provisioning_download(
         app,
-        models_dir,
-        missing_models,
-        missing_encoders,
-        MODEL_BASE_URL,
-        "whisper_model",
+        ProvisioningDownloadBatch {
+            models_dir,
+            missing_models,
+            missing_encoders,
+            model_base_url: MODEL_BASE_URL,
+            model_asset_kind: "whisper_model",
+        },
         cancel_token,
+        slot_guard,
     );
 
     Ok(ProvisioningStartResponse { started: true })
@@ -1176,14 +1242,15 @@ pub async fn provisioning_install_pyannote(
         return Ok(ProvisioningStartResponse { started: false });
     }
 
-    let cancel_token = CancellationToken::new();
-    *state.provisioning.cancel_token.lock().await = Some(cancel_token.clone());
+    let (cancel_token, slot_guard) =
+        acquire_provisioning_slot(state.provisioning.cancel_token.clone()).await?;
 
     if state.runtime_factory.has_bundled_pyannote_override_assets() {
         spawn_pyannote_bundled_install(
             app,
             state.runtime_factory.clone(),
             cancel_token,
+            slot_guard,
             repair_required,
         );
     } else {
@@ -1191,6 +1258,7 @@ pub async fn provisioning_install_pyannote(
             app,
             state.runtime_factory.clone(),
             cancel_token,
+            slot_guard,
             health.pyannote.ready,
             repair_required,
         );
@@ -1222,10 +1290,15 @@ pub async fn provisioning_install_runtime(
         return Ok(ProvisioningStartResponse { started: false });
     }
 
-    let cancel_token = CancellationToken::new();
-    *state.provisioning.cancel_token.lock().await = Some(cancel_token.clone());
+    let (cancel_token, slot_guard) =
+        acquire_provisioning_slot(state.provisioning.cancel_token.clone()).await?;
 
-    spawn_runtime_provisioning_download(app, state.runtime_factory.clone(), cancel_token);
+    spawn_runtime_provisioning_download(
+        app,
+        state.runtime_factory.clone(),
+        cancel_token,
+        slot_guard,
+    );
 
     Ok(ProvisioningStartResponse { started: true })
 }
@@ -1233,8 +1306,8 @@ pub async fn provisioning_install_runtime(
 #[tauri::command]
 pub async fn provisioning_cancel(state: State<'_, AppState>) -> Result<(), CommandError> {
     let token = {
-        let mut guard = state.provisioning.cancel_token.lock().await;
-        guard.take()
+        let guard = state.provisioning.cancel_token.lock().await;
+        guard.clone()
     };
 
     if let Some(token) = token {
@@ -1321,16 +1394,21 @@ pub async fn read_setup_report(
 
 fn spawn_provisioning_download(
     app: tauri::AppHandle,
-    models_dir: PathBuf,
-    missing_models: Vec<String>,
-    missing_encoders: Vec<(String, String)>,
-    model_base_url: &'static str,
-    model_asset_kind: &'static str,
+    batch: ProvisioningDownloadBatch,
     cancel_token: CancellationToken,
+    slot_guard: ProvisioningSlotGuard,
 ) {
-    let total = missing_models.len() + missing_encoders.len();
+    let total = batch.missing_models.len() + batch.missing_encoders.len();
 
     tauri::async_runtime::spawn(async move {
+        let _slot_guard = slot_guard;
+        let ProvisioningDownloadBatch {
+            models_dir,
+            missing_models,
+            missing_encoders,
+            model_base_url,
+            model_asset_kind,
+        } = batch;
         let client = reqwest::Client::new();
         let mut current = 0usize;
 
@@ -1429,6 +1507,16 @@ fn spawn_provisioning_download(
             })
             .await;
 
+            if let Err(error) = cleanup_downloaded_archive(&archive_path).await {
+                emit_provisioning_status(
+                    &app,
+                    "error",
+                    &format!("Failed to clean up {encoder_dir} archive: {error}"),
+                    Some("archive_cleanup_failed"),
+                );
+                return;
+            }
+
             match extraction {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -1450,8 +1538,6 @@ fn spawn_provisioning_download(
                     return;
                 }
             }
-
-            let _ = tokio::fs::remove_file(&archive_path).await;
             emit_progress(encoder_dir, "whisper_encoder", "downloaded".to_string());
         }
 
@@ -1484,9 +1570,11 @@ fn spawn_pyannote_bundled_install(
     app: tauri::AppHandle,
     runtime_factory: std::sync::Arc<RuntimeTranscriptionFactory>,
     cancel_token: CancellationToken,
+    slot_guard: ProvisioningSlotGuard,
     _repair_required: bool,
 ) {
     tauri::async_runtime::spawn(async move {
+        let _slot_guard = slot_guard;
         if cancel_token.is_cancelled() {
             emit_provisioning_status(
                 &app,
@@ -1566,10 +1654,12 @@ fn spawn_pyannote_provisioning_download(
     app: tauri::AppHandle,
     runtime_factory: std::sync::Arc<RuntimeTranscriptionFactory>,
     cancel_token: CancellationToken,
+    slot_guard: ProvisioningSlotGuard,
     had_ready_install: bool,
     reset_existing_install: bool,
 ) {
     tauri::async_runtime::spawn(async move {
+        let _slot_guard = slot_guard;
         let client = reqwest::Client::new();
         let total = 2usize;
         let runtime_dir = runtime_factory.managed_pyannote_runtime_dir();
@@ -1942,8 +2032,10 @@ fn spawn_runtime_provisioning_download(
     app: tauri::AppHandle,
     runtime_factory: std::sync::Arc<RuntimeTranscriptionFactory>,
     cancel_token: CancellationToken,
+    slot_guard: ProvisioningSlotGuard,
 ) {
     tauri::async_runtime::spawn(async move {
+        let _slot_guard = slot_guard;
         let client = reqwest::Client::new();
         let selection = match fetch_runtime_asset_selection(&client).await {
             Ok(value) => value,
@@ -2686,45 +2778,264 @@ fn remove_path_if_exists(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum DownloadAttemptError {
+    Cancelled,
+    NonRetryable(String),
+    Retryable(String),
+}
+
+impl std::fmt::Display for DownloadAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("cancelled"),
+            Self::NonRetryable(message) | Self::Retryable(message) => formatter.write_str(message),
+        }
+    }
+}
+
+fn download_temp_path(destination: &Path) -> PathBuf {
+    let filename = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
+    let sequence = DOWNLOAD_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    destination.with_file_name(format!(
+        ".{filename}.part-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+fn response_looks_like_html(prefix: &[u8]) -> bool {
+    let trimmed = prefix
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map_or(&[][..], |offset| &prefix[offset..]);
+    if !trimmed.starts_with(b"<") {
+        return false;
+    }
+
+    let text = String::from_utf8_lossy(trimmed).to_ascii_lowercase();
+    text.starts_with("<!doctype html")
+        || text.starts_with("<html")
+        || text.starts_with("<?xml")
+        || text.contains("<html")
+}
+
+async fn cleanup_download_temp(temp_path: &Path) -> Result<(), String> {
+    match tokio::fs::remove_file(temp_path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to clean up temporary download '{}': {error}",
+            temp_path.display()
+        )),
+    }
+}
+
+async fn cleanup_downloaded_archive(archive_path: &Path) -> Result<(), String> {
+    match tokio::fs::remove_file(archive_path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to remove downloaded archive '{}': {error}",
+            archive_path.display()
+        )),
+    }
+}
+
+async fn download_to_temp(
+    client: &reqwest::Client,
+    url: &str,
+    temp_path: &Path,
+    cancel_token: &CancellationToken,
+) -> Result<(), DownloadAttemptError> {
+    if cancel_token.is_cancelled() {
+        return Err(DownloadAttemptError::Cancelled);
+    }
+
+    let response_result = tokio::select! {
+        _ = cancel_token.cancelled() => return Err(DownloadAttemptError::Cancelled),
+        result = tokio::time::timeout(MODEL_DOWNLOAD_REQUEST_TIMEOUT, client.get(url).send()) => result,
+    };
+    let response = response_result
+        .map_err(|_| {
+            DownloadAttemptError::Retryable(format!(
+                "request timed out after {}s",
+                MODEL_DOWNLOAD_REQUEST_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|error| DownloadAttemptError::Retryable(format!("request failed: {error}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let message = format!("download failed with HTTP {}", status.as_u16());
+        let retryable = status.is_server_error()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        return Err(if retryable {
+            DownloadAttemptError::Retryable(message)
+        } else {
+            DownloadAttemptError::NonRetryable(message)
+        });
+    }
+
+    if response.content_length() == Some(0) {
+        return Err(DownloadAttemptError::NonRetryable(
+            "downloaded file is empty".to_string(),
+        ));
+    }
+
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/html"))
+    {
+        return Err(DownloadAttemptError::NonRetryable(
+            "download returned an HTML response instead of a model asset".to_string(),
+        ));
+    }
+
+    let mut file = tokio::fs::File::create(temp_path).await.map_err(|error| {
+        DownloadAttemptError::NonRetryable(format!(
+            "failed to create temporary download file: {error}"
+        ))
+    })?;
+    let mut response = response;
+    let mut prefix = Vec::with_capacity(512);
+    let mut total_bytes = 0_u64;
+
+    loop {
+        let chunk_result = tokio::select! {
+            _ = cancel_token.cancelled() => return Err(DownloadAttemptError::Cancelled),
+            result = tokio::time::timeout(MODEL_DOWNLOAD_CHUNK_TIMEOUT, response.chunk()) => result,
+        };
+        let chunk = chunk_result
+            .map_err(|_| {
+                DownloadAttemptError::Retryable(format!(
+                    "download stream timed out after {}s",
+                    MODEL_DOWNLOAD_CHUNK_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|error| {
+                DownloadAttemptError::Retryable(format!("download stream failure: {error}"))
+            })?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+
+        if cancel_token.is_cancelled() {
+            return Err(DownloadAttemptError::Cancelled);
+        }
+        if prefix.len() < 512 {
+            let remaining = 512 - prefix.len();
+            prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+        file.write_all(&chunk).await.map_err(|error| {
+            DownloadAttemptError::NonRetryable(format!("failed to write download: {error}"))
+        })?;
+    }
+
+    if total_bytes == 0 {
+        return Err(DownloadAttemptError::NonRetryable(
+            "downloaded file is empty".to_string(),
+        ));
+    }
+    if response_looks_like_html(&prefix) {
+        return Err(DownloadAttemptError::NonRetryable(
+            "download returned HTML instead of a model asset".to_string(),
+        ));
+    }
+
+    file.flush().await.map_err(|error| {
+        DownloadAttemptError::NonRetryable(format!("failed to flush download: {error}"))
+    })?;
+    file.sync_all().await.map_err(|error| {
+        DownloadAttemptError::NonRetryable(format!("failed to sync download: {error}"))
+    })?;
+    Ok(())
+}
+
 async fn download_to_path(
     client: &reqwest::Client,
     url: &str,
     destination: &Path,
     cancel_token: &CancellationToken,
 ) -> Result<(), String> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("download failed: {e}"))?;
+    let temp_path = download_temp_path(destination);
+    let mut last_error = None;
 
-    let mut file = tokio::fs::File::create(destination)
-        .await
-        .map_err(|e| format!("failed to create destination file: {e}"))?;
-
-    let mut response = response;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| format!("download stream failure: {e}"))?
-    {
+    for attempt in 1..=MODEL_DOWNLOAD_MAX_ATTEMPTS {
         if cancel_token.is_cancelled() {
-            let _ = tokio::fs::remove_file(destination).await;
+            let _ = cleanup_download_temp(&temp_path).await;
             return Err("cancelled".to_string());
         }
+        cleanup_download_temp(&temp_path).await?;
 
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("failed to write chunk: {e}"))?;
+        match download_to_temp(client, url, &temp_path, cancel_token).await {
+            Ok(()) => {
+                if cancel_token.is_cancelled() {
+                    let _ = cleanup_download_temp(&temp_path).await;
+                    return Err("cancelled".to_string());
+                }
+                if destination.exists() {
+                    let _ = cleanup_download_temp(&temp_path).await;
+                    return Err(format!(
+                        "download destination appeared while installing '{}'; refusing to overwrite it",
+                        destination.display()
+                    ));
+                }
+                return match tokio::fs::rename(&temp_path, destination).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let cleanup = cleanup_download_temp(&temp_path).await.err();
+                        Err(match cleanup {
+                            Some(cleanup_error) => format!(
+                                "failed to finalize download '{}': {error}; {cleanup_error}",
+                                destination.display()
+                            ),
+                            None => format!(
+                                "failed to finalize download '{}': {error}",
+                                destination.display()
+                            ),
+                        })
+                    }
+                };
+            }
+            Err(DownloadAttemptError::Cancelled) => {
+                let _ = cleanup_download_temp(&temp_path).await;
+                return Err("cancelled".to_string());
+            }
+            Err(DownloadAttemptError::NonRetryable(error)) => {
+                let cleanup = cleanup_download_temp(&temp_path).await.err();
+                return Err(match cleanup {
+                    Some(cleanup_error) => format!("{error}; {cleanup_error}"),
+                    None => error,
+                });
+            }
+            Err(DownloadAttemptError::Retryable(error)) => {
+                let cleanup = cleanup_download_temp(&temp_path).await;
+                if let Err(cleanup_error) = cleanup {
+                    return Err(format!("{error}; {cleanup_error}"));
+                }
+                last_error = Some(error);
+                if attempt < MODEL_DOWNLOAD_MAX_ATTEMPTS {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => return Err("cancelled".to_string()),
+                        _ = tokio::time::sleep(MODEL_DOWNLOAD_RETRY_DELAY) => {}
+                    }
+                }
+            }
+        }
     }
 
-    file.flush()
-        .await
-        .map_err(|e| format!("failed to flush destination file: {e}"))?;
-
-    Ok(())
+    Err(format!(
+        "download failed after {MODEL_DOWNLOAD_MAX_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    ))
 }
 
 fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), String> {
@@ -2832,9 +3143,13 @@ mod tests {
         RuntimeTranscriptionFactory,
     };
     use std::collections::BTreeMap;
-    use std::io::Write;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener};
     use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
 
     fn build_runtime_factory() -> (tempfile::TempDir, Arc<RuntimeTranscriptionFactory>) {
         std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
@@ -2846,6 +3161,139 @@ mod tests {
                 .expect("runtime factory should initialize"),
         );
         (temp, factory)
+    }
+
+    fn spawn_download_server(responses: Vec<&'static str>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("download server should bind");
+        let address = listener
+            .local_addr()
+            .expect("download server address should resolve");
+        let thread = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("download request should connect");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("download request timeout should set");
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("download response should write");
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+        (format!("http://{address}/model"), thread)
+    }
+
+    #[tokio::test]
+    async fn transactional_model_download_retries_and_commits_only_complete_file() {
+        let (url, server) = spawn_download_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\npartial",
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nmodel-bytes",
+        ]);
+        let temp = tempdir().expect("download tempdir should create");
+        let destination = temp.path().join("parakeet.gguf");
+        let client = reqwest::Client::new();
+
+        super::download_to_path(&client, &url, &destination, &CancellationToken::new())
+            .await
+            .expect("download should recover on the second attempt");
+        server.join().expect("download server should finish");
+
+        assert_eq!(
+            std::fs::read(&destination).expect("final model should exist"),
+            b"model-bytes"
+        );
+        let leftovers = std::fs::read_dir(temp.path())
+            .expect("download tempdir should read")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".parakeet.gguf.part-")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "partial download temp must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_model_download_rejects_html_without_final_file() {
+        let (url, server) = spawn_download_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 31\r\nConnection: close\r\n\r\n<html>not a model</html>",
+        ]);
+        let temp = tempdir().expect("download tempdir should create");
+        let destination = temp.path().join("whisper.bin");
+        let client = reqwest::Client::new();
+
+        let error = super::download_to_path(&client, &url, &destination, &CancellationToken::new())
+            .await
+            .expect_err("HTML response must not install as a model");
+        server.join().expect("download server should finish");
+
+        assert!(
+            error.contains("HTML"),
+            "error should explain invalid asset: {error}"
+        );
+        assert!(!destination.exists());
+        assert!(std::fs::read_dir(temp.path())
+            .expect("download tempdir should read")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".whisper.bin.part-")));
+    }
+
+    #[tokio::test]
+    async fn failed_encoder_archive_cleanup_allows_retry_download() {
+        let (url, server) = spawn_download_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nvalid-bytes",
+        ]);
+        let temp = tempdir().expect("download tempdir should create");
+        let archive_path = temp.path().join("encoder.zip");
+        std::fs::write(&archive_path, b"broken archive").expect("write stale archive");
+
+        super::cleanup_downloaded_archive(&archive_path)
+            .await
+            .expect("failed extraction archive should be removed");
+        super::download_to_path(
+            &reqwest::Client::new(),
+            &url,
+            &archive_path,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("retry should install a fresh archive");
+        server.join().expect("download server should finish");
+
+        assert_eq!(
+            std::fs::read(archive_path).expect("fresh archive should exist"),
+            b"valid-bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioning_slot_rejects_concurrent_operation_until_guard_drops() {
+        let slot = Arc::new(tokio::sync::Mutex::new(None));
+        let (_token, guard) = super::acquire_provisioning_slot(slot.clone())
+            .await
+            .expect("first provisioning operation should acquire slot");
+        let error = match super::acquire_provisioning_slot(slot.clone()).await {
+            Ok(_) => panic!("second provisioning operation should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "provisioning_busy");
+
+        drop(guard);
+        tokio::task::yield_now().await;
+        let (_token, guard) = super::acquire_provisioning_slot(slot)
+            .await
+            .expect("slot should be reusable after operation exits");
+        drop(guard);
     }
 
     fn persist_settings(factory: &RuntimeTranscriptionFactory, diarization_enabled: bool) {

@@ -11,11 +11,20 @@ use crate::{ApplicationError, SettingsRepository};
 #[derive(Clone)]
 pub struct SettingsService {
     settings_repo: Arc<dyn SettingsRepository>,
+    /// Serializes every load-modify-save transaction owned by this service.
+    ///
+    /// Settings are also read by the UI while a mutation is in flight.  The
+    /// lock deliberately covers the load as well as the save so two callers
+    /// cannot both load the same snapshot and then overwrite one another.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SettingsService {
     pub fn new(settings_repo: Arc<dyn SettingsRepository>) -> Self {
-        Self { settings_repo }
+        Self {
+            settings_repo,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     pub async fn get(&self) -> Result<AppSettings, ApplicationError> {
@@ -23,6 +32,7 @@ impl SettingsService {
     }
 
     pub async fn update(&self, settings: AppSettings) -> Result<AppSettings, ApplicationError> {
+        let _write_guard = self.write_lock.lock().await;
         self.persist_with_source(settings, SettingsSyncSource::Legacy)
             .await
     }
@@ -40,6 +50,7 @@ impl SettingsService {
         ai: Option<AiSettings>,
         prompts: Option<PromptSettings>,
     ) -> Result<AppSettings, ApplicationError> {
+        let _write_guard = self.write_lock.lock().await;
         let mut settings = self.load_synced().await?;
         if let Some(value) = general {
             settings.general = value;
@@ -75,6 +86,7 @@ impl SettingsService {
         gemini_api_key: Option<Option<String>>,
         gemini_model: Option<String>,
     ) -> Result<AiSettings, ApplicationError> {
+        let _write_guard = self.write_lock.lock().await;
         let mut settings = self.load_synced().await?;
 
         if let Some(value) = active_provider {
@@ -107,6 +119,7 @@ impl SettingsService {
         mut template: PromptTemplate,
         bind_task: Option<PromptTask>,
     ) -> Result<AppSettings, ApplicationError> {
+        let _write_guard = self.write_lock.lock().await;
         template.id = normalize_optional_string(Some(template.id.clone())).unwrap_or_else(|| {
             format!(
                 "custom_{}",
@@ -155,6 +168,7 @@ impl SettingsService {
     }
 
     pub async fn delete_prompt(&self, prompt_id: String) -> Result<AppSettings, ApplicationError> {
+        let _write_guard = self.write_lock.lock().await;
         let Some(prompt_id) = normalize_optional_string(Some(prompt_id)) else {
             return Err(ApplicationError::Validation(
                 "prompt template id cannot be empty".to_string(),
@@ -185,6 +199,7 @@ impl SettingsService {
     }
 
     pub async fn reset_prompts(&self) -> Result<AppSettings, ApplicationError> {
+        let _write_guard = self.write_lock.lock().await;
         let mut settings = self.load_synced().await?;
         settings.prompts = PromptSettings::default();
         self.persist_with_source(settings, SettingsSyncSource::Sections)

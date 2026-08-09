@@ -226,6 +226,7 @@ import {
 } from "./lib/artifactExportFlow";
 import { buildExportFileName } from "./lib/exportFileName";
 import { buildConfidenceTranscript } from "./lib/whisperConfidence";
+import { SerialTaskQueue } from "./lib/serialTaskQueue";
 import { useAppStore } from "./state/useAppStore";
 import type {
   AiCapabilityStatus,
@@ -3537,9 +3538,6 @@ export function App({
     Record<string, string>
   >({});
   const [testingAiServiceId, setTestingAiServiceId] = useState<string | null>(null);
-  const [verifiedAiServiceIds, setVerifiedAiServiceIds] = useState<Set<string>>(
-    () => new Set(),
-  );
   const [remoteServiceModelChoices, setRemoteServiceModelChoices] = useState<
     Record<string, string[]>
   >({});
@@ -3803,6 +3801,7 @@ export function App({
   const queuedTranscriptionSequenceRef = useRef(0);
   const startupWatchdogRef = useRef<number | null>(null);
   const settingsSaveSequenceRef = useRef(0);
+  const settingsMutationQueueRef = useRef(new SerialTaskQueue());
   const summaryAutostartedArtifactIdsRef = useRef<Set<string>>(new Set());
   const automaticImportStartupScanTriggeredRef = useRef(false);
   realtimeSpeakerDiarizationEnabledRef.current = Boolean(
@@ -6895,7 +6894,7 @@ export function App({
   async function persistSettings(
     updated: AppSettings,
     previous: AppSettings | null,
-  ): Promise<void> {
+  ): Promise<AppSettings | null> {
     const sequence = ++settingsSaveSequenceRef.current;
     const normalized = normalizeSettings(updated);
     setSettings(normalized);
@@ -6905,6 +6904,7 @@ export function App({
       if (sequence === settingsSaveSequenceRef.current) {
         setSettings(normalizeSettings(persisted));
       }
+      return normalizeSettings(persisted);
     } catch (settingsError) {
       if (sequence === settingsSaveSequenceRef.current && previous) {
         setSettings(previous);
@@ -6916,48 +6916,57 @@ export function App({
           settingsError,
         ),
       );
+      return null;
     }
   }
 
   async function patchSettings(
     mutator: (current: AppSettings) => AppSettings,
-  ): Promise<void> {
-    if (!settings) return;
-    const previous = normalizeSettings(settings);
-    const next = normalizeSettings(mutator(normalizeSettings(settings)));
-    await persistSettings(next, previous);
+  ): Promise<AppSettings | null> {
+    return settingsMutationQueueRef.current.enqueue(async () => {
+      const current = useAppStore.getState().settings;
+      if (!current) return null;
+      const previous = normalizeSettings(current);
+      const next = normalizeSettings(mutator(normalizeSettings(current)));
+      return persistSettings(next, previous);
+    });
   }
 
   async function patchAiSettings(
     mutator: (current: AppSettings["ai"]) => AppSettings["ai"],
-  ): Promise<void> {
-    if (!settings) return;
-    const previous = normalizeSettings(settings);
-    const next = normalizeSettings({
-      ...previous,
-      ai: mutator(previous.ai),
+  ): Promise<AppSettings | null> {
+    return settingsMutationQueueRef.current.enqueue(async () => {
+      const current = useAppStore.getState().settings;
+      if (!current) return null;
+      const previous = normalizeSettings(current);
+      const next = normalizeSettings({
+        ...previous,
+        ai: mutator(previous.ai),
+      });
+
+      const sequence = ++settingsSaveSequenceRef.current;
+      setSettings(next);
+
+      try {
+        const persisted = await saveSettingsPartial({ ai: next.ai });
+        if (sequence === settingsSaveSequenceRef.current) {
+          setSettings(normalizeSettings(persisted));
+        }
+        return normalizeSettings(persisted);
+      } catch (settingsError) {
+        if (sequence === settingsSaveSequenceRef.current) {
+          setSettings(previous);
+        }
+        setError(
+          formatUiError(
+            "error.saveSettings",
+            "Could not save settings",
+            settingsError,
+          ),
+        );
+        return null;
+      }
     });
-
-    const sequence = ++settingsSaveSequenceRef.current;
-    setSettings(next);
-
-    try {
-      const persisted = await saveSettingsPartial({ ai: next.ai });
-      if (sequence === settingsSaveSequenceRef.current) {
-        setSettings(normalizeSettings(persisted));
-      }
-    } catch (settingsError) {
-      if (sequence === settingsSaveSequenceRef.current) {
-        setSettings(previous);
-      }
-      setError(
-        formatUiError(
-          "error.saveSettings",
-          "Could not save settings",
-          settingsError,
-        ),
-      );
-    }
   }
 
   async function patchAutomaticImportSettings(
@@ -6965,33 +6974,36 @@ export function App({
       current: AppSettings["automation"],
     ) => AppSettings["automation"],
   ): Promise<void> {
-    if (!settings) return;
-    const previous = normalizeSettings(settings);
-    const next = normalizeSettings({
-      ...previous,
-      automation: mutator(previous.automation),
+    return settingsMutationQueueRef.current.enqueue(async () => {
+      const current = useAppStore.getState().settings;
+      if (!current) return;
+      const previous = normalizeSettings(current);
+      const next = normalizeSettings({
+        ...previous,
+        automation: mutator(previous.automation),
+      });
+
+      const sequence = ++settingsSaveSequenceRef.current;
+      setSettings(next);
+
+      try {
+        const persisted = await saveSettingsPartial({ automation: next.automation });
+        if (sequence === settingsSaveSequenceRef.current) {
+          setSettings(normalizeSettings(persisted));
+        }
+      } catch (settingsError) {
+        if (sequence === settingsSaveSequenceRef.current) {
+          setSettings(previous);
+        }
+        setError(
+          formatUiError(
+            "error.saveSettings",
+            "Could not save settings",
+            settingsError,
+          ),
+        );
+      }
     });
-
-    const sequence = ++settingsSaveSequenceRef.current;
-    setSettings(next);
-
-    try {
-      const persisted = await saveSettingsPartial({ automation: next.automation });
-      if (sequence === settingsSaveSequenceRef.current) {
-        setSettings(normalizeSettings(persisted));
-      }
-    } catch (settingsError) {
-      if (sequence === settingsSaveSequenceRef.current) {
-        setSettings(previous);
-      }
-      setError(
-        formatUiError(
-          "error.saveSettings",
-          "Could not save settings",
-          settingsError,
-        ),
-      );
-    }
   }
 
   async function patchOrganizationSettings(
@@ -6999,35 +7011,38 @@ export function App({
       current: AppSettings["organization"],
     ) => AppSettings["organization"],
   ): Promise<void> {
-    if (!settings) return;
-    const previous = normalizeSettings(settings);
-    const next = normalizeSettings({
-      ...previous,
-      organization: mutator(previous.organization),
-    });
-
-    const sequence = ++settingsSaveSequenceRef.current;
-    setSettings(next);
-
-    try {
-      const persisted = await saveSettingsPartial({
-        organization: next.organization,
+    return settingsMutationQueueRef.current.enqueue(async () => {
+      const current = useAppStore.getState().settings;
+      if (!current) return;
+      const previous = normalizeSettings(current);
+      const next = normalizeSettings({
+        ...previous,
+        organization: mutator(previous.organization),
       });
-      if (sequence === settingsSaveSequenceRef.current) {
-        setSettings(normalizeSettings(persisted));
+
+      const sequence = ++settingsSaveSequenceRef.current;
+      setSettings(next);
+
+      try {
+        const persisted = await saveSettingsPartial({
+          organization: next.organization,
+        });
+        if (sequence === settingsSaveSequenceRef.current) {
+          setSettings(normalizeSettings(persisted));
+        }
+      } catch (settingsError) {
+        if (sequence === settingsSaveSequenceRef.current) {
+          setSettings(previous);
+        }
+        setError(
+          formatUiError(
+            "error.saveSettings",
+            "Could not save settings",
+            settingsError,
+          ),
+        );
       }
-    } catch (settingsError) {
-      if (sequence === settingsSaveSequenceRef.current) {
-        setSettings(previous);
-      }
-      setError(
-        formatUiError(
-          "error.saveSettings",
-          "Could not save settings",
-          settingsError,
-        ),
-      );
-    }
+    });
   }
 
   function registerAutomaticImportQueuedJobs(
@@ -14409,6 +14424,7 @@ export function App({
       checked: boolean,
       label: string,
       onToggle: () => void,
+      disabled = false,
     ) => (
       <button
         type="button"
@@ -14417,6 +14433,7 @@ export function App({
         aria-checked={checked}
         aria-label={label}
         title={label}
+        disabled={disabled}
         onClick={onToggle}
       >
         <span className="settings-switch-track" aria-hidden="true">
@@ -14948,6 +14965,7 @@ export function App({
                         ),
                       }));
                     },
+                    !aiFeaturesAvailable,
                   )}
                 </div>
 
@@ -16716,15 +16734,6 @@ export function App({
       remoteServices.map((service) => service.kind),
     );
 
-    const markAiServiceUnverified = (id: string): void => {
-      setVerifiedAiServiceIds((current) => {
-        if (!current.has(id)) return current;
-        const next = new Set(current);
-        next.delete(id);
-        return next;
-      });
-    };
-
     const saveAndVerifyAiService = async (
       service: RemoteServiceConfig,
       apiKeyDraft: string,
@@ -16737,7 +16746,7 @@ export function App({
       setTestingAiServiceId(service.id);
       setError(null);
       try {
-        await patchAiSettings((current) => ({
+        const persisted = await patchAiSettings((current) => ({
           ...current,
           providers:
             service.kind === "google"
@@ -16780,8 +16789,13 @@ export function App({
               : entry,
           ),
         }));
+        if (!persisted) {
+          throw new Error("Settings could not be saved");
+        }
+        if (!persisted.ai.remote_services?.some((entry) => entry.id === service.id)) {
+          throw new Error("AI service disappeared while saving settings");
+        }
         await testAiService(service.id);
-        setVerifiedAiServiceIds((current) => new Set(current).add(service.id));
         setRemoteServiceApiKeyDrafts((current) => ({
           ...current,
           [service.id]: "",
@@ -16798,9 +16812,13 @@ export function App({
           delete next[service.id];
           return next;
         });
+        setRemoteServiceModelChoices((current) => {
+          const next = { ...current };
+          delete next[service.id];
+          return next;
+        });
         setAiCapabilityStatus(await fetchAiCapabilityStatus());
       } catch (verificationError) {
-        markAiServiceUnverified(service.id);
         setError(formatAiServiceVerificationError(verificationError));
       } finally {
         setTestingAiServiceId(null);
@@ -16808,9 +16826,19 @@ export function App({
     };
 
     const clearAiServiceApiKey = (service: RemoteServiceConfig): void => {
-      markAiServiceUnverified(service.id);
       void patchAiSettings((current) => ({
         ...current,
+        active_provider:
+          current.active_remote_service_id === service.id ||
+          (service.kind === "google" && current.active_provider === "gemini")
+            ? current.providers.foundation_apple.enabled && platformIsAppleSilicon
+              ? "foundation_apple"
+              : "none"
+            : current.active_provider,
+        active_remote_service_id:
+          current.active_remote_service_id === service.id
+            ? null
+            : current.active_remote_service_id,
         providers:
           service.kind === "google"
             ? {
@@ -17079,8 +17107,7 @@ export function App({
                     disabled={
                       !geminiConfigured ||
                       geminiActive ||
-                      !googleService ||
-                      !verifiedAiServiceIds.has(googleService.id)
+                      !googleService
                     }
                     onClick={activateGemini}
                   >
@@ -17104,7 +17131,7 @@ export function App({
                       value={geminiApiKeyDraft}
                       onChange={(event) => {
                         setGeminiApiKeyDraft(event.target.value);
-                        if (googleService) markAiServiceUnverified(googleService.id);
+                        setGeminiModelChoices(fallbackGeminiModelOptions);
                       }}
                     />
                   </label>
@@ -17117,7 +17144,6 @@ export function App({
                           geminiModelDraft ?? settings.ai.providers.gemini.model
                         }
                         onChange={(event) => {
-                          if (googleService) markAiServiceUnverified(googleService.id);
                           setGeminiModelDraft(event.target.value);
                         }}
                       >
@@ -17317,11 +17343,9 @@ export function App({
                         className="secondary-button"
                         disabled={
                           !service.enabled ||
-                          isActiveRemote ||
-                          !verifiedAiServiceIds.has(service.id)
+                          isActiveRemote
                         }
                         onClick={() => {
-                          if (!verifiedAiServiceIds.has(service.id)) return;
                           void patchAiSettings((current) => ({
                             ...current,
                             active_provider:
@@ -17350,7 +17374,11 @@ export function App({
                               ...current,
                               [service.id]: nextValue,
                             }));
-                            markAiServiceUnverified(service.id);
+                            setRemoteServiceModelChoices((current) => {
+                              const next = { ...current };
+                              delete next[service.id];
+                              return next;
+                            });
                           }}
                         />
                       </label>
@@ -17368,7 +17396,6 @@ export function App({
                             "Optional model name",
                           )}
                           onChange={(event) => {
-                            markAiServiceUnverified(service.id);
                             setRemoteServiceModelDrafts((current) => ({
                               ...current,
                               [service.id]: event.target.value,
@@ -17387,7 +17414,13 @@ export function App({
                           disabled={loadingRemoteModelsId === service.id}
                           onClick={() => {
                             setLoadingRemoteModelsId(service.id);
-                            void listAiServiceModels(service.id)
+                            void listAiServiceModels(service.id, {
+                              api_key: remoteServiceApiKeyDrafts[service.id],
+                              base_url:
+                                remoteServiceBaseUrlDrafts[service.id] ??
+                                service.base_url ??
+                                undefined,
+                            })
                               .then((models) =>
                                 setRemoteServiceModelChoices((current) => ({
                                   ...current,
@@ -17424,11 +17457,15 @@ export function App({
                             "Optional API endpoint",
                           )}
                           onChange={(event) => {
-                            markAiServiceUnverified(service.id);
                             setRemoteServiceBaseUrlDrafts((current) => ({
                               ...current,
                               [service.id]: event.target.value,
                             }));
+                            setRemoteServiceModelChoices((current) => {
+                              const next = { ...current };
+                              delete next[service.id];
+                              return next;
+                            });
                           }}
                         />
                       </label>

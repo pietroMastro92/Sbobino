@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, io::Write, path::PathBuf};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -31,23 +31,7 @@ impl FsSettingsRepository {
     pub fn load_sync(&self) -> Result<AppSettings, ApplicationError> {
         if !self.path.exists() {
             let defaults = AppSettings::default();
-            let serialized = serde_json::to_string_pretty(&defaults).map_err(|e| {
-                ApplicationError::Settings(format!("failed to serialize default settings: {e}"))
-            })?;
-            if let Some(parent) = self.path.parent() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    ApplicationError::Settings(format!(
-                        "failed to create settings directory {}: {e}",
-                        parent.display()
-                    ))
-                })?;
-            }
-            fs::write(&self.path, serialized).map_err(|e| {
-                ApplicationError::Settings(format!(
-                    "failed to write settings file {}: {e}",
-                    self.path.display()
-                ))
-            })?;
+            self.write_settings_file(&defaults)?;
             return Ok(defaults);
         }
 
@@ -111,12 +95,20 @@ impl FsSettingsRepository {
         }
         backfill_automatic_import_source_transcription_defaults(&mut settings, &raw_json);
 
-        self.populate_secrets(&mut settings)?;
+        let plaintext_secrets_found = self.populate_secrets(&mut settings)?;
+        if plaintext_secrets_found {
+            // Legacy releases stored API keys in settings.json.  Move them to
+            // secure storage and immediately rewrite the file redacted so a
+            // successful migration does not leave plaintext behind. Redact
+            // even when secure storage already contains a newer key.
+            self.write_settings_file(&settings)?;
+        }
 
         Ok(settings)
     }
 
     pub fn save_sync(&self, settings: &AppSettings) -> Result<(), ApplicationError> {
+        let previous_remote_service_ids = self.stored_remote_service_ids().unwrap_or_default();
         let mut normalized = settings.clone();
         self.merge_stored_secrets_for_save(&mut normalized)?;
         if should_treat_legacy_fields_as_source(&normalized) {
@@ -127,7 +119,24 @@ impl FsSettingsRepository {
 
         self.persist_secrets(&normalized)?;
 
-        let mut file_settings = normalized.redacted_clone();
+        let current_remote_service_ids = normalized
+            .ai
+            .remote_services
+            .iter()
+            .map(|service| service.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        for removed_id in previous_remote_service_ids {
+            if !current_remote_service_ids.contains(removed_id.as_str()) {
+                self.secure_storage
+                    .delete_secret(&format!("remote_service.{removed_id}.api_key"))?;
+            }
+        }
+
+        self.write_settings_file(&normalized)
+    }
+
+    fn write_settings_file(&self, settings: &AppSettings) -> Result<(), ApplicationError> {
+        let mut file_settings = settings.redacted_clone();
         file_settings.refresh_secret_presence_flags();
 
         let serialized = serde_json::to_string_pretty(&file_settings).map_err(|e| {
@@ -143,12 +152,36 @@ impl FsSettingsRepository {
             })?;
         }
 
-        fs::write(&self.path, serialized).map_err(|e| {
+        let parent = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut staged = tempfile::Builder::new()
+            .prefix(".sbobino-settings-")
+            .tempfile_in(parent)
+            .map_err(|e| {
+                ApplicationError::Settings(format!(
+                    "failed to stage settings file in {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        staged.write_all(serialized.as_bytes()).map_err(|e| {
+            ApplicationError::Settings(format!("failed to write staged settings file: {e}"))
+        })?;
+        staged.flush().map_err(|e| {
+            ApplicationError::Settings(format!("failed to flush staged settings file: {e}"))
+        })?;
+        staged.as_file().sync_all().map_err(|e| {
+            ApplicationError::Settings(format!("failed to sync staged settings file: {e}"))
+        })?;
+        staged.persist(&self.path).map_err(|e| {
             ApplicationError::Settings(format!(
-                "failed to save settings file {}: {e}",
-                self.path.display()
+                "failed to atomically replace settings file {}: {}",
+                self.path.display(),
+                e.error
             ))
-        })
+        })?;
+        Ok(())
     }
 
     fn merge_stored_secrets_for_save(
@@ -181,20 +214,74 @@ impl FsSettingsRepository {
         Ok(())
     }
 
-    fn populate_secrets(&self, settings: &mut AppSettings) -> Result<(), ApplicationError> {
+    fn populate_secrets(&self, settings: &mut AppSettings) -> Result<bool, ApplicationError> {
+        let mut plaintext_secrets_found = false;
         let gemini_account = "settings.gemini_api_key";
-        settings.ai.providers.gemini.api_key = self.secure_storage.read_secret(gemini_account)?;
-        settings.gemini_api_key = settings.ai.providers.gemini.api_key.clone();
-        settings.ai.providers.gemini.has_api_key = settings.ai.providers.gemini.api_key.is_some();
-        settings.gemini_api_key_present = settings.ai.providers.gemini.has_api_key;
+        let legacy_gemini_key = settings
+            .ai
+            .providers
+            .gemini
+            .api_key
+            .clone()
+            .or_else(|| settings.gemini_api_key.clone())
+            .and_then(normalize_secret);
+        plaintext_secrets_found |= legacy_gemini_key.is_some();
+        let secure_gemini_key = self.secure_storage.read_secret(gemini_account)?;
+        let gemini_key = secure_gemini_key.clone().or(legacy_gemini_key.clone());
+        if secure_gemini_key.is_none() && legacy_gemini_key.is_some() {
+            self.secure_storage.write_secret(
+                gemini_account,
+                legacy_gemini_key.as_deref().expect("checked above"),
+            )?;
+        }
+        settings.ai.providers.gemini.api_key = gemini_key.clone();
+        settings.gemini_api_key = gemini_key.clone();
+        settings.ai.providers.gemini.has_api_key = gemini_key.is_some();
+        settings.gemini_api_key_present = gemini_key.is_some();
 
         for service in &mut settings.ai.remote_services {
             let account = format!("remote_service.{}.api_key", service.id);
-            service.api_key = self.secure_storage.read_secret(&account)?;
-            service.has_api_key = service.api_key.is_some();
+            let legacy_key = service.api_key.clone().and_then(normalize_secret);
+            plaintext_secrets_found |= legacy_key.is_some();
+            let secure_key = self.secure_storage.read_secret(&account)?;
+            let key = secure_key.clone().or(legacy_key.clone());
+            if secure_key.is_none() && legacy_key.is_some() {
+                self.secure_storage
+                    .write_secret(&account, legacy_key.as_deref().expect("checked above"))?;
+            }
+            service.api_key = key.clone();
+            service.has_api_key = key.is_some();
         }
 
-        Ok(())
+        Ok(plaintext_secrets_found)
+    }
+
+    fn stored_remote_service_ids(&self) -> Result<Vec<String>, ApplicationError> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&self.path).map_err(|e| {
+            ApplicationError::Settings(format!(
+                "failed to read settings file {}: {e}",
+                self.path.display()
+            ))
+        })?;
+        let raw_json = serde_json::from_str::<serde_json::Value>(&content).map_err(|e| {
+            ApplicationError::Settings(format!(
+                "invalid settings JSON in {}: {e}",
+                self.path.display()
+            ))
+        })?;
+        Ok(raw_json
+            .get("ai")
+            .and_then(|ai| ai.get("remote_services"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|service| service.get("id").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .filter(|id| !id.trim().is_empty())
+            .collect())
     }
 
     fn persist_secrets(&self, settings: &AppSettings) -> Result<(), ApplicationError> {
@@ -266,6 +353,11 @@ fn should_treat_legacy_fields_as_source(settings: &AppSettings) -> bool {
     });
 
     legacy_differs && sections_match_defaults
+}
+
+fn normalize_secret(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn backfill_automatic_import_source_transcription_defaults(

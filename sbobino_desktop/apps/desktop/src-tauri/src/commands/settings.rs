@@ -56,6 +56,10 @@ pub struct TestAiServicePayload {
 #[derive(Debug, Deserialize)]
 pub struct AiServiceIdPayload {
     pub service_id: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -385,45 +389,41 @@ pub async fn list_ai_service_models(
     ) {
         return Ok(Vec::new());
     }
-    let base_url = service
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    let base_url = draft_or_stored_value(payload.base_url.as_deref(), service.base_url.as_deref())
         .ok_or_else(|| CommandError::new("validation", "AI service base URL is required"))?;
     let base_url = base_url
         .split("/chat/completions")
         .next()
-        .unwrap_or(base_url)
+        .unwrap_or(base_url.as_str())
         .trim_end_matches('/');
     let endpoint = format!("{base_url}/models");
     let mut headers = HeaderMap::new();
     if service.kind == sbobino_domain::RemoteServiceKind::Anthropic {
-        let key = service
-            .api_key
-            .as_deref()
+        let key = draft_or_stored_value(payload.api_key.as_deref(), service.api_key.as_deref())
             .ok_or_else(|| CommandError::new("missing_api_key", "Anthropic API key is required"))?;
         headers.insert(
             HeaderName::from_static("x-api-key"),
-            HeaderValue::from_str(key)
+            HeaderValue::from_str(&key)
                 .map_err(|error| CommandError::new("validation", error.to_string()))?,
         );
         headers.insert(
             HeaderName::from_static("anthropic-version"),
             HeaderValue::from_static("2023-06-01"),
         );
-    } else if let Some(key) = service
-        .api_key
-        .as_deref()
-        .filter(|key| !key.trim().is_empty())
+    } else if let Some(key) =
+        draft_or_stored_value(payload.api_key.as_deref(), service.api_key.as_deref())
     {
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", key.trim()))
+            HeaderValue::from_str(&format!("Bearer {key}"))
                 .map_err(|error| CommandError::new("validation", error.to_string()))?,
         );
     }
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|error| CommandError::new("ai_models", error.to_string()))?;
+    let response = client
         .get(endpoint)
         .headers(headers)
         .send()
@@ -451,6 +451,16 @@ pub async fn list_ai_service_models(
         }
     }
     Ok(models.into_iter().collect())
+}
+
+fn draft_or_stored_value(draft: Option<&str>, stored: Option<&str>) -> Option<String> {
+    let normalize = |value: &str| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    draft
+        .and_then(normalize)
+        .or_else(|| stored.and_then(normalize))
 }
 
 #[tauri::command]
@@ -709,7 +719,7 @@ pub async fn test_prompt(
 mod tests {
     use sbobino_application::ApplicationError;
 
-    use super::classify_ai_service_error;
+    use super::{classify_ai_service_error, draft_or_stored_value, AiServiceIdPayload};
 
     #[test]
     fn quota_errors_are_not_misclassified_as_authentication() {
@@ -720,5 +730,30 @@ mod tests {
         let classified = classify_ai_service_error(error);
 
         assert_eq!(classified.code, "ai_quota");
+    }
+
+    #[test]
+    fn model_catalog_uses_non_empty_drafts_without_persisting_them() {
+        assert_eq!(
+            draft_or_stored_value(Some("  draft-key  "), Some("stored-key")),
+            Some("draft-key".to_string())
+        );
+        assert_eq!(
+            draft_or_stored_value(Some("  "), Some("stored-value")),
+            Some("stored-value".to_string())
+        );
+        assert_eq!(draft_or_stored_value(Some(" "), None), None);
+
+        let payload = serde_json::from_value::<AiServiceIdPayload>(serde_json::json!({
+            "service_id": "service",
+            "api_key": "draft-key",
+            "base_url": "http://localhost:1234/v1"
+        }))
+        .expect("draft payload should deserialize");
+        assert_eq!(payload.api_key.as_deref(), Some("draft-key"));
+        assert_eq!(
+            payload.base_url.as_deref(),
+            Some("http://localhost:1234/v1")
+        );
     }
 }

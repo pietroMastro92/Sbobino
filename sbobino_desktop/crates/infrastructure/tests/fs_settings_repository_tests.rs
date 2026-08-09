@@ -7,6 +7,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use sbobino_application::SettingsRepository;
 use sbobino_domain::{LanguageCode, RemoteServiceConfig, RemoteServiceKind, SpeechModel};
 use sbobino_infrastructure::repositories::fs_settings_repository::FsSettingsRepository;
+use sbobino_infrastructure::secure_storage::SecureStorage;
 
 fn enable_local_secure_storage_for_tests() {
     std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
@@ -312,4 +313,159 @@ async fn load_backfills_legacy_automatic_import_source_model_and_language() {
         loaded.automation.watched_sources[0].language,
         LanguageCode::It
     );
+}
+
+#[tokio::test]
+async fn load_migrates_legacy_plaintext_provider_keys_and_redacts_file() {
+    let _guard = secure_storage_test_guard().await;
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let settings_path = temp.path().join("settings.json");
+    let mut settings = sbobino_domain::AppSettings::default();
+    settings.ai.providers.gemini.api_key = Some("legacy-gemini-key".to_string());
+    settings.ai.providers.gemini.has_api_key = true;
+    settings.ai.remote_services.push(RemoteServiceConfig {
+        id: "legacy-remote".to_string(),
+        kind: RemoteServiceKind::OpenAi,
+        label: "Legacy OpenAI".to_string(),
+        enabled: true,
+        api_key: Some("legacy-remote-key".to_string()),
+        has_api_key: true,
+        model: Some("gpt-4.1-mini".to_string()),
+        base_url: Some("https://api.openai.com/v1".to_string()),
+    });
+    settings.sync_legacy_from_sections();
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).expect("settings JSON"),
+    )
+    .expect("write legacy settings");
+
+    let repo = FsSettingsRepository::new(settings_path.clone());
+    let loaded = repo.load().await.expect("legacy load should succeed");
+    assert_eq!(
+        loaded.ai.providers.gemini.api_key.as_deref(),
+        Some("legacy-gemini-key")
+    );
+    assert_eq!(
+        loaded.ai.remote_services[0].api_key.as_deref(),
+        Some("legacy-remote-key")
+    );
+
+    let file_contents = fs::read_to_string(&settings_path).expect("read migrated settings");
+    assert!(!file_contents.contains("legacy-gemini-key"));
+    assert!(!file_contents.contains("legacy-remote-key"));
+
+    let storage = SecureStorage::load_or_create_with_fallback(temp.path())
+        .expect("secure storage should open");
+    assert_eq!(
+        storage
+            .read_secret("settings.gemini_api_key")
+            .expect("read Gemini secret")
+            .as_deref(),
+        Some("legacy-gemini-key")
+    );
+    assert_eq!(
+        storage
+            .read_secret("remote_service.legacy-remote.api_key")
+            .expect("read remote secret")
+            .as_deref(),
+        Some("legacy-remote-key")
+    );
+}
+
+#[tokio::test]
+async fn load_redacts_plaintext_when_secure_storage_already_has_newer_keys() {
+    let _guard = secure_storage_test_guard().await;
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let settings_path = temp.path().join("settings.json");
+    let storage = SecureStorage::load_or_create_with_fallback(temp.path())
+        .expect("secure storage should open");
+    storage
+        .write_secret("settings.gemini_api_key", "secure-gemini-key")
+        .expect("write secure Gemini key");
+    storage
+        .write_secret("remote_service.secure-remote.api_key", "secure-remote-key")
+        .expect("write secure remote key");
+
+    let mut settings = sbobino_domain::AppSettings::default();
+    settings.ai.providers.gemini.api_key = Some("stale-plaintext-gemini".to_string());
+    settings.ai.providers.gemini.has_api_key = true;
+    settings.ai.remote_services.push(RemoteServiceConfig {
+        id: "secure-remote".to_string(),
+        kind: RemoteServiceKind::OpenAi,
+        label: "Secure OpenAI".to_string(),
+        enabled: true,
+        api_key: Some("stale-plaintext-remote".to_string()),
+        has_api_key: true,
+        model: Some("gpt-4.1-mini".to_string()),
+        base_url: Some("https://api.openai.com/v1".to_string()),
+    });
+    settings.sync_legacy_from_sections();
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).expect("settings JSON"),
+    )
+    .expect("write legacy settings");
+
+    let repo = FsSettingsRepository::new(settings_path.clone());
+    let loaded = repo.load().await.expect("legacy load should succeed");
+    assert_eq!(
+        loaded.ai.providers.gemini.api_key.as_deref(),
+        Some("secure-gemini-key")
+    );
+    assert_eq!(
+        loaded.ai.remote_services[0].api_key.as_deref(),
+        Some("secure-remote-key")
+    );
+
+    let file_contents = fs::read_to_string(settings_path).expect("read redacted settings");
+    assert!(!file_contents.contains("stale-plaintext-gemini"));
+    assert!(!file_contents.contains("stale-plaintext-remote"));
+    assert!(!file_contents.contains("secure-gemini-key"));
+    assert!(!file_contents.contains("secure-remote-key"));
+}
+
+#[tokio::test]
+async fn removing_remote_service_deletes_its_secure_secret() {
+    let _guard = secure_storage_test_guard().await;
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let settings_path = temp.path().join("settings.json");
+    let repo = FsSettingsRepository::new(settings_path);
+    let mut settings = repo.load().await.expect("initial load should succeed");
+    settings.ai.remote_services.push(RemoteServiceConfig {
+        id: "to-remove".to_string(),
+        kind: RemoteServiceKind::OpenRouter,
+        label: "OpenRouter".to_string(),
+        enabled: true,
+        api_key: Some("remove-me".to_string()),
+        has_api_key: true,
+        model: Some("openai/gpt-4.1-mini".to_string()),
+        base_url: Some("https://openrouter.ai/api/v1".to_string()),
+    });
+    repo.save(&settings)
+        .await
+        .expect("save service should succeed");
+
+    let storage = SecureStorage::load_or_create_with_fallback(temp.path())
+        .expect("secure storage should open");
+    assert_eq!(
+        storage
+            .read_secret("remote_service.to-remove.api_key")
+            .expect("read saved remote secret")
+            .as_deref(),
+        Some("remove-me")
+    );
+
+    let mut removed = repo.load().await.expect("reload should succeed");
+    removed.ai.remote_services.clear();
+    repo.save(&removed)
+        .await
+        .expect("save removal should succeed");
+    assert!(storage
+        .read_secret("remote_service.to-remove.api_key")
+        .expect("read removed remote secret")
+        .is_none());
 }

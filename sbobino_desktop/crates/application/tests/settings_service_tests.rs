@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use sbobino_application::{ApplicationError, SettingsRepository, SettingsService};
 use sbobino_domain::{
-    AiProvider, AiSettings, AppSettings, LanguageCode, RemoteServiceConfig, RemoteServiceKind,
-    SpeechModel,
+    AiProvider, AiSettings, AppSettings, GeneralSettings, LanguageCode, RemoteServiceConfig,
+    RemoteServiceKind, SpeechModel, TranscriptionSettings,
 };
 
 #[derive(Default)]
@@ -185,4 +186,58 @@ async fn update_partial_accepts_all_remote_service_kinds() {
             .iter()
             .any(|service| service.kind == expected));
     }
+}
+
+struct DelayedSettingsRepository {
+    settings: Mutex<AppSettings>,
+}
+
+#[async_trait]
+impl SettingsRepository for DelayedSettingsRepository {
+    async fn load(&self) -> Result<AppSettings, ApplicationError> {
+        Ok(self
+            .settings
+            .lock()
+            .expect("settings lock poisoned")
+            .clone())
+    }
+
+    async fn save(&self, settings: &AppSettings) -> Result<(), ApplicationError> {
+        // Keep the save open long enough for an unlocked implementation to
+        // expose the classic load-modify-save lost update.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        *self.settings.lock().expect("settings lock poisoned") = settings.clone();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn concurrent_partial_updates_keep_both_changes() {
+    let repo = Arc::new(DelayedSettingsRepository {
+        settings: Mutex::new(AppSettings::default()),
+    });
+    let service = Arc::new(SettingsService::new(repo.clone()));
+
+    let general = GeneralSettings {
+        auto_update_enabled: true,
+        ..GeneralSettings::default()
+    };
+    let transcription = TranscriptionSettings {
+        enable_ai_post_processing: true,
+        ..TranscriptionSettings::default()
+    };
+
+    let first = service.update_partial(Some(general), None, None, None, None, None);
+    let second = service.update_partial(None, Some(transcription), None, None, None, None);
+    let (first, second) = tokio::join!(first, second);
+    first.expect("general update should succeed");
+    second.expect("transcription update should succeed");
+
+    let saved = repo
+        .settings
+        .lock()
+        .expect("settings lock poisoned")
+        .clone();
+    assert!(saved.general.auto_update_enabled);
+    assert!(saved.transcription.enable_ai_post_processing);
 }

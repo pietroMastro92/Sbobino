@@ -124,8 +124,17 @@ export async function testAiService(service_id: string): Promise<{
   return invoke("test_ai_service", { payload: { service_id } });
 }
 
-export async function listAiServiceModels(service_id: string): Promise<string[]> {
-  return invoke<string[]>("list_ai_service_models", { payload: { service_id } });
+export async function listAiServiceModels(
+  service_id: string,
+  options?: { api_key?: string; base_url?: string },
+): Promise<string[]> {
+  return invoke<string[]>("list_ai_service_models", {
+    payload: {
+      service_id,
+      ...(options?.api_key === undefined ? {} : { api_key: options.api_key }),
+      ...(options?.base_url === undefined ? {} : { base_url: options.base_url }),
+    },
+  });
 }
 
 export async function listPromptTemplates(): Promise<PromptTemplate[]> {
