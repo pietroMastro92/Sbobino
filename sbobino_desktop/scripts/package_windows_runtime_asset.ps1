@@ -16,9 +16,9 @@ $ParakeetSourceUrl = "https://github.com/mudler/parakeet.cpp.git"
 $ParakeetSourceRef = "fa5aeef1e3d353679cbd374a426fee28387deb6e"
 # BtbN prunes dated autobuild releases, so a URL pinned to one of those tags is
 # not durable. Reuse the immutable, already validated Windows runtime from the
-# previous Sbobino release as the FFmpeg source for this patch release.
-$FfmpegUrl = "https://github.com/pietroMastro92/Sbobino/releases/download/v2.0.23/speech-runtime-windows-x86_64.zip"
-$FfmpegSha256 = "3a40b429a84de00bbfced1a26407e455edbc67133cd89c6429c67ba7fdbf5832"
+# immediately preceding stable release, which the promotion policy retains.
+$FfmpegUrl = "https://github.com/pietroMastro92/Sbobino/releases/download/v2.0.25/speech-runtime-windows-x86_64.zip"
+$FfmpegSha256 = "a0dadc1a7a58008a4c45b9c612a1c58ecc2a85baa6eefecad083f78c746a8c83"
 $TargetTriple = "x86_64-pc-windows-msvc"
 
 function Download-VerifiedArchive {
