@@ -33,6 +33,7 @@ function createSettingsFixture(): AppSettings {
     },
     transcription: {
       engine: "whisper_cpp",
+      compute_device: "auto",
       model: "base",
       parakeet_model: "tdt06b_v3_q4",
       language: "it",

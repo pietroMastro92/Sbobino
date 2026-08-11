@@ -14,6 +14,22 @@ OUTPUT_DIR=$5
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 REPO_SLUG=${SBOBINO_RELEASE_REPOSITORY:-pietroMastro92/Sbobino}
 RELEASE_URL="https://github.com/$REPO_SLUG/releases/download/v$VERSION"
+NOTES_SOURCE=${SBOBINO_RELEASE_NOTES_FILE:-"$ROOT_DIR/docs/release-notes/v$VERSION.md"}
+CURRENT_REF=${SBOBINO_RELEASE_NOTES_CURRENT_REF:-HEAD}
+PREVIOUS_REF=${SBOBINO_RELEASE_NOTES_PREVIOUS_REF:-}
+
+if [[ ! -f "$NOTES_SOURCE" ]]; then
+  echo "Versioned release notes are required: $NOTES_SOURCE" >&2
+  exit 1
+fi
+
+if [[ -z "$PREVIOUS_REF" ]]; then
+  PREVIOUS_REF=$(git -C "$ROOT_DIR/.." describe --tags --abbrev=0 "$CURRENT_REF^" 2>/dev/null || true)
+fi
+if [[ -z "$PREVIOUS_REF" ]]; then
+  echo "Unable to determine previous release ref for $VERSION; set SBOBINO_RELEASE_NOTES_PREVIOUS_REF." >&2
+  exit 1
+fi
 
 for path in \
   "$ARM_DIR/Sbobino_${VERSION}_aarch64.dmg" \
@@ -101,12 +117,17 @@ python3 "$ROOT_DIR/scripts/generate_release_candidate_metadata.py" \
   --release-profile public \
   --commit-sha "$(git -C "$ROOT_DIR/.." rev-parse HEAD)"
 
-cat >"$OUTPUT_DIR/release-notes.md" <<EOF
-## Sbobino $VERSION
+python3 "$ROOT_DIR/scripts/generate_codex_style_release_notes.py" \
+  "$VERSION" \
+  "$PREVIOUS_REF" \
+  --notes-file "$NOTES_SOURCE" \
+  --out "$OUTPUT_DIR/release-notes.md" \
+  --repo-root "$ROOT_DIR/.."
 
-This prerelease provides native Apple Silicon, macOS Intel, and Windows x86_64
-installers, with architecture-matched updaters and first-launch runtime assets.
-EOF
+"$ROOT_DIR/scripts/check_release_notes.sh" \
+  "$VERSION" \
+  "$OUTPUT_DIR/release-notes.md" \
+  "$PREVIOUS_REF"
 
 cat <<EOF
 Multi-platform local candidate prepared in:

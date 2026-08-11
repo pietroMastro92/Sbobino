@@ -16,7 +16,8 @@ use tokio::time::{timeout, Duration};
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
 use sbobino_domain::{
     collapse_consecutive_repeated_segments, minimize_transcript_repetitions, LanguageCode,
-    TimedSegment, TimedWord, TranscriptionLanguagePolicy, TranscriptionOutput, WhisperOptions,
+    TimedSegment, TimedWord, TranscriptionComputeDevice, TranscriptionLanguagePolicy,
+    TranscriptionOutput, WhisperOptions,
 };
 
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
@@ -33,6 +34,7 @@ const WHISPER_MIN_UTTERANCE_SECONDS: f32 = 1.5;
 const WHISPER_MAX_UTTERANCE_SECONDS: f32 = 15.0;
 const WHISPER_MARGIN_SECONDS: f32 = 0.2;
 const WHISPER_OVERLAP_SECONDS: f32 = 0.4;
+const WHISPER_MAX_INPUTS_PER_PROCESS: usize = 16;
 
 fn frame_sample_count() -> usize {
     WHISPER_SAMPLE_RATE / 50
@@ -42,6 +44,7 @@ fn frame_sample_count() -> usize {
 pub struct WhisperCppEngine {
     binary_path: String,
     models_dir: String,
+    compute_device: TranscriptionComputeDevice,
 }
 
 #[derive(Default)]
@@ -131,7 +134,29 @@ impl WhisperCppEngine {
         Self {
             binary_path,
             models_dir,
+            compute_device: TranscriptionComputeDevice::Auto,
         }
+    }
+
+    /// Select the compute policy used by whisper.cpp. Values are normalized to
+    /// `auto`, `gpu`, or `cpu`; unknown values intentionally retain the safe
+    /// automatic policy for forward compatibility with persisted settings.
+    pub fn with_compute_device(mut self, value: TranscriptionComputeDevice) -> Self {
+        self.compute_device = value;
+        self
+    }
+
+    fn initial_execution_mode(&self) -> WhisperCliExecutionMode {
+        match self.compute_device {
+            TranscriptionComputeDevice::Cpu => WhisperCliExecutionMode::CpuFallback,
+            TranscriptionComputeDevice::Auto | TranscriptionComputeDevice::Gpu => {
+                WhisperCliExecutionMode::Default
+            }
+        }
+    }
+
+    fn allows_cpu_fallback(&self) -> bool {
+        self.compute_device == TranscriptionComputeDevice::Auto
     }
 
     fn normalize_detected_language(value: &str) -> Option<String> {
@@ -495,7 +520,7 @@ impl WhisperCppEngine {
     }
 
     fn clean_cli_display_line(raw_line: &str) -> String {
-        raw_line
+        Self::strip_ansi_escape_codes(raw_line)
             .replace("\u{001b}[2K", "")
             .replace("[2K]", "")
             .replace("[BLANK_AUDIO]", "")
@@ -528,6 +553,10 @@ impl WhisperCppEngine {
         }
 
         output
+    }
+
+    fn input_is_decodable_wav(input_wav: &Path) -> bool {
+        hound::WavReader::open(input_wav).is_ok()
     }
 
     fn parse_cli_line(raw_line: &str) -> Option<ParsedCliEvent> {
@@ -574,7 +603,6 @@ impl WhisperCppEngine {
         }
 
         let end_index = cleaned.find(']')?;
-        let display_end_index = display_line.find(']')?;
         let bracket_content = cleaned[1..end_index].trim();
         let (start_value, end_value) = bracket_content.split_once("-->")?;
         let start_seconds = Self::parse_timecode_seconds(start_value.trim());
@@ -587,7 +615,11 @@ impl WhisperCppEngine {
             return None;
         }
 
-        let preview_text = display_line[display_end_index + 1..].trim().to_string();
+        // Preview deltas are consumed by the desktop UI and persisted in the
+        // transcript event stream. Keep them terminal-independent: ANSI color
+        // escapes from whisper.cpp are presentation noise, not transcript
+        // content.
+        let preview_text = cleaned[end_index + 1..].trim().to_string();
 
         let words = Self::build_word_candidates(&normalized, start_seconds, end_seconds);
         let segment = TimedSegment {
@@ -779,7 +811,7 @@ impl WhisperCppEngine {
             .transcription
             .into_iter()
             .filter_map(|segment| {
-                let text = segment.text.trim().to_string();
+                let text = Self::strip_ansi_escape_codes(segment.text.trim()).to_string();
                 if text.is_empty() {
                     return None;
                 }
@@ -801,7 +833,7 @@ impl WhisperCppEngine {
                     .tokens
                     .into_iter()
                     .filter_map(|token| {
-                        let text = token.text.trim().to_string();
+                        let text = Self::strip_ansi_escape_codes(token.text.trim()).to_string();
                         if text.is_empty() {
                             return None;
                         }
@@ -915,7 +947,8 @@ impl WhisperCppEngine {
 
         let mut collapsed: Vec<String> = Vec::new();
         for line in raw_stderr.lines() {
-            let trimmed = line.trim();
+            let cleaned = Self::strip_ansi_escape_codes(line);
+            let trimmed = cleaned.trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -1128,6 +1161,17 @@ impl WhisperCppEngine {
                 status: None,
             });
         }
+        if chunks.len() > WHISPER_MAX_INPUTS_PER_PROCESS {
+            return Err(WhisperCliAttemptError {
+                message: format!(
+                    "adaptive Whisper process group contains {} inputs; maximum is {}",
+                    chunks.len(),
+                    WHISPER_MAX_INPUTS_PER_PROCESS
+                ),
+                stderr_output: String::new(),
+                status: None,
+            });
+        }
         let output_prefix = format!(
             "sbobino-whisper-batch-{}-{}-{}",
             std::process::id(),
@@ -1226,14 +1270,7 @@ impl WhisperCppEngine {
                 stderr_output: String::new(),
                 status: Some(status),
             })?;
-        let stderr_output = stderr_lines.join("\n");
-        if !status.success() {
-            return Err(WhisperCliAttemptError {
-                message: format!("whisper-cli failed: {}", stderr_output.trim()),
-                stderr_output,
-                status: Some(status),
-            });
-        }
+        let stderr_output = Self::strip_ansi_escape_codes(&stderr_lines.join("\n"));
 
         let mut all_segments = Vec::<TimedSegment>::new();
         let mut text_parts = Vec::<String>::new();
@@ -1261,8 +1298,10 @@ impl WhisperCppEngine {
                 // retain it and leave language/timestamps undetermined.
                 vec![TimedSegment {
                     text: text.to_string(),
-                    start_seconds: Some(chunk.start_seconds),
-                    end_seconds: Some(chunk.end_seconds),
+                    // TXT output has no timestamps; keep its local interval
+                    // here and apply the chunk offset exactly once below.
+                    start_seconds: Some(0.0),
+                    end_seconds: Some(chunk.end_seconds - chunk.start_seconds),
                     speaker_id: None,
                     speaker_label: None,
                     language_code: None,
@@ -1296,15 +1335,17 @@ impl WhisperCppEngine {
                 let chunk = &chunks[index];
                 let retry_start_seconds = chunk.start_seconds;
                 let retry_end_seconds = chunk.end_seconds;
-                let batch_progress = emit_progress_seconds.clone();
-                let retry_progress: Arc<dyn Fn(f32) + Send + Sync> = Arc::new(move |seconds| {
-                    batch_progress(
-                        (retry_start_seconds + seconds)
-                            .min(retry_end_seconds)
-                            .max(retry_start_seconds),
-                    );
-                });
-                match self
+                let make_retry_progress = || {
+                    let batch_progress = emit_progress_seconds.clone();
+                    Arc::new(move |seconds: f32| {
+                        batch_progress(
+                            (retry_start_seconds + seconds)
+                                .min(retry_end_seconds)
+                                .max(retry_start_seconds),
+                        );
+                    }) as Arc<dyn Fn(f32) + Send + Sync>
+                };
+                let isolated_retry = self
                     .run_whisper_cli_attempt(
                         &chunk.path,
                         model_path,
@@ -1312,11 +1353,57 @@ impl WhisperCppEngine {
                         options,
                         Some(chunk.end_seconds - chunk.start_seconds),
                         emit_partial.clone(),
-                        retry_progress,
+                        make_retry_progress(),
                         mode,
                     )
-                    .await
-                {
+                    .await;
+                let isolated_retry = match isolated_retry {
+                    Ok(recovered) => Ok(recovered),
+                    Err(primary_error)
+                        if self.allows_cpu_fallback()
+                            && mode == WhisperCliExecutionMode::Default =>
+                    {
+                        // Recover only this missing interval in CPU-safe mode;
+                        // already-written outputs in the group stay committed.
+                        let mut fallback_options = options.clone();
+                        fallback_options.processors = 1;
+                        match self
+                            .run_whisper_cli_attempt(
+                                &chunk.path,
+                                model_path,
+                                language_code,
+                                &fallback_options,
+                                Some(chunk.end_seconds - chunk.start_seconds),
+                                emit_partial.clone(),
+                                make_retry_progress(),
+                                WhisperCliExecutionMode::CpuFallback,
+                            )
+                            .await
+                        {
+                            Ok(recovered) => Ok(recovered),
+                            Err(cpu_error) => {
+                                return Err(WhisperCliAttemptError {
+                                    message: format!(
+                                        "whisper-cli isolated adaptive chunk {} ({:.2}-{:.2}s) failed in default mode: {}; CPU-safe isolated retry failed: {}",
+                                        index + 1,
+                                        chunk.start_seconds,
+                                        chunk.end_seconds,
+                                        primary_error.message,
+                                        cpu_error.message,
+                                    ),
+                                    stderr_output: format!(
+                                        "{}\n{}",
+                                        primary_error.stderr_output,
+                                        cpu_error.stderr_output
+                                    ),
+                                    status: cpu_error.status.or(primary_error.status),
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                match isolated_retry {
                     Ok(mut recovered) => {
                         Self::offset_segments(&mut recovered.segments, chunk.start_seconds);
                         all_segments.extend(recovered.segments);
@@ -1327,7 +1414,7 @@ impl WhisperCppEngine {
                     Err(retry_error) => {
                         return Err(WhisperCliAttemptError {
                             message: format!(
-                                "whisper-cli did not produce output for adaptive chunk {} ({:.2}-{:.2}s) after isolated retry: {}",
+                                "whisper-cli isolated adaptive chunk {} ({:.2}-{:.2}s) did not produce output after isolated retry: {}",
                                 index + 1,
                                 chunk.start_seconds,
                                 chunk.end_seconds,
@@ -1506,7 +1593,7 @@ impl WhisperCppEngine {
                 stderr_output: String::new(),
                 status: Some(status),
             })?;
-        let stderr_output = stderr_lines.join("\n");
+        let stderr_output = Self::strip_ansi_escape_codes(&stderr_lines.join("\n"));
 
         if !status.success() {
             return Err(WhisperCliAttemptError {
@@ -1571,6 +1658,138 @@ impl WhisperCppEngine {
         })
     }
 
+    fn merge_whisper_group_outputs(
+        outputs: &[TranscriptionOutput],
+        total_audio_seconds: Option<f32>,
+    ) -> Result<TranscriptionOutput, ApplicationError> {
+        let mut segments = outputs
+            .iter()
+            .flat_map(|output| output.segments.iter().cloned())
+            .collect::<Vec<_>>();
+        segments = Self::deduplicate_overlapping_segments(segments);
+        let text = if segments.is_empty() {
+            outputs
+                .iter()
+                .map(|output| output.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            Self::join_segment_text(&segments)
+        };
+        let text = minimize_transcript_repetitions(&text);
+        if text.trim().is_empty() {
+            return Err(ApplicationError::SpeechToText(
+                "whisper-cli produced empty output for adaptive chunks".to_string(),
+            ));
+        }
+        Ok(TranscriptionOutput {
+            text: text.clone(),
+            segments: normalize_transcript_segments(&text, &segments, total_audio_seconds),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_whisper_cli_chunk_groups(
+        &self,
+        chunks: &[WhisperAudioChunk],
+        model_path: &Path,
+        language_code: &str,
+        options: &WhisperOptions,
+        total_audio_seconds: Option<f32>,
+        emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+    ) -> Result<TranscriptionOutput, ApplicationError> {
+        let mut outputs = Vec::<TranscriptionOutput>::new();
+        let initial_mode = self.initial_execution_mode();
+
+        for group in chunks.chunks(WHISPER_MAX_INPUTS_PER_PROCESS) {
+            let group_start = group
+                .first()
+                .map(|chunk| chunk.start_seconds)
+                .unwrap_or_default();
+            let prior_preview = outputs
+                .iter()
+                .map(|output| output.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let group_emit = emit_partial.clone();
+            let cumulative_emit: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |line| {
+                if let Some(snapshot) = line.strip_prefix(DELTA_REPLACE_PREFIX) {
+                    let snapshot = snapshot.trim();
+                    let combined = if prior_preview.trim().is_empty() {
+                        snapshot.to_string()
+                    } else if snapshot.is_empty() {
+                        prior_preview.clone()
+                    } else {
+                        format!("{}\n{}", prior_preview, snapshot)
+                    };
+                    group_emit(format!("{DELTA_REPLACE_PREFIX}{combined}"));
+                } else {
+                    group_emit(line);
+                }
+            });
+
+            let attempt = self
+                .run_whisper_cli_batch_attempt(
+                    group,
+                    model_path,
+                    language_code,
+                    options,
+                    total_audio_seconds,
+                    cumulative_emit.clone(),
+                    emit_progress_seconds.clone(),
+                    initial_mode,
+                )
+                .await;
+            let output = match attempt {
+                Ok(output) => output,
+                Err(error)
+                    if self.allows_cpu_fallback()
+                        && Self::should_retry_with_cpu_fallback(&error)
+                        && !error.message.contains("isolated adaptive chunk") =>
+                {
+                    // Only this failed <=16-input group is retried. Earlier
+                    // groups remain committed and are never replayed.
+                    emit_partial("Whisper fallback CPU-safe mode...".to_string());
+                    emit_progress_seconds(group_start);
+                    let mut fallback_options = options.clone();
+                    fallback_options.processors = 1;
+                    self.run_whisper_cli_batch_attempt(
+                        group,
+                        model_path,
+                        language_code,
+                        &fallback_options,
+                        total_audio_seconds,
+                        cumulative_emit,
+                        emit_progress_seconds.clone(),
+                        WhisperCliExecutionMode::CpuFallback,
+                    )
+                    .await
+                    .map_err(|retry_error| {
+                        let summary = Self::summarize_stderr_for_user(&retry_error.stderr_output);
+                        ApplicationError::SpeechToText(format!(
+                            "Whisper retry in CPU-safe mode failed: {summary}"
+                        ))
+                    })?
+                }
+                Err(error) => return Err(ApplicationError::SpeechToText(error.message)),
+            };
+            outputs.push(output);
+        }
+
+        let output = Self::merge_whisper_group_outputs(&outputs, total_audio_seconds)?;
+        emit_partial(format!("{DELTA_REPLACE_PREFIX}{}", output.text));
+        emit_progress_seconds(total_audio_seconds.unwrap_or_else(|| {
+            chunks
+                .last()
+                .map(|chunk| chunk.end_seconds)
+                .unwrap_or_default()
+        }));
+        Ok(output)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn transcribe_with_cli(
         &self,
@@ -1582,58 +1801,32 @@ impl WhisperCppEngine {
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Result<TranscriptionOutput, ApplicationError> {
-        // The converter normally hands us a mono 16 kHz WAV.  If that
-        // invariant is unavailable (for example in an older imported job),
-        // retain the proven single-file path rather than dropping audio.
-        let adaptive_chunks = Self::write_whisper_chunks(input_wav).ok();
+        // The converter normally hands us a mono 16 kHz WAV. Preserve the
+        // legacy single-file path only for inputs that are not decodable WAVs
+        // at all (older imported jobs may contain placeholders); real WAV
+        // chunking errors must reach the caller instead of being swallowed.
+        let adaptive_chunks = match Self::write_whisper_chunks(input_wav) {
+            Ok(chunks) => Some(chunks),
+            Err(_error) if !Self::input_is_decodable_wav(input_wav) => None,
+            Err(error) => return Err(error),
+        };
         if let Some((chunk_dir, chunks)) = adaptive_chunks {
             if chunks.len() > 1 {
                 let _chunk_dir = chunk_dir;
-                match self
-                    .run_whisper_cli_batch_attempt(
+                return self
+                    .run_whisper_cli_chunk_groups(
                         &chunks,
                         model_path,
                         language_code,
                         options,
                         total_audio_seconds,
-                        emit_partial.clone(),
-                        emit_progress_seconds.clone(),
-                        WhisperCliExecutionMode::Default,
+                        emit_partial,
+                        emit_progress_seconds,
                     )
-                    .await
-                {
-                    Ok(output) => return Ok(output),
-                    Err(error) if Self::should_retry_with_cpu_fallback(&error) => {
-                        emit_partial("Whisper fallback CPU-safe mode...".to_string());
-                        emit_progress_seconds(0.0);
-                        let mut fallback_options = options.clone();
-                        fallback_options.processors = 1;
-                        return self
-                            .run_whisper_cli_batch_attempt(
-                                &chunks,
-                                model_path,
-                                language_code,
-                                &fallback_options,
-                                total_audio_seconds,
-                                emit_partial,
-                                emit_progress_seconds,
-                                WhisperCliExecutionMode::CpuFallback,
-                            )
-                            .await
-                            .map_err(|retry_error| {
-                                let summary =
-                                    Self::summarize_stderr_for_user(&retry_error.stderr_output);
-                                ApplicationError::SpeechToText(format!(
-                                    "Whisper retry in CPU-safe mode failed: {summary}"
-                                ))
-                            });
-                    }
-                    Err(error) => {
-                        return Err(ApplicationError::SpeechToText(error.message));
-                    }
-                }
+                    .await;
             }
         }
+        let initial_mode = self.initial_execution_mode();
         match self
             .run_whisper_cli_attempt(
                 input_wav,
@@ -1643,12 +1836,14 @@ impl WhisperCppEngine {
                 total_audio_seconds,
                 emit_partial.clone(),
                 emit_progress_seconds.clone(),
-                WhisperCliExecutionMode::Default,
+                initial_mode,
             )
             .await
         {
             Ok(output) => Ok(output),
-            Err(error) if Self::should_retry_with_cpu_fallback(&error) => {
+            Err(error)
+                if self.allows_cpu_fallback() && Self::should_retry_with_cpu_fallback(&error) =>
+            {
                 emit_partial("Whisper fallback CPU-safe mode...".to_string());
                 // Reset progress before the retry so the UI does not stay stuck
                 // at the first attempt's last value while the CPU-safe run
@@ -1715,7 +1910,7 @@ mod tests {
     use tokio::process::Command;
 
     use super::{WhisperCppEngine, PROCESS_IDLE_TIMEOUT_MAX, PROCESS_IDLE_TIMEOUT_MIN};
-    use sbobino_domain::WhisperOptions;
+    use sbobino_domain::{TranscriptionComputeDevice, WhisperOptions};
 
     #[test]
     fn transcription_idle_timeout_defaults_to_minimum_without_duration() {
@@ -1793,6 +1988,31 @@ mod tests {
             language_flag,
             "expected whisper-cli args to contain -l auto: {args:?}"
         );
+    }
+
+    #[test]
+    fn explicit_cpu_policy_adds_cpu_safe_flags_without_auto_fallback() {
+        let engine = WhisperCppEngine::new("whisper-cli".to_string(), ".".to_string())
+            .with_compute_device(TranscriptionComputeDevice::Cpu);
+        let mut command = Command::new("whisper-cli");
+        WhisperCppEngine::append_cli_flags(
+            &mut command,
+            Path::new("input.wav"),
+            Path::new("model.bin"),
+            "auto",
+            &WhisperOptions::default(),
+            Path::new("output"),
+            engine.initial_execution_mode(),
+        );
+        let args = command
+            .as_std_mut()
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-ng" && pair[1] == "-nfa"));
+        assert!(!engine.allows_cpu_fallback());
     }
 
     #[test]

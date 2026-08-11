@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
-use sbobino_domain::{LanguageCode, TimedSegment};
+use sbobino_domain::{LanguageCode, TimedSegment, TranscriptionComputeDevice};
 
 #[cfg(target_os = "windows")]
 use crate::background_process::std_background_command;
@@ -47,6 +47,7 @@ pub struct WhisperStreamStopResult {
 pub struct WhisperStreamEngine {
     binary_path: String,
     models_dir: String,
+    compute_device: TranscriptionComputeDevice,
     state: Arc<Mutex<StreamState>>,
 }
 
@@ -55,7 +56,20 @@ impl WhisperStreamEngine {
         Self {
             binary_path,
             models_dir,
+            compute_device: TranscriptionComputeDevice::Auto,
             state: Arc::new(Mutex::new(StreamState::default())),
+        }
+    }
+
+    pub fn with_compute_device(mut self, compute_device: TranscriptionComputeDevice) -> Self {
+        self.compute_device = compute_device;
+        self
+    }
+
+    fn compute_device_args(device: TranscriptionComputeDevice) -> &'static [&'static str] {
+        match device {
+            TranscriptionComputeDevice::Cpu => &["-ng", "-nfa"],
+            TranscriptionComputeDevice::Auto | TranscriptionComputeDevice::Gpu => &[],
         }
     }
 
@@ -491,6 +505,9 @@ impl WhisperStreamEngine {
 
         let _preferred_language = language_code;
         command.arg("-l").arg("auto");
+        for argument in Self::compute_device_args(self.compute_device) {
+            command.arg(argument);
+        }
 
         if let Some(bin_dir) = self.runtime_bin_dir() {
             let lib_dir = self.runtime_lib_dir().filter(|path| path.is_dir());
@@ -698,6 +715,21 @@ impl WhisperStreamEngine {
 #[cfg(test)]
 mod tests {
     use super::{StreamState, WhisperStreamEngine};
+    use sbobino_domain::TranscriptionComputeDevice;
+
+    #[test]
+    fn cpu_mode_disables_gpu_and_flash_attention_for_live_whisper() {
+        assert_eq!(
+            WhisperStreamEngine::compute_device_args(TranscriptionComputeDevice::Cpu),
+            &["-ng", "-nfa"]
+        );
+        assert!(
+            WhisperStreamEngine::compute_device_args(TranscriptionComputeDevice::Auto).is_empty()
+        );
+        assert!(
+            WhisperStreamEngine::compute_device_args(TranscriptionComputeDevice::Gpu).is_empty()
+        );
+    }
 
     #[test]
     fn language_detection_requires_two_agreeing_windows() {

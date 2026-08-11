@@ -70,7 +70,8 @@ fn resolve_realtime_engine(
                 sbobino_infrastructure::adapters::whisper_stream::WhisperStreamEngine::new(
                     whisper_stream_path,
                     models_dir,
-                ),
+                )
+                .with_compute_device(settings.transcription.compute_device),
             )
         }
     }
@@ -78,7 +79,12 @@ fn resolve_realtime_engine(
 
 fn resolve_parakeet_live_engine(state: &AppState) -> Result<ParakeetRealtimeEngine, CommandError> {
     let (lib_path, models_dir) = resolve_parakeet_live_runtime_paths(state)?;
-    Ok(ParakeetRealtimeEngine::new(lib_path, models_dir.into()))
+    let settings = state
+        .runtime_factory
+        .load_settings()
+        .map_err(|load_error| CommandError::new("settings", load_error))?;
+    Ok(ParakeetRealtimeEngine::new(lib_path, models_dir.into())
+        .with_compute_device(settings.transcription.compute_device))
 }
 
 fn resolve_parakeet_live_runtime_paths(

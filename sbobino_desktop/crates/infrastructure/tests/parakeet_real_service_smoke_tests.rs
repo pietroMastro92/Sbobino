@@ -19,6 +19,7 @@ use sbobino_domain::{
 };
 use sbobino_infrastructure::adapters::{
     ffmpeg::FfmpegAdapter, noop_enhancer::NoopEnhancer, parakeet_cpp::ParakeetCppEngine,
+    whisper_cpp::WhisperCppEngine,
 };
 
 const DEFAULT_REAL_SMOKE_MODEL: &str = "tdt-0.6b-v3-q4_k.gguf";
@@ -210,6 +211,7 @@ fn assert_timeline_has_word_timestamp(artifact: &TranscriptArtifact) {
 fn assert_detected_language_contract(
     artifact: &TranscriptArtifact,
     expected_detected_language: &str,
+    expected_processing_language: &str,
 ) {
     assert_eq!(
         artifact
@@ -230,8 +232,8 @@ fn assert_detected_language_contract(
     let metadata_language = artifact.metadata.get("language").map(String::as_str);
     assert_eq!(
         metadata_language,
-        Some(expected_detected_language),
-        "service smoke should persist the detected processing language, not the auto preference"
+        Some(expected_processing_language),
+        "service smoke should persist the processing language, not the auto preference"
     );
     assert_eq!(
         artifact.processing_language.as_deref(),
@@ -266,6 +268,9 @@ async fn parakeet_service_real_smoke_persists_metadata() {
         optional_env("SBOBINO_PARAKEET_MODEL").unwrap_or_else(|| DEFAULT_REAL_SMOKE_MODEL.into());
     let expected_detected_language = optional_env("SBOBINO_PARAKEET_EXPECTED_DETECTED_LANGUAGE")
         .unwrap_or_else(|| "it".to_string());
+    let expected_processing_language =
+        optional_env("SBOBINO_PARAKEET_EXPECTED_PROCESSING_LANGUAGE")
+            .unwrap_or_else(|| "mixed".to_string());
     let model = parakeet_model_for_filename(&model_filename);
 
     assert!(
@@ -355,7 +360,11 @@ async fn parakeet_service_real_smoke_persists_metadata() {
         artifact.metadata.get("model").map(String::as_str),
         Some(model_filename.as_str())
     );
-    assert_detected_language_contract(&artifact, &expected_detected_language);
+    assert_detected_language_contract(
+        &artifact,
+        &expected_detected_language,
+        &expected_processing_language,
+    );
     assert_timeline_has_word_timestamp(&artifact);
 
     let persisted = repo
@@ -371,7 +380,11 @@ async fn parakeet_service_real_smoke_persists_metadata() {
         persisted[0].processing_model.as_deref(),
         Some(model_filename.as_str())
     );
-    assert_detected_language_contract(&persisted[0], &expected_detected_language);
+    assert_detected_language_contract(
+        &persisted[0],
+        &expected_detected_language,
+        &expected_processing_language,
+    );
     assert_eq!(
         persisted[0].processing_language, artifact.processing_language,
         "persisted artifact should preserve the detected processing language"
@@ -390,4 +403,116 @@ async fn parakeet_service_real_smoke_persists_metadata() {
         );
     }
     assert_timeline_has_word_timestamp(&persisted[0]);
+}
+
+#[tokio::test]
+#[ignore = "requires real whisper-cli, model, ffmpeg, and spoken audio env vars"]
+async fn whisper_service_real_smoke_preserves_timeline_and_plain_text() {
+    let cli_path = required_env("SBOBINO_WHISPER_CLI");
+    let models_dir = required_env("SBOBINO_WHISPER_MODELS_DIR");
+    let audio_path = required_env("SBOBINO_WHISPER_AUDIO");
+    let model_filename =
+        optional_env("SBOBINO_WHISPER_MODEL").unwrap_or_else(|| "ggml-base.bin".to_string());
+
+    assert!(
+        Path::new(&cli_path).is_file(),
+        "SBOBINO_WHISPER_CLI must point to an existing file"
+    );
+    assert!(
+        Path::new(&models_dir).join(&model_filename).is_file(),
+        "Whisper model file must exist in SBOBINO_WHISPER_MODELS_DIR"
+    );
+    assert!(
+        Path::new(&audio_path).is_file(),
+        "SBOBINO_WHISPER_AUDIO must point to an existing audio file"
+    );
+
+    let repository = Arc::new(SmokeArtifactRepository::default());
+    let service = TranscriptionService::new(
+        Arc::new(FfmpegAdapter::new(
+            optional_env("SBOBINO_WHISPER_FFMPEG").unwrap_or_else(|| "ffmpeg".to_string()),
+        )),
+        Arc::new(WhisperCppEngine::new(cli_path, models_dir)),
+        Arc::new(NoopEnhancer),
+        repository,
+    );
+
+    let artifact = service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "whisper-real-smoke".to_string(),
+                input_path: audio_path,
+                engine: TranscriptionEngine::WhisperCpp,
+                language: LanguageCode::Auto,
+                model: match model_filename.as_str() {
+                    "ggml-tiny.bin" => SpeechModel::Tiny,
+                    "ggml-small.bin" => SpeechModel::Small,
+                    "ggml-medium.bin" => SpeechModel::Medium,
+                    "ggml-large-v3-turbo-q8_0.bin" => SpeechModel::LargeTurbo,
+                    _ => SpeechModel::Base,
+                },
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: Some("Whisper real smoke".to_string()),
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+            },
+            Arc::new(|progress| {
+                eprintln!(
+                    "whisper_service_progress={:?}:{}:{}",
+                    progress.stage, progress.percentage, progress.message
+                );
+            }),
+            Arc::new(|delta| {
+                assert!(
+                    !delta.contains('\u{001b}'),
+                    "Whisper service delta must not contain ANSI escapes"
+                );
+            }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("service real Whisper transcription should succeed");
+
+    assert!(
+        !artifact.raw_transcript.trim().is_empty(),
+        "Whisper service smoke produced an empty transcript"
+    );
+    assert!(
+        !artifact.raw_transcript.contains('\u{001b}'),
+        "Whisper service transcript must not contain ANSI escapes"
+    );
+    let timeline = artifact
+        .metadata
+        .get("timeline_v2")
+        .expect("Whisper service smoke should persist timeline_v2 metadata");
+    let timeline: Value = serde_json::from_str(timeline).expect("timeline_v2 should be JSON");
+    let segments = timeline
+        .get("segments")
+        .and_then(Value::as_array)
+        .expect("timeline_v2 should contain segments");
+    assert!(
+        !segments.is_empty(),
+        "Whisper service smoke persisted no segments"
+    );
+    let mut previous_start = 0.0_f64;
+    for segment in segments {
+        let start = segment
+            .get("start_seconds")
+            .and_then(Value::as_f64)
+            .expect("Whisper segment should have a start timestamp");
+        let end = segment
+            .get("end_seconds")
+            .and_then(Value::as_f64)
+            .expect("Whisper segment should have an end timestamp");
+        assert!(start.is_finite() && end.is_finite() && end >= start);
+        assert!(
+            start + 0.05 >= previous_start,
+            "Whisper timestamps must be monotonic"
+        );
+        previous_start = start;
+    }
 }

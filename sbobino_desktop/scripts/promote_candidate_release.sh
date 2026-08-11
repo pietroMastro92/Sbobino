@@ -63,6 +63,7 @@ expected_assets = {
     "windows-gui-smoke-report.json",
     "portability-smoke-report.json",
     "intel-portability-smoke-report.json",
+    "release-notes.md",
 }
 present_assets = {
     asset.get("name", "").strip()
@@ -94,7 +95,13 @@ gh release download "$TAG" \
   --pattern "windows-distribution-readiness-proof.json" \
   --pattern "windows-gui-smoke-report.json" \
   --pattern "portability-smoke-report.json" \
-  --pattern "intel-portability-smoke-report.json"
+  --pattern "intel-portability-smoke-report.json" \
+  --pattern "release-notes.md"
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+"$ROOT_DIR/scripts/check_release_notes.sh" \
+  "$VERSION" \
+  "$TMP_DIR/release-notes.md"
 
 python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG"
 import json

@@ -12,8 +12,8 @@ use tokio::process::Command;
 
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
 use sbobino_domain::{
-    LanguageCode, TimedSegment, TimedWord, TranscriptionLanguagePolicy, TranscriptionOutput,
-    WhisperOptions,
+    LanguageCode, TimedSegment, TimedWord, TranscriptionComputeDevice, TranscriptionLanguagePolicy,
+    TranscriptionOutput, WhisperOptions,
 };
 
 use crate::adapters::transcript_segmentation::normalize_transcript_segments;
@@ -31,7 +31,7 @@ const PREVIEW_TIMEOUT: Duration = Duration::from_secs(12);
 const PREVIEW_CHUNK_SECONDS: f32 = 8.0;
 const PREVIEW_MAX_CHUNKS: usize = 2;
 const PREVIEW_CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
-const LONG_FILE_THRESHOLD_SECONDS: f32 = 10.0 * 60.0;
+const LONG_FILE_THRESHOLD_SECONDS: f32 = 45.0;
 // Parakeet TDT allocates its graph from the decoded clip rather than from the
 // worker batch size. Keep every serialized clip safely below the graph size
 // that caused the real 16 GiB Apple Silicon watchdog panic.
@@ -54,6 +54,7 @@ const WORKER_RSS_LIMIT_ENV: &str = "SBOBINO_PARAKEET_WORKER_RSS_LIMIT_BYTES";
 pub struct ParakeetCppEngine {
     binary_path: String,
     models_dir: String,
+    compute_device: TranscriptionComputeDevice,
     worker_rss_limit_override_bytes: Option<u64>,
 }
 
@@ -129,6 +130,15 @@ struct AudioChunk {
 struct LongFileCallbacks {
     emit_partial: Arc<dyn Fn(String) + Send + Sync>,
     emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+}
+
+/// A worker attempt may emit valid rows before a later chunk exhausts the
+/// backend memory budget. Keep those rows attached to the error so the retry
+/// planner can resume at the first uncovered commit window instead of
+/// replaying already-completed audio.
+struct LongFileAttemptError {
+    error: ApplicationError,
+    completed: Vec<(AudioChunk, TranscriptionOutput)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -334,8 +344,14 @@ impl ParakeetCppEngine {
         Self {
             binary_path,
             models_dir,
+            compute_device: TranscriptionComputeDevice::Auto,
             worker_rss_limit_override_bytes: None,
         }
+    }
+
+    pub fn with_compute_device(mut self, compute_device: TranscriptionComputeDevice) -> Self {
+        self.compute_device = compute_device;
+        self
     }
 
     #[doc(hidden)]
@@ -402,7 +418,7 @@ impl ParakeetCppEngine {
         self.validate_model_exists(final_model_filename)
     }
 
-    fn configure_command_environment(command: &mut Command, binary_path: &str) {
+    fn configure_command_environment(&self, command: &mut Command, binary_path: &str) {
         // Keep Metal enabled, but disable ggml Metal features that can make
         // the packaged runtime diverge from the dev runtime on Apple Silicon.
         // Do not auto-force CPU: CPU transcription is too heavy for the app UX
@@ -410,7 +426,11 @@ impl ParakeetCppEngine {
         for (name, value) in Self::safe_metal_environment() {
             command.env(name, value);
         }
-        if let Some(device) = Self::parakeet_device_override() {
+        if self.compute_device == TranscriptionComputeDevice::Gpu {
+            // An inherited `PARAKEET_DEVICE=cpu` must not silently turn an
+            // explicit GPU selection into a CPU run.
+            command.env_remove("PARAKEET_DEVICE");
+        } else if let Some(device) = self.parakeet_device_override() {
             command.env("PARAKEET_DEVICE", device);
         }
 
@@ -444,7 +464,12 @@ impl ParakeetCppEngine {
         }
     }
 
-    fn parakeet_device_override() -> Option<&'static str> {
+    fn parakeet_device_override(&self) -> Option<&'static str> {
+        match self.compute_device {
+            TranscriptionComputeDevice::Cpu => return Some("cpu"),
+            TranscriptionComputeDevice::Gpu => return None,
+            TranscriptionComputeDevice::Auto => {}
+        }
         if Self::truthy_env("SBOBINO_PARAKEET_FORCE_CPU") {
             return Some("cpu");
         }
@@ -481,10 +506,6 @@ impl ParakeetCppEngine {
     fn worker_rss_limit_bytes(&self) -> u64 {
         self.worker_rss_limit_override_bytes
             .unwrap_or_else(Self::configured_worker_rss_limit_bytes)
-    }
-
-    fn allows_long_file_cli_fallback(is_windows: bool) -> bool {
-        !is_windows
     }
 
     fn configure_worker_process_group(command: &mut Command) {
@@ -754,7 +775,7 @@ impl ParakeetCppEngine {
     }
 
     fn clean_transcript_text(value: &str) -> String {
-        value
+        Self::strip_ansi_escape_codes(value)
             .replace("<EOU>", "")
             .replace("[EOU]", "")
             .split_whitespace()
@@ -762,6 +783,27 @@ impl ParakeetCppEngine {
             .join(" ")
             .trim()
             .to_string()
+    }
+
+    fn strip_ansi_escape_codes(value: &str) -> String {
+        let mut output = String::with_capacity(value.len());
+        let mut chars = value.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{001b}' && chars.peek() == Some(&'[') {
+                let _ = chars.next();
+                for next in chars.by_ref() {
+                    if next == 'm' {
+                        break;
+                    }
+                    if !matches!(next, '0'..='9' | ';' | ':' | '?') {
+                        break;
+                    }
+                }
+                continue;
+            }
+            output.push(ch);
+        }
+        output
     }
 
     fn normalize_detected_language(value: &str) -> Option<String> {
@@ -1627,7 +1669,7 @@ impl ParakeetCppEngine {
         language_code: &str,
     ) -> Result<(), ApplicationError> {
         let mut command = tokio_background_command(&self.binary_path);
-        Self::configure_command_environment(&mut command, &self.binary_path);
+        self.configure_command_environment(&mut command, &self.binary_path);
         command
             .arg("transcribe")
             .arg("--model")
@@ -1885,7 +1927,7 @@ impl ParakeetCppEngine {
         language_code: &str,
     ) -> Result<String, ApplicationError> {
         let mut command = tokio_background_command(&self.binary_path);
-        Self::configure_command_environment(&mut command, &self.binary_path);
+        self.configure_command_environment(&mut command, &self.binary_path);
         command
             .arg("transcribe")
             .arg("--model")
@@ -2005,6 +2047,14 @@ impl ParakeetCppEngine {
         input_wav: &Path,
         target_seconds: f32,
     ) -> Result<(TempDir, Vec<AudioChunk>), ApplicationError> {
+        Self::prepare_long_file_chunks_from_offset(input_wav, target_seconds, 0.0)
+    }
+
+    fn prepare_long_file_chunks_from_offset(
+        input_wav: &Path,
+        target_seconds: f32,
+        resume_from_seconds: f32,
+    ) -> Result<(TempDir, Vec<AudioChunk>), ApplicationError> {
         let mut reader = hound::WavReader::open(input_wav).map_err(|error| {
             ApplicationError::SpeechToText(format!(
                 "Parakeet long-file chunking could not read WAV {}: {error}",
@@ -2045,6 +2095,19 @@ impl ParakeetCppEngine {
 
         let sample_rate = spec.sample_rate as usize;
         let total_frames = samples.len();
+        if !resume_from_seconds.is_finite() || resume_from_seconds < 0.0 {
+            return Err(ApplicationError::SpeechToText(
+                "Parakeet long-file resume offset must be finite and non-negative".to_string(),
+            ));
+        }
+        let resume_start_frames = (resume_from_seconds * spec.sample_rate as f32)
+            .round()
+            .clamp(0.0, total_frames as f32) as usize;
+        if resume_start_frames >= total_frames {
+            return Err(ApplicationError::SpeechToText(
+                "Parakeet long-file resume offset is at or beyond the audio end".to_string(),
+            ));
+        }
         let min_commit_frames = ((LONG_FILE_MIN_COMMIT_WINDOW_SECONDS * spec.sample_rate as f32)
             .round() as usize)
             .max(sample_rate);
@@ -2080,10 +2143,10 @@ impl ParakeetCppEngine {
             as usize)
             .min(sample_rate * 5);
 
-        let mut boundaries = vec![0usize];
-        let mut cursor = 0usize;
+        let mut boundaries = vec![resume_start_frames];
+        let mut cursor = resume_start_frames;
         while total_frames.saturating_sub(cursor) > target_frames {
-            let current_target_frames = if cursor == 0 {
+            let current_target_frames = if cursor == resume_start_frames {
                 initial_target_frames
             } else {
                 target_frames
@@ -2205,7 +2268,11 @@ impl ParakeetCppEngine {
             });
         }
 
-        Self::validate_audio_chunks(&chunks, Some(total_frames as f32 / spec.sample_rate as f32))?;
+        Self::validate_audio_chunks_from_start(
+            &chunks,
+            Some(total_frames as f32 / spec.sample_rate as f32),
+            resume_start_frames as f32 / spec.sample_rate as f32,
+        )?;
 
         Ok((temp_dir, chunks))
     }
@@ -2257,9 +2324,10 @@ impl ParakeetCppEngine {
         best
     }
 
-    fn validate_audio_chunks(
+    fn validate_audio_chunks_from_start(
         chunks: &[AudioChunk],
         expected_commit_end_seconds: Option<f32>,
+        expected_commit_start_seconds: f32,
     ) -> Result<(), ApplicationError> {
         if chunks.is_empty() {
             return Err(ApplicationError::SpeechToText(
@@ -2269,7 +2337,7 @@ impl ParakeetCppEngine {
 
         let tolerance = LONG_FILE_CHUNK_VALIDATION_TOLERANCE_SECONDS;
         let mut previous_decode_start = None;
-        let mut previous_commit_end = 0.0_f32;
+        let mut previous_commit_end = expected_commit_start_seconds;
         for (expected_index, chunk) in chunks.iter().enumerate() {
             let values = [
                 chunk.decode_start_seconds,
@@ -2365,7 +2433,14 @@ impl ParakeetCppEngine {
         // Do not hand a malformed plan to the native sidecar. The worker
         // repeats these checks independently because the manifest is a process
         // boundary, not a trusted in-memory interface.
-        Self::validate_audio_chunks(chunks, None)?;
+        // Retries resume at the first uncovered commit edge, so a valid
+        // manifest need not start at t=0. Validate contiguity from that edge
+        // instead of rejecting every resumed attempt as a coverage break.
+        let expected_commit_start_seconds = chunks
+            .first()
+            .map(|chunk| chunk.commit_start_seconds)
+            .unwrap_or(0.0);
+        Self::validate_audio_chunks_from_start(chunks, None, expected_commit_start_seconds)?;
         let mut manifest = tempfile::Builder::new()
             .prefix("sbobino-parakeet-worker-")
             .suffix(".tsv")
@@ -2457,18 +2532,24 @@ impl ParakeetCppEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_worker_for_chunks(
         &self,
         worker_path: &Path,
         model_path: &Path,
         language_code: &str,
         chunks: &[AudioChunk],
+        existing: &[(AudioChunk, TranscriptionOutput)],
         total_audio_seconds: Option<f32>,
         callbacks: &LongFileCallbacks,
-    ) -> Result<Vec<(AudioChunk, TranscriptionOutput)>, ApplicationError> {
-        let manifest = Self::write_worker_manifest(chunks)?;
+    ) -> Result<Vec<(AudioChunk, TranscriptionOutput)>, LongFileAttemptError> {
+        let manifest =
+            Self::write_worker_manifest(chunks).map_err(|error| LongFileAttemptError {
+                error,
+                completed: Vec::new(),
+            })?;
         let mut command = tokio_background_command(worker_path);
-        Self::configure_command_environment(&mut command, worker_path.to_string_lossy().as_ref());
+        self.configure_command_environment(&mut command, worker_path.to_string_lossy().as_ref());
         Self::configure_worker_process_group(&mut command);
         command
             .arg("--model")
@@ -2480,16 +2561,18 @@ impl ParakeetCppEngine {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         command.kill_on_drop(true);
-        let mut child = command.spawn().map_err(|error| {
-            ApplicationError::SpeechToText(format!(
+        let mut child = command.spawn().map_err(|error| LongFileAttemptError {
+            error: ApplicationError::SpeechToText(format!(
                 "parakeet-batch-json failed to start at '{}': {error}",
                 worker_path.display()
-            ))
+            )),
+            completed: Vec::new(),
         })?;
-        let worker_pid = child.id().ok_or_else(|| {
-            ApplicationError::SpeechToText(
+        let worker_pid = child.id().ok_or_else(|| LongFileAttemptError {
+            error: ApplicationError::SpeechToText(
                 "parakeet-batch-json started without a visible worker PID".to_string(),
-            )
+            ),
+            completed: Vec::new(),
         })?;
         let process_group = Self::isolated_worker_process_group(worker_pid);
         #[cfg(windows)]
@@ -2499,10 +2582,13 @@ impl ParakeetCppEngine {
                 None => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    return Err(ApplicationError::SpeechToText(
-                        "parakeet-batch-json started without a process handle for the Windows memory guard"
-                            .to_string(),
-                    ));
+                    return Err(LongFileAttemptError {
+                        error: ApplicationError::SpeechToText(
+                            "parakeet-batch-json started without a process handle for the Windows memory guard"
+                                .to_string(),
+                        ),
+                        completed: Vec::new(),
+                    });
                 }
             };
             match WindowsWorkerJobGuard::attach(process_handle, self.worker_rss_limit_bytes()) {
@@ -2510,9 +2596,12 @@ impl ParakeetCppEngine {
                 Err(error) => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    return Err(ApplicationError::SpeechToText(format!(
-                        "parakeet-batch-json Windows memory guard setup failed closed: {error}"
-                    )));
+                    return Err(LongFileAttemptError {
+                        error: ApplicationError::SpeechToText(format!(
+                            "parakeet-batch-json Windows memory guard setup failed closed: {error}"
+                        )),
+                        completed: Vec::new(),
+                    });
                 }
             }
         };
@@ -2531,11 +2620,17 @@ impl ParakeetCppEngine {
                 .as_ref()
                 .map(|job| job.handle as usize),
         };
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ApplicationError::SpeechToText("parakeet-batch-json stdout was unavailable".to_string())
+        let stdout = child.stdout.take().ok_or_else(|| LongFileAttemptError {
+            error: ApplicationError::SpeechToText(
+                "parakeet-batch-json stdout was unavailable".to_string(),
+            ),
+            completed: Vec::new(),
         })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            ApplicationError::SpeechToText("parakeet-batch-json stderr was unavailable".to_string())
+        let stderr = child.stderr.take().ok_or_else(|| LongFileAttemptError {
+            error: ApplicationError::SpeechToText(
+                "parakeet-batch-json stderr was unavailable".to_string(),
+            ),
+            completed: Vec::new(),
         })?;
         let (stdout_sender, mut stdout_receiver) = tokio::sync::mpsc::channel(32);
         let stdout_task = tokio::spawn(async move {
@@ -2571,6 +2666,8 @@ impl ParakeetCppEngine {
             tail.join("\n")
         });
 
+        let mut results = Vec::new();
+
         macro_rules! abort_worker {
             ($error:expr) => {{
                 let error = $error;
@@ -2585,11 +2682,13 @@ impl ParakeetCppEngine {
                 if !stderr.trim().is_empty() {
                     eprintln!("parakeet-batch-json aborted diagnostic: {stderr}");
                 }
-                return Err(error);
+                return Err(LongFileAttemptError {
+                    error,
+                    completed: results.clone(),
+                });
             }};
         }
 
-        let mut results = Vec::new();
         let mut monitor = tokio::time::interval(WORKER_RSS_SAMPLE_INTERVAL);
         monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut stdout_closed = false;
@@ -2648,9 +2747,16 @@ impl ParakeetCppEngine {
                                 chunk.commit_end_seconds,
                             );
                             let commit_end_seconds = chunk.commit_end_seconds;
+                            // Worker indices are local to this retry manifest;
+                            // make them global for cumulative snapshots so a
+                            // resumed attempt cannot reorder prior chunks.
+                            let mut chunk = chunk;
+                            chunk.index = existing.len() + results.len();
                             results.push((chunk, output));
+                            let mut snapshot_chunks = existing.to_vec();
+                            snapshot_chunks.extend(results.iter().cloned());
                             if let Some(snapshot) = match Self::merge_chunk_transcriptions_snapshot(
-                                &results,
+                                &snapshot_chunks,
                                 total_audio_seconds,
                             ) {
                                 Ok(snapshot) => snapshot,
@@ -2672,15 +2778,17 @@ impl ParakeetCppEngine {
         }
 
         let status = status.expect("worker loop exits only after a child status");
-        stdout_task.await.map_err(|error| {
-            ApplicationError::SpeechToText(format!(
+        stdout_task.await.map_err(|error| LongFileAttemptError {
+            error: ApplicationError::SpeechToText(format!(
                 "failed to join parakeet-batch-json stdout reader: {error}"
-            ))
+            )),
+            completed: results.clone(),
         })?;
-        let stderr = stderr_task.await.map_err(|error| {
-            ApplicationError::SpeechToText(format!(
+        let stderr = stderr_task.await.map_err(|error| LongFileAttemptError {
+            error: ApplicationError::SpeechToText(format!(
                 "failed to join parakeet-batch-json stderr reader: {error}"
-            ))
+            )),
+            completed: results.clone(),
         })?;
         process_group_guard.disarm();
         if memory_stats.peak_rss_bytes > 0 {
@@ -2701,88 +2809,26 @@ impl ParakeetCppEngine {
             );
         }
         if !status.success() {
-            return Err(Self::parakeet_command_failure(
-                "parakeet-batch-json failed",
-                stderr.as_bytes(),
-                Some(status.to_string()),
-            ));
+            return Err(LongFileAttemptError {
+                error: Self::parakeet_command_failure(
+                    "parakeet-batch-json failed",
+                    stderr.as_bytes(),
+                    Some(status.to_string()),
+                ),
+                completed: results,
+            });
         }
         if results.len() != chunks.len() {
-            return Err(ApplicationError::SpeechToText(format!(
-                "parakeet-batch-json returned {} chunk result(s), expected {}",
-                results.len(),
-                chunks.len()
-            )));
+            return Err(LongFileAttemptError {
+                error: ApplicationError::SpeechToText(format!(
+                    "parakeet-batch-json returned {} chunk result(s), expected {}",
+                    results.len(),
+                    chunks.len()
+                )),
+                completed: results,
+            });
         }
         results.sort_by_key(|(chunk, _)| chunk.index);
-        Ok(results)
-    }
-
-    async fn run_cli_for_chunk(
-        &self,
-        chunk: &AudioChunk,
-        model_path: &Path,
-        model_filename: &str,
-        language_code: &str,
-    ) -> Result<TranscriptionOutput, ApplicationError> {
-        let mut command = Command::new(&self.binary_path);
-        Self::configure_command_environment(&mut command, &self.binary_path);
-        command
-            .arg("transcribe")
-            .arg("--model")
-            .arg(model_path)
-            .arg("--input")
-            .arg(&chunk.path)
-            .arg("--json")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        command.kill_on_drop(true);
-        if Self::is_nemotron_streaming_model(model_filename) {
-            command
-                .arg("--lang")
-                .arg(Self::parakeet_target_lang(language_code));
-        }
-        let output = command.output().await.map_err(|error| {
-            ApplicationError::SpeechToText(format!(
-                "parakeet-cli failed to start at '{}': {error}. Configure Parakeet CLI path in Settings > Local Models.",
-                self.binary_path
-            ))
-        })?;
-        if !output.status.success() {
-            return Err(Self::parakeet_command_failure(
-                "parakeet-cli chunk failed",
-                &output.stderr,
-                Some(output.status.to_string()),
-            ));
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut parsed = Self::parse_json_output(
-            &stdout,
-            Some((chunk.decode_end_seconds - chunk.decode_start_seconds).max(0.0)),
-        )?;
-        Self::offset_transcription_output(&mut parsed, chunk.decode_start_seconds);
-        Self::filter_transcription_to_commit_window(
-            &mut parsed,
-            chunk.commit_start_seconds,
-            chunk.commit_end_seconds,
-        );
-        Ok(parsed)
-    }
-
-    async fn run_cli_for_chunks(
-        &self,
-        chunks: &[AudioChunk],
-        model_path: &Path,
-        model_filename: &str,
-        language_code: &str,
-    ) -> Result<Vec<(AudioChunk, TranscriptionOutput)>, ApplicationError> {
-        let mut results = Vec::new();
-        for chunk in chunks {
-            let output = self
-                .run_cli_for_chunk(chunk, model_path, model_filename, language_code)
-                .await?;
-            results.push((chunk.clone(), output));
-        }
         Ok(results)
     }
 
@@ -2790,83 +2836,181 @@ impl ParakeetCppEngine {
         &self,
         input_wav: &Path,
         model_path: &Path,
-        model_filename: &str,
+        _model_filename: &str,
         language_code: &str,
         total_audio_seconds: Option<f32>,
         callbacks: LongFileCallbacks,
     ) -> Result<TranscriptionOutput, ApplicationError> {
+        let worker_path = self.parakeet_worker_path().ok_or_else(|| {
+            ApplicationError::SpeechToText(
+                "Parakeet batch worker is required for audio longer than 45 seconds; install parakeet-batch-json next to parakeet-cli"
+                    .to_string(),
+            )
+        })?;
         let target_sizes = std::iter::once(LONG_FILE_TARGET_COMMIT_WINDOW_SECONDS)
             .chain(LONG_FILE_RETRY_COMMIT_WINDOW_SECONDS)
             .collect::<Vec<_>>();
+        let mut completed = Vec::<(AudioChunk, TranscriptionOutput)>::new();
+        let mut resume_from_seconds = 0.0_f32;
+        // Keep an explicit end-of-audio invariant even when callers do not
+        // provide a duration. The chunk planner has already decoded the WAV,
+        // so the final manifest row is the authoritative physical end. This
+        // prevents a worker that emitted only a valid prefix before an OOM or
+        // other terminal error from being reported as a successful transcript.
+        let mut expected_audio_end_seconds = total_audio_seconds;
         let mut last_error = None;
-        for chunk_seconds in target_sizes {
-            let (_temp_dir, chunks) = Self::prepare_long_file_chunks(input_wav, chunk_seconds)?;
+
+        for (attempt_index, chunk_seconds) in target_sizes.into_iter().enumerate() {
+            // Once a worker has committed the complete coverage, no retry
+            // plan should replay the already-successful tail.
+            if total_audio_seconds.is_some_and(|total| {
+                resume_from_seconds + LONG_FILE_CHUNK_VALIDATION_TOLERANCE_SECONDS >= total
+            }) {
+                break;
+            }
+            let (_temp_dir, chunks) = if resume_from_seconds > 0.0 {
+                Self::prepare_long_file_chunks_from_offset(
+                    input_wav,
+                    chunk_seconds,
+                    resume_from_seconds,
+                )?
+            } else {
+                Self::prepare_long_file_chunks(input_wav, chunk_seconds)?
+            };
             if chunks.is_empty() {
                 break;
             }
-            let attempt = if let Some(worker_path) = self.parakeet_worker_path() {
-                match self
+            if expected_audio_end_seconds.is_none() {
+                expected_audio_end_seconds = chunks
+                    .last()
+                    .map(|chunk| chunk.commit_end_seconds)
+                    .filter(|end| end.is_finite() && *end >= 0.0);
+            }
+
+            let attempt = self
+                .run_worker_for_chunks(
+                    &worker_path,
+                    model_path,
+                    language_code,
+                    &chunks,
+                    &completed,
+                    total_audio_seconds,
+                    &callbacks,
+                )
+                .await;
+            match attempt {
+                Ok(results) => {
+                    Self::append_completed_chunks(&mut completed, results);
+                    let merged =
+                        Self::merge_chunk_transcriptions_snapshot(&completed, total_audio_seconds)?
+                            .ok_or_else(|| {
+                                ApplicationError::SpeechToText(
+                                    "Parakeet long-file transcription produced empty output"
+                                        .to_string(),
+                                )
+                            })?;
+                    if !Self::has_complete_audio_coverage(&completed, expected_audio_end_seconds) {
+                        let coverage_error = ApplicationError::SpeechToText(format!(
+                            "Parakeet long-file worker completed a prefix but did not cover the full audio (covered {:.3}s, expected {:.3}s)",
+                            Self::completed_audio_end_seconds(&completed).unwrap_or_default(),
+                            expected_audio_end_seconds.unwrap_or_default(),
+                        ));
+                        last_error = Some(coverage_error);
+                        break;
+                    }
+                    (callbacks.emit_partial)(format!("{DELTA_REPLACE_PREFIX}{}", merged.text));
+                    if let Some(total) = total_audio_seconds {
+                        (callbacks.emit_progress_seconds)(total);
+                    }
+                    return Ok(merged);
+                }
+                Err(attempt_error) => {
+                    let retryable =
+                        Self::is_retryable_long_file_memory_error(&attempt_error.error.to_string());
+                    Self::append_completed_chunks(&mut completed, attempt_error.completed);
+                    if let Some((chunk, _)) = completed.last() {
+                        resume_from_seconds = chunk.commit_end_seconds;
+                    }
+                    last_error = Some(attempt_error.error);
+                    if !retryable {
+                        return Err(last_error.expect("attempt error was just stored"));
+                    }
+                    if attempt_index + 1 >= 4 {
+                        // Keep the retryable error for the automatic CPU
+                        // worker fallback below; do not return before it can
+                        // run.
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Automatic mode gets one final CPU worker attempt after all guarded
+        // GPU windows are exhausted. The manifest starts at the first
+        // uncovered commit edge, so confirmed rows are never replayed.
+        if self.compute_device == TranscriptionComputeDevice::Auto
+            && last_error
+                .as_ref()
+                .is_some_and(|error| Self::is_retryable_long_file_memory_error(&error.to_string()))
+        {
+            let mut cpu_engine = self.clone();
+            cpu_engine.compute_device = TranscriptionComputeDevice::Cpu;
+            (callbacks.emit_partial)("Parakeet fallback CPU-safe mode...".to_string());
+            if total_audio_seconds
+                .map(|total| {
+                    resume_from_seconds + LONG_FILE_CHUNK_VALIDATION_TOLERANCE_SECONDS < total
+                })
+                .unwrap_or(true)
+            {
+                let (_temp_dir, cpu_chunks) = if resume_from_seconds > 0.0 {
+                    Self::prepare_long_file_chunks_from_offset(
+                        input_wav,
+                        LONG_FILE_MIN_COMMIT_WINDOW_SECONDS,
+                        resume_from_seconds,
+                    )?
+                } else {
+                    Self::prepare_long_file_chunks(input_wav, LONG_FILE_MIN_COMMIT_WINDOW_SECONDS)?
+                };
+                match cpu_engine
                     .run_worker_for_chunks(
                         &worker_path,
                         model_path,
                         language_code,
-                        &chunks,
+                        &cpu_chunks,
+                        &completed,
                         total_audio_seconds,
                         &callbacks,
                     )
                     .await
                 {
-                    Ok(results) => Ok(results),
-                    Err(error) if Self::is_retryable_long_file_memory_error(&error.to_string()) => {
-                        Err(error)
-                    }
-                    Err(error) => {
-                        if Self::allows_long_file_cli_fallback(cfg!(windows)) {
-                            eprintln!(
-                                "Parakeet worker unavailable or failed, falling back to chunk CLI: {error}"
-                            );
-                            self.run_cli_for_chunks(
-                                &chunks,
-                                model_path,
-                                model_filename,
-                                language_code,
-                            )
-                            .await
-                        } else {
-                            Err(error)
-                        }
+                    Ok(results) => Self::append_completed_chunks(&mut completed, results),
+                    Err(cpu_error) => {
+                        return Err(ApplicationError::SpeechToText(format!(
+                            "Parakeet retry in CPU-safe mode failed: {}",
+                            cpu_error.error
+                        )));
                     }
                 }
-            } else {
-                if Self::allows_long_file_cli_fallback(cfg!(windows)) {
-                    self.run_cli_for_chunks(&chunks, model_path, model_filename, language_code)
-                        .await
-                } else {
-                    Err(ApplicationError::SpeechToText(
-                        "Parakeet batch worker is missing; refusing an unguarded Windows CLI fallback"
-                            .to_string(),
-                    ))
-                }
-            };
-
-            match attempt {
-                Ok(results) => {
-                    return Self::merge_chunk_transcriptions(
-                        results,
-                        total_audio_seconds,
-                        callbacks.emit_partial.as_ref(),
-                        callbacks.emit_progress_seconds.as_ref(),
-                    );
-                }
-                Err(error)
-                    if Self::is_retryable_long_file_memory_error(&error.to_string())
-                        && chunk_seconds > LONG_FILE_MIN_COMMIT_WINDOW_SECONDS =>
-                {
-                    last_error = Some(error);
-                    continue;
-                }
-                Err(error) => return Err(error),
             }
+        }
+
+        if let Some(merged) =
+            Self::merge_chunk_transcriptions_snapshot(&completed, total_audio_seconds)?
+        {
+            // A non-empty merge is not sufficient evidence of success: an
+            // exhausted explicit CPU/GPU retry plan may contain a perfectly
+            // valid prefix. Never return or persist that truncated transcript.
+            if !Self::has_complete_audio_coverage(&completed, expected_audio_end_seconds) {
+                return Err(last_error.unwrap_or_else(|| {
+                    ApplicationError::SpeechToText(format!(
+                        "Parakeet long-file transcription stopped before covering the full audio (covered {:.3}s, expected {:.3}s)",
+                        Self::completed_audio_end_seconds(&completed).unwrap_or_default(),
+                        expected_audio_end_seconds.unwrap_or_default(),
+                    ))
+                }));
+            }
+            (callbacks.emit_partial)(format!("{DELTA_REPLACE_PREFIX}{}", merged.text));
+            return Ok(merged);
         }
         Err(last_error.unwrap_or_else(|| {
             ApplicationError::SpeechToText(
@@ -2875,31 +3019,39 @@ impl ParakeetCppEngine {
         }))
     }
 
-    fn merge_chunk_transcriptions(
-        chunks: Vec<(AudioChunk, TranscriptionOutput)>,
-        total_audio_seconds: Option<f32>,
-        emit_partial: &(dyn Fn(String) + Send + Sync),
-        emit_progress_seconds: &(dyn Fn(f32) + Send + Sync),
-    ) -> Result<TranscriptionOutput, ApplicationError> {
-        let mut cumulative = Vec::new();
-        for item in chunks {
-            cumulative.push(item);
-            if let Some(snapshot) =
-                Self::merge_chunk_transcriptions_snapshot(&cumulative, total_audio_seconds)?
-            {
-                emit_partial(format!("{DELTA_REPLACE_PREFIX}{}", snapshot.text));
-            }
-            if let Some((chunk, _)) = cumulative.last() {
-                emit_progress_seconds(chunk.commit_end_seconds);
-            }
+    fn completed_audio_end_seconds(completed: &[(AudioChunk, TranscriptionOutput)]) -> Option<f32> {
+        completed
+            .iter()
+            .map(|(chunk, _)| chunk.commit_end_seconds)
+            .filter(|end| end.is_finite())
+            .max_by(f32::total_cmp)
+    }
+
+    fn has_complete_audio_coverage(
+        completed: &[(AudioChunk, TranscriptionOutput)],
+        expected_audio_end_seconds: Option<f32>,
+    ) -> bool {
+        let Some(expected) = expected_audio_end_seconds else {
+            // The planner always supplies an end for long-file WAV input. If
+            // that invariant ever breaks, fail closed instead of treating an
+            // unknown end as complete coverage.
+            return false;
+        };
+        expected.is_finite()
+            && expected >= 0.0
+            && Self::completed_audio_end_seconds(completed).is_some_and(|covered| {
+                covered + LONG_FILE_CHUNK_VALIDATION_TOLERANCE_SECONDS >= expected
+            })
+    }
+
+    fn append_completed_chunks(
+        destination: &mut Vec<(AudioChunk, TranscriptionOutput)>,
+        mut source: Vec<(AudioChunk, TranscriptionOutput)>,
+    ) {
+        for (mut chunk, output) in source.drain(..) {
+            chunk.index = destination.len();
+            destination.push((chunk, output));
         }
-        Self::merge_chunk_transcriptions_snapshot(&cumulative, total_audio_seconds)?.ok_or_else(
-            || {
-                ApplicationError::SpeechToText(
-                    "Parakeet long-file transcription produced empty output".to_string(),
-                )
-            },
-        )
     }
 
     fn merge_chunk_transcriptions_snapshot(
@@ -3095,7 +3247,7 @@ impl ParakeetCppEngine {
         stderr: &[u8],
         status: Option<String>,
     ) -> ApplicationError {
-        let stderr = String::from_utf8_lossy(stderr);
+        let stderr = Self::strip_ansi_escape_codes(&String::from_utf8_lossy(stderr));
         if Self::is_metal_oom_error(&stderr) {
             return ApplicationError::SpeechToText(format!(
                 "{prefix}: Parakeet Metal ran out of memory on this chunk. The app will retry with smaller chunks when possible."
@@ -3190,7 +3342,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
         }
 
         let mut command = tokio_background_command(&self.binary_path);
-        Self::configure_command_environment(&mut command, &self.binary_path);
+        self.configure_command_environment(&mut command, &self.binary_path);
         command
             .arg("transcribe")
             .arg("--model")
@@ -3259,7 +3411,9 @@ impl SpeechToTextEngine for ParakeetCppEngine {
 mod tests {
     use std::path::PathBuf;
 
-    use sbobino_domain::TranscriptionOutput;
+    use tokio::process::Command;
+
+    use sbobino_domain::{TranscriptionComputeDevice, TranscriptionOutput};
 
     use super::{AudioChunk, ParakeetCppEngine};
 
@@ -3279,9 +3433,20 @@ mod tests {
     }
 
     #[test]
-    fn windows_batch_worker_routing_fails_closed_without_cli_fallback() {
-        assert!(ParakeetCppEngine::allows_long_file_cli_fallback(false));
-        assert!(!ParakeetCppEngine::allows_long_file_cli_fallback(true));
+    fn explicit_cpu_routes_worker_to_cpu_without_disabling_safety_env() {
+        let engine = ParakeetCppEngine::new("parakeet-cli".to_string(), ".".to_string())
+            .with_compute_device(TranscriptionComputeDevice::Cpu);
+        let mut command = Command::new("parakeet-batch-json");
+        engine.configure_command_environment(&mut command, "parakeet-batch-json");
+        let cpu_device = command
+            .as_std_mut()
+            .get_envs()
+            .find_map(|(name, value)| {
+                (name == std::ffi::OsStr::new("PARAKEET_DEVICE"))
+                    .then(|| value.map(|value| value.to_string_lossy().to_string()))
+            })
+            .flatten();
+        assert_eq!(cpu_device.as_deref(), Some("cpu"));
     }
 
     #[cfg(windows)]
@@ -3350,10 +3515,8 @@ mod tests {
             commit_start_seconds: 0.0,
             commit_end_seconds: 30.0,
         };
-        let emit_partial = |_line: String| {};
-        let emit_progress = |_seconds: f32| {};
-        let error = ParakeetCppEngine::merge_chunk_transcriptions(
-            vec![(
+        let merged = ParakeetCppEngine::merge_chunk_transcriptions_snapshot(
+            &[(
                 empty_worker_chunk,
                 TranscriptionOutput {
                     text: String::new(),
@@ -3361,13 +3524,12 @@ mod tests {
                 },
             )],
             Some(30.0),
-            &emit_partial,
-            &emit_progress,
         )
-        .expect_err("all-silent worker coverage must still fail the final transcription");
+        .expect("silent worker coverage should be a valid merge snapshot");
 
-        assert!(error
-            .to_string()
-            .contains("Parakeet long-file transcription produced empty output"));
+        assert!(
+            merged.is_none(),
+            "all-silent worker coverage must still fail the final transcription"
+        );
     }
 }

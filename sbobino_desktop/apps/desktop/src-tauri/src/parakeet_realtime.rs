@@ -6,7 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,7 +18,7 @@ use cpal::{
 use libloading::Library;
 
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
-use sbobino_domain::{LanguageCode, TimedSegment};
+use sbobino_domain::{LanguageCode, TimedSegment, TranscriptionComputeDevice};
 
 use crate::realtime_audio::{classify_input_error, RealtimeInputLevelEvent};
 
@@ -26,6 +26,8 @@ type ParakeetCtx = std::ffi::c_void;
 type ParakeetStream = std::ffi::c_void;
 type ParakeetLiveDeltaPiece = (String, Option<String>, bool);
 type ParakeetLiveDeltaPieces = Vec<ParakeetLiveDeltaPiece>;
+
+static PARAKEET_DEVICE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 type LoadFn = unsafe extern "C" fn(*const c_char) -> *mut ParakeetCtx;
 type FreeFn = unsafe extern "C" fn(*mut ParakeetCtx);
@@ -74,6 +76,7 @@ pub struct ParakeetRealtimeStopResult {
 
 struct ParakeetCaptureSession {
     target_lang: String,
+    requested_device: Option<String>,
     audio_path: PathBuf,
     shutdown_rx: mpsc::Receiver<()>,
     startup_tx: mpsc::Sender<Result<(), ApplicationError>>,
@@ -89,6 +92,7 @@ struct ParakeetCaptureSession {
 pub struct ParakeetRealtimeEngine {
     lib_path: PathBuf,
     models_dir: PathBuf,
+    compute_device: TranscriptionComputeDevice,
     state: Arc<Mutex<ParakeetRealtimeState>>,
 }
 
@@ -97,10 +101,24 @@ impl ParakeetRealtimeEngine {
         Self {
             lib_path,
             models_dir,
+            compute_device: TranscriptionComputeDevice::Auto,
             state: Arc::new(Mutex::new(ParakeetRealtimeState {
                 paused: Arc::new(AtomicBool::new(false)),
                 ..ParakeetRealtimeState::default()
             })),
+        }
+    }
+
+    pub fn with_compute_device(mut self, compute_device: TranscriptionComputeDevice) -> Self {
+        self.compute_device = compute_device;
+        self
+    }
+
+    #[cfg(test)]
+    fn requested_device_env(device: TranscriptionComputeDevice) -> Option<&'static str> {
+        match device {
+            TranscriptionComputeDevice::Cpu => Some("cpu"),
+            TranscriptionComputeDevice::Auto | TranscriptionComputeDevice::Gpu => None,
         }
     }
 
@@ -158,6 +176,13 @@ impl ParakeetRealtimeEngine {
         let (startup_tx, startup_rx) = mpsc::channel();
         let model_for_thread = model_path.clone();
         let target_lang_for_thread = target_lang.to_string();
+        let requested_device_for_thread = match self.compute_device {
+            TranscriptionComputeDevice::Cpu => Some("cpu".to_string()),
+            TranscriptionComputeDevice::Gpu => None,
+            TranscriptionComputeDevice::Auto => {
+                Self::parakeet_device_override().map(str::to_string)
+            }
+        };
         let audio_for_thread = saved_audio_path.clone();
         let transcript_for_thread = transcript.clone();
         let segments_for_thread = segments.clone();
@@ -181,6 +206,7 @@ impl ParakeetRealtimeEngine {
                         model_for_thread,
                         ParakeetCaptureSession {
                             target_lang: target_lang_for_thread,
+                            requested_device: requested_device_for_thread,
                             audio_path: audio_for_thread,
                             shutdown_rx,
                             startup_tx: startup_tx.clone(),
@@ -370,10 +396,6 @@ impl ParakeetRealtimeEngine {
         for (name, value) in Self::safe_metal_environment() {
             std::env::set_var(name, value);
         }
-        if let Some(device) = Self::parakeet_device_override() {
-            std::env::set_var("PARAKEET_DEVICE", device);
-        }
-
         let library = unsafe { Library::new(&self.lib_path) }.map_err(|error| {
             ApplicationError::SpeechToText(format!(
                 "failed to load Parakeet live library {}: {error}",
@@ -495,6 +517,40 @@ fn take_c_string(api: &ParakeetApi, ptr: *mut c_char) -> Option<String> {
     Some(text)
 }
 
+struct ParakeetDeviceEnvRestore(Option<std::ffi::OsString>);
+
+impl Drop for ParakeetDeviceEnvRestore {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            std::env::set_var("PARAKEET_DEVICE", previous);
+        } else {
+            std::env::remove_var("PARAKEET_DEVICE");
+        }
+    }
+}
+
+fn load_parakeet_context_with_scoped_device(
+    api: &ParakeetApi,
+    model: &CString,
+    requested_device: Option<&str>,
+) -> Result<*mut ParakeetCtx, ApplicationError> {
+    let _lock = PARAKEET_DEVICE_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| {
+            ApplicationError::SpeechToText(
+                "Parakeet device-selection lock is unavailable".to_string(),
+            )
+        })?;
+    let _restore = ParakeetDeviceEnvRestore(std::env::var_os("PARAKEET_DEVICE"));
+    if let Some(device) = requested_device {
+        std::env::set_var("PARAKEET_DEVICE", device);
+    } else {
+        std::env::remove_var("PARAKEET_DEVICE");
+    }
+    Ok(unsafe { (api.load)(model.as_ptr()) })
+}
+
 fn run_parakeet_capture(
     api: ParakeetApi,
     model_path: PathBuf,
@@ -509,7 +565,11 @@ fn run_parakeet_capture(
     let model_c = CString::new(model_path.to_string_lossy().as_bytes()).map_err(|_| {
         ApplicationError::SpeechToText("Parakeet model path contains a NUL byte".to_string())
     })?;
-    let ctx = unsafe { (api.load)(model_c.as_ptr()) };
+    let ctx = load_parakeet_context_with_scoped_device(
+        &api,
+        &model_c,
+        session.requested_device.as_deref(),
+    )?;
     if ctx.is_null() {
         eprintln!(
             "[parakeet-live] parakeet_capi_load returned null for {}",
@@ -1412,6 +1472,18 @@ mod tests {
         assert!(
             !env.iter().any(|(name, _)| *name == "PARAKEET_DEVICE"),
             "Metal safety must not force the CPU backend"
+        );
+    }
+
+    #[test]
+    fn parakeet_realtime_cpu_mode_requests_cpu_backend() {
+        assert_eq!(
+            ParakeetRealtimeEngine::requested_device_env(TranscriptionComputeDevice::Cpu),
+            Some("cpu")
+        );
+        assert_eq!(
+            ParakeetRealtimeEngine::requested_device_env(TranscriptionComputeDevice::Auto),
+            None
         );
     }
 

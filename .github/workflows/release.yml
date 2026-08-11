@@ -334,6 +334,13 @@ jobs:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
+      - name: Validate release version and notes
+        working-directory: sbobino_desktop
+        run: |
+          VERSION="${TAG_NAME#v}"
+          ./scripts/check_release_versions.sh "$VERSION"
+          ./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md"
+
       - uses: actions/download-artifact@v4
         with:
           name: sbobino-macos-aarch64

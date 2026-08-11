@@ -802,16 +802,6 @@ const chunkingOptions: Array<{
   { value: "none", label: "No chunking" },
 ];
 
-const computeUnitOptions: Array<{
-  value: WhisperOptions["audio_encoder_compute_units"];
-  label: string;
-}> = [
-  { value: "cpu_and_neural_engine", label: "CPU + Neural Engine" },
-  { value: "cpu_and_gpu", label: "CPU + GPU" },
-  { value: "cpu_only", label: "CPU only" },
-  { value: "all", label: "All" },
-];
-
 const promptTaskOptions: Array<{ value: PromptTask; label: string }> = [
   { value: "optimize", label: "Optimize transcript" },
   { value: "summary", label: "Summary" },
@@ -2424,6 +2414,7 @@ function normalizeSettings(settings: AppSettings): AppSettings {
     },
     transcription: {
       ...settings.transcription,
+      compute_device: settings.transcription.compute_device ?? "auto",
       parakeet_model:
         settings.transcription.parakeet_model ?? "tdt06b_v3_q4",
       parakeet_cli_path:
@@ -15434,6 +15425,45 @@ export function App({
           <div className="settings-row settings-row-block">
             <div>
               <strong>
+                {t("settings.transcription.computeDevice", "Compute device")}
+              </strong>
+              <small>
+                {t(
+                  "settings.transcription.computeDeviceDesc",
+                  "Auto uses supported acceleration with a controlled CPU fallback. CPU never starts a GPU backend.",
+                )}
+              </small>
+            </div>
+            <select
+              value={settings.transcription.compute_device ?? "auto"}
+              onChange={(event) => {
+                void patchSettings((current) => ({
+                  ...current,
+                  transcription: {
+                    ...current.transcription,
+                    compute_device: event.target.value as
+                      | "auto"
+                      | "gpu"
+                      | "cpu",
+                  },
+                }));
+              }}
+            >
+              <option value="auto">
+                {t("settings.transcription.computeAuto", "Auto")}
+              </option>
+              <option value="gpu">
+                {t("settings.transcription.computeGpu", "GPU")}
+              </option>
+              <option value="cpu">
+                {t("settings.transcription.computeCpu", "CPU")}
+              </option>
+            </select>
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>
                 {settings.transcription.engine === "parakeet_cpp"
                   ? t(
                       "settings.transcription.parakeetModel",
@@ -16005,62 +16035,6 @@ export function App({
               }}
             />
           </div>
-
-          {platformIsAppleSilicon && (
-            <div className="settings-row settings-row-block">
-              <div>
-                <strong>{t("settings.whisperkit.audioEncoderUnits")}</strong>
-                <small>{t("settings.whisperkit.audioEncoderUnitsDesc")}</small>
-              </div>
-              <select
-                value={whisperOptions.audio_encoder_compute_units}
-                onChange={(event) => {
-                  void onPatchWhisperOptions((current) => ({
-                    ...current,
-                    audio_encoder_compute_units: event.target
-                      .value as WhisperOptions["audio_encoder_compute_units"],
-                  }));
-                }}
-              >
-                {computeUnitOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {t(
-                      `settings.whisperkit.compute.${option.value}`,
-                      option.label,
-                    )}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-
-          {platformIsAppleSilicon && (
-            <div className="settings-row settings-row-block">
-              <div>
-                <strong>{t("settings.whisperkit.textDecoderUnits")}</strong>
-                <small>{t("settings.whisperkit.textDecoderUnitsDesc")}</small>
-              </div>
-              <select
-                value={whisperOptions.text_decoder_compute_units}
-                onChange={(event) => {
-                  void onPatchWhisperOptions((current) => ({
-                    ...current,
-                    text_decoder_compute_units: event.target
-                      .value as WhisperOptions["text_decoder_compute_units"],
-                  }));
-                }}
-              >
-                {computeUnitOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {t(
-                      `settings.whisperkit.compute.${option.value}`,
-                      option.label,
-                    )}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
 
           <div className="settings-row">
             <div>

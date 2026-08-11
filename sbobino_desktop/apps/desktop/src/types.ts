@@ -110,6 +110,7 @@ export type SpeakerDiarizationSettings = {
 
 export type TranscriptionSettings = {
   engine: TranscriptionEngine;
+  compute_device: "auto" | "gpu" | "cpu";
   model: SpeechModel;
   parakeet_model: ParakeetModel;
   language: LanguageCode;

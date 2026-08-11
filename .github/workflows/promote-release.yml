@@ -21,7 +21,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag_name }}
           fetch-depth: 0
+
+      - name: Validate versioned release notes
+        working-directory: sbobino_desktop
+        run: |
+          VERSION="${TAG_NAME#v}"
+          ./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md"
 
       - name: Promote validated candidate
         working-directory: sbobino_desktop

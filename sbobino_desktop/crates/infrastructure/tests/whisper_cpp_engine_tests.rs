@@ -29,6 +29,23 @@ fn write_executable_script(path: &Path, content: &str) {
     std::fs::set_permissions(path, permissions).expect("failed to chmod script");
 }
 
+fn write_speech_wav(path: &Path, seconds: u32) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).expect("failed to create wav");
+    for index in 0..(seconds * 16_000) {
+        let sample = ((index as f32 * 0.03).sin() * 12_000.0) as i16;
+        writer
+            .write_sample(sample)
+            .expect("failed to write wav sample");
+    }
+    writer.finalize().expect("failed to finalize wav");
+}
+
 #[tokio::test]
 async fn transcribe_collects_lines_from_stdout_and_stderr() {
     let temp = tempdir().expect("failed to create temp dir");
@@ -348,6 +365,88 @@ exit 0
             .any(|line| line.contains("Whisper fallback CPU-safe mode")),
         "expected a CPU-safe fallback notice in the partial stream: {:?}",
         emitted_lines
+    );
+}
+
+#[tokio::test]
+async fn nonzero_batch_preserves_written_outputs_and_recovers_only_missing_chunk() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+    let invocations = temp.path().join("invocations.log");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    write_speech_wav(&input_wav, 18);
+
+    let invocations_path = invocations.to_string_lossy().to_string();
+    write_executable_script(
+        &script_path,
+        &format!(
+            r#"#!/bin/sh
+args="$*"
+input_count=0
+of_count=0
+cpu=0
+out=""
+first_out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-f" ]; then input_count=$((input_count + 1)); fi
+  if [ "$1" = "-ng" ]; then cpu=1; fi
+  if [ "$1" = "-of" ]; then of_count=$((of_count + 1)); shift; out="$1"; if [ -z "$first_out" ]; then first_out="$out"; fi; fi
+  shift
+done
+echo "inputs=$of_count cpu=$cpu" >> "{invocations}"
+if [ "$of_count" -gt 1 ]; then
+  # Simulate a batch that saved its first output before the process failed.
+  printf "batch first\n" > "${{first_out}}.txt"
+  echo "ggml_metal_buffer_init: error: failed to allocate buffer" 1>&2
+  exit 139
+fi
+if [ "$cpu" -eq 0 ]; then
+  echo "ggml_metal_buffer_init: error: failed to allocate buffer" 1>&2
+  exit 139
+fi
+printf "cpu isolated\n" > "${{out}}.txt"
+exit 0
+"#,
+            invocations = invocations_path
+        ),
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            &transcription_policy("en"),
+            &WhisperOptions::default(),
+            Some(18.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("isolated missing-chunk recovery should succeed");
+
+    assert!(transcript.text.contains("batch first"));
+    assert!(transcript.text.contains("cpu isolated"));
+    let invocation_lines =
+        std::fs::read_to_string(&invocations).expect("script should record invocations");
+    assert!(invocation_lines.contains("inputs=2 cpu=0"));
+    assert!(invocation_lines.contains("inputs=1 cpu=0"));
+    assert!(invocation_lines.contains("inputs=1 cpu=1"));
+    assert_eq!(
+        invocation_lines
+            .lines()
+            .filter(|line| line.contains("inputs=2"))
+            .count(),
+        1,
+        "the successful first output must not trigger a full-group CPU replay"
     );
 }
 
@@ -1042,16 +1141,12 @@ exit 0
 
     let lines = emitted.lock().expect("emit lock poisoned").clone();
     assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("\u{001b}[32mconfident\u{001b}[0m")),
-        "expected ANSI-colored preview output"
+        lines.iter().all(|line| !line.contains('\u{001b}')),
+        "ANSI escapes must never enter preview deltas: {lines:?}"
     );
     assert!(
-        lines
-            .last()
-            .is_some_and(|line| line.contains("\u{001b}[33mcareful\u{001b}[0m")),
-        "expected latest preview snapshot to keep color escapes"
+        lines.last().is_some_and(|line| line.contains("careful")),
+        "expected latest preview snapshot to contain plain text"
     );
 }
 

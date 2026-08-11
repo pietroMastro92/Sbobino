@@ -205,12 +205,13 @@ static bool read_manifest(const std::string& path, std::vector<Chunk>& chunks,
                              " has a duplicate, skipped, or non-monotonic index";
             return false;
         }
-        if (chunks.empty()) {
-            if (std::fabs(chunk.commit_start) > kManifestTimestampToleranceSeconds) {
-                failure_reason = "first manifest commit window must start at zero";
-                return false;
-            }
-        } else {
+        // A retry manifest may start at the first uncovered global commit
+        // edge rather than at t=0. The parent has already persisted the
+        // preceding rows, so require contiguity from this row onward instead
+        // of rejecting every resumed attempt. The non-negative bounds above
+        // still prevent malformed offsets; subsequent rows must remain
+        // contiguous and monotonic within the timestamp tolerance.
+        if (!chunks.empty()) {
             const Chunk& previous = chunks.back();
             if (std::fabs(chunk.commit_start - previous.commit_end) >
                     kManifestTimestampToleranceSeconds ||

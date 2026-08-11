@@ -2,7 +2,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex, OnceLock,
 };
 use std::time::Duration;
 
@@ -28,8 +28,9 @@ use crate::{
 };
 use sbobino_domain::TranscriptionEngine;
 use sbobino_infrastructure::{
-    ManagedPyannoteManifest, ManagedRuntimeHealth, ReconcileManagedPyannoteReleaseOutcome,
-    RuntimeTranscriptionFactory, PYANNOTE_MANIFEST_FILENAME,
+    background_process::tokio_background_command, ManagedPyannoteManifest, ManagedRuntimeHealth,
+    ReconcileManagedPyannoteReleaseOutcome, RuntimeTranscriptionFactory,
+    PYANNOTE_MANIFEST_FILENAME,
 };
 
 const REQUIRED_MODELS: [&str; 5] = [
@@ -121,9 +122,47 @@ const MODEL_DOWNLOAD_MAX_ATTEMPTS: usize = 3;
 const MODEL_DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MODEL_DOWNLOAD_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 const MODEL_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
+const RELEASE_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const RELEASE_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+const PYANNOTE_IMPORT_LOAD_TIMEOUT: Duration = Duration::from_secs(90);
 static DOWNLOAD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PROVISIONING_SWAP_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Runtime publication moves the `bin` and `lib` directories independently.
+// Health/recovery commands must not inspect or remove the journal, stage, or
+// backup while that pair is being moved.  The provisioning slot serialises
+// normal app operations; this process-wide lock also covers synchronous
+// readiness calls and the blocking extraction worker.
+static RUNTIME_INSTALL_TRANSACTION_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
 type ProvisioningSlot = Arc<Mutex<Option<CancellationToken>>>;
+
+pub(crate) fn runtime_install_transaction_lock() -> &'static StdMutex<()> {
+    RUNTIME_INSTALL_TRANSACTION_LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn provisioning_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(RELEASE_HTTP_CONNECT_TIMEOUT)
+        .timeout(RELEASE_HTTP_TOTAL_TIMEOUT)
+        .build()
+        .expect("release asset HTTP client configuration is valid")
+}
+
+const PYANNOTE_PYTHON_ENV_VARS_TO_CLEAR: &[&str] = &[
+    "PYTHONPATH",
+    "PYTHONEXECUTABLE",
+    "PYTHONHOME",
+    "PYTHONNOUSERSITE",
+    "PYTHONUSERBASE",
+    "PYTHONSTARTUP",
+    "PYTHONPLATLIBDIR",
+    "PYTHONPYCACHEPREFIX",
+    "PYTHONBREAKPOINT",
+    "__PYVENV_LAUNCHER__",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+];
 
 struct ProvisioningSlotGuard {
     slot: ProvisioningSlot,
@@ -428,10 +467,49 @@ fn persist_pyannote_install_failure(
     reason_code: &str,
     message: &str,
 ) {
-    if !had_ready_install {
-        if let Err(error) = cleanup_pyannote_workdir(runtime_factory) {
-            tracing::warn!("failed to clean up incomplete pyannote install: {error}");
+    if had_ready_install {
+        // A failed repair must never make an already usable installation look
+        // unhealthy.  Keep the last successful status/manifest intact and
+        // record the repair diagnostic separately for Settings to surface.
+        let runtime_dir = runtime_factory.managed_pyannote_runtime_dir();
+        let diagnostic_path = runtime_dir.join("last-install-failure.json");
+        let diagnostic_tmp = provisioning_swap_path(&runtime_dir, "pyannote-failure");
+        let diagnostic = serde_json::json!({
+            "reason_code": reason_code.trim(),
+            "message": message.trim(),
+            "updated_at": Utc::now().to_rfc3339(),
+        });
+        match serde_json::to_vec_pretty(&diagnostic)
+            .map_err(|error| format!("failed to serialize pyannote install diagnostic: {error}"))
+            .and_then(|body| {
+                std::fs::create_dir_all(&runtime_dir).map_err(|error| {
+                    format!(
+                        "failed to create pyannote runtime directory '{}': {error}",
+                        runtime_dir.display()
+                    )
+                })?;
+                std::fs::write(&diagnostic_tmp, body).map_err(|error| {
+                    format!(
+                        "failed to write pyannote install diagnostic '{}': {error}",
+                        diagnostic_tmp.display()
+                    )
+                })?;
+                std::fs::rename(&diagnostic_tmp, &diagnostic_path).map_err(|error| {
+                    let _ = remove_path_if_exists(&diagnostic_tmp);
+                    format!(
+                        "failed to publish pyannote install diagnostic '{}': {error}",
+                        diagnostic_path.display()
+                    )
+                })
+            }) {
+            Ok(()) => {}
+            Err(error) => tracing::warn!("failed to persist pyannote repair diagnostic: {error}"),
         }
+        return;
+    }
+
+    if let Err(error) = cleanup_pyannote_workdir(runtime_factory) {
+        tracing::warn!("failed to clean up incomplete pyannote install: {error}");
     }
     if let Err(error) = runtime_factory.write_managed_pyannote_status(reason_code, message) {
         tracing::warn!("failed to persist pyannote failure status: {error}");
@@ -863,7 +941,7 @@ async fn plan_pyannote_background_action_inner(
     if matches!(trigger, PyannoteBackgroundActionTrigger::PostUpdate)
         && should_attempt_post_update_pyannote_reconcile(manifest_before.as_ref())
     {
-        let client = reqwest::Client::new();
+        let client = provisioning_http_client();
         if let Ok(selection) = fetch_pyannote_asset_selection(&client).await {
             let outcome = runtime_factory
                 .reconcile_managed_pyannote_release_assets(
@@ -1251,6 +1329,7 @@ pub async fn provisioning_install_pyannote(
             state.runtime_factory.clone(),
             cancel_token,
             slot_guard,
+            health.pyannote.ready,
             repair_required,
         );
     } else {
@@ -1409,7 +1488,7 @@ fn spawn_provisioning_download(
             model_base_url,
             model_asset_kind,
         } = batch;
-        let client = reqwest::Client::new();
+        let client = provisioning_http_client();
         let mut current = 0usize;
 
         let mut emit_progress = |asset: String, asset_kind: &str, stage: String| {
@@ -1503,7 +1582,8 @@ fn spawn_provisioning_download(
             let extraction = tokio::task::spawn_blocking({
                 let archive_path = archive_path.clone();
                 let models_dir = models_dir.clone();
-                move || extract_zip_archive(&archive_path, &models_dir)
+                let encoder_dir = encoder_dir.clone();
+                move || install_coreml_encoder_archive(&archive_path, &models_dir, &encoder_dir)
             })
             .await;
 
@@ -1566,11 +1646,172 @@ fn emit_provisioning_status(
     );
 }
 
+fn managed_pyannote_python_executable(
+    runtime_factory: &RuntimeTranscriptionFactory,
+) -> Option<PathBuf> {
+    let python_dir = runtime_factory.managed_pyannote_python_dir();
+    #[cfg(target_os = "windows")]
+    let candidates = [
+        python_dir.join("python.exe"),
+        python_dir.join("python3.exe"),
+        python_dir.join("bin").join("python3"),
+        python_dir.join("bin").join("python"),
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let candidates = [
+        python_dir.join("bin").join("python3"),
+        python_dir.join("bin").join("python"),
+    ];
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn managed_pyannote_python_path_env(python_root: &Path) -> Option<std::ffi::OsString> {
+    #[cfg(target_os = "windows")]
+    let entries = [
+        python_root.join("Lib"),
+        python_root.join("DLLs"),
+        python_root.join("Lib").join("site-packages"),
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let entries = {
+        let version_dir = std::fs::read_dir(python_root.join("lib"))
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.starts_with("python3."))
+            })?;
+        [
+            version_dir.clone(),
+            version_dir.join("lib-dynload"),
+            version_dir.join("site-packages"),
+        ]
+    };
+
+    let entries = entries
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    (!entries.is_empty())
+        .then(|| std::env::join_paths(entries).ok())
+        .flatten()
+}
+
+pub(crate) async fn probe_pyannote_import_and_load(
+    runtime_factory: &RuntimeTranscriptionFactory,
+    cancel_token: &CancellationToken,
+) -> Result<(), String> {
+    if cancel_token.is_cancelled() {
+        return Err("cancelled".to_string());
+    }
+
+    let python_root = runtime_factory.managed_pyannote_python_dir();
+    let python_path = managed_pyannote_python_executable(runtime_factory).ok_or_else(|| {
+        "Pyannote import probe could not find the managed Python executable.".to_string()
+    })?;
+    let model_dir = runtime_factory.managed_pyannote_model_dir();
+    if !model_dir.is_dir() {
+        return Err(format!(
+            "Pyannote import probe could not find the managed model at '{}'.",
+            model_dir.display()
+        ));
+    }
+
+    let probe_script = r#"
+import sys
+from pyannote.audio import Pipeline
+Pipeline.from_pretrained(sys.argv[1])
+print("pyannote-import-load-ok")
+"#;
+    let mut command = tokio_background_command(&python_path);
+    command
+        .arg("-c")
+        .arg(probe_script)
+        .arg(&model_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for key in PYANNOTE_PYTHON_ENV_VARS_TO_CLEAR {
+        command.env_remove(key);
+    }
+    command.env("PYTHONHOME", &python_root);
+    if let Some(path) = managed_pyannote_python_path_env(&python_root) {
+        command.env("PYTHONPATH", path);
+    }
+    let mut path_entries = vec![
+        python_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| python_root.join("bin")),
+        runtime_factory.data_dir().join("bin"),
+    ];
+    if let Some(existing) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&existing));
+    }
+    if let Ok(path) = std::env::join_paths(path_entries) {
+        command.env("PATH", path);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut library_entries = vec![runtime_factory.data_dir().join("lib")];
+        let embedded = python_root.join("lib").join("embedded-dylibs");
+        if embedded.is_dir() {
+            library_entries.push(embedded);
+        }
+        if let Some(existing) = std::env::var_os("DYLD_LIBRARY_PATH") {
+            library_entries.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(path) = std::env::join_paths(library_entries) {
+            command
+                .env("DYLD_LIBRARY_PATH", &path)
+                .env("DYLD_FALLBACK_LIBRARY_PATH", path);
+        }
+    }
+
+    let child = command
+        .spawn()
+        .map_err(|error| format!("failed to start Pyannote import/load probe: {error}"))?;
+    let output = tokio::select! {
+        _ = cancel_token.cancelled() => return Err("cancelled".to_string()),
+        result = tokio::time::timeout(PYANNOTE_IMPORT_LOAD_TIMEOUT, child.wait_with_output()) => {
+            result
+                .map_err(|_| format!("Pyannote import/load probe timed out after {} seconds.", PYANNOTE_IMPORT_LOAD_TIMEOUT.as_secs()))?
+                .map_err(|error| format!("Pyannote import/load probe could not be collected: {error}"))?
+        }
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    let detail = if detail.len() > 600 {
+        format!("{}…", detail.chars().take(600).collect::<String>())
+    } else {
+        detail
+    };
+    Err(if detail.is_empty() {
+        format!(
+            "Pyannote import/load probe exited with status {}.",
+            output.status
+        )
+    } else {
+        format!("Pyannote import/load probe failed: {detail}")
+    })
+}
+
 fn spawn_pyannote_bundled_install(
     app: tauri::AppHandle,
     runtime_factory: std::sync::Arc<RuntimeTranscriptionFactory>,
     cancel_token: CancellationToken,
     slot_guard: ProvisioningSlotGuard,
+    had_ready_install: bool,
     _repair_required: bool,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -1582,8 +1823,38 @@ fn spawn_pyannote_bundled_install(
                 "Pyannote installation cancelled.",
                 Some("cancelled"),
             );
+            persist_pyannote_install_failure(
+                runtime_factory.as_ref(),
+                had_ready_install,
+                "cancelled",
+                "Pyannote installation was cancelled before completion.",
+            );
             return;
         }
+
+        let runtime_dir = runtime_factory.managed_pyannote_runtime_dir();
+        let backup_runtime_dir = if had_ready_install {
+            match prepare_pyannote_runtime_swap(&runtime_dir, true) {
+                Ok(value) => value,
+                Err(error) => {
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_install_incomplete"),
+                    );
+                    persist_pyannote_install_failure(
+                        runtime_factory.as_ref(),
+                        had_ready_install,
+                        "pyannote_install_incomplete",
+                        &error,
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         let install_result = runtime_factory
             .reinstall_managed_pyannote_from_bundled_override()
@@ -1596,7 +1867,18 @@ fn spawn_pyannote_bundled_install(
             });
 
         if let Err(error) = install_result {
+            if let Err(restore_error) =
+                rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
+            {
+                tracing::warn!("failed to rollback bundled pyannote runtime: {restore_error}");
+            }
             emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"));
+            persist_pyannote_install_failure(
+                runtime_factory.as_ref(),
+                had_ready_install,
+                "pyannote_repair_required",
+                &error,
+            );
             return;
         }
 
@@ -1625,6 +1907,30 @@ fn spawn_pyannote_bundled_install(
 
         match runtime_factory.validate_managed_pyannote_runtime() {
             Ok(()) => {
+                if let Err(error) =
+                    probe_pyannote_import_and_load(&runtime_factory, &cancel_token).await
+                {
+                    let reason_code = if error == "cancelled" {
+                        "cancelled"
+                    } else {
+                        "pyannote_import_load_failed"
+                    };
+                    if let Err(restore_error) =
+                        rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
+                    {
+                        tracing::warn!(
+                            "failed to rollback bundled pyannote runtime after probe error: {restore_error}"
+                        );
+                    }
+                    emit_provisioning_status(&app, "error", &error, Some(reason_code));
+                    persist_pyannote_install_failure(
+                        runtime_factory.as_ref(),
+                        had_ready_install,
+                        reason_code,
+                        &error,
+                    );
+                    return;
+                }
                 if let Err(error) = runtime_factory
                     .write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")
                 {
@@ -1634,6 +1940,19 @@ fn spawn_pyannote_bundled_install(
                         &error,
                         Some("pyannote_install_incomplete"),
                     );
+                    if let Err(restore_error) =
+                        rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
+                    {
+                        tracing::warn!(
+                            "failed to rollback bundled pyannote runtime after status error: {restore_error}"
+                        );
+                    }
+                    persist_pyannote_install_failure(
+                        runtime_factory.as_ref(),
+                        had_ready_install,
+                        "pyannote_install_incomplete",
+                        &error,
+                    );
                     return;
                 }
                 emit_provisioning_status(
@@ -1642,9 +1961,27 @@ fn spawn_pyannote_bundled_install(
                     "Pyannote diarization runtime installed successfully.",
                     None,
                 );
+                if let Err(cleanup_error) = cleanup_pyannote_runtime_backup(backup_runtime_dir) {
+                    tracing::warn!(
+                        "failed to clean up bundled pyannote runtime backup: {cleanup_error}"
+                    );
+                }
             }
             Err(error) => {
-                emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"))
+                if let Err(restore_error) =
+                    rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
+                {
+                    tracing::warn!(
+                        "failed to rollback bundled pyannote runtime after validation error: {restore_error}"
+                    );
+                }
+                emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"));
+                persist_pyannote_install_failure(
+                    runtime_factory.as_ref(),
+                    had_ready_install,
+                    "pyannote_repair_required",
+                    &error,
+                )
             }
         }
     });
@@ -1660,7 +1997,7 @@ fn spawn_pyannote_provisioning_download(
 ) {
     tauri::async_runtime::spawn(async move {
         let _slot_guard = slot_guard;
-        let client = reqwest::Client::new();
+        let client = provisioning_http_client();
         let total = 2usize;
         let runtime_dir = runtime_factory.managed_pyannote_runtime_dir();
         let stage_dir = match prepare_pyannote_runtime_stage(&runtime_dir) {
@@ -1973,6 +2310,28 @@ fn spawn_pyannote_provisioning_download(
 
         match runtime_factory.validate_managed_pyannote_runtime() {
             Ok(()) => {
+                if let Err(error) =
+                    probe_pyannote_import_and_load(&runtime_factory, &cancel_token).await
+                {
+                    let reason_code = if error == "cancelled" {
+                        "cancelled"
+                    } else {
+                        "pyannote_import_load_failed"
+                    };
+                    emit_provisioning_status(&app, "error", &error, Some(reason_code));
+                    if let Err(restore_error) =
+                        rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
+                    {
+                        tracing::warn!("failed to rollback pyannote runtime after import/load probe error: {restore_error}");
+                    }
+                    persist_pyannote_install_failure(
+                        runtime_factory.as_ref(),
+                        had_ready_install,
+                        reason_code,
+                        &error,
+                    );
+                    return;
+                }
                 if let Err(error) = runtime_factory
                     .write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")
                 {
@@ -2036,7 +2395,7 @@ fn spawn_runtime_provisioning_download(
 ) {
     tauri::async_runtime::spawn(async move {
         let _slot_guard = slot_guard;
-        let client = reqwest::Client::new();
+        let client = provisioning_http_client();
         let selection = match fetch_runtime_asset_selection(&client).await {
             Ok(value) => value,
             Err(error) => {
@@ -2109,8 +2468,8 @@ fn spawn_runtime_provisioning_download(
 
         let _ = tokio::fs::remove_file(&archive_path).await;
 
-        match extraction {
-            Ok(Ok(())) => {}
+        let transaction = match extraction {
+            Ok(Ok(transaction)) => transaction,
             Ok(Err(error)) => {
                 emit_provisioning_status(&app, "error", &error, Some("runtime_install_incomplete"));
                 return;
@@ -2124,16 +2483,54 @@ fn spawn_runtime_provisioning_download(
                 );
                 return;
             }
-        }
+        };
 
         let managed_runtime = runtime_factory.managed_runtime_health();
         if !managed_runtime.ready {
+            let rollback = transaction.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                rollback_runtime_install_transaction(&rollback)
+            })
+            .await;
             emit_provisioning_status(
                 &app,
                 "error",
                 &format_managed_runtime_install_error(&managed_runtime),
                 Some("runtime_install_incomplete"),
             );
+            return;
+        }
+
+        if let Err(error) = commit_runtime_install_transaction(&transaction) {
+            let message = match error {
+                RuntimeInstallCommitError::BeforeValidationMarker(error) => {
+                    // A failed marker write leaves an unvalidated journal;
+                    // restore the previous runtime before reporting the
+                    // incomplete install.  Do not claim that restoration if
+                    // the rollback itself fails.
+                    let rollback = transaction.clone();
+                    let rollback_result = tokio::task::spawn_blocking(move || {
+                        rollback_runtime_install_transaction(&rollback)
+                    })
+                    .await;
+                    match rollback_result {
+                        Ok(Ok(())) => format!(
+                            "Failed to finalize the local transcription runtime: {error}. Previous runtime restored."
+                        ),
+                        Ok(Err(rollback_error)) => format!(
+                            "Failed to finalize the local transcription runtime: {error}. Automatic rollback failed: {rollback_error}. Repair the runtime from Settings > Local Models."
+                        ),
+                        Err(join_error) => format!(
+                            "Failed to finalize the local transcription runtime: {error}. Automatic rollback task failed: {join_error}. Repair the runtime from Settings > Local Models."
+                        ),
+                    }
+                }
+                RuntimeInstallCommitError::AfterValidationMarker(error) => format!(
+                    "The local transcription runtime was validated, but cleanup is incomplete: {error}. The validated runtime remains active; the install journal is retained for safe cleanup. Repair the runtime from Settings > Local Models."
+                ),
+            };
+            tracing::error!("{message}");
+            emit_provisioning_status(&app, "error", &message, Some("runtime_install_incomplete"));
             return;
         }
 
@@ -2399,12 +2796,51 @@ async fn stage_release_asset(
                 local_root.display()
             ));
         }
-        tokio::fs::copy(&source, destination).await.map_err(|e| {
-            format!(
-                "failed to stage local release asset '{}': {e}",
+
+        if cancel_token.is_cancelled() {
+            return Err("cancelled".to_string());
+        }
+
+        // Keep the same transactional semantics for local test/dev assets as
+        // for hosted downloads.  A process termination during copy must not
+        // turn a partial archive into the next install candidate.
+        let temp_path = download_temp_path(destination);
+        cleanup_download_temp(&temp_path).await?;
+        let copy_result = tokio::fs::copy(&source, &temp_path).await;
+        if let Err(error) = copy_result {
+            let _ = cleanup_download_temp(&temp_path).await;
+            return Err(format!(
+                "failed to stage local release asset '{}': {error}",
                 source.display()
-            )
-        })?;
+            ));
+        }
+        if cancel_token.is_cancelled() {
+            let _ = cleanup_download_temp(&temp_path).await;
+            return Err("cancelled".to_string());
+        }
+        if let Err(error) = tokio::fs::remove_file(destination).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                let _ = cleanup_download_temp(&temp_path).await;
+                return Err(format!(
+                    "failed to replace staged release asset '{}': {error}",
+                    destination.display()
+                ));
+            }
+        }
+        let result = tokio::fs::rename(&temp_path, destination).await;
+        if let Err(error) = result {
+            let cleanup = cleanup_download_temp(&temp_path).await.err();
+            return Err(match cleanup {
+                Some(cleanup_error) => format!(
+                    "failed to finalize local release asset '{}': {error}; {cleanup_error}",
+                    destination.display()
+                ),
+                None => format!(
+                    "failed to finalize local release asset '{}': {error}",
+                    destination.display()
+                ),
+            });
+        }
         Ok(())
     } else {
         let url = release_asset_url(version, asset_name);
@@ -2612,6 +3048,7 @@ fn is_pyannote_repair_reason(reason_code: &str) -> bool {
             | "pyannote_repair_required"
             | "pyannote_install_incomplete"
             | "pyannote_checksum_invalid"
+            | "pyannote_import_load_failed"
     )
 }
 
@@ -2711,12 +3148,323 @@ fn install_pyannote_archive(
     Ok(())
 }
 
+/// Extract a Core ML encoder into a sibling staging directory and publish it
+/// with a directory rename.  The download/extraction path must never write
+/// directly into the model directory: a killed extraction otherwise leaves a
+/// directory that looks installed to the next readiness check.
+fn install_coreml_encoder_archive(
+    archive_path: &Path,
+    models_dir: &Path,
+    encoder_dir_name: &str,
+) -> Result<(), String> {
+    let stage_dir = provisioning_swap_path(models_dir, "encoder-stage");
+    let destination = models_dir.join(encoder_dir_name);
+    let backup_dir = provisioning_swap_path(models_dir, "encoder-backup");
+
+    remove_path_if_exists(&stage_dir)?;
+    remove_path_if_exists(&backup_dir)?;
+    std::fs::create_dir_all(&stage_dir)
+        .map_err(|e| format!("failed to create encoder staging directory: {e}"))?;
+
+    if let Err(error) = extract_zip_archive(archive_path, &stage_dir) {
+        let _ = remove_path_if_exists(&stage_dir);
+        return Err(error);
+    }
+
+    let staged_destination = stage_dir.join(encoder_dir_name);
+    if !staged_destination.is_dir() {
+        let _ = remove_path_if_exists(&stage_dir);
+        return Err(format!(
+            "Encoder archive '{}' does not contain expected '{}' directory.",
+            archive_path.display(),
+            encoder_dir_name
+        ));
+    }
+
+    let had_existing = destination.exists();
+    if had_existing {
+        if let Err(error) = std::fs::rename(&destination, &backup_dir) {
+            let _ = remove_path_if_exists(&stage_dir);
+            return Err(format!(
+                "failed to stage existing encoder '{}' into backup '{}': {error}",
+                destination.display(),
+                backup_dir.display()
+            ));
+        }
+    }
+
+    let promote_result = std::fs::rename(&staged_destination, &destination);
+    if let Err(error) = promote_result {
+        let _ = remove_path_if_exists(&stage_dir);
+        if had_existing {
+            let _ = std::fs::rename(&backup_dir, &destination);
+        }
+        return Err(format!(
+            "failed to promote staged encoder '{}' into '{}': {error}",
+            staged_destination.display(),
+            destination.display()
+        ));
+    }
+
+    if let Err(error) = remove_path_if_exists(&stage_dir) {
+        tracing::warn!(
+            "encoder install committed but staging cleanup failed for '{}': {error}",
+            stage_dir.display()
+        );
+    }
+    if had_existing {
+        if let Err(error) = remove_path_if_exists(&backup_dir) {
+            tracing::warn!(
+                "encoder install committed but backup cleanup failed for '{}': {error}",
+                backup_dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RuntimeInstallJournal {
+    install_root: PathBuf,
+    destination: PathBuf,
+    lib_destination: PathBuf,
+    backup_dir: PathBuf,
+    stage_dir: PathBuf,
+    old_bin_present: bool,
+    old_lib_present: bool,
+    new_bin_attempted: bool,
+    new_lib_attempted: bool,
+    /// Set only after the replacement passed managed-runtime validation.  A
+    /// crash after this marker is written should finish cleanup, not roll
+    /// back an already validated runtime.
+    #[serde(default)]
+    validated: bool,
+}
+
+/// A published runtime whose binaries have not yet passed the managed-runtime
+/// probe.  The backup and journal intentionally stay on disk until the caller
+/// commits this transaction after validation.  If validation fails, rollback
+/// restores the complete previous `bin`/`lib` pair.
+#[derive(Debug, Clone)]
+struct RuntimeInstallTransaction {
+    journal: RuntimeInstallJournal,
+    install_root: PathBuf,
+    backup_dir: PathBuf,
+    stage_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeInstallCommitError {
+    BeforeValidationMarker(String),
+    AfterValidationMarker(String),
+}
+
+impl std::fmt::Display for RuntimeInstallCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeValidationMarker(message) | Self::AfterValidationMarker(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+fn runtime_install_journal_path(install_root: &Path) -> PathBuf {
+    install_root.join(".runtime-install-journal.json")
+}
+
+fn runtime_install_journal_backup_path(install_root: &Path) -> PathBuf {
+    install_root.join(".runtime-install-journal.previous.json")
+}
+
+fn write_runtime_install_journal(journal: &RuntimeInstallJournal) -> Result<(), String> {
+    let path = runtime_install_journal_path(&journal.install_root);
+    let temp_path = provisioning_swap_path(&journal.install_root, "runtime-journal");
+    let body = serde_json::to_vec_pretty(journal)
+        .map_err(|error| format!("failed to serialize runtime install journal: {error}"))?;
+    std::fs::write(&temp_path, body).map_err(|error| {
+        format!(
+            "failed to write runtime install journal '{}': {error}",
+            temp_path.display()
+        )
+    })?;
+    if std::fs::rename(&temp_path, &path).is_ok() {
+        return Ok(());
+    }
+
+    // Windows does not replace an existing file with rename(2).  Keep a
+    // recoverable previous journal while swapping the new one in, and let
+    // recovery consume the fallback if the process is terminated mid-swap.
+    let previous_path = runtime_install_journal_backup_path(&journal.install_root);
+    remove_path_if_exists(&previous_path)?;
+    if let Err(error) = std::fs::rename(&path, &previous_path) {
+        let _ = remove_path_if_exists(&temp_path);
+        return Err(format!(
+            "failed to publish runtime install journal '{}': {error}",
+            path.display()
+        ));
+    }
+    if let Err(error) = std::fs::rename(&temp_path, &path) {
+        let _ = std::fs::rename(&previous_path, &path);
+        let _ = remove_path_if_exists(&temp_path);
+        return Err(format!(
+            "failed to publish runtime install journal '{}': {error}",
+            path.display()
+        ));
+    }
+    remove_path_if_exists(&previous_path).map_err(|error| {
+        format!(
+            "failed to remove previous runtime install journal '{}': {error}",
+            previous_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn clear_runtime_install_journal(install_root: &Path) -> Result<(), String> {
+    clear_runtime_install_journal_with(install_root, &remove_path_if_exists)
+}
+
+fn read_runtime_install_journal(install_root: &Path) -> Result<RuntimeInstallJournal, String> {
+    let path = runtime_install_journal_path(install_root);
+    let body = std::fs::read(&path).map_err(|error| {
+        format!(
+            "failed to read runtime install journal '{}': {error}",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&body).map_err(|error| {
+        format!(
+            "failed to parse runtime install journal '{}': {error}",
+            path.display()
+        )
+    })
+}
+
+fn clear_runtime_install_journal_with<F>(install_root: &Path, remove: &F) -> Result<(), String>
+where
+    F: Fn(&Path) -> Result<(), String>,
+{
+    // Remove the fallback first.  If this fails, the validated primary stays
+    // authoritative; deleting it first could expose a stale unvalidated
+    // fallback on the next recovery pass.
+    remove(&runtime_install_journal_backup_path(install_root))?;
+    remove(&runtime_install_journal_path(install_root))
+}
+
+/// Recover a runtime publish interrupted between the two component renames.
+/// The journal is written before any existing component is moved, so a crash
+/// can never silently discard the previous runtime.  If both new components
+/// are present we finish the commit; otherwise every backed-up component is
+/// restored and untouched components are left in place.
+pub(crate) fn recover_interrupted_runtime_install(data_dir: &Path) -> Result<(), String> {
+    let _transaction_guard = runtime_install_transaction_lock()
+        .lock()
+        .map_err(|_| "runtime install transaction lock is poisoned".to_string())?;
+    recover_interrupted_runtime_install_locked(data_dir)
+}
+
+fn recover_interrupted_runtime_install_locked(data_dir: &Path) -> Result<(), String> {
+    let primary_journal_path = runtime_install_journal_path(data_dir);
+    let journal_path = if primary_journal_path.is_file() {
+        primary_journal_path
+    } else {
+        let fallback_path = runtime_install_journal_backup_path(data_dir);
+        if !fallback_path.is_file() {
+            return Ok(());
+        }
+        fallback_path
+    };
+
+    if !journal_path.is_file() {
+        return Ok(());
+    }
+
+    let body = std::fs::read(&journal_path).map_err(|error| {
+        format!(
+            "failed to read runtime install journal '{}': {error}",
+            journal_path.display()
+        )
+    })?;
+    let journal: RuntimeInstallJournal = serde_json::from_slice(&body).map_err(|error| {
+        format!(
+            "failed to parse runtime install journal '{}': {error}",
+            journal_path.display()
+        )
+    })?;
+    if journal.install_root != data_dir {
+        return Err(format!(
+            "runtime install journal points to unexpected root '{}', expected '{}'; refusing recovery",
+            journal.install_root.display(),
+            data_dir.display()
+        ));
+    }
+
+    if journal.validated {
+        // Validation completed and the process stopped during cleanup.  Do
+        // not roll back a known-good replacement; simply finish deleting the
+        // transaction artifacts.
+        remove_path_if_exists(&journal.stage_dir)?;
+        remove_path_if_exists(&journal.backup_dir)?;
+        return clear_runtime_install_journal(data_dir);
+    }
+
+    // A journal is deliberately kept until the replacement has passed a real
+    // managed-runtime probe.  Therefore an unvalidated journal found during
+    // startup or readiness recovery always represents a failed/incomplete
+    // transaction, even when both replacement directories happen to exist.
+    let backup_bin = journal.backup_dir.join("bin");
+    let backup_lib = journal.backup_dir.join("lib");
+
+    if backup_bin.exists() {
+        remove_path_if_exists(&journal.destination)?;
+        std::fs::rename(&backup_bin, &journal.destination).map_err(|error| {
+            format!(
+                "failed to restore runtime binaries from '{}': {error}",
+                backup_bin.display()
+            )
+        })?;
+    } else if journal.new_bin_attempted && !journal.old_bin_present {
+        remove_path_if_exists(&journal.destination)?;
+    }
+
+    if backup_lib.exists() {
+        remove_path_if_exists(&journal.lib_destination)?;
+        std::fs::rename(&backup_lib, &journal.lib_destination).map_err(|error| {
+            format!(
+                "failed to restore runtime libraries from '{}': {error}",
+                backup_lib.display()
+            )
+        })?;
+    } else if journal.new_lib_attempted && !journal.old_lib_present {
+        remove_path_if_exists(&journal.lib_destination)?;
+    }
+
+    remove_path_if_exists(&journal.stage_dir)?;
+    remove_path_if_exists(&journal.backup_dir)?;
+    clear_runtime_install_journal(data_dir)
+}
+
 fn install_runtime_archive(
     archive_path: &Path,
     runtime_dir: &Path,
     destination: &Path,
-) -> Result<(), String> {
-    let stage_dir = runtime_dir.join(".stage-runtime");
+) -> Result<RuntimeInstallTransaction, String> {
+    let install_root = destination.parent().ok_or_else(|| {
+        format!(
+            "failed to determine runtime install root from '{}'.",
+            destination.display()
+        )
+    })?;
+    let _transaction_guard = runtime_install_transaction_lock()
+        .lock()
+        .map_err(|_| "runtime install transaction lock is poisoned".to_string())?;
+    recover_interrupted_runtime_install_locked(install_root)?;
+
+    let stage_dir = runtime_dir.join(format!(
+        ".stage-runtime-{}",
+        PROVISIONING_SWAP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     remove_path_if_exists(&stage_dir)?;
     std::fs::create_dir_all(&stage_dir)
         .map_err(|e| format!("failed to create runtime staging directory: {e}"))?;
@@ -2745,26 +3493,174 @@ fn install_runtime_archive(
         ));
     }
 
-    let install_root = destination.parent().ok_or_else(|| {
-        format!(
-            "failed to determine runtime install root from '{}'.",
-            destination.display()
-        )
-    })?;
     let lib_destination = install_root.join("lib");
 
-    remove_path_if_exists(destination)?;
-    remove_path_if_exists(&lib_destination)?;
     std::fs::create_dir_all(install_root)
         .map_err(|e| format!("failed to create runtime install root: {e}"))?;
 
-    std::fs::rename(&staged_bin, destination)
-        .map_err(|e| format!("failed to move staged runtime binaries into place: {e}"))?;
-    std::fs::rename(&staged_lib, &lib_destination)
-        .map_err(|e| format!("failed to move staged runtime libraries into place: {e}"))?;
+    // Keep both components of the managed runtime together.  Renaming bin and
+    // lib independently without a backup can leave a mixed-version runtime if
+    // the second rename fails (or if the process is terminated between them).
+    let backup_dir = provisioning_swap_path(install_root, "runtime-backup");
+    remove_path_if_exists(&backup_dir)?;
+    std::fs::create_dir_all(&backup_dir)
+        .map_err(|e| format!("failed to create runtime backup directory: {e}"))?;
+    let existing_bin = destination.exists();
+    let existing_lib = lib_destination.exists();
 
-    remove_path_if_exists(&stage_dir)?;
-    Ok(())
+    // The two component renames below are intentionally journaled.  A
+    // process termination between them is recovered on the next health or
+    // install operation, restoring the previous pair unless both new
+    // components were committed.  The journal is written only after the
+    // complete archive has been staged, so the previous runtime remains
+    // usable until publication starts.
+    let mut journal = RuntimeInstallJournal {
+        install_root: install_root.to_path_buf(),
+        destination: destination.to_path_buf(),
+        lib_destination: lib_destination.clone(),
+        backup_dir: backup_dir.clone(),
+        stage_dir: stage_dir.clone(),
+        old_bin_present: existing_bin,
+        old_lib_present: existing_lib,
+        new_bin_attempted: false,
+        new_lib_attempted: false,
+        validated: false,
+    };
+    if let Err(error) = write_runtime_install_journal(&journal) {
+        let _ = remove_path_if_exists(&stage_dir);
+        let _ = remove_path_if_exists(&backup_dir);
+        return Err(error);
+    }
+
+    if existing_bin {
+        if let Err(error) = std::fs::rename(destination, backup_dir.join("bin")) {
+            let _ = remove_path_if_exists(&stage_dir);
+            let _ = remove_path_if_exists(&backup_dir);
+            let _ = clear_runtime_install_journal(install_root);
+            return Err(format!(
+                "failed to stage existing runtime binaries into backup '{}': {error}",
+                backup_dir.display()
+            ));
+        }
+    }
+    if existing_lib {
+        if let Err(error) = std::fs::rename(&lib_destination, backup_dir.join("lib")) {
+            // The failed rename leaves the existing library in place.  Never
+            // remove it while rolling back the binary move; recovery restores
+            // only the component that was actually moved.
+            if let Err(recovery_error) = recover_interrupted_runtime_install_locked(install_root) {
+                tracing::warn!(
+                    "failed to recover runtime after library backup failure: {recovery_error}"
+                );
+            }
+            return Err(format!(
+                "failed to stage existing runtime libraries into backup '{}': {error}",
+                backup_dir.display()
+            ));
+        }
+    }
+
+    journal.new_bin_attempted = true;
+    if let Err(error) = write_runtime_install_journal(&journal) {
+        let _ = recover_interrupted_runtime_install_locked(install_root);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&staged_bin, destination) {
+        let _ = recover_interrupted_runtime_install_locked(install_root);
+        return Err(format!(
+            "failed to promote staged runtime into '{}': {error}; previous runtime restored",
+            install_root.display()
+        ));
+    }
+
+    journal.new_lib_attempted = true;
+    if let Err(error) = write_runtime_install_journal(&journal) {
+        let _ = recover_interrupted_runtime_install_locked(install_root);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&staged_lib, &lib_destination) {
+        let _ = recover_interrupted_runtime_install_locked(install_root);
+        return Err(format!(
+            "failed to promote staged runtime into '{}': {error}; previous runtime restored",
+            install_root.display()
+        ));
+    }
+
+    // Keep the journal and old runtime backup until the caller validates the
+    // newly published binaries.  This is what lets a checksum-valid but
+    // unrunnable archive roll back to the previous working runtime.
+    Ok(RuntimeInstallTransaction {
+        journal,
+        install_root: install_root.to_path_buf(),
+        backup_dir,
+        stage_dir,
+    })
+}
+
+fn commit_runtime_install_transaction(
+    transaction: &RuntimeInstallTransaction,
+) -> Result<(), RuntimeInstallCommitError> {
+    commit_runtime_install_transaction_with_cleanup(transaction, remove_path_if_exists)
+}
+
+fn commit_runtime_install_transaction_with_cleanup<F>(
+    transaction: &RuntimeInstallTransaction,
+    remove: F,
+) -> Result<(), RuntimeInstallCommitError>
+where
+    F: Fn(&Path) -> Result<(), String>,
+{
+    let _transaction_guard = runtime_install_transaction_lock().lock().map_err(|_| {
+        RuntimeInstallCommitError::BeforeValidationMarker(
+            "runtime install transaction lock is poisoned".to_string(),
+        )
+    })?;
+    // Publish the validation marker before deleting the backup.  If cleanup
+    // is interrupted, startup recovery can then finish cleanup without
+    // mistaking a validated runtime for an incomplete replacement.
+    let mut journal = transaction.journal.clone();
+    journal.validated = true;
+    if let Err(error) = write_runtime_install_journal(&journal) {
+        // Journal publication can fail after the new primary has already been
+        // installed (for example when removing the Windows fallback fails).
+        // Inspect the durable primary before deciding whether rollback is
+        // safe; a validated primary means the replacement must be retained
+        // and cleanup retried rather than restoring an older runtime.
+        let marker_published = read_runtime_install_journal(&journal.install_root)
+            .map(|value| value.validated)
+            .unwrap_or(false);
+        return Err(if marker_published {
+            RuntimeInstallCommitError::AfterValidationMarker(error)
+        } else {
+            RuntimeInstallCommitError::BeforeValidationMarker(error)
+        });
+    }
+    remove(&transaction.stage_dir).map_err(|error| {
+        RuntimeInstallCommitError::AfterValidationMarker(format!(
+            "runtime validation completed, but staging cleanup failed for '{}': {error}",
+            transaction.stage_dir.display()
+        ))
+    })?;
+    remove(&transaction.backup_dir).map_err(|error| {
+        RuntimeInstallCommitError::AfterValidationMarker(format!(
+            "runtime validation completed, but backup cleanup failed for '{}': {error}",
+            transaction.backup_dir.display()
+        ))
+    })?;
+    clear_runtime_install_journal_with(&transaction.install_root, &remove).map_err(|error| {
+        RuntimeInstallCommitError::AfterValidationMarker(format!(
+            "runtime validation completed, but install journal cleanup failed: {error}"
+        ))
+    })
+}
+
+fn rollback_runtime_install_transaction(
+    transaction: &RuntimeInstallTransaction,
+) -> Result<(), String> {
+    let _transaction_guard = runtime_install_transaction_lock()
+        .lock()
+        .map_err(|_| "runtime install transaction lock is poisoned".to_string())?;
+    recover_interrupted_runtime_install_locked(&transaction.install_root)
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<(), String> {
@@ -2804,6 +3700,11 @@ fn download_temp_path(destination: &Path) -> PathBuf {
         ".{filename}.part-{}-{sequence}",
         std::process::id()
     ))
+}
+
+fn provisioning_swap_path(parent: &Path, prefix: &str) -> PathBuf {
+    let sequence = PROVISIONING_SWAP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{prefix}-{}-{sequence}", std::process::id()))
 }
 
 fn response_looks_like_html(prefix: &[u8]) -> bool {
@@ -3124,12 +4025,18 @@ fn extract_zip_archive_with_zip_crate(
 #[cfg(test)]
 mod tests {
     use super::{
+        commit_runtime_install_transaction, commit_runtime_install_transaction_with_cleanup,
         estimate_pyannote_required_free_bytes, install_pyannote_archive, install_runtime_archive,
-        plan_pyannote_background_action_inner, prepare_pyannote_runtime_stage,
-        prepare_pyannote_runtime_swap, promote_staged_pyannote_runtime, pyannote_reconcile_action,
-        rollback_pyannote_runtime_swap, sha256_file_hex, transcription_runtime_install_complete,
-        validate_arch_descriptors, validate_manifest_asset_descriptor, validate_setup_manifest,
-        verify_file_sha256, PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
+        persist_pyannote_install_failure, plan_pyannote_background_action_inner,
+        prepare_pyannote_runtime_stage, prepare_pyannote_runtime_swap,
+        probe_pyannote_import_and_load, promote_staged_pyannote_runtime, pyannote_reconcile_action,
+        recover_interrupted_runtime_install, remove_path_if_exists, rollback_pyannote_runtime_swap,
+        rollback_runtime_install_transaction, runtime_install_journal_backup_path,
+        runtime_install_journal_path, runtime_install_transaction_lock, sha256_file_hex,
+        transcription_runtime_install_complete, validate_arch_descriptors,
+        validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
+        write_runtime_install_journal, PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
+        RuntimeInstallCommitError, RuntimeInstallJournal, RuntimeInstallTransaction,
     };
     use crate::release_assets::{
         PyannoteReleaseAsset, PyannoteReleaseManifest, ReleaseAssetDescriptor, RuntimeReleaseAsset,
@@ -3787,6 +4694,26 @@ mod tests {
         assert!(installed.is_file());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pyannote_import_load_probe_is_bounded_and_reports_failure() {
+        let (_temp, factory) = build_runtime_factory();
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\necho 'synthetic pyannote import failure' >&2\nexit 1\n",
+        );
+        std::fs::create_dir_all(factory.managed_pyannote_model_dir())
+            .expect("model directory should exist");
+
+        let error = probe_pyannote_import_and_load(&factory, &CancellationToken::new())
+            .await
+            .expect_err("failed Python import should be surfaced");
+        assert!(error.contains("synthetic pyannote import failure"));
+    }
+
     #[test]
     fn install_runtime_archive_extracts_expected_layout_and_permissions() {
         let temp = tempdir().expect("failed to create tempdir");
@@ -3815,13 +4742,17 @@ mod tests {
         zip.finish().expect("zip should finish");
 
         let destination = runtime_dir.join("bin");
-        install_runtime_archive(&archive_path, &runtime_dir, &destination)
+        let transaction = install_runtime_archive(&archive_path, &runtime_dir, &destination)
             .expect("runtime should install");
 
         let installed_binary = destination.join("whisper-cli");
         let installed_library = runtime_dir.join("lib").join("libwhisper.dylib");
         assert!(installed_binary.is_file());
         assert!(installed_library.is_file());
+
+        commit_runtime_install_transaction(&transaction)
+            .expect("validated runtime transaction should commit");
+        assert!(!runtime_dir.join(".runtime-install-journal.json").exists());
 
         #[cfg(unix)]
         {
@@ -3832,6 +4763,543 @@ mod tests {
                 .mode();
             assert_ne!(mode & 0o111, 0, "installed binary should remain executable");
         }
+    }
+
+    #[test]
+    fn checksum_valid_but_unrunnable_runtime_rolls_back_until_validation() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let install_root = temp.path().join("app-data");
+        let runtime_dir = install_root.join("runtime");
+        let destination = install_root.join("bin");
+        let lib_destination = install_root.join("lib");
+        std::fs::create_dir_all(&destination).expect("old binary directory should exist");
+        std::fs::write(destination.join("whisper-cli"), b"old-working-runtime")
+            .expect("old binary should write");
+        std::fs::create_dir_all(&lib_destination).expect("old library directory should exist");
+        std::fs::write(
+            lib_destination.join("libwhisper.dylib"),
+            b"old-working-library",
+        )
+        .expect("old library should write");
+
+        let archive_path = temp.path().join("replacement.zip");
+        let file = std::fs::File::create(&archive_path).expect("archive should create");
+        let mut zip = zip::ZipWriter::new(file);
+        let options: zip::write::SimpleFileOptions =
+            zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+        for directory in ["runtime/", "runtime/bin/", "runtime/lib/"] {
+            zip.add_directory(directory, options)
+                .expect("directory should add");
+        }
+        zip.start_file("runtime/bin/whisper-cli", options)
+            .expect("replacement binary should start");
+        zip.write_all(b"this is not a runnable executable")
+            .expect("replacement binary should write");
+        zip.start_file("runtime/lib/libwhisper.dylib", options)
+            .expect("replacement library should start");
+        zip.write_all(b"replacement-library")
+            .expect("replacement library should write");
+        zip.finish().expect("archive should finish");
+
+        let transaction = install_runtime_archive(&archive_path, &runtime_dir, &destination)
+            .expect("checksum-valid archive should publish transactionally");
+        assert!(install_root.join(".runtime-install-journal.json").is_file());
+        assert!(transaction.backup_dir.join("bin/whisper-cli").is_file());
+        assert_eq!(
+            std::fs::read(destination.join("whisper-cli")).expect("replacement should exist"),
+            b"this is not a runnable executable"
+        );
+
+        rollback_runtime_install_transaction(&transaction)
+            .expect("failed validation should restore the previous runtime");
+        assert_eq!(
+            std::fs::read(destination.join("whisper-cli")).expect("old binary should restore"),
+            b"old-working-runtime"
+        );
+        assert_eq!(
+            std::fs::read(lib_destination.join("libwhisper.dylib"))
+                .expect("old library should restore"),
+            b"old-working-library"
+        );
+        assert!(!install_root.join(".runtime-install-journal.json").exists());
+        assert!(!transaction.backup_dir.exists());
+    }
+
+    fn runtime_commit_cleanup_fixture() -> (tempfile::TempDir, RuntimeInstallTransaction) {
+        let temp = tempdir().expect("commit fixture tempdir should exist");
+        let install_root = temp.path().join("app-data");
+        let destination = install_root.join("bin");
+        let lib_destination = install_root.join("lib");
+        let backup_dir = install_root.join(".runtime-backup-cleanup");
+        let stage_dir = install_root.join("runtime").join(".stage-cleanup");
+        std::fs::create_dir_all(&destination).expect("new binary directory should exist");
+        std::fs::write(destination.join("whisper-cli"), b"new-runtime")
+            .expect("new binary should write");
+        std::fs::create_dir_all(&lib_destination).expect("new library directory should exist");
+        std::fs::write(lib_destination.join("libwhisper.dylib"), b"new-library")
+            .expect("new library should write");
+        std::fs::create_dir_all(backup_dir.join("bin")).expect("backup bin should exist");
+        std::fs::write(backup_dir.join("bin/whisper-cli"), b"old-runtime")
+            .expect("old binary should write");
+        std::fs::create_dir_all(backup_dir.join("lib")).expect("backup lib should exist");
+        std::fs::write(backup_dir.join("lib/libwhisper.dylib"), b"old-library")
+            .expect("old library should write");
+        std::fs::create_dir_all(&stage_dir).expect("stage should exist");
+
+        let journal = RuntimeInstallJournal {
+            install_root: install_root.clone(),
+            destination,
+            lib_destination,
+            backup_dir: backup_dir.clone(),
+            stage_dir: stage_dir.clone(),
+            old_bin_present: true,
+            old_lib_present: true,
+            new_bin_attempted: true,
+            new_lib_attempted: true,
+            validated: false,
+        };
+        write_runtime_install_journal(&journal).expect("unvalidated journal should write");
+
+        let transaction = RuntimeInstallTransaction {
+            journal,
+            install_root,
+            backup_dir,
+            stage_dir,
+        };
+        (temp, transaction)
+    }
+
+    #[test]
+    fn runtime_commit_marker_failure_rolls_back_without_success_state() {
+        let temp = tempdir().expect("recovery tempdir should exist");
+        let install_root = temp.path().join("app-data");
+        let destination = install_root.join("bin");
+        let lib_destination = install_root.join("lib");
+        let backup_dir = install_root.join(".runtime-backup-commit-failure");
+        let stage_dir = install_root.join("runtime").join(".stage-commit-failure");
+        std::fs::create_dir_all(&destination).expect("new binary directory should exist");
+        std::fs::write(destination.join("whisper-cli"), b"new-runtime")
+            .expect("new binary should write");
+        std::fs::create_dir_all(&lib_destination).expect("new library directory should exist");
+        std::fs::write(lib_destination.join("libwhisper.dylib"), b"new-library")
+            .expect("new library should write");
+        std::fs::create_dir_all(backup_dir.join("bin")).expect("backup bin should exist");
+        std::fs::write(backup_dir.join("bin/whisper-cli"), b"old-runtime")
+            .expect("old binary should write");
+        std::fs::create_dir_all(backup_dir.join("lib")).expect("backup lib should exist");
+        std::fs::write(backup_dir.join("lib/libwhisper.dylib"), b"old-library")
+            .expect("old library should write");
+        std::fs::create_dir_all(&stage_dir).expect("stage should exist");
+
+        let journal = RuntimeInstallJournal {
+            install_root: install_root.clone(),
+            destination: destination.clone(),
+            lib_destination: lib_destination.clone(),
+            backup_dir: backup_dir.clone(),
+            stage_dir: stage_dir.clone(),
+            old_bin_present: true,
+            old_lib_present: true,
+            new_bin_attempted: true,
+            new_lib_attempted: true,
+            validated: false,
+        };
+        write_runtime_install_journal(&journal).expect("unvalidated journal should write");
+
+        // Point the commit's journal copy at a non-existent parent to inject
+        // the validation-marker publication failure while retaining the real
+        // transaction root used by rollback/recovery.
+        let mut failed_commit_journal = journal.clone();
+        failed_commit_journal.install_root = temp.path().join("missing-parent").join("runtime");
+        let transaction = RuntimeInstallTransaction {
+            journal: failed_commit_journal,
+            install_root: install_root.clone(),
+            backup_dir: backup_dir.clone(),
+            stage_dir: stage_dir.clone(),
+        };
+        let commit_error = commit_runtime_install_transaction(&transaction)
+            .expect_err("validation marker publication should fail");
+        assert!(matches!(
+            commit_error,
+            RuntimeInstallCommitError::BeforeValidationMarker(ref message)
+                if message.contains("failed to write runtime install journal")
+        ));
+
+        // This is the same durable failure policy used by the provisioning
+        // command: never emit installed/completed after commit failure; first
+        // restore the previous runtime from the unvalidated journal.
+        rollback_runtime_install_transaction(&transaction)
+            .expect("commit failure should roll back the previous runtime");
+        assert_eq!(
+            std::fs::read(destination.join("whisper-cli")).expect("old binary should restore"),
+            b"old-runtime"
+        );
+        assert_eq!(
+            std::fs::read(lib_destination.join("libwhisper.dylib"))
+                .expect("old library should restore"),
+            b"old-library"
+        );
+        assert!(!runtime_install_journal_path(&install_root).exists());
+        assert!(!backup_dir.exists());
+        assert!(!stage_dir.exists());
+    }
+
+    #[test]
+    fn runtime_commit_post_marker_cleanup_failures_are_incomplete_and_recoverable() {
+        for (label, fail_stage, fail_backup, fail_journal, fail_fallback) in [
+            ("stage", true, false, false, false),
+            ("backup", false, true, false, false),
+            ("journal", false, false, true, false),
+            ("journal-fallback", false, false, false, true),
+        ] {
+            let (_temp, transaction) = runtime_commit_cleanup_fixture();
+            let stage_target = transaction.stage_dir.clone();
+            let backup_target = transaction.backup_dir.clone();
+            let journal_target = runtime_install_journal_path(&transaction.install_root);
+            let fallback_target = runtime_install_journal_backup_path(&transaction.install_root);
+            let install_root = transaction.install_root.clone();
+            let destination = transaction.journal.destination.clone();
+            if fail_fallback {
+                std::fs::write(
+                    &fallback_target,
+                    serde_json::to_vec_pretty(&transaction.journal)
+                        .expect("stale fallback journal should serialize"),
+                )
+                .expect("stale fallback journal should write");
+            }
+            let target = if fail_stage {
+                stage_target.clone()
+            } else if fail_backup {
+                backup_target.clone()
+            } else if fail_journal {
+                journal_target.clone()
+            } else if fail_fallback {
+                fallback_target.clone()
+            } else {
+                unreachable!("fixture must inject one cleanup failure");
+            };
+            let target_for_cleanup = target.clone();
+            let error =
+                commit_runtime_install_transaction_with_cleanup(&transaction, move |path| {
+                    if path == target_for_cleanup {
+                        return Err(format!("injected {label} cleanup failure"));
+                    }
+                    remove_path_if_exists(path)
+                })
+                .expect_err("post-marker cleanup failure must not report success");
+            assert!(matches!(
+                error,
+                RuntimeInstallCommitError::AfterValidationMarker(ref message)
+                    if message.contains("runtime validation completed")
+            ));
+
+            let journal_body = std::fs::read(runtime_install_journal_path(&install_root))
+                .expect("validated journal should remain for safe cleanup");
+            let journal: RuntimeInstallJournal =
+                serde_json::from_slice(&journal_body).expect("validated journal should parse");
+            assert!(
+                journal.validated,
+                "{label} cleanup failure must retain validation marker"
+            );
+            assert_eq!(
+                std::fs::read(destination.join("whisper-cli"))
+                    .expect("validated runtime should remain active"),
+                b"new-runtime"
+            );
+            if fail_stage {
+                assert!(
+                    stage_target.exists(),
+                    "failed stage cleanup must retain stage"
+                );
+                assert!(
+                    backup_target.exists(),
+                    "failed stage cleanup must retain backup"
+                );
+            } else if fail_backup {
+                assert!(
+                    !stage_target.exists(),
+                    "stage cleanup should precede backup failure"
+                );
+                assert!(
+                    backup_target.exists(),
+                    "failed backup cleanup must retain backup"
+                );
+            } else {
+                assert!(
+                    !stage_target.exists(),
+                    "stage should be cleaned before journal failure"
+                );
+                assert!(
+                    !backup_target.exists(),
+                    "backup should be cleaned before journal failure"
+                );
+            }
+            if fail_fallback {
+                assert!(
+                    journal_target.exists(),
+                    "fallback cleanup failure must retain validated primary journal"
+                );
+                assert!(
+                    fallback_target.exists(),
+                    "fallback cleanup failure must retain stale fallback for recovery"
+                );
+            }
+
+            // A later health/recovery pass can safely finish cleanup without
+            // rolling back the already validated replacement.
+            recover_interrupted_runtime_install(&install_root)
+                .expect("validated cleanup should recover after the injected failure");
+            assert!(!runtime_install_journal_path(&install_root).exists());
+            assert!(!stage_target.exists());
+            assert!(!backup_target.exists());
+            assert_eq!(
+                std::fs::read(destination.join("whisper-cli"))
+                    .expect("validated runtime should remain after recovery"),
+                b"new-runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_waits_for_active_runtime_publish_before_touching_transaction_files() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let install_root = temp.path().join("app-data");
+        let destination = install_root.join("bin");
+        let lib_destination = install_root.join("lib");
+        let backup_dir = install_root.join(".runtime-backup-active");
+        let stage_dir = install_root.join("runtime").join(".stage-runtime-active");
+        std::fs::create_dir_all(&destination).expect("replacement binary directory should exist");
+        std::fs::write(destination.join("tool"), b"replacement")
+            .expect("replacement binary should write");
+        std::fs::create_dir_all(&lib_destination)
+            .expect("replacement library directory should exist");
+        std::fs::write(lib_destination.join("libtool"), b"replacement")
+            .expect("replacement library should write");
+        std::fs::create_dir_all(backup_dir.join("bin")).expect("backup bin should exist");
+        std::fs::write(backup_dir.join("bin/tool"), b"previous")
+            .expect("previous binary should write");
+        std::fs::create_dir_all(backup_dir.join("lib")).expect("backup lib should exist");
+        std::fs::write(backup_dir.join("lib/libtool"), b"previous")
+            .expect("previous library should write");
+        std::fs::create_dir_all(&stage_dir).expect("stage should exist");
+        write_runtime_install_journal(&RuntimeInstallJournal {
+            install_root: install_root.clone(),
+            destination: destination.clone(),
+            lib_destination: lib_destination.clone(),
+            backup_dir: backup_dir.clone(),
+            stage_dir: stage_dir.clone(),
+            old_bin_present: true,
+            old_lib_present: true,
+            new_bin_attempted: true,
+            new_lib_attempted: true,
+            validated: false,
+        })
+        .expect("active journal should write");
+
+        let transaction_guard = runtime_install_transaction_lock()
+            .lock()
+            .expect("transaction lock should be available");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let recovery_root = install_root.clone();
+        let recovery_thread = std::thread::spawn(move || {
+            started_tx.send(()).expect("recovery thread should start");
+            recover_interrupted_runtime_install(&recovery_root)
+                .expect("recovery should complete after publish releases lock");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recovery thread should start");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            runtime_install_journal_path(&install_root).is_file(),
+            "active transaction journal must not be removed while publish holds lock"
+        );
+        assert!(stage_dir.exists(), "active stage must remain untouched");
+        assert!(backup_dir.exists(), "active backup must remain untouched");
+        drop(transaction_guard);
+        recovery_thread.join().expect("recovery thread should join");
+        assert_eq!(
+            std::fs::read(destination.join("tool")).expect("previous binary should restore"),
+            b"previous"
+        );
+        assert!(!runtime_install_journal_path(&install_root).exists());
+    }
+
+    #[test]
+    fn recovery_finishes_cleanup_after_validation_marker_without_rollback() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let install_root = temp.path().join("app-data");
+        let destination = install_root.join("bin");
+        let lib_destination = install_root.join("lib");
+        let backup_dir = install_root.join(".runtime-backup-validated");
+        let stage_dir = install_root
+            .join("runtime")
+            .join(".stage-runtime-validated");
+        std::fs::create_dir_all(&destination).expect("new binary directory should exist");
+        std::fs::write(destination.join("tool"), b"validated-new")
+            .expect("new binary should write");
+        std::fs::create_dir_all(&lib_destination).expect("new library directory should exist");
+        std::fs::write(lib_destination.join("libtool"), b"validated-new")
+            .expect("new library should write");
+        std::fs::create_dir_all(backup_dir.join("bin")).expect("backup bin should exist");
+        std::fs::write(backup_dir.join("bin/tool"), b"old").expect("old binary should write");
+        std::fs::create_dir_all(backup_dir.join("lib")).expect("backup lib should exist");
+        std::fs::write(backup_dir.join("lib/libtool"), b"old").expect("old library should write");
+        std::fs::create_dir_all(&stage_dir).expect("stage should exist");
+        write_runtime_install_journal(&RuntimeInstallJournal {
+            install_root: install_root.clone(),
+            destination: destination.clone(),
+            lib_destination: lib_destination.clone(),
+            backup_dir: backup_dir.clone(),
+            stage_dir: stage_dir.clone(),
+            old_bin_present: true,
+            old_lib_present: true,
+            new_bin_attempted: true,
+            new_lib_attempted: true,
+            validated: true,
+        })
+        .expect("validated journal should write");
+
+        recover_interrupted_runtime_install(&install_root)
+            .expect("validated transaction cleanup should succeed");
+        assert_eq!(
+            std::fs::read(destination.join("tool")).expect("validated binary should remain"),
+            b"validated-new"
+        );
+        assert!(!backup_dir.exists());
+        assert!(!runtime_install_journal_path(&install_root).exists());
+    }
+
+    #[test]
+    fn runtime_recovery_fault_injection_preserves_library_when_backup_fails() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let install_root = temp.path().join("app-data");
+        let destination = install_root.join("bin");
+        let lib_destination = install_root.join("lib");
+        let backup_dir = install_root.join(".runtime-backup-fault");
+        let stage_dir = install_root.join("runtime").join(".stage-runtime-fault");
+
+        std::fs::create_dir_all(&destination).expect("old binary directory should exist");
+        std::fs::write(destination.join("tool"), b"old-bin").expect("old binary should write");
+        std::fs::create_dir_all(&lib_destination).expect("old library directory should exist");
+        std::fs::write(lib_destination.join("libtool"), b"old-lib")
+            .expect("old library should write");
+        std::fs::create_dir_all(&backup_dir).expect("backup directory should exist");
+        std::fs::rename(&destination, backup_dir.join("bin"))
+            .expect("fault should occur after binary backup");
+        std::fs::create_dir_all(&stage_dir).expect("stage directory should exist");
+
+        write_runtime_install_journal(&RuntimeInstallJournal {
+            install_root: install_root.clone(),
+            destination: destination.clone(),
+            lib_destination: lib_destination.clone(),
+            backup_dir: backup_dir.clone(),
+            stage_dir: stage_dir.clone(),
+            old_bin_present: true,
+            old_lib_present: true,
+            new_bin_attempted: false,
+            new_lib_attempted: false,
+            validated: false,
+        })
+        .expect("fault journal should write");
+
+        recover_interrupted_runtime_install(&install_root)
+            .expect("recovery should restore the previous pair");
+        assert_eq!(
+            std::fs::read(destination.join("tool")).expect("binary should be restored"),
+            b"old-bin"
+        );
+        assert_eq!(
+            std::fs::read(lib_destination.join("libtool")).expect("library should be untouched"),
+            b"old-lib"
+        );
+        assert!(!install_root.join(".runtime-install-journal.json").exists());
+    }
+
+    #[test]
+    fn runtime_recovery_fault_injection_rolls_back_second_promotion() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let install_root = temp.path().join("app-data");
+        let destination = install_root.join("bin");
+        let lib_destination = install_root.join("lib");
+        let backup_dir = install_root.join(".runtime-backup-fault");
+        let stage_dir = install_root.join("runtime").join(".stage-runtime-fault");
+
+        std::fs::create_dir_all(&destination).expect("old binary directory should exist");
+        std::fs::write(destination.join("tool"), b"old-bin").expect("old binary should write");
+        std::fs::create_dir_all(&lib_destination).expect("old library directory should exist");
+        std::fs::write(lib_destination.join("libtool"), b"old-lib")
+            .expect("old library should write");
+        std::fs::create_dir_all(&backup_dir).expect("backup directory should exist");
+        std::fs::rename(&destination, backup_dir.join("bin"))
+            .expect("old binary should move to backup");
+        std::fs::rename(&lib_destination, backup_dir.join("lib"))
+            .expect("old library should move to backup");
+        std::fs::create_dir_all(&destination).expect("partial new binary should exist");
+        std::fs::write(destination.join("tool"), b"new-bin")
+            .expect("partial new binary should write");
+        std::fs::create_dir_all(&stage_dir).expect("stage directory should exist");
+
+        write_runtime_install_journal(&RuntimeInstallJournal {
+            install_root: install_root.clone(),
+            destination: destination.clone(),
+            lib_destination: lib_destination.clone(),
+            backup_dir: backup_dir.clone(),
+            stage_dir: stage_dir.clone(),
+            old_bin_present: true,
+            old_lib_present: true,
+            new_bin_attempted: true,
+            new_lib_attempted: true,
+            validated: false,
+        })
+        .expect("fault journal should write");
+
+        recover_interrupted_runtime_install(&install_root)
+            .expect("recovery should roll back an incomplete second promotion");
+        assert_eq!(
+            std::fs::read(destination.join("tool")).expect("binary should be restored"),
+            b"old-bin"
+        );
+        assert_eq!(
+            std::fs::read(lib_destination.join("libtool")).expect("library should be restored"),
+            b"old-lib"
+        );
+        assert!(!install_root.join(".runtime-install-journal.json").exists());
+    }
+
+    #[test]
+    fn failed_pyannote_repair_keeps_ready_status_and_records_diagnostic() {
+        let (_temp, factory) = build_runtime_factory();
+        let manifest = ManagedPyannoteManifest {
+            source: "release_asset".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            compat_level: PYANNOTE_COMPAT_LEVEL,
+            runtime_asset: "pyannote-runtime-test.zip".to_string(),
+            runtime_sha256: "runtime-sha".to_string(),
+            model_asset: "pyannote-model-test.zip".to_string(),
+            model_sha256: "model-sha".to_string(),
+            runtime_arch: super::host_pyannote_arch_label().to_string(),
+            installed_at: "2026-04-21T00:00:00Z".to_string(),
+        };
+        prepare_ready_pyannote_install(&factory, manifest, "ok");
+
+        persist_pyannote_install_failure(
+            &factory,
+            true,
+            "pyannote_import_load_failed",
+            "synthetic repair failure",
+        );
+
+        let status = factory
+            .read_managed_pyannote_status()
+            .expect("ready status should remain present");
+        assert_eq!(status.reason_code, "ok");
+        let diagnostic_path = factory
+            .managed_pyannote_runtime_dir()
+            .join("last-install-failure.json");
+        let diagnostic = std::fs::read_to_string(diagnostic_path)
+            .expect("repair diagnostic should be recorded separately");
+        assert!(diagnostic.contains("pyannote_import_load_failed"));
+        assert!(diagnostic.contains("synthetic repair failure"));
     }
 
     #[test]

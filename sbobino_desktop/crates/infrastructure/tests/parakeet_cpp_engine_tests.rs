@@ -10,7 +10,9 @@ use regex::Regex;
 use tempfile::tempdir;
 
 use sbobino_application::{ApplicationError, SpeechToTextEngine};
-use sbobino_domain::{LanguageCode, TranscriptionLanguagePolicy, WhisperOptions};
+use sbobino_domain::{
+    LanguageCode, TranscriptionComputeDevice, TranscriptionLanguagePolicy, WhisperOptions,
+};
 use sbobino_infrastructure::adapters::parakeet_cpp::ParakeetCppEngine;
 
 const DEFAULT_REAL_SMOKE_MODEL: &str = "tdt-0.6b-v3-q4_k.gguf";
@@ -191,18 +193,29 @@ extern "C" void parakeet_capi_free_string(char*) {}
     );
 
     let cases = [
-        ("nan", "0\\tNaN\\t30\\t0\\t30\\t/tmp/chunk.wav\\n"),
+        ("nan", "0\\tNaN\\t30\\t0\\t30\\t/tmp/chunk.wav\\n", false),
         (
             "negative_decode_start",
             "0\\t-0.001\\t30\\t0\\t30\\t/tmp/chunk.wav\\n",
+            false,
         ),
-        ("oversize", "0\\t0\\t45.001\\t0\\t30\\t/tmp/chunk.wav\\n"),
+        (
+            "oversize",
+            "0\\t0\\t45.001\\t0\\t30\\t/tmp/chunk.wav\\n",
+            false,
+        ),
         (
             "duplicate_index",
             "0\\t0\\t30\\t0\\t30\\t/tmp/chunk0.wav\\n0\\t25\\t45\\t30\\t45\\t/tmp/chunk1.wav\\n",
+            false,
+        ),
+        (
+            "resumed_nonzero",
+            "0\\t25\\t55\\t30\\t50\\t/tmp/chunk-resumed.wav\\n",
+            true,
         ),
     ];
-    for (name, contents) in cases {
+    for (name, contents, should_reach_model_load) in cases {
         let manifest = temp.path().join(format!("{name}.tsv"));
         std::fs::write(
             &manifest,
@@ -215,15 +228,27 @@ extern "C" void parakeet_capi_free_string(char*) {}
             .output()
             .expect("failed to launch fake-CAPI worker");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !output.status.success() && stderr.contains("rejected manifest"),
-            "{name} manifest should fail validation, got status {:?}, stderr: {stderr}",
-            output.status
-        );
-        assert!(
-            !stderr.contains("MODEL_LOAD_SHOULD_NOT_HAPPEN"),
-            "{name} manifest must be rejected before model load: {stderr}"
-        );
+        if should_reach_model_load {
+            assert!(
+                !output.status.success() && stderr.contains("MODEL_LOAD_SHOULD_NOT_HAPPEN"),
+                "{name} resumed manifest should pass validation before model load, got status {:?}, stderr: {stderr}",
+                output.status
+            );
+            assert!(
+                !stderr.contains("rejected manifest"),
+                "{name} resumed manifest must not be rejected before model load: {stderr}"
+            );
+        } else {
+            assert!(
+                !output.status.success() && stderr.contains("rejected manifest"),
+                "{name} manifest should fail validation, got status {:?}, stderr: {stderr}",
+                output.status
+            );
+            assert!(
+                !stderr.contains("MODEL_LOAD_SHOULD_NOT_HAPPEN"),
+                "{name} manifest must be rejected before model load: {stderr}"
+            );
+        }
     }
 }
 
@@ -1197,7 +1222,184 @@ exit 0
 }
 
 #[tokio::test]
-async fn long_file_parent_rejects_oversize_worker_row_before_merging() {
+async fn long_file_auto_falls_back_to_cpu_worker_after_gpu_retries() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let worker_path = temp.path().join("parakeet-batch-json");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+    let attempt_file = temp.path().join("auto-attempt-count");
+    let device_file = temp.path().join("auto-devices");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
+        .expect("failed to create model");
+    write_constant_test_wav(&input_wav, 100);
+
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+echo 'long-file transcription must not invoke the CLI' 1>&2
+exit 45
+"#,
+    );
+    write_executable_script(
+        &worker_path,
+        r#"#!/bin/sh
+set -eu
+base=$(dirname "$0")
+attempt_file="$base/auto-attempt-count"
+device_file="$base/auto-devices"
+attempt=0
+if [ -f "$attempt_file" ]; then attempt=$(cat "$attempt_file"); fi
+attempt=$((attempt + 1))
+echo "$attempt" > "$attempt_file"
+printf '%s\n' "${PARAKEET_DEVICE:-auto}" >> "$device_file"
+manifest=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -s "$manifest" ] || exit 47
+if [ "$attempt" -le 4 ]; then
+  echo 'ggml_backend_graph_compute failed: kIOGPUCommandBufferCallbackErrorOutOfMemory' 1>&2
+  exit 86
+fi
+while IFS='	' read -r idx decode_start decode_end commit_start commit_end path; do
+  [ -n "$idx" ] || continue
+  word_start=$(awk -v c="$commit_start" -v d="$decode_start" 'BEGIN { printf "%.3f", c - d + 0.1 }')
+  word_end=$(awk -v s="$word_start" 'BEGIN { printf "%.3f", s + 0.2 }')
+  printf '{"index":%s,"decode_start":%s,"decode_end":%s,"commit_start":%s,"commit_end":%s,"result":{"text":"cpu%s","words":[{"w":"cpu%s","start":%s,"end":%s}]}}\n' "$idx" "$decode_start" "$decode_end" "$commit_start" "$commit_end" "$idx" "$idx" "$word_start" "$word_end"
+done < "$manifest"
+exit 0
+"#,
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-q4_k.gguf",
+            &transcription_policy("it"),
+            &WhisperOptions::default(),
+            Some(100.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("Auto should recover with the CPU worker after GPU retries");
+
+    assert!(transcript.text.contains("cpu0"));
+    assert_eq!(
+        std::fs::read_to_string(&attempt_file)
+            .expect("worker should persist attempt count")
+            .trim(),
+        "5",
+        "Auto should run four GPU attempts followed by one CPU worker attempt"
+    );
+    let devices = std::fs::read_to_string(&device_file)
+        .expect("worker should persist each execution device")
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(devices.len(), 5);
+    assert!(devices[..4].iter().all(|device| device != "cpu"));
+    assert_eq!(devices.last().map(String::as_str), Some("cpu"));
+}
+
+#[tokio::test]
+async fn long_file_explicit_cpu_rejects_terminal_partial_oom_prefix() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let worker_path = temp.path().join("parakeet-batch-json");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+    let attempt_file = temp.path().join("attempt-count");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
+        .expect("failed to create model");
+    // Four exhausted retry windows can commit a valid 30 s prefix each. Keep
+    // the physical audio longer than that prefix so the final result must
+    // remain an error instead of persisting a truncated transcript.
+    write_constant_test_wav(&input_wav, 150);
+
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\necho 'long-file transcription must not invoke the CLI' 1>&2\nexit 45\n",
+    );
+    write_executable_script(
+        &worker_path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+attempt=0
+if [ -f "{attempt_file}" ]; then attempt=$(cat "{attempt_file}"); fi
+attempt=$((attempt + 1))
+echo "$attempt" > "{attempt_file}"
+manifest=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -s "$manifest" ] || exit 47
+# Emit one valid prefix row, then fail as a backend OOM. The parent must retain
+# the row for retry accounting but never report it as a completed transcript.
+IFS='	' read -r idx decode_start decode_end commit_start commit_end path < "$manifest"
+word_start=$(awk -v c="$commit_start" -v d="$decode_start" 'BEGIN {{ printf "%.3f", c - d + 0.1 }}')
+word_end=$(awk -v s="$word_start" 'BEGIN {{ printf "%.3f", s + 0.2 }}')
+printf '{{"index":%s,"decode_start":%s,"decode_end":%s,"commit_start":%s,"commit_end":%s,"result":{{"text":"prefix%s","words":[{{"w":"prefix%s","start":%s,"end":%s}}]}}}}\n' \
+  "$idx" "$decode_start" "$decode_end" "$commit_start" "$commit_end" "$attempt" "$attempt" "$word_start" "$word_end"
+echo 'ggml_backend_graph_compute failed: kIOGPUCommandBufferCallbackErrorOutOfMemory' 1>&2
+exit 86
+"#,
+            attempt_file = attempt_file.display()
+        ),
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    )
+    .with_compute_device(TranscriptionComputeDevice::Cpu);
+    let error = engine
+        .transcribe(
+            &input_wav,
+            "tdt-0.6b-v3-q4_k.gguf",
+            &transcription_policy("it"),
+            &WhisperOptions::default(),
+            Some(150.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect_err("explicit CPU must fail closed after terminal partial OOM retries");
+
+    assert!(
+        error
+            .to_string()
+            .contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+            || error.to_string().contains("out of memory"),
+        "the terminal backend error must be retained, got: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&attempt_file)
+            .expect("worker should persist retry attempts")
+            .trim(),
+        "4",
+        "explicit CPU must exhaust the four bounded retry windows without an Auto fallback"
+    );
+}
+
+#[tokio::test]
+async fn long_file_parent_rejects_oversize_worker_row_without_cli_fallback() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");
     let worker_path = temp.path().join("parakeet-batch-json");
@@ -1246,7 +1448,7 @@ exit 0
         script_path.to_string_lossy().to_string(),
         models_dir.to_string_lossy().to_string(),
     );
-    let transcript = engine
+    let error = engine
         .transcribe(
             &input_wav,
             "tdt-0.6b-v3-q4_k.gguf",
@@ -1257,16 +1459,17 @@ exit 0
             Arc::new(|_seconds: f32| {}),
         )
         .await
-        .expect("worker protocol rejection must safely fall back to bounded chunk CLI");
+        .expect_err("worker protocol rejection must fail closed without a CLI fallback");
 
     assert!(
-        cli_fallback_marker.exists(),
-        "the rejected worker result must not be merged; only the bounded CLI fallback may run"
+        !cli_fallback_marker.exists(),
+        "the rejected worker result must not trigger a full-file or bounded CLI fallback"
     );
     assert!(
-        transcript.text.contains("safe fallback") && !transcript.text.contains("unsafe"),
-        "oversize worker output must be rejected before transcript merge, got: {}",
-        transcript.text
+        error
+            .to_string()
+            .contains("invalid decode/commit bounds for chunk 0"),
+        "oversize worker output must be rejected before transcript merge, got: {error}"
     );
 }
 

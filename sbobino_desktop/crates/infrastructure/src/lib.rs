@@ -498,15 +498,25 @@ impl RuntimeTranscriptionFactory {
         let transcoder = Arc::new(FfmpegAdapter::new(ffmpeg_path));
         let speech_engine: Arc<dyn sbobino_application::SpeechToTextEngine> =
             match settings.transcription.engine {
-                TranscriptionEngine::WhisperCpp => {
-                    Arc::new(WhisperCppEngine::new(whisper_cli_path, models_dir))
-                }
-                TranscriptionEngine::ParakeetCpp => Arc::new(ParakeetCppEngine::new(
-                    parakeet_cli_path,
-                    parakeet_models_dir,
-                )),
+                TranscriptionEngine::WhisperCpp => Arc::new(
+                    WhisperCppEngine::new(whisper_cli_path, models_dir)
+                        .with_compute_device(settings.transcription.compute_device),
+                ),
+                TranscriptionEngine::ParakeetCpp => Arc::new(
+                    ParakeetCppEngine::new(parakeet_cli_path, parakeet_models_dir)
+                        .with_compute_device(settings.transcription.compute_device),
+                ),
             };
-        let speaker_diarizer = self.build_speaker_diarizer(&settings)?;
+        let speaker_diarizer = match self.build_speaker_diarizer(&settings) {
+            Ok(diarizer) => diarizer,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "speaker diarization is unavailable; continuing with transcription only"
+                );
+                None
+            }
+        };
 
         let enhancer_candidates = self
             .build_enhancer_candidates()
@@ -1121,7 +1131,8 @@ impl RuntimeTranscriptionFactory {
             }
         }
         let models_dir = self.resolve_models_dir(&settings.transcription.models_dir);
-        Ok(WhisperStreamEngine::new(whisper_stream_path, models_dir))
+        Ok(WhisperStreamEngine::new(whisper_stream_path, models_dir)
+            .with_compute_device(settings.transcription.compute_device))
     }
 
     pub fn build_speaker_diarizer(
@@ -4998,7 +5009,7 @@ mod tests {
     }
 
     #[test]
-    fn build_service_fails_when_enabled_pyannote_is_not_ready() {
+    fn build_service_keeps_asr_available_when_enabled_pyannote_is_not_ready() {
         let (_temp, factory) = build_factory();
         persist_enabled_diarization(&factory);
         prepare_managed_runtime(
@@ -5020,8 +5031,12 @@ mod tests {
         std::fs::create_dir_all(models_dir.join("ggml-large-v3-turbo-encoder.mlmodelc"))
             .expect("large turbo encoder dir should exist");
 
-        let error = match factory.build_service() {
-            Ok(_) => panic!("service should fail when pyannote is required but missing"),
+        factory
+            .build_service()
+            .expect("missing optional pyannote must not block transcription");
+        let settings = factory.load_settings().expect("settings should load");
+        let error = match factory.build_speaker_diarizer(&settings) {
+            Ok(_) => panic!("direct diarization construction should still report setup failure"),
             Err(error) => error,
         };
         assert!(error.contains("Pyannote diarization runtime is not installed"));

@@ -27,6 +27,15 @@ pub enum AppLanguage {
     De,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionComputeDevice {
+    #[default]
+    Auto,
+    Gpu,
+    Cpu,
+}
+
 impl LanguageCode {
     pub fn from_code(value: &str) -> Self {
         Self::try_from_code(value).unwrap_or_default()
@@ -485,6 +494,7 @@ pub struct TranscriptionSettings {
     pub model: SpeechModel,
     pub parakeet_model: ParakeetModel,
     pub language: LanguageCode,
+    pub compute_device: TranscriptionComputeDevice,
     pub whisper_cli_path: String,
     #[serde(alias = "whisper_stream_path")]
     pub whisperkit_cli_path: String,
@@ -504,6 +514,7 @@ impl Default for TranscriptionSettings {
             model: SpeechModel::Base,
             parakeet_model: ParakeetModel::default(),
             language: LanguageCode::Auto,
+            compute_device: TranscriptionComputeDevice::Auto,
             whisper_cli_path: "whisper-cli".to_string(),
             whisperkit_cli_path: "whisper-stream".to_string(),
             parakeet_cli_path: "parakeet-cli".to_string(),
@@ -1237,5 +1248,18 @@ mod language_tests {
         let policy = TranscriptionLanguagePolicy::default();
         assert!(policy.adaptive_detection);
         assert_eq!(policy.preferred_language, LanguageCode::Auto);
+    }
+
+    #[test]
+    fn transcription_compute_device_defaults_and_round_trips() {
+        let defaults = TranscriptionSettings::default();
+        assert_eq!(defaults.compute_device, TranscriptionComputeDevice::Auto);
+
+        let json = serde_json::to_string(&TranscriptionComputeDevice::Cpu).unwrap();
+        assert_eq!(json, "\"cpu\"");
+        assert_eq!(
+            serde_json::from_str::<TranscriptionComputeDevice>("\"gpu\"").unwrap(),
+            TranscriptionComputeDevice::Gpu
+        );
     }
 }

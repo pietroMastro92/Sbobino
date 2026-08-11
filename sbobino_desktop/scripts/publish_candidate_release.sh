@@ -69,6 +69,29 @@ for asset in "${required_assets[@]}"; do
   fi
 done
 
+PREVIOUS_NOTES_REF=${SBOBINO_RELEASE_NOTES_PREVIOUS_REF:-}
+if [[ -z "$PREVIOUS_NOTES_REF" ]]; then
+  PREVIOUS_NOTES_REF=$(git -C "$ROOT_DIR/.." describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+fi
+if [[ -z "$PREVIOUS_NOTES_REF" ]]; then
+  echo "Unable to determine previous release ref for release-notes.md." >&2
+  exit 1
+fi
+"$ROOT_DIR/scripts/check_release_notes.sh" \
+  "$VERSION" \
+  "$ASSET_DIR/release-notes.md" \
+  "$PREVIOUS_NOTES_REF"
+
+CANONICAL_NOTES="$ROOT_DIR/docs/release-notes/v$VERSION.md"
+if [[ ! -f "$CANONICAL_NOTES" ]]; then
+  echo "Versioned release notes are missing from the checkout: $CANONICAL_NOTES" >&2
+  exit 1
+fi
+if ! cmp -s "$CANONICAL_NOTES" "$ASSET_DIR/release-notes.md"; then
+  echo "Candidate release-notes.md must be generated from $CANONICAL_NOTES." >&2
+  exit 1
+fi
+
 python3 - <<'PY' "$VERSION" "$ASSET_DIR"
 import hashlib
 import json
