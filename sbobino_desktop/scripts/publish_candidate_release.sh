@@ -248,6 +248,7 @@ gh release upload "$TAG" \
   "$ASSET_DIR/pyannote-runtime-windows-x86_64.zip" \
   "$ASSET_DIR/pyannote-model-community-1.zip" \
   "$ASSET_DIR/pyannote-manifest.json" \
+  "$ASSET_DIR/release-notes.md" \
   "$ASSET_DIR/release-readiness-proof.json" \
   --repo "$REPO_SLUG"
 
