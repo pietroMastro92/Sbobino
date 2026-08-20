@@ -154,6 +154,12 @@ case "$REQUIRE_WORKER_RSS_MONITOR" in
   *) fail "SBOBINO_PARAKEET_REQUIRE_WORKER_RSS_MONITOR must be 0 or 1" ;;
 esac
 
+SMOKE_MODE=${SBOBINO_PARAKEET_SMOKE_MODE:-both}
+case "$SMOKE_MODE" in
+  adapter|service|both) ;;
+  *) fail "SBOBINO_PARAKEET_SMOKE_MODE must be adapter, service, or both" ;;
+esac
+
 MODEL_PATH="$SBOBINO_PARAKEET_MODELS_DIR/$MODEL_FILENAME"
 if [[ ! -f "$MODEL_PATH" ]]; then
   echo "missing Parakeet model: $MODEL_PATH" >&2
@@ -320,14 +326,18 @@ export SBOBINO_PARAKEET_AUDIO="$WAV_AUDIO"
 
 cd "$ROOT_DIR"
 
-echo "running adapter smoke with parakeet-cli=$SBOBINO_PARAKEET_CLI model=$MODEL_FILENAME"
-run_with_worker_rss_watchdog adapter_smoke cargo test -p sbobino-infrastructure \
-  --test parakeet_cpp_engine_tests \
-  parakeet_cpp_real_smoke \
-  -- --ignored --nocapture
+if [[ "$SMOKE_MODE" == "adapter" || "$SMOKE_MODE" == "both" ]]; then
+  echo "running adapter smoke with parakeet-cli=$SBOBINO_PARAKEET_CLI model=$MODEL_FILENAME"
+  run_with_worker_rss_watchdog adapter_smoke cargo test -p sbobino-infrastructure \
+    --test parakeet_cpp_engine_tests \
+    parakeet_cpp_real_smoke \
+    -- --ignored --nocapture
+fi
 
-echo "running service smoke with parakeet-cli=$SBOBINO_PARAKEET_CLI model=$MODEL_FILENAME"
-run_with_worker_rss_watchdog service_smoke cargo test -p sbobino-infrastructure \
-  --test parakeet_real_service_smoke_tests \
-  parakeet_service_real_smoke_persists_metadata \
-  -- --ignored --nocapture
+if [[ "$SMOKE_MODE" == "service" || "$SMOKE_MODE" == "both" ]]; then
+  echo "running service smoke with parakeet-cli=$SBOBINO_PARAKEET_CLI model=$MODEL_FILENAME"
+  run_with_worker_rss_watchdog service_smoke cargo test -p sbobino-infrastructure \
+    --test parakeet_real_service_smoke_tests \
+    parakeet_service_real_smoke_persists_metadata \
+    -- --ignored --nocapture
+fi

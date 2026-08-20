@@ -58,6 +58,16 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("smoke_parakeet_real.sh", workflow)
         self.assertIn("SBOBINO_PARAKEET_FORCE_CPU=1", workflow)
         self.assertIn("SBOBINO_PARAKEET_REQUIRE_WORKER_RSS_MONITOR=1", workflow)
+        self.assertIn("SBOBINO_PARAKEET_SMOKE_MODE=service", workflow)
+
+    def test_intel_release_smoke_transcribes_the_long_fixture_only_once(self):
+        intel = INTEL_SMOKE.read_text(encoding="utf-8")
+        harness = (ROOT / "scripts" / "smoke_parakeet_real.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("SBOBINO_PARAKEET_SMOKE_MODE=service", intel)
+        self.assertIn('SMOKE_MODE=${SBOBINO_PARAKEET_SMOKE_MODE:-both}', harness)
+        self.assertIn('if [[ "$SMOKE_MODE" == "service" || "$SMOKE_MODE" == "both" ]]', harness)
 
     def test_promotion_requires_both_nested_quality_reports(self):
         promotion = PROMOTION.read_text(encoding="utf-8")

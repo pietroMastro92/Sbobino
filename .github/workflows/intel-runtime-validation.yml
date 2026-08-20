@@ -72,6 +72,10 @@ jobs:
           export SBOBINO_PARAKEET_SKIP_NEMOTRON=1
           export SBOBINO_PARAKEET_FORCE_CPU=1
           export SBOBINO_PARAKEET_REQUIRE_WORKER_RSS_MONITOR=1
+          # The service smoke already exercises the production adapter, batch
+          # worker, progress, persistence, timeline and RSS watchdog. Running
+          # the adapter smoke too would transcribe the same 65s input twice.
+          export SBOBINO_PARAKEET_SMOKE_MODE=service
           export SBOBINO_PARAKEET_EXPECTED_DETECTED_LANGUAGE=en
           export SBOBINO_PARAKEET_EXPECTED_PROCESSING_LANGUAGE=en
           ./scripts/smoke_parakeet_real.sh
