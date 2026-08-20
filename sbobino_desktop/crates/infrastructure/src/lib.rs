@@ -1874,12 +1874,9 @@ impl RuntimeTranscriptionFactory {
                 migrated.model_sha256 = expected_model_sha256.trim().to_string();
                 Some(migrated)
             });
-            let receipt_changed = receipt_migration
-                .as_ref()
-                .and_then(|migrated| {
-                    self.read_managed_pyannote_receipt()
-                        .map(|current| (current, migrated))
-                })
+            let receipt_changed = self
+                .read_managed_pyannote_receipt()
+                .zip(receipt_migration.as_ref())
                 .is_some_and(|(current, migrated)| current != *migrated);
             let changed = manifest.app_version.trim() != current_version
                 || manifest.compat_level != expected_compat_level
