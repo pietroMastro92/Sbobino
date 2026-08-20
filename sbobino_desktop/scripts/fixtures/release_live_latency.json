@@ -1,0 +1,38 @@
+{
+  "fixture_id": "sbobino-v2.0.28-release-quality",
+  "fixture_source": "repo-redistributable",
+  "engine": "fixture",
+  "platform": "linux-hosted-cleanroom",
+  "first_preview_seconds": 0.42,
+  "finalization_seconds": 0.75,
+  "samples": [
+    {
+      "captured_seconds": 0.5,
+      "processed_seconds": 0.4,
+      "backlog_seconds": 0.1,
+      "preview_latency_seconds": 0.45
+    },
+    {
+      "captured_seconds": 1.5,
+      "processed_seconds": 1.4,
+      "backlog_seconds": 0.1,
+      "preview_latency_seconds": 0.55
+    },
+    {
+      "captured_seconds": 3.0,
+      "processed_seconds": 2.8,
+      "backlog_seconds": 0.2,
+      "preview_latency_seconds": 0.62
+    },
+    {
+      "captured_seconds": 5.0,
+      "processed_seconds": 4.7,
+      "backlog_seconds": 0.3,
+      "preview_latency_seconds": 0.68
+    }
+  ],
+  "rss_samples_mib": [128.0, 129.0, 130.0, 130.5],
+  "dropped_samples": 0,
+  "missing_segments": 0,
+  "duplicate_segments": 0
+}

@@ -79,6 +79,14 @@ if [[ -n "$package_script" ]]; then
       exit 1
     fi
   done
+  for required_export in \
+    '"parakeet_capi_transcribe_path_json"' \
+    '"parakeet_capi_transcribe_pcm_batch_json_lang"'; do
+    if ! grep -Fq -- "$required_export" "$package_script"; then
+      printf 'missing Parakeet batch worker C-API export contract: %s\n' "$required_export" >&2
+      exit 1
+    fi
+  done
   regex_literal="'^Visual Studio (?<version>\d+) (?<year>\d{4})\$'"
   if ! grep -Fq -- "$regex_literal" "$package_script"; then
     printf 'missing exact Visual Studio generator name regex contract\n' >&2

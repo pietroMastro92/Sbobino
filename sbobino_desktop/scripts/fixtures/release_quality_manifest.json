@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "fixture_id": "sbobino-v2.0.28-release-quality",
+  "fixture_source": "repo-redistributable",
+  "files": {
+    "asr_reference": "release_asr_reference.json",
+    "asr_hypothesis": "release_asr_hypothesis.json",
+    "live_latency": "release_live_latency.json"
+  },
+  "sha256": {
+    "release_asr_reference.json": "5c8544055fcab174d2fc0761da967c38cd2d43e0092ade2639f343fc9800f0cd",
+    "release_asr_hypothesis.json": "66ebd180aeac186e8a1e656413bddc9974c52d19f93331eba86b18e8c7d45fc7",
+    "release_live_latency.json": "021acbc5e867cdfaaa8e762b5cf3dcf891abf109a420b179cb1731c2624b0ec4"
+  }
+}

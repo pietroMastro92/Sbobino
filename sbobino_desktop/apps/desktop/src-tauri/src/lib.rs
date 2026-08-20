@@ -190,7 +190,6 @@ pub fn run() {
                     active_engine: Arc::new(Mutex::new(
                         sbobino_domain::TranscriptionEngine::WhisperCpp,
                     )),
-                    preview: Arc::new(Mutex::new(None)),
                     active_job_id: Arc::new(Mutex::new(None)),
                     session_name: Arc::new(Mutex::new(None)),
                     model_filename: Arc::new(Mutex::new(None)),

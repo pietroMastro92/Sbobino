@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -46,9 +47,30 @@ const LONG_FILE_TAIL_PAD_SECONDS: f32 = 2.0;
 const LONG_FILE_MAX_SERIALIZED_DECODE_SECONDS: f32 = 45.0;
 const LONG_FILE_CHUNK_VALIDATION_TOLERANCE_SECONDS: f32 = 0.01;
 const OVERLAP_DEDUPE_TOLERANCE_SECONDS: f32 = 0.05;
+const WORD_DUPLICATE_TOLERANCE_SECONDS: f32 = 0.12;
+const NEMOTRON_UTTERANCE_GAP_SECONDS: f32 = 1.25;
 const WORKER_RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_WORKER_RSS_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 const WORKER_RSS_LIMIT_ENV: &str = "SBOBINO_PARAKEET_WORKER_RSS_LIMIT_BYTES";
+const EMPTY_VOICED_CHUNK_MARKER: &str = "SBOBINO_PARAKEET_EMPTY_VOICED_CHUNK";
+
+fn monotonic_progress_callback(
+    callback: Arc<dyn Fn(f32) + Send + Sync>,
+) -> Arc<dyn Fn(f32) + Send + Sync> {
+    let last = Arc::new(Mutex::new(0.0_f32));
+    let last_ref = last.clone();
+    Arc::new(move |seconds: f32| {
+        let seconds = seconds.max(0.0);
+        let Ok(mut previous) = last_ref.lock() else {
+            return;
+        };
+        if seconds <= *previous + 0.05 {
+            return;
+        }
+        *previous = seconds;
+        callback(seconds);
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ParakeetCppEngine {
@@ -139,6 +161,7 @@ struct LongFileCallbacks {
 struct LongFileAttemptError {
     error: ApplicationError,
     completed: Vec<(AudioChunk, TranscriptionOutput)>,
+    failed_chunk: Option<AudioChunk>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -775,14 +798,64 @@ impl ParakeetCppEngine {
     }
 
     fn clean_transcript_text(value: &str) -> String {
-        Self::strip_ansi_escape_codes(value)
+        Self::strip_technical_markers(&Self::strip_ansi_escape_codes(value))
             .replace("<EOU>", "")
             .replace("[EOU]", "")
             .split_whitespace()
+            .filter(|token| !Self::is_technical_marker_token(token))
             .collect::<Vec<_>>()
             .join(" ")
             .trim()
             .to_string()
+    }
+
+    fn strip_technical_markers(value: &str) -> String {
+        let chars = value.chars().collect::<Vec<_>>();
+        let mut output = String::with_capacity(value.len());
+        let mut index = 0_usize;
+        while index < chars.len() {
+            if chars[index] == '<' {
+                if let Some(close_offset) = chars[index + 1..].iter().position(|ch| *ch == '>') {
+                    let close = index + 1 + close_offset;
+                    let marker = chars[index + 1..close]
+                        .iter()
+                        .collect::<String>()
+                        .trim_matches('|')
+                        .to_string();
+                    if matches!(marker.to_ascii_uppercase().as_str(), "EOU" | "EOS" | "UNK")
+                        || Self::normalize_detected_language(&marker).is_some()
+                    {
+                        index = close + 1;
+                        continue;
+                    }
+                }
+            }
+            output.push(chars[index]);
+            index += 1;
+        }
+        output
+    }
+
+    fn is_technical_marker_token(value: &str) -> bool {
+        let trimmed = value.trim();
+        if !(trimmed.starts_with('<') && trimmed.ends_with('>')) || trimmed.len() < 3 {
+            return false;
+        }
+        let marker = trimmed[1..trimmed.len() - 1].trim_matches('|');
+        matches!(marker.to_ascii_uppercase().as_str(), "EOU" | "EOS" | "UNK")
+            || Self::normalize_detected_language(marker).is_some()
+    }
+
+    fn language_from_marker_token(value: &str) -> Option<String> {
+        let trimmed = value.trim();
+        if !(trimmed.starts_with('<') && trimmed.ends_with('>')) || trimmed.len() < 3 {
+            return None;
+        }
+        let marker = trimmed[1..trimmed.len() - 1].trim_matches('|');
+        if matches!(marker.to_ascii_uppercase().as_str(), "EOU" | "EOS" | "UNK") {
+            return None;
+        }
+        Self::normalize_detected_language(marker)
     }
 
     fn strip_ansi_escape_codes(value: &str) -> String {
@@ -833,6 +906,10 @@ impl ParakeetCppEngine {
                         marker_core.to_ascii_uppercase().as_str(),
                         "EOU" | "EOS" | "UNK"
                     );
+                    if marker_is_service {
+                        index = close + 1;
+                        continue;
+                    }
                     let primary = marker_core.split(['-', '_']).next().unwrap_or_default();
                     let is_language_marker = (2..=3).contains(&primary.len())
                         && !marker_is_service
@@ -841,27 +918,20 @@ impl ParakeetCppEngine {
                             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_');
                     if is_language_marker {
                         let normalized = Self::normalize_detected_language(marker_core);
-                        let trailing_is_empty =
-                            chars[close + 1..].iter().all(|ch| ch.is_whitespace());
                         let text = Self::clean_transcript_text(&current);
                         if !text.is_empty() {
-                            // Markers emitted directly after text (or at the
-                            // end of an output) label the preceding utterance;
-                            // markers separated by whitespace from following
-                            // text start the next utterance.
-                            let marker_is_suffix = trailing_is_empty
-                                || !current.chars().last().is_some_and(char::is_whitespace);
-                            if marker_is_suffix {
-                                let language_for_text =
-                                    current_language.clone().or_else(|| normalized.clone());
-                                pieces.push((text, language_for_text));
-                                current.clear();
-                                current_language = None;
-                            } else {
-                                pieces.push((text, current_language.clone()));
-                                current.clear();
-                                current_language = normalized;
-                            }
+                            // Nemotron commonly emits a marker after the
+                            // utterance it labels. A marker that was already
+                            // pending at the beginning labels the current
+                            // utterance; the new marker then begins the next
+                            // one. This supports both `<it>Ciao <en>Hello` and
+                            // `Ciao <it> Hello` without leaking tags.
+                            let had_prefix_marker = current_language.is_some();
+                            let language_for_text =
+                                current_language.take().or_else(|| normalized.clone());
+                            pieces.push((text, language_for_text));
+                            current.clear();
+                            current_language = if had_prefix_marker { normalized } else { None };
                         } else {
                             current_language = normalized;
                         }
@@ -901,16 +971,20 @@ impl ParakeetCppEngine {
                 Language::French,
                 Language::German,
                 Language::Greek,
+                Language::Hindi,
                 Language::Hungarian,
                 Language::Italian,
                 Language::Latvian,
                 Language::Lithuanian,
+                Language::Malay,
+                Language::Persian,
                 Language::Polish,
                 Language::Portuguese,
                 Language::Romanian,
                 Language::Slovak,
                 Language::Slovene,
                 Language::Spanish,
+                Language::Swahili,
                 Language::Swedish,
                 Language::Russian,
                 Language::Ukrainian,
@@ -1006,12 +1080,20 @@ impl ParakeetCppEngine {
         }
 
         let has_flat_words = !parsed.words.is_empty();
+        let flat_words_have_language_markers = parsed
+            .words
+            .iter()
+            .any(|word| Self::language_from_marker_token(&word.w).is_some());
         let segment_words_available = parsed
             .segments
             .iter()
             .any(|segment| !segment.words.is_empty());
         let raw_segments = if parsed.segments.is_empty() {
-            if marked_text.len() > 1 {
+            if flat_words_have_language_markers {
+                Self::segments_from_nemotron_marker_words(parsed.words)
+            } else if marked_text.len() > 1 && has_flat_words {
+                Self::segments_from_marked_text_and_words(marked_text.clone(), parsed.words)
+            } else if marked_text.len() > 1 {
                 marked_text
                     .iter()
                     .map(|(text, language_code)| TimedSegment {
@@ -1070,7 +1152,9 @@ impl ParakeetCppEngine {
             .iter()
             .filter(|(_, language)| language.is_some())
             .count();
-        let output_language_fallback = if explicit_marker_count == 0
+        let output_language_fallback = if flat_words_have_language_markers {
+            None
+        } else if explicit_marker_count == 0
             || (explicit_marker_count == 1 && marked_text.len() == 1)
         {
             output_language
@@ -1139,6 +1223,156 @@ impl ParakeetCppEngine {
         }
 
         Self::segments_from_timed_words(text, words, total_audio_seconds)
+    }
+
+    fn segments_from_marked_text_and_words(
+        marked_text: Vec<(String, Option<String>)>,
+        raw_words: Vec<ParakeetJsonWord>,
+    ) -> Vec<TimedSegment> {
+        let words = raw_words
+            .into_iter()
+            .filter_map(Self::word_from_json)
+            .collect::<Vec<_>>();
+        if words.is_empty() {
+            return marked_text
+                .into_iter()
+                .map(|(text, language_code)| TimedSegment {
+                    text,
+                    start_seconds: None,
+                    end_seconds: None,
+                    speaker_id: None,
+                    speaker_label: None,
+                    language_code,
+                    language_confidence: None,
+                    words: Vec::new(),
+                })
+                .collect();
+        }
+
+        let piece_count = marked_text.len();
+        let text_word_counts = marked_text
+            .iter()
+            .map(|(text, _)| text.split_whitespace().count().max(1))
+            .collect::<Vec<_>>();
+        let mut word_offset = 0_usize;
+        let mut segments = Vec::with_capacity(marked_text.len());
+        for (index, ((text, language_code), requested_word_count)) in
+            marked_text.into_iter().zip(text_word_counts).enumerate()
+        {
+            let words_remaining = words.len().saturating_sub(word_offset);
+            let pieces_remaining = piece_count.saturating_sub(index + 1);
+            let take = if index + 1 == piece_count {
+                words_remaining
+            } else {
+                let take =
+                    requested_word_count.min(words_remaining.saturating_sub(pieces_remaining));
+                if words_remaining > 0 {
+                    take.max(1)
+                } else {
+                    0
+                }
+            };
+            let piece_words = words
+                .get(word_offset..word_offset.saturating_add(take))
+                .unwrap_or_default()
+                .to_vec();
+            word_offset = word_offset.saturating_add(piece_words.len());
+            let (start_seconds, end_seconds) = if piece_words.is_empty() {
+                (None, None)
+            } else {
+                (
+                    piece_words.iter().find_map(|word| word.start_seconds),
+                    piece_words.iter().rev().find_map(|word| word.end_seconds),
+                )
+            };
+            segments.push(TimedSegment {
+                text,
+                start_seconds,
+                end_seconds,
+                speaker_id: None,
+                speaker_label: None,
+                language_code,
+                language_confidence: None,
+                words: piece_words,
+            });
+        }
+
+        if word_offset < words.len() {
+            if let Some(last) = segments.last_mut() {
+                last.words.extend(words[word_offset..].iter().cloned());
+                last.start_seconds = last.words.iter().find_map(|word| word.start_seconds);
+                last.end_seconds = last.words.iter().rev().find_map(|word| word.end_seconds);
+            }
+        }
+        segments
+    }
+
+    fn segments_from_nemotron_marker_words(raw_words: Vec<ParakeetJsonWord>) -> Vec<TimedSegment> {
+        fn push_segment(
+            segments: &mut Vec<TimedSegment>,
+            words: &mut Vec<TimedWord>,
+            language_code: Option<String>,
+        ) {
+            if words.is_empty() {
+                return;
+            }
+            let text = words
+                .iter()
+                .map(|word| word.text.trim())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() {
+                words.clear();
+                return;
+            }
+            let start_seconds = words.iter().find_map(|word| word.start_seconds);
+            let end_seconds = words.iter().rev().find_map(|word| word.end_seconds);
+            segments.push(TimedSegment {
+                text,
+                start_seconds,
+                end_seconds,
+                speaker_id: None,
+                speaker_label: None,
+                language_code,
+                language_confidence: None,
+                words: std::mem::take(words),
+            });
+        }
+
+        let mut segments = Vec::new();
+        let mut words = Vec::<TimedWord>::new();
+        let mut current_language = None;
+        let mut previous_end = None::<f32>;
+
+        for raw_word in raw_words {
+            if let Some(marker_language) = Self::language_from_marker_token(&raw_word.w) {
+                if words.is_empty() {
+                    current_language = Some(marker_language);
+                } else {
+                    let had_prefix_marker = current_language.is_some();
+                    let language = current_language.take().or(Some(marker_language.clone()));
+                    push_segment(&mut segments, &mut words, language);
+                    current_language = had_prefix_marker.then_some(marker_language);
+                    previous_end = None;
+                }
+                continue;
+            }
+
+            let Some(word) = Self::word_from_json(raw_word) else {
+                continue;
+            };
+            if previous_end
+                .zip(word.start_seconds)
+                .is_some_and(|(end, start)| start - end > NEMOTRON_UTTERANCE_GAP_SECONDS)
+            {
+                push_segment(&mut segments, &mut words, current_language.take());
+            }
+            previous_end = word.end_seconds.or(word.start_seconds).or(previous_end);
+            words.push(word);
+        }
+        push_segment(&mut segments, &mut words, current_language);
+        segments
     }
 
     fn split_segment_if_needed(
@@ -1331,6 +1565,9 @@ impl ParakeetCppEngine {
     }
 
     fn word_from_json(word: ParakeetJsonWord) -> Option<TimedWord> {
+        if Self::is_technical_marker_token(&word.w) {
+            return None;
+        }
         let text = Self::clean_transcript_text(&word.w);
         if text.is_empty() {
             return None;
@@ -2050,6 +2287,102 @@ impl ParakeetCppEngine {
         Self::prepare_long_file_chunks_from_offset(input_wav, target_seconds, 0.0)
     }
 
+    fn prepare_isolated_retry_chunk(
+        failed_chunk: &AudioChunk,
+    ) -> Result<(TempDir, AudioChunk), ApplicationError> {
+        let mut reader = hound::WavReader::open(&failed_chunk.path).map_err(|error| {
+            ApplicationError::SpeechToText(format!(
+                "Parakeet isolated retry could not read failed chunk {}: {error}",
+                failed_chunk.path.display()
+            ))
+        })?;
+        let spec = reader.spec();
+        if spec.channels != 1
+            || spec.sample_rate == 0
+            || spec.bits_per_sample > 16
+            || spec.sample_format != hound::SampleFormat::Int
+        {
+            return Err(ApplicationError::SpeechToText(format!(
+                "Parakeet isolated retry expected normalized PCM16 mono WAV, got channels={} rate={} bits={} format={:?}",
+                spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format
+            )));
+        }
+
+        let samples = reader
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "failed to decode failed Parakeet chunk for isolated retry: {error}"
+                ))
+            })?;
+        let local_start_seconds =
+            failed_chunk.commit_start_seconds - failed_chunk.decode_start_seconds;
+        let local_end_seconds = failed_chunk.commit_end_seconds - failed_chunk.decode_start_seconds;
+        if !local_start_seconds.is_finite()
+            || !local_end_seconds.is_finite()
+            || local_start_seconds < 0.0
+            || local_end_seconds <= local_start_seconds
+        {
+            return Err(ApplicationError::SpeechToText(
+                "Parakeet isolated retry received invalid local commit bounds".to_string(),
+            ));
+        }
+
+        let sample_rate = spec.sample_rate as f32;
+        let start_frame = (local_start_seconds * sample_rate)
+            .round()
+            .clamp(0.0, samples.len() as f32) as usize;
+        let end_frame = (local_end_seconds * sample_rate)
+            .round()
+            .clamp(0.0, samples.len() as f32) as usize;
+        if end_frame <= start_frame || end_frame > samples.len() {
+            return Err(ApplicationError::SpeechToText(format!(
+                "Parakeet isolated retry commit bounds do not fit failed chunk {}",
+                failed_chunk.path.display()
+            )));
+        }
+
+        let temp_dir = tempfile::Builder::new()
+            .prefix("sbobino-parakeet-isolated-retry-")
+            .tempdir()
+            .map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "failed to create Parakeet isolated retry directory: {error}"
+                ))
+            })?;
+        let path = temp_dir.path().join("chunk-0000.wav");
+        let mut writer = hound::WavWriter::create(&path, spec).map_err(|error| {
+            ApplicationError::SpeechToText(format!(
+                "failed to create Parakeet isolated retry chunk: {error}"
+            ))
+        })?;
+        for sample in &samples[start_frame..end_frame] {
+            writer.write_sample(*sample).map_err(|error| {
+                ApplicationError::SpeechToText(format!(
+                    "failed to write Parakeet isolated retry chunk: {error}"
+                ))
+            })?;
+        }
+        writer.finalize().map_err(|error| {
+            ApplicationError::SpeechToText(format!(
+                "failed to finalize Parakeet isolated retry chunk: {error}"
+            ))
+        })?;
+
+        Ok((
+            temp_dir,
+            AudioChunk {
+                index: 0,
+                path,
+                decode_start_seconds: failed_chunk.commit_start_seconds,
+                decode_end_seconds: failed_chunk.commit_end_seconds,
+                commit_start_seconds: failed_chunk.commit_start_seconds,
+                commit_end_seconds: failed_chunk.commit_end_seconds,
+            },
+        ))
+    }
+
     fn prepare_long_file_chunks_from_offset(
         input_wav: &Path,
         target_seconds: f32,
@@ -2547,6 +2880,7 @@ impl ParakeetCppEngine {
             Self::write_worker_manifest(chunks).map_err(|error| LongFileAttemptError {
                 error,
                 completed: Vec::new(),
+                failed_chunk: None,
             })?;
         let mut command = tokio_background_command(worker_path);
         self.configure_command_environment(&mut command, worker_path.to_string_lossy().as_ref());
@@ -2567,12 +2901,14 @@ impl ParakeetCppEngine {
                 worker_path.display()
             )),
             completed: Vec::new(),
+            failed_chunk: None,
         })?;
         let worker_pid = child.id().ok_or_else(|| LongFileAttemptError {
             error: ApplicationError::SpeechToText(
                 "parakeet-batch-json started without a visible worker PID".to_string(),
             ),
             completed: Vec::new(),
+            failed_chunk: None,
         })?;
         let process_group = Self::isolated_worker_process_group(worker_pid);
         #[cfg(windows)]
@@ -2588,6 +2924,7 @@ impl ParakeetCppEngine {
                                 .to_string(),
                         ),
                         completed: Vec::new(),
+                        failed_chunk: None,
                     });
                 }
             };
@@ -2601,6 +2938,7 @@ impl ParakeetCppEngine {
                             "parakeet-batch-json Windows memory guard setup failed closed: {error}"
                         )),
                         completed: Vec::new(),
+                        failed_chunk: None,
                     });
                 }
             }
@@ -2625,12 +2963,14 @@ impl ParakeetCppEngine {
                 "parakeet-batch-json stdout was unavailable".to_string(),
             ),
             completed: Vec::new(),
+            failed_chunk: None,
         })?;
         let stderr = child.stderr.take().ok_or_else(|| LongFileAttemptError {
             error: ApplicationError::SpeechToText(
                 "parakeet-batch-json stderr was unavailable".to_string(),
             ),
             completed: Vec::new(),
+            failed_chunk: None,
         })?;
         let (stdout_sender, mut stdout_receiver) = tokio::sync::mpsc::channel(32);
         let stdout_task = tokio::spawn(async move {
@@ -2667,6 +3007,7 @@ impl ParakeetCppEngine {
         });
 
         let mut results = Vec::new();
+        let mut failed_chunk: Option<AudioChunk> = None;
 
         macro_rules! abort_worker {
             ($error:expr) => {{
@@ -2685,6 +3026,7 @@ impl ParakeetCppEngine {
                 return Err(LongFileAttemptError {
                     error,
                     completed: results.clone(),
+                    failed_chunk: failed_chunk.clone(),
                 });
             }};
         }
@@ -2746,6 +3088,27 @@ impl ParakeetCppEngine {
                                 chunk.commit_start_seconds,
                                 chunk.commit_end_seconds,
                             );
+                            if output.text.trim().is_empty()
+                                && Self::chunk_has_audio_energy(
+                                    &chunk.path,
+                                    (chunk.commit_start_seconds - chunk.decode_start_seconds)
+                                        .max(0.0),
+                                    (chunk.commit_end_seconds - chunk.decode_start_seconds)
+                                        .max(0.0),
+                                )
+                            {
+                                // A voiced window with no words is not a valid
+                                // silent row.  Do not emit progress or mark it
+                                // committed; the caller retries this exact
+                                // window once before shrinking the plan.
+                                failed_chunk = Some(chunk.clone());
+                                abort_worker!(ApplicationError::SpeechToText(format!(
+                                    "{EMPTY_VOICED_CHUNK_MARKER}: worker returned empty text for voiced chunk {} ({:.3}-{:.3}s)",
+                                    chunk.index,
+                                    chunk.commit_start_seconds,
+                                    chunk.commit_end_seconds,
+                                )));
+                            }
                             let commit_end_seconds = chunk.commit_end_seconds;
                             // Worker indices are local to this retry manifest;
                             // make them global for cumulative snapshots so a
@@ -2783,12 +3146,14 @@ impl ParakeetCppEngine {
                 "failed to join parakeet-batch-json stdout reader: {error}"
             )),
             completed: results.clone(),
+            failed_chunk: None,
         })?;
         let stderr = stderr_task.await.map_err(|error| LongFileAttemptError {
             error: ApplicationError::SpeechToText(format!(
                 "failed to join parakeet-batch-json stderr reader: {error}"
             )),
             completed: results.clone(),
+            failed_chunk: None,
         })?;
         process_group_guard.disarm();
         if memory_stats.peak_rss_bytes > 0 {
@@ -2816,6 +3181,7 @@ impl ParakeetCppEngine {
                     Some(status.to_string()),
                 ),
                 completed: results,
+                failed_chunk: None,
             });
         }
         if results.len() != chunks.len() {
@@ -2826,6 +3192,7 @@ impl ParakeetCppEngine {
                     chunks.len()
                 )),
                 completed: results,
+                failed_chunk: None,
             });
         }
         results.sort_by_key(|(chunk, _)| chunk.index);
@@ -2852,6 +3219,7 @@ impl ParakeetCppEngine {
             .collect::<Vec<_>>();
         let mut completed = Vec::<(AudioChunk, TranscriptionOutput)>::new();
         let mut resume_from_seconds = 0.0_f32;
+        let mut isolated_empty_retries = HashSet::<(i64, i64)>::new();
         // Keep an explicit end-of-audio invariant even when callers do not
         // provide a duration. The chunk planner has already decoded the WAV,
         // so the final manifest row is the authoritative physical end. This
@@ -2925,13 +3293,79 @@ impl ParakeetCppEngine {
                     return Ok(merged);
                 }
                 Err(attempt_error) => {
-                    let retryable =
-                        Self::is_retryable_long_file_memory_error(&attempt_error.error.to_string());
-                    Self::append_completed_chunks(&mut completed, attempt_error.completed);
+                    let LongFileAttemptError {
+                        mut error,
+                        completed: attempt_completed,
+                        failed_chunk,
+                    } = attempt_error;
+                    Self::append_completed_chunks(&mut completed, attempt_completed);
                     if let Some((chunk, _)) = completed.last() {
                         resume_from_seconds = chunk.commit_end_seconds;
                     }
-                    last_error = Some(attempt_error.error);
+                    let mut retryable =
+                        Self::is_retryable_long_file_memory_error(&error.to_string());
+
+                    // A voiced-empty row is unconfirmed. Retry exactly that
+                    // window once with the same backend before moving to the
+                    // smaller-window plan. Confirmed rows remain in `completed`
+                    // and are never replayed.
+                    if let Some(failed_chunk) = failed_chunk {
+                        let key = (
+                            (failed_chunk.commit_start_seconds * 1000.0).round() as i64,
+                            (failed_chunk.commit_end_seconds * 1000.0).round() as i64,
+                        );
+                        if isolated_empty_retries.insert(key) {
+                            match Self::prepare_isolated_retry_chunk(&failed_chunk) {
+                                Ok((_isolated_temp_dir, isolated_chunk)) => {
+                                    // The temporary directory owns the exact
+                                    // commit-only WAV and stays alive through
+                                    // the worker call. The one-row retry
+                                    // manifest is locally indexed from zero;
+                                    // absolute commit timing is retained on the
+                                    // chunk for merge/progress bookkeeping.
+                                    match self
+                                        .run_worker_for_chunks(
+                                            &worker_path,
+                                            model_path,
+                                            language_code,
+                                            std::slice::from_ref(&isolated_chunk),
+                                            &completed,
+                                            total_audio_seconds,
+                                            &callbacks,
+                                        )
+                                        .await
+                                    {
+                                        Ok(results) => {
+                                            Self::append_completed_chunks(&mut completed, results);
+                                            if let Some((chunk, _)) = completed.last() {
+                                                resume_from_seconds = chunk.commit_end_seconds;
+                                            }
+                                            last_error = None;
+                                            continue;
+                                        }
+                                        Err(isolated_error) => {
+                                            Self::append_completed_chunks(
+                                                &mut completed,
+                                                isolated_error.completed,
+                                            );
+                                            if let Some((chunk, _)) = completed.last() {
+                                                resume_from_seconds = chunk.commit_end_seconds;
+                                            }
+                                            error = isolated_error.error;
+                                            retryable = Self::is_retryable_long_file_memory_error(
+                                                &error.to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(isolated_error) => {
+                                    error = isolated_error;
+                                    retryable = false;
+                                }
+                            }
+                        }
+                    }
+                    last_error = Some(error);
                     if !retryable {
                         return Err(last_error.expect("attempt error was just stored"));
                     }
@@ -2955,7 +3389,6 @@ impl ParakeetCppEngine {
         {
             let mut cpu_engine = self.clone();
             cpu_engine.compute_device = TranscriptionComputeDevice::Cpu;
-            (callbacks.emit_partial)("Parakeet fallback CPU-safe mode...".to_string());
             if total_audio_seconds
                 .map(|total| {
                     resume_from_seconds + LONG_FILE_CHUNK_VALIDATION_TOLERANCE_SECONDS < total
@@ -2986,7 +3419,7 @@ impl ParakeetCppEngine {
                     Ok(results) => Self::append_completed_chunks(&mut completed, results),
                     Err(cpu_error) => {
                         return Err(ApplicationError::SpeechToText(format!(
-                            "Parakeet retry in CPU-safe mode failed: {}",
+                            "Parakeet transcription failed after a backend retry: {}",
                             cpu_error.error
                         )));
                     }
@@ -3070,7 +3503,7 @@ impl ParakeetCppEngine {
         // already committed: same (normalized) text AND a timestamp that overlaps
         // an already-committed word within tolerance. A word in the overlap zone
         // that the previous chunk never produced always survives.
-        let mut committed_word_keys: Vec<(String, f32, f32)> = Vec::new();
+        let mut committed_word_keys: Vec<(String, String, f32, f32)> = Vec::new();
         let mut merged_segments = Vec::new();
 
         let mut sorted = chunks.to_vec();
@@ -3091,21 +3524,24 @@ impl ParakeetCppEngine {
                             // No timestamp at all: keep it (rare, never a dup).
                             return true;
                         };
-                        let key =
-                            format!("{language_key}\u{001f}{}", normalize_word_text(&word.text));
+                        let word_key = normalize_word_text(&word.text);
                         let start = word.start_seconds.unwrap_or(seconds);
                         let end = word.end_seconds.unwrap_or(seconds);
                         let is_duplicate = committed_word_keys.iter().any(
-                            |(existing_key, existing_start, existing_end)| {
-                                existing_key == &key
-                                    && start <= existing_end + OVERLAP_DEDUPE_TOLERANCE_SECONDS
-                                    && end >= existing_start - OVERLAP_DEDUPE_TOLERANCE_SECONDS
+                            |(existing_language, existing_word, existing_start, existing_end)| {
+                                let compatible_language = existing_language == &language_key
+                                    || existing_language == "und"
+                                    || language_key == "und";
+                                compatible_language
+                                    && existing_word == &word_key
+                                    && start <= existing_end + WORD_DUPLICATE_TOLERANCE_SECONDS
+                                    && end >= existing_start - WORD_DUPLICATE_TOLERANCE_SECONDS
                             },
                         );
                         if is_duplicate {
                             return false;
                         }
-                        committed_word_keys.push((key, start, end));
+                        committed_word_keys.push((language_key.clone(), word_key, start, end));
                         true
                     });
                     if segment.words.is_empty() {
@@ -3168,14 +3604,14 @@ impl ParakeetCppEngine {
         for mut segment in output.segments.drain(..) {
             if !segment.words.is_empty() {
                 segment.words.retain(|word| {
-                    let anchor = match (word.start_seconds, word.end_seconds) {
-                        (Some(start), Some(end)) => (start + end) * 0.5,
-                        (Some(start), None) => start,
-                        (None, Some(end)) => end,
+                    let (start, end) = match (word.start_seconds, word.end_seconds) {
+                        (Some(start), Some(end)) => (start.min(end), start.max(end)),
+                        (Some(start), None) => (start, start),
+                        (None, Some(end)) => (end, end),
                         (None, None) => return true,
                     };
-                    anchor >= commit_start_seconds - tolerance
-                        && anchor <= commit_end_seconds + tolerance
+                    end >= commit_start_seconds - tolerance
+                        && start <= commit_end_seconds + tolerance
                 });
 
                 if segment.words.is_empty() {
@@ -3226,6 +3662,82 @@ impl ParakeetCppEngine {
         output.segments = filtered_segments;
     }
 
+    /// Return whether the committed portion of a serialized worker chunk
+    /// contains enough PCM energy to be considered voiced. Context can contain
+    /// speech that is intentionally owned by an adjacent chunk; measuring the
+    /// whole decode would turn that context-only speech into a false voiced
+    /// empty failure. An empty row is retried only when the commit interval
+    /// itself is voiced, so spoken commit audio is never silently advanced.
+    fn chunk_has_audio_energy(path: &Path, start_seconds: f32, end_seconds: f32) -> bool {
+        if !start_seconds.is_finite()
+            || !end_seconds.is_finite()
+            || start_seconds < 0.0
+            || end_seconds <= start_seconds
+        {
+            return false;
+        }
+        let Ok(mut reader) = hound::WavReader::open(path) else {
+            // If the chunk cannot be read, let the normal worker/protocol error
+            // path decide; do not manufacture a voiced-empty retry here.
+            return false;
+        };
+        let spec = reader.spec();
+        if spec.channels == 0 || spec.sample_rate == 0 {
+            return false;
+        }
+        let channels = usize::from(spec.channels);
+        let first_sample =
+            (start_seconds * spec.sample_rate as f32).floor().max(0.0) as usize * channels;
+        let last_sample =
+            (end_seconds * spec.sample_rate as f32).ceil().max(0.0) as usize * channels;
+        if last_sample <= first_sample {
+            return false;
+        }
+        let (sum, count, peak) = match spec.sample_format {
+            hound::SampleFormat::Int => {
+                let mut sum = 0.0_f64;
+                let mut count = 0_u64;
+                let mut peak = 0.0_f64;
+                for (index, sample) in reader.samples::<i16>().flatten().enumerate() {
+                    if index < first_sample {
+                        continue;
+                    }
+                    if index >= last_sample {
+                        break;
+                    }
+                    let value = f64::from(sample) / f64::from(i16::MAX);
+                    sum += value * value;
+                    peak = peak.max(value.abs());
+                    count += 1;
+                }
+                (sum, count, peak)
+            }
+            hound::SampleFormat::Float => {
+                let mut sum = 0.0_f64;
+                let mut count = 0_u64;
+                let mut peak = 0.0_f64;
+                for (index, sample) in reader.samples::<f32>().flatten().enumerate() {
+                    if index < first_sample {
+                        continue;
+                    }
+                    if index >= last_sample {
+                        break;
+                    }
+                    let value = f64::from(sample).clamp(-1.0, 1.0);
+                    sum += value * value;
+                    peak = peak.max(value.abs());
+                    count += 1;
+                }
+                (sum, count, peak)
+            }
+        };
+        if count == 0 {
+            return false;
+        }
+        let rms = (sum / count as f64).sqrt();
+        rms >= 0.006 || peak >= 0.03
+    }
+
     fn is_metal_oom_error(message: &str) -> bool {
         let lower = message.to_ascii_lowercase();
         lower.contains("outofmemory")
@@ -3240,6 +3752,9 @@ impl ParakeetCppEngine {
             .to_ascii_lowercase()
             .contains("sbobino_parakeet_memory_limit")
             || Self::is_metal_oom_error(message)
+            || message
+                .to_ascii_lowercase()
+                .contains(&EMPTY_VOICED_CHUNK_MARKER.to_ascii_lowercase())
     }
 
     fn parakeet_command_failure(
@@ -3289,6 +3804,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
                 "Parakeet.cpp does not support translate-to-English mode".to_string(),
             ));
         }
+        let emit_progress_seconds = monotonic_progress_callback(emit_progress_seconds);
 
         let model_path = self.validate_model_exists(model_filename)?;
         if Self::should_use_long_file_chunking(input_wav, total_audio_seconds) {
@@ -3305,9 +3821,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
                     },
                 )
                 .await?;
-            if !Self::is_nemotron_streaming_model(model_filename) {
-                Self::classify_tdt_output(&mut result);
-            }
+            Self::classify_tdt_output(&mut result);
             emit_partial(format!("{DELTA_REPLACE_PREFIX}{}", result.text));
             if let Some(total) = total_audio_seconds {
                 emit_progress_seconds(total);
@@ -3381,9 +3895,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut result = Self::parse_json_output(&stdout, total_audio_seconds)?;
-        if !Self::is_nemotron_streaming_model(model_filename) {
-            Self::classify_tdt_output(&mut result);
-        }
+        Self::classify_tdt_output(&mut result);
         let (preview_text, preview_delta_count) = {
             let preview_snapshot = preview_state
                 .lock()
@@ -3411,11 +3923,45 @@ impl SpeechToTextEngine for ParakeetCppEngine {
 mod tests {
     use std::path::PathBuf;
 
+    use hound::{SampleFormat, WavSpec, WavWriter};
+    use tempfile::tempdir;
     use tokio::process::Command;
 
-    use sbobino_domain::{TranscriptionComputeDevice, TranscriptionOutput};
+    use sbobino_domain::{
+        TimedSegment, TimedWord, TranscriptionComputeDevice, TranscriptionOutput,
+    };
 
     use super::{AudioChunk, ParakeetCppEngine};
+
+    fn write_energy_fixture(path: &std::path::Path, sample: i16) {
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer = WavWriter::create(path, spec).expect("create energy fixture");
+        for _ in 0..16_000 {
+            writer.write_sample(sample).expect("write energy fixture");
+        }
+        writer.finalize().expect("finalize energy fixture");
+    }
+
+    #[test]
+    fn voiced_empty_worker_row_is_detected_as_retryable() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("voiced.wav");
+        write_energy_fixture(&path, 12_000);
+        assert!(ParakeetCppEngine::chunk_has_audio_energy(&path, 0.0, 1.0));
+    }
+
+    #[test]
+    fn silent_empty_worker_row_is_allowed() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("silent.wav");
+        write_energy_fixture(&path, 0);
+        assert!(!ParakeetCppEngine::chunk_has_audio_energy(&path, 0.0, 1.0));
+    }
 
     #[cfg(windows)]
     use super::{WindowsWorkerJobGuard, WorkerMemoryStats};
@@ -3489,20 +4035,116 @@ mod tests {
                 ("Hello".to_string(), None),
             ]
         );
+
+        let pieces = ParakeetCppEngine::parse_language_marked_text("Ciao <it-IT> Hello");
+        assert_eq!(
+            pieces,
+            vec![
+                ("Ciao".to_string(), Some("it".to_string())),
+                ("Hello".to_string(), None),
+            ]
+        );
     }
 
     #[test]
     fn json_output_preserves_multiple_nemotron_language_markers() {
         let output = ParakeetCppEngine::parse_json_output(
-            r#"{"text":"<it-IT>Ciao <en-US>Hello"}"#,
+            r#"{"text":"<it-IT>Ciao <en-US>Hello <unk>","words":[{"w":"Ciao","start":0.0,"end":0.5},{"w":"<it-IT>","start":0.5,"end":0.5},{"w":"Hello","start":1.0,"end":1.5},{"w":"<en-US>","start":1.5,"end":1.5},{"w":"<unk>na","start":1.5,"end":1.7}]}"#,
             Some(4.0),
         )
         .expect("marker output should parse");
-        assert_eq!(output.segments.len(), 2);
+        assert!(output.segments.len() >= 2);
         assert_eq!(output.segments[0].language_code.as_deref(), Some("it"));
         assert_eq!(output.segments[1].language_code.as_deref(), Some("en"));
         assert!(!output.text.contains("<it-IT>"));
         assert!(!output.text.contains("<en-US>"));
+        assert!(!output.text.contains("<unk>"));
+        assert!(output
+            .segments
+            .iter()
+            .flat_map(|segment| &segment.words)
+            .all(|word| !word.text.starts_with('<')));
+        assert!(output
+            .segments
+            .iter()
+            .flat_map(|segment| &segment.words)
+            .any(|word| word.text == "na"));
+        assert!(output
+            .segments
+            .iter()
+            .all(|segment| segment.language_code.as_deref() != Some("unk")));
+    }
+
+    #[test]
+    fn nemotron_suffix_marker_labels_only_the_utterance_after_a_timed_gap() {
+        let output = ParakeetCppEngine::parse_json_output(
+            r#"{"text":"farsi Deutsch. <de-DE>","words":[{"w":"farsi","start":1.0,"end":2.0},{"w":"Deutsch.","start":4.0,"end":4.5},{"w":"<de-DE>","start":4.6,"end":4.6}]}"#,
+            Some(5.0),
+        )
+        .expect("marker output should parse");
+
+        assert_eq!(output.segments.len(), 2);
+        assert_eq!(output.segments[0].text, "farsi");
+        assert_eq!(output.segments[0].language_code, None);
+        assert_eq!(output.segments[1].text, "Deutsch.");
+        assert_eq!(output.segments[1].language_code.as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn overlap_dedupe_accepts_unknown_language_but_preserves_confirmed_changes() {
+        let word = |text: &str, start: f32, end: f32| TimedWord {
+            text: text.to_string(),
+            start_seconds: Some(start),
+            end_seconds: Some(end),
+            confidence: None,
+        };
+        let segment = |language: Option<&str>, start: f32, end: f32| TimedSegment {
+            text: "ciao".to_string(),
+            start_seconds: Some(start),
+            end_seconds: Some(end),
+            language_code: language.map(str::to_string),
+            words: vec![word("ciao", start, end)],
+            ..TimedSegment::default()
+        };
+        let chunks = vec![
+            (
+                AudioChunk {
+                    index: 0,
+                    path: PathBuf::from("first.wav"),
+                    decode_start_seconds: 0.0,
+                    decode_end_seconds: 2.0,
+                    commit_start_seconds: 0.0,
+                    commit_end_seconds: 1.5,
+                },
+                TranscriptionOutput {
+                    text: "ciao".to_string(),
+                    segments: vec![segment(Some("it"), 1.0, 1.5)],
+                },
+            ),
+            (
+                AudioChunk {
+                    index: 1,
+                    path: PathBuf::from("second.wav"),
+                    decode_start_seconds: 1.4,
+                    decode_end_seconds: 3.0,
+                    commit_start_seconds: 1.5,
+                    commit_end_seconds: 3.0,
+                },
+                TranscriptionOutput {
+                    text: "ciao ciao".to_string(),
+                    segments: vec![segment(None, 1.55, 1.6), segment(Some("en"), 1.55, 1.6)],
+                },
+            ),
+        ];
+
+        let merged = ParakeetCppEngine::merge_chunk_transcriptions_snapshot(&chunks, Some(3.0))
+            .expect("merge should succeed")
+            .expect("merge should remain non-empty");
+
+        assert_eq!(merged.text, "ciao ciao");
+        assert_eq!(merged.segments.len(), 2);
+        assert_eq!(merged.segments[0].language_code.as_deref(), Some("it"));
+        assert_eq!(merged.segments[1].language_code.as_deref(), Some("en"));
     }
 
     #[test]

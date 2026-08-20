@@ -208,6 +208,50 @@ fn assert_timeline_has_word_timestamp(artifact: &TranscriptArtifact) {
     );
 }
 
+/// Optionally export the persisted timeline for the release/reference evaluator.
+///
+/// Real-service smoke tests remain unchanged unless `SBOBINO_ASR_TIMELINE_OUTPUT`
+/// is set.  Keeping this opt-in avoids creating files during normal test runs,
+/// while allowing the evaluator to consume the exact timeline written by the
+/// application service (rather than a second parser or a CLI-specific format).
+fn write_optional_timeline_output(artifact: &TranscriptArtifact) {
+    let Some(output_path) = optional_env("SBOBINO_ASR_TIMELINE_OUTPUT") else {
+        return;
+    };
+
+    let timeline = artifact
+        .metadata
+        .get("timeline_v2")
+        .expect("artifact should persist timeline_v2 metadata before export");
+    let mut payload: Value =
+        serde_json::from_str(timeline).expect("timeline_v2 should be valid JSON before export");
+    if let Some(duration_seconds) = artifact.audio_duration_seconds {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "duration_seconds".to_string(),
+                Value::from(f64::from(duration_seconds)),
+            );
+        }
+    }
+
+    let output_path = Path::new(&output_path);
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .expect("SBOBINO_ASR_TIMELINE_OUTPUT parent directory should be writable");
+    }
+    let serialized = serde_json::to_vec_pretty(&payload)
+        .expect("timeline_v2 payload should be serializable for export");
+    std::fs::write(output_path, serialized)
+        .expect("SBOBINO_ASR_TIMELINE_OUTPUT should be writable");
+    eprintln!(
+        "wrote ASR timeline evaluator output to {}",
+        output_path.display()
+    );
+}
+
 fn assert_detected_language_contract(
     artifact: &TranscriptArtifact,
     expected_detected_language: &str,
@@ -366,6 +410,7 @@ async fn parakeet_service_real_smoke_persists_metadata() {
         &expected_processing_language,
     );
     assert_timeline_has_word_timestamp(&artifact);
+    write_optional_timeline_output(&artifact);
 
     let persisted = repo
         .list_recent(10, 0)
@@ -515,4 +560,5 @@ async fn whisper_service_real_smoke_preserves_timeline_and_plain_text() {
         );
         previous_start = start;
     }
+    write_optional_timeline_output(&artifact);
 }

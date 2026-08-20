@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -34,6 +35,10 @@ struct StreamState {
     language_detections: Vec<(String, f32)>,
     session_started_at: Option<Instant>,
     last_segment_end_seconds: f32,
+    terminal_error: Option<String>,
+    stop_requested: bool,
+    telemetry_sink: Option<WhisperTelemetrySink>,
+    first_preview_ms: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +46,47 @@ pub struct WhisperStreamStopResult {
     pub transcript: String,
     pub segments: Vec<TimedSegment>,
     pub saved_audio_path: Option<PathBuf>,
+}
+
+/// Runtime-only live metrics emitted alongside Whisper preview deltas.  The
+/// timestamps are derived from the session clock and parsed segment arrival,
+/// so consumers can diagnose decoder lag without inspecting transcript text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WhisperStreamTelemetry {
+    pub captured_seconds: f32,
+    pub processed_seconds: f32,
+    pub backlog_seconds: f32,
+    pub inference_ms: Option<f32>,
+    pub first_preview_ms: Option<f32>,
+    pub finalization_ms: Option<f32>,
+}
+
+pub type WhisperTelemetrySink = Arc<dyn Fn(WhisperStreamTelemetry) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WhisperLiveProfile {
+    step_ms: u32,
+    length_ms: u32,
+}
+
+impl WhisperLiveProfile {
+    /// Keep the live window short enough for a responsive preview while
+    /// allowing larger models to amortize decoder setup. CPU is deliberately
+    /// more aggressive because it cannot sustain the long default window.
+    fn for_model(model_filename: &str, device: TranscriptionComputeDevice) -> Self {
+        let lower = model_filename.to_ascii_lowercase();
+        let large_model = lower.contains("large") || lower.contains("medium");
+        match device {
+            TranscriptionComputeDevice::Cpu => Self {
+                step_ms: 320,
+                length_ms: if large_model { 2_400 } else { 1_920 },
+            },
+            TranscriptionComputeDevice::Gpu | TranscriptionComputeDevice::Auto => Self {
+                step_ms: 320,
+                length_ms: if large_model { 4_800 } else { 3_200 },
+            },
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -71,6 +117,31 @@ impl WhisperStreamEngine {
             TranscriptionComputeDevice::Cpu => &["-ng", "-nfa"],
             TranscriptionComputeDevice::Auto | TranscriptionComputeDevice::Gpu => &[],
         }
+    }
+
+    fn child_exit_diagnostic(status: Option<&ExitStatus>) -> String {
+        match status.and_then(ExitStatus::code) {
+            Some(code) => format!("Whisper live worker exited unexpectedly with status {code}."),
+            None => "Whisper live worker exited unexpectedly (signal/unknown status).".to_string(),
+        }
+    }
+
+    fn mark_terminal_child_failure(state: &mut StreamState, status: Option<&ExitStatus>) {
+        if status.is_some_and(|status| status.code() == Some(0)) {
+            // A clean worker completion is a valid terminal state. The caller
+            // may still stop and collect the complete transcript/history.
+            state.running = false;
+            state.paused = false;
+            return;
+        }
+        if state.terminal_error.is_some() {
+            return;
+        }
+        let message = Self::child_exit_diagnostic(status);
+        state.terminal_error = Some(message.clone());
+        state.diagnostics.push(message);
+        state.running = false;
+        state.paused = false;
     }
 
     fn create_session_dir() -> Result<PathBuf, ApplicationError> {
@@ -253,6 +324,30 @@ impl WhisperStreamEngine {
             .unwrap_or(state.last_segment_end_seconds)
     }
 
+    fn telemetry_snapshot(state: &StreamState) -> WhisperStreamTelemetry {
+        let captured_seconds = Self::elapsed_seconds(state).max(state.last_segment_end_seconds);
+        // whisper-stream does not expose a hardware sample cursor. The end
+        // timestamp assigned when a segment arrives is the processed cursor;
+        // the difference to the session clock is an explicit inference-lag
+        // proxy, rather than hidden in transcript text.
+        let processed_seconds = state.last_segment_end_seconds.min(captured_seconds);
+        let backlog_seconds = (captured_seconds - processed_seconds).max(0.0);
+        WhisperStreamTelemetry {
+            captured_seconds,
+            processed_seconds,
+            backlog_seconds,
+            inference_ms: Some(backlog_seconds * 1_000.0),
+            first_preview_ms: state.first_preview_ms,
+            finalization_ms: None,
+        }
+    }
+
+    fn emit_telemetry(sink: Option<&WhisperTelemetrySink>, telemetry: WhisperStreamTelemetry) {
+        if let Some(sink) = sink {
+            sink(telemetry);
+        }
+    }
+
     fn should_store_diagnostic(text: &str) -> bool {
         let lower = text.to_ascii_lowercase();
         lower.contains("failed")
@@ -313,6 +408,7 @@ impl WhisperStreamEngine {
         shared_state: Arc<Mutex<StreamState>>,
         reader: R,
         emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
+        telemetry_sink: Option<WhisperTelemetrySink>,
     ) -> JoinHandle<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -325,7 +421,8 @@ impl WhisperStreamEngine {
             let process_record =
                 |raw_line: String,
                  shared_state: Arc<Mutex<StreamState>>,
-                 emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>| async move {
+                 emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
+                 telemetry_sink: Option<WhisperTelemetrySink>| async move {
                     let is_preview = raw_line.contains("[2K]") || raw_line.contains("\u{001b}[2K");
                     let cleaned = Self::clean_line(&raw_line);
                     if cleaned.is_empty() {
@@ -360,6 +457,7 @@ impl WhisperStreamEngine {
                             {
                                 state.running = false;
                                 state.paused = false;
+                                state.terminal_error = state.diagnostics.last().cloned();
                             }
                         }
                         return;
@@ -372,6 +470,10 @@ impl WhisperStreamEngine {
 
                     if is_preview {
                         state.preview = cleaned.clone();
+                        if state.first_preview_ms.is_none() {
+                            state.first_preview_ms = Some(Self::elapsed_seconds(&state) * 1_000.0);
+                        }
+                        let telemetry = Self::telemetry_snapshot(&state);
                         emit_delta(RealtimeDelta {
                             kind: RealtimeDeltaKind::UpdatePreview,
                             text: cleaned,
@@ -380,6 +482,7 @@ impl WhisperStreamEngine {
                             language_code: None,
                             language_confidence: None,
                         });
+                        Self::emit_telemetry(telemetry_sink.as_ref(), telemetry);
                         return;
                     }
 
@@ -405,6 +508,7 @@ impl WhisperStreamEngine {
                             words: Vec::new(),
                         });
                         state.last_segment_end_seconds = end_seconds;
+                        let telemetry = Self::telemetry_snapshot(&state);
                         emit_delta(RealtimeDelta {
                             kind,
                             text: cleaned,
@@ -413,6 +517,7 @@ impl WhisperStreamEngine {
                             language_code,
                             language_confidence,
                         });
+                        Self::emit_telemetry(telemetry_sink.as_ref(), telemetry);
                     }
                 };
 
@@ -433,8 +538,13 @@ impl WhisperStreamEngine {
                                 let raw_line =
                                     String::from_utf8_lossy(&pending[record_start..index])
                                         .to_string();
-                                process_record(raw_line, shared_state.clone(), emit_delta.clone())
-                                    .await;
+                                process_record(
+                                    raw_line,
+                                    shared_state.clone(),
+                                    emit_delta.clone(),
+                                    telemetry_sink.clone(),
+                                )
+                                .await;
                             }
 
                             record_start = index + 1;
@@ -451,12 +561,30 @@ impl WhisperStreamEngine {
 
             if !pending.is_empty() {
                 let raw_line = String::from_utf8_lossy(&pending).to_string();
-                process_record(raw_line, shared_state.clone(), emit_delta.clone()).await;
+                process_record(
+                    raw_line,
+                    shared_state.clone(),
+                    emit_delta.clone(),
+                    telemetry_sink.clone(),
+                )
+                .await;
             }
 
             let mut state = shared_state.lock().await;
             state.active_readers = state.active_readers.saturating_sub(1);
             if state.active_readers == 0 {
+                let child_status = state
+                    .child
+                    .as_mut()
+                    .and_then(|child| child.try_wait().ok().flatten());
+                if state.running
+                    && !state.stop_requested
+                    && child_status
+                        .as_ref()
+                        .is_some_and(|status| status.code() != Some(0))
+                {
+                    Self::mark_terminal_child_failure(&mut state, child_status.as_ref());
+                }
                 state.running = false;
                 state.paused = false;
             }
@@ -469,6 +597,17 @@ impl WhisperStreamEngine {
         language_code: &str,
         emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
     ) -> Result<(), ApplicationError> {
+        self.start_with_telemetry(model_filename, language_code, emit_delta, None)
+            .await
+    }
+
+    pub async fn start_with_telemetry(
+        &self,
+        model_filename: &str,
+        language_code: &str,
+        emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
+        telemetry_sink: Option<WhisperTelemetrySink>,
+    ) -> Result<(), ApplicationError> {
         let mut state = self.state.lock().await;
         if state.running {
             return Err(ApplicationError::Validation(
@@ -477,6 +616,8 @@ impl WhisperStreamEngine {
         }
 
         state.diagnostics.clear();
+        state.terminal_error = None;
+        state.stop_requested = false;
 
         let model_path = self.model_path(model_filename);
         if !model_path.exists() {
@@ -488,6 +629,7 @@ impl WhisperStreamEngine {
 
         let session_dir = Self::create_session_dir()?;
         let mut command = tokio_background_command(&self.binary_path);
+        let profile = WhisperLiveProfile::for_model(model_filename, self.compute_device);
         command
             .kill_on_drop(true)
             .arg("-m")
@@ -495,9 +637,9 @@ impl WhisperStreamEngine {
             .arg("-t")
             .arg("8")
             .arg("--step")
-            .arg("500")
+            .arg(profile.step_ms.to_string())
             .arg("--length")
-            .arg("5000")
+            .arg(profile.length_ms.to_string())
             .arg("--save-audio")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -550,11 +692,18 @@ impl WhisperStreamEngine {
         state.language_detections.clear();
         state.session_started_at = Some(Instant::now());
         state.last_segment_end_seconds = 0.0;
+        state.telemetry_sink = telemetry_sink.clone();
+        state.first_preview_ms = None;
         drop(state);
 
         let reader_tasks = vec![
-            Self::spawn_reader_task(self.state.clone(), stdout, emit_delta.clone()),
-            Self::spawn_reader_task(self.state.clone(), stderr, emit_delta),
+            Self::spawn_reader_task(
+                self.state.clone(),
+                stdout,
+                emit_delta.clone(),
+                telemetry_sink.clone(),
+            ),
+            Self::spawn_reader_task(self.state.clone(), stderr, emit_delta, telemetry_sink),
         ];
 
         let mut state = self.state.lock().await;
@@ -586,8 +735,18 @@ impl WhisperStreamEngine {
     }
 
     pub async fn stop(&self) -> Result<WhisperStreamStopResult, ApplicationError> {
+        let finalization_started = Instant::now();
         let (mut child, reader_tasks) = {
             let mut state = self.state.lock().await;
+            // Observe an already-exited child before taking ownership of it.
+            // Once `child` is moved out, the reader tasks cannot reliably
+            // distinguish a crash from the intentional stop signal.
+            if let Some(child) = state.child.as_mut() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    Self::mark_terminal_child_failure(&mut state, Some(&status));
+                }
+            }
+            state.stop_requested = true;
             (state.child.take(), std::mem::take(&mut state.reader_tasks))
         };
 
@@ -645,10 +804,31 @@ impl WhisperStreamEngine {
         let session_dir = state.session_dir.take();
         let consolidated = state.lines.join("\n");
         let segments = state.segments.clone();
+        let mut final_telemetry = Self::telemetry_snapshot(&state);
+        let telemetry_sink = state.telemetry_sink.clone();
+        let terminal_error = state.terminal_error.clone();
         state.session_started_at = None;
         state.language_detections.clear();
+        state.stop_requested = false;
         drop(state);
         let saved_audio_path = Self::await_saved_audio_path(session_dir.as_deref()).await;
+
+        final_telemetry.finalization_ms =
+            Some(finalization_started.elapsed().as_secs_f32() * 1_000.0);
+        Self::emit_telemetry(telemetry_sink.as_ref(), final_telemetry);
+
+        if let Some(error) = terminal_error {
+            let recovery = match saved_audio_path.as_ref() {
+                Some(path) => format!(
+                    "{error} The captured audio was preserved at {}. Transcribe that WAV as a file to recover the session; no partial live transcript was saved.",
+                    path.display()
+                ),
+                None => format!(
+                    "{error} No captured audio file was found, so no partial live transcript was saved. Retry the live session after checking the microphone and runtime."
+                ),
+            };
+            return Err(ApplicationError::SpeechToText(recovery));
+        }
 
         Ok(WhisperStreamStopResult {
             transcript: consolidated,
@@ -659,15 +839,20 @@ impl WhisperStreamEngine {
 
     pub async fn is_running(&self) -> bool {
         let mut state = self.state.lock().await;
-        if let Some(child) = state.child.as_mut() {
-            if child.try_wait().ok().flatten().is_some() {
+        let child_status = state
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten());
+        if let Some(status) = child_status.as_ref() {
+            if status.code() == Some(0) {
                 state.running = false;
                 state.paused = false;
-            } else if let Some(pid) = child.id() {
-                if !Self::process_is_alive(pid) {
-                    state.running = false;
-                    state.paused = false;
-                }
+            } else {
+                Self::mark_terminal_child_failure(&mut state, Some(status));
+            }
+        } else if let Some(pid) = state.child.as_ref().and_then(Child::id) {
+            if !Self::process_is_alive(pid) {
+                Self::mark_terminal_child_failure(&mut state, None);
             }
         }
         state.running
@@ -689,6 +874,8 @@ impl WhisperStreamEngine {
         state.segments.clear();
         state.language_detections.clear();
         state.last_segment_end_seconds = 0.0;
+        state.terminal_error = None;
+        state.stop_requested = false;
     }
 
     pub async fn snapshot_text(&self) -> String {
@@ -704,6 +891,7 @@ impl WhisperStreamEngine {
         state.lines.clear();
         state.preview.clear();
         state.diagnostics.clear();
+        state.terminal_error = None;
         state.session_dir = None;
         state.segments.clear();
         state.language_detections.clear();
@@ -714,7 +902,7 @@ impl WhisperStreamEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamState, WhisperStreamEngine};
+    use super::{StreamState, WhisperLiveProfile, WhisperStreamEngine};
     use sbobino_domain::TranscriptionComputeDevice;
 
     #[test]
@@ -729,6 +917,18 @@ mod tests {
         assert!(
             WhisperStreamEngine::compute_device_args(TranscriptionComputeDevice::Gpu).is_empty()
         );
+    }
+
+    #[test]
+    fn adaptive_live_profile_keeps_preview_step_at_320ms_and_scales_window() {
+        let cpu = WhisperLiveProfile::for_model("ggml-base.bin", TranscriptionComputeDevice::Cpu);
+        let gpu = WhisperLiveProfile::for_model("ggml-base.bin", TranscriptionComputeDevice::Gpu);
+        let large =
+            WhisperLiveProfile::for_model("ggml-large-v3.bin", TranscriptionComputeDevice::Auto);
+        assert_eq!(cpu.step_ms, 320);
+        assert_eq!(gpu.step_ms, 320);
+        assert!(cpu.length_ms < gpu.length_ms);
+        assert!(large.length_ms > gpu.length_ms);
     }
 
     #[test]
@@ -751,5 +951,91 @@ mod tests {
             "whisper_full_with_state: auto-detected language: en (p = 0.83)",
         );
         assert_eq!(parsed, Some(("en".to_string(), 0.83)));
+    }
+
+    #[tokio::test]
+    async fn child_exit_after_start_is_terminal_and_visible() {
+        let engine = WhisperStreamEngine::new("whisper-stream".to_string(), "models".to_string());
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("fake whisper child should spawn");
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        {
+            let mut state = engine.state.lock().await;
+            state.child = Some(child);
+            state.running = true;
+            state.active_readers = 1;
+        }
+        let mut running = true;
+        for _ in 0..20 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+            running = engine.is_running().await;
+            if !running {
+                break;
+            }
+        }
+        assert!(!running);
+        let diagnostics = engine.snapshot_diagnostics().await;
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("status 7"), "{diagnostics:?}");
+        assert!(engine
+            .state
+            .lock()
+            .await
+            .terminal_error
+            .as_deref()
+            .is_some_and(|message| message.contains("status 7")));
+    }
+
+    #[tokio::test]
+    async fn stop_after_child_exit_returns_recovery_error_and_keeps_audio_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let audio_path = temp.path().join("whisper-live.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&audio_path, spec).expect("create wav");
+        writer.write_sample(0_i16).expect("write wav");
+        writer.finalize().expect("finalize wav");
+
+        let engine = WhisperStreamEngine::new("whisper-stream".to_string(), "models".to_string());
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("fake whisper child should spawn");
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        {
+            let mut state = engine.state.lock().await;
+            state.child = Some(child);
+            state.running = true;
+            state.active_readers = 0;
+            state.session_dir = Some(temp.path().to_path_buf());
+            state
+                .lines
+                .push("partial preview must not be saved".to_string());
+        }
+
+        let error = engine
+            .stop()
+            .await
+            .expect_err("an exited Whisper child must fail stop");
+        let message = error.to_string();
+        assert!(message.contains("status 7"), "{message}");
+        assert!(
+            message.contains(audio_path.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(
+            message.contains("Transcribe that WAV as a file"),
+            "{message}"
+        );
+        assert!(
+            message.contains("no partial live transcript was saved"),
+            "{message}"
+        );
     }
 }

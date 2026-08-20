@@ -162,7 +162,7 @@ if [[ ! -f "$MODEL_PATH" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$SBOBINO_PARAKEET_MODELS_DIR/$NEMOTRON_STREAMING_Q4_MODEL" ]]; then
+if [[ "${SBOBINO_PARAKEET_SKIP_NEMOTRON:-0}" != "1" && ! -f "$SBOBINO_PARAKEET_MODELS_DIR/$NEMOTRON_STREAMING_Q4_MODEL" ]]; then
   echo "missing Parakeet NVIDIA Nemotron live model in: $SBOBINO_PARAKEET_MODELS_DIR" >&2
   echo "download manually:" >&2
   echo "  curl -L -o '$SBOBINO_PARAKEET_MODELS_DIR/$NEMOTRON_STREAMING_Q4_MODEL' '$NEMOTRON_STREAMING_Q4_URL'" >&2

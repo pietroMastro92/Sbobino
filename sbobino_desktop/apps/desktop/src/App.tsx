@@ -204,6 +204,7 @@ import {
   clampPercentage,
   formatProgressPercentageLabel,
   makeProgressVisible,
+  percentageFromProgress,
 } from "./lib/progressUi";
 import {
   buildQueuedTranscriptionJob,
@@ -1761,12 +1762,7 @@ function percentageFromJobProgress(
   progress: JobProgress | null | undefined,
 ): number {
   if (!progress) return 0;
-  const currentSeconds = progress.current_seconds ?? null;
-  const totalSeconds = progress.total_seconds ?? null;
-  if (currentSeconds !== null && totalSeconds !== null && totalSeconds > 0) {
-    return clampPercentage((currentSeconds / totalSeconds) * 100);
-  }
-  return clampPercentage(progress.percentage);
+  return percentageFromProgress(progress);
 }
 
 function activeJobPercentage(
@@ -2415,6 +2411,10 @@ function normalizeSettings(settings: AppSettings): AppSettings {
     transcription: {
       ...settings.transcription,
       compute_device: settings.transcription.compute_device ?? "auto",
+      // Older settings only had the file-transcription device. Live sessions
+      // intentionally migrate to automatic backend selection until the user
+      // chooses a dedicated live preference.
+      live_compute_device: settings.transcription.live_compute_device ?? "auto",
       parakeet_model:
         settings.transcription.parakeet_model ?? "tdt06b_v3_q4",
       parakeet_cli_path:
@@ -3425,8 +3425,17 @@ export function App({
   const [realtimePreviewSegment, setRealtimePreviewSegment] =
     useState<TimelineV2Segment | null>(null);
   const [realtimeInputLevels, setRealtimeInputLevels] = useState<number[]>([]);
+  const [realtimeTelemetry, setRealtimeTelemetry] = useState<
+    RealtimeInputLevelEvent["telemetry"]
+  >(null);
   const [realtimePreviewState, setRealtimePreviewState] = useState<
-    "idle" | "connecting" | "running" | "paused" | "blocked" | "unavailable"
+    | "idle"
+    | "connecting"
+    | "running"
+    | "paused"
+    | "blocked"
+    | "unavailable"
+    | "degraded"
   >("idle");
   const [activeRealtimeJobId, setActiveRealtimeJobId] = useState<string | null>(
     null,
@@ -5277,8 +5286,39 @@ export function App({
 
       const uRealtimeInput = await subscribeRealtimeInputLevel(
         (event: RealtimeInputLevelEvent) => {
+          if (event.telemetry) {
+            setRealtimeTelemetry(event.telemetry);
+            if (event.telemetry.backlog_seconds > 2) {
+              setRealtimeMessage(
+                event.message ||
+                  t(
+                    "realtime.backlogWarning",
+                    "Live preview is behind; continuous audio is being saved.",
+                  ),
+              );
+            }
+          }
+
+          if (event.state === "degraded") {
+            setRealtimePreviewState("degraded");
+            setRealtimeMessage(event.message);
+            return;
+          }
+
+          if (event.state === "finalizing") {
+            // Stop emits idle before the bounded worker finalizes its saved
+            // audio. Do not let this diagnostic event resurrect the live UI.
+            setRealtimeMessage(event.message);
+            return;
+          }
+
           if (event.state === "running") {
-            setRealtimePreviewState("running");
+            // A degraded preview is terminal for this session: capture/WAV
+            // continues, but subsequent level ticks must not hide the saved-
+            // audio fallback behind a fresh "running" overlay.
+            setRealtimePreviewState((previous) =>
+              previous === "degraded" ? previous : "running",
+            );
             setRealtimeInputLevels((previous) => {
               const next = [...previous, Math.max(0, Math.min(1, event.level ?? 0))];
               return next.length > 160 ? next.slice(next.length - 160) : next;
@@ -10057,6 +10097,7 @@ export function App({
     try {
       setRealtimePreviewState("connecting");
       setRealtimeInputLevels([]);
+      setRealtimeTelemetry(null);
 
       const readiness = await withTimeout(
         fetchRealtimeStartReadiness({
@@ -10142,6 +10183,7 @@ export function App({
       setRealtimeStartedAtMs(null);
       setRealtimePreviewState("idle");
       setRealtimeInputLevels([]);
+      setRealtimeTelemetry(null);
       setRealtimeSegments([]);
       setRealtimePreviewSegment(null);
       setError(
@@ -10233,6 +10275,7 @@ export function App({
         activeRealtimeJobIdRef.current = null;
         setActiveRealtimeJobId(null);
         setRealtimePreview("");
+        setRealtimeTelemetry(null);
         setRealtimeFinalLines([]);
         setRealtimeSessionOpen(false);
         setRealtimeStartedAtMs(null);
@@ -10258,6 +10301,7 @@ export function App({
       }
       clearRealtimeSpeakerDetectionRequest();
       setRealtimePreview("");
+      setRealtimeTelemetry(null);
       setRealtimeFinalLines([]);
       setRealtimeSegments([]);
       setRealtimePreviewSegment(null);
@@ -13860,6 +13904,10 @@ export function App({
                     "realtime.waveformUnavailable",
                     "Microphone preview is unavailable on this device.",
                   )}
+                  degradedLabel={t(
+                    "realtime.waveformDegraded",
+                    "Live preview paused; saved audio is available for file transcription.",
+                  )}
                 />
               ) : (
                 <AudioPlayer
@@ -14070,6 +14118,10 @@ export function App({
               unavailableLabel={t(
                 "realtime.waveformUnavailable",
                 "Microphone preview is unavailable on this device.",
+              )}
+              degradedLabel={t(
+                "realtime.waveformDegraded",
+                "Live preview paused; saved audio is available for file transcription.",
               )}
             />
 
@@ -15442,6 +15494,45 @@ export function App({
                   transcription: {
                     ...current.transcription,
                     compute_device: event.target.value as
+                      | "auto"
+                      | "gpu"
+                      | "cpu",
+                  },
+                }));
+              }}
+            >
+              <option value="auto">
+                {t("settings.transcription.computeAuto", "Auto")}
+              </option>
+              <option value="gpu">
+                {t("settings.transcription.computeGpu", "GPU")}
+              </option>
+              <option value="cpu">
+                {t("settings.transcription.computeCpu", "CPU")}
+              </option>
+            </select>
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
+              <strong>
+                {t("settings.transcription.liveComputeDevice", "Live compute device")}
+              </strong>
+              <small>
+                {t(
+                  "settings.transcription.liveComputeDeviceDesc",
+                  "Used only for live microphone transcription. File jobs keep the setting above.",
+                )}
+              </small>
+            </div>
+            <select
+              value={settings.transcription.live_compute_device ?? "auto"}
+              onChange={(event) => {
+                void patchSettings((current) => ({
+                  ...current,
+                  transcription: {
+                    ...current.transcription,
+                    live_compute_device: event.target.value as
                       | "auto"
                       | "gpu"
                       | "cpu",

@@ -3,6 +3,7 @@ import {
   clampPercentage,
   formatProgressPercentageLabel,
   makeProgressVisible,
+  percentageFromProgress,
 } from "./progressUi";
 
 describe("progressUi", () => {
@@ -24,5 +25,19 @@ describe("progressUi", () => {
     expect(formatProgressPercentageLabel(0.2)).toBe("01%");
     expect(formatProgressPercentageLabel(7.2)).toBe("07%");
     expect(formatProgressPercentageLabel(100)).toBe("100%");
+  });
+
+  it("prefers monotonic overall progress over the completed audio cursor", () => {
+    expect(
+      percentageFromProgress({
+        percentage: 85,
+        overall_percentage: 85,
+        current_seconds: 60,
+        total_seconds: 60,
+      }),
+    ).toBe(85);
+    expect(
+      percentageFromProgress({ percentage: 42, current_seconds: 5, total_seconds: 10 }),
+    ).toBe(50);
   });
 });

@@ -354,17 +354,30 @@ PYANNOTE_SMOKE_DIR="$TEMP_DIR/pyannote-smoke"
 mkdir -p "$PYANNOTE_SMOKE_DIR"
 /usr/bin/ditto -x -k "$TEMP_DIR/pyannote-runtime-macos-$RELEASE_ARCH.zip" "$PYANNOTE_SMOKE_DIR"
 
+PYANNOTE_MODEL_SMOKE_DIR="$TEMP_DIR/pyannote-model-smoke"
+mkdir -p "$PYANNOTE_MODEL_SMOKE_DIR"
+/usr/bin/ditto -x -k "$TEMP_DIR/pyannote-model-community-1.zip" "$PYANNOTE_MODEL_SMOKE_DIR"
+if [[ ! -f "$PYANNOTE_MODEL_SMOKE_DIR/model/config.yaml" ]]; then
+  echo "Remote Pyannote model asset is missing model/config.yaml." >&2
+  exit 1
+fi
+
 PATH="/usr/bin:/bin" \
 PYANNOTE_RUNTIME_ROOT="$PYANNOTE_SMOKE_DIR/python" \
+PYANNOTE_MODEL_ROOT="$PYANNOTE_MODEL_SMOKE_DIR/model" \
+HF_HUB_OFFLINE="1" \
+TRANSFORMERS_OFFLINE="1" \
 PYTHONHOME="$PYANNOTE_SMOKE_DIR/python" \
 PYTHONPATH="$PYANNOTE_SMOKE_DIR/python/lib/python3.11:$PYANNOTE_SMOKE_DIR/python/lib/python3.11/lib-dynload:$PYANNOTE_SMOKE_DIR/python/lib/python3.11/site-packages" \
 PYTHONNOUSERSITE="1" \
 "$PYANNOTE_SMOKE_DIR/python/bin/python3" - <<'PY'
 import os
 import pathlib
+import re
 import subprocess
 
 root = pathlib.Path(os.environ["PYANNOTE_RUNTIME_ROOT"])
+model_root = pathlib.Path(os.environ["PYANNOTE_MODEL_ROOT"])
 host_prefixes = ("/opt/homebrew", "/usr/local", "/Library/Frameworks")
 
 
@@ -513,6 +526,7 @@ import collections.abc
 import ctypes
 import csv
 import encodings
+import importlib.metadata
 import ssl
 import sqlite3
 import traceback
@@ -520,7 +534,25 @@ import types
 import torch
 import torchcodec
 from pyannote.audio import Pipeline
+pipeline = Pipeline.from_pretrained(str(model_root))
+if pipeline is None:
+    raise SystemExit("Remote Pyannote model deep smoke returned no pipeline")
+ffmpeg_abi = sorted(
+    {
+        f"lib{match.group(1)}.{match.group(2)}"
+        for directory in (torchcodec_dir / ".dylibs", torchcodec_dir, root / "lib" / "embedded-dylibs")
+        if directory.is_dir()
+        for path in directory.iterdir()
+        for match in [re.match(r"(?:lib)?(av(?:util|codec|format|device|filter|swscale|swresample))(?:[.]|[-])([0-9]+)", path.name)]
+        if match
+    }
+)
+if not ffmpeg_abi:
+    raise SystemExit("Remote Pyannote runtime did not expose a bundled FFmpeg ABI")
 print("Remote pyannote runtime smoke test passed")
+print(f"torch_version={torch.__version__}")
+print(f"torchcodec_version={importlib.metadata.version('torchcodec')}")
+print("ffmpeg_abi=" + ",".join(ffmpeg_abi))
 PY
 
 echo "Distribution readiness checks passed for $TAG"

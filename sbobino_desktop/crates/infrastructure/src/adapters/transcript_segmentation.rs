@@ -23,7 +23,7 @@ pub fn normalize_transcript_segments(
         .iter()
         .any(|segment| segment.start_seconds.is_some() || segment.end_seconds.is_some())
     {
-        return merge_timed_segments(cleaned_segments);
+        return clamp_timeline_monotonic(merge_timed_segments(cleaned_segments));
     }
 
     // Model-provided language markers are utterance boundaries. Keep them
@@ -53,6 +53,35 @@ pub fn normalize_transcript_segments(
         }
     }
     inferred
+}
+
+/// Model timestamps and overlapped ASR windows can disagree by a few frames.
+/// Persist a non-overlapping timeline without changing text or segment order.
+fn clamp_timeline_monotonic(mut segments: Vec<TimedSegment>) -> Vec<TimedSegment> {
+    let mut segment_cursor = 0.0_f32;
+
+    for segment in &mut segments {
+        let start = segment
+            .start_seconds
+            .unwrap_or(segment_cursor)
+            .max(segment_cursor);
+        let end = segment.end_seconds.unwrap_or(start).max(start);
+        segment.start_seconds = Some(start);
+        segment.end_seconds = Some(end);
+
+        let mut word_cursor = start;
+        for word in &mut segment.words {
+            let word_start = word.start_seconds.unwrap_or(word_cursor).max(word_cursor);
+            let word_end = word.end_seconds.unwrap_or(word_start).max(word_start);
+            word.start_seconds = Some(word_start);
+            word.end_seconds = Some(word_end);
+            word_cursor = word_end;
+        }
+
+        segment_cursor = end;
+    }
+
+    segments
 }
 
 fn infer_timings_for_language_marked_segments(
@@ -409,7 +438,7 @@ fn ends_with_soft_boundary(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::normalize_transcript_segments;
-    use sbobino_domain::TimedSegment;
+    use sbobino_domain::{TimedSegment, TimedWord};
 
     #[test]
     fn merges_word_level_timed_segments_into_readable_sentences() {
@@ -559,5 +588,44 @@ mod tests {
         assert_eq!(normalized[1].language_code.as_deref(), Some("en"));
         assert_eq!(normalized[1].start_seconds, Some(2.0));
         assert_eq!(normalized[1].end_seconds, Some(4.0));
+    }
+
+    #[test]
+    fn clamps_overlapped_backend_segments_and_words_without_losing_text() {
+        let segments = vec![
+            TimedSegment {
+                text: "First sentence.".to_string(),
+                start_seconds: Some(10.0),
+                end_seconds: Some(12.0),
+                words: vec![TimedWord {
+                    text: "sentence".to_string(),
+                    start_seconds: Some(11.5),
+                    end_seconds: Some(12.0),
+                    confidence: None,
+                }],
+                ..TimedSegment::default()
+            },
+            TimedSegment {
+                text: "Second sentence.".to_string(),
+                start_seconds: Some(11.9),
+                end_seconds: Some(12.8),
+                words: vec![TimedWord {
+                    text: "Second".to_string(),
+                    start_seconds: Some(11.9),
+                    end_seconds: Some(12.2),
+                    confidence: None,
+                }],
+                ..TimedSegment::default()
+            },
+        ];
+
+        let normalized = normalize_transcript_segments("", &segments, Some(13.0));
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].text, "First sentence.");
+        assert_eq!(normalized[1].text, "Second sentence.");
+        assert_eq!(normalized[1].start_seconds, Some(12.0));
+        assert_eq!(normalized[1].words[0].start_seconds, Some(12.0));
+        assert_eq!(normalized[1].words[0].end_seconds, Some(12.2));
     }
 }

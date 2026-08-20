@@ -238,6 +238,10 @@ static std::string unwrap_singleton_json_array(const std::string& batch_json) {
     return batch_json.substr(1, batch_json.size() - 2);
 }
 
+static bool is_auto_target_lang(const std::string& target_lang) {
+    return target_lang.empty() || target_lang == "auto";
+}
+
 static void emit_event(const char* phase, int index, const std::string& message) {
     std::fprintf(stderr,
                  "SBOBINO_PARAKEET_WORKER {\"phase\":\"%s\",\"index\":%d,\"message\":\"%s\"}\n",
@@ -287,6 +291,7 @@ int main(int argc, char** argv) {
     }
     emit_event("model_ready", -1, "Parakeet model ready");
 
+    const bool auto_target_lang = is_auto_target_lang(target_lang);
     int expected_sample_rate = 0;
     for (const auto& chunk : chunks) {
         emit_event("chunk_started", chunk.index, "Processing Parakeet chunk");
@@ -310,23 +315,37 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        int sample_count = static_cast<int>(samples.size());
-        char* json = parakeet_capi_transcribe_pcm_batch_json_lang(
-            ctx, samples.data(), &sample_count, 1, sample_rate, 0, target_lang.c_str());
+        char* json = nullptr;
+        bool result_is_batch = false;
+        if (auto_target_lang) {
+            // Nemotron's language-aware PCM batch path can return an empty
+            // result for an otherwise voiced chunk. The path JSON API uses
+            // the same loaded model and the same WAV bytes as parakeet-cli,
+            // while retaining timestamps and confidence in the JSON result.
+            json = parakeet_capi_transcribe_path_json(ctx, chunk.path.c_str(), 0);
+        } else {
+            int sample_count = static_cast<int>(samples.size());
+            json = parakeet_capi_transcribe_pcm_batch_json_lang(
+                ctx, samples.data(), &sample_count, 1, sample_rate, 0, target_lang.c_str());
+            result_is_batch = true;
+        }
         if (!json) {
             emit_event("failed", chunk.index, "Parakeet chunk failed");
-            std::fprintf(stderr, "parakeet-batch-json: chunk %d failed: %s\n",
-                         chunk.index, parakeet_capi_last_error(ctx));
+            const char* last_error = parakeet_capi_last_error(ctx);
+            std::fprintf(stderr, "parakeet-batch-json: chunk %d failed: %s\n", chunk.index,
+                         last_error ? last_error : "unknown Parakeet error");
             parakeet_capi_free(ctx);
             return 1;
         }
 
-        const std::string batch_json(json);
-        const std::string result_json = unwrap_singleton_json_array(batch_json);
+        const std::string serialized_json(json);
         parakeet_capi_free_string(json);
+        const std::string result_json = result_is_batch
+            ? unwrap_singleton_json_array(serialized_json)
+            : serialized_json;
         if (result_json.empty()) {
             emit_event("failed", chunk.index, "Chunk returned malformed JSON");
-            std::fprintf(stderr, "parakeet-batch-json: chunk %d returned malformed batch JSON\n",
+            std::fprintf(stderr, "parakeet-batch-json: chunk %d returned malformed JSON\n",
                          chunk.index);
             parakeet_capi_free(ctx);
             return 1;

@@ -1,6 +1,13 @@
 import { useEffect, useRef } from "react";
 
-type PreviewState = "idle" | "connecting" | "running" | "paused" | "blocked" | "unavailable";
+type PreviewState =
+  | "idle"
+  | "connecting"
+  | "running"
+  | "paused"
+  | "blocked"
+  | "unavailable"
+  | "degraded";
 
 type LiveMicrophoneWaveformProps = {
   ariaLabel: string;
@@ -15,6 +22,7 @@ type LiveMicrophoneWaveformProps = {
   connectingLabel: string;
   blockedLabel: string;
   unavailableLabel: string;
+  degradedLabel?: string;
 };
 
 const BAR_WIDTH = 3;
@@ -169,16 +177,44 @@ export function LiveMicrophoneWaveform({
   connectingLabel,
   blockedLabel,
   unavailableLabel,
+  degradedLabel = "Live preview paused; saved audio is available for file transcription.",
 }: LiveMicrophoneWaveformProps): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Keep the hot audio path outside React's render loop. Input events update a
+  // bounded ring buffer and one RAF paints the latest snapshot at display
+  // cadence, avoiding per-sample canvas/state churn.
+  const levelsRef = useRef<number[]>([]);
+  const previewStateRef = useRef(previewState);
+  const modeRef = useRef(mode);
+
+  useEffect(() => {
+    const next = levels.slice(-160);
+    levelsRef.current = next;
+  }, [levels]);
+
+  useEffect(() => {
+    previewStateRef.current = previewState;
+    modeRef.current = mode;
+  }, [mode, previewState]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) {
       return;
     }
-    drawWaveform(canvas, levels, previewState, mode);
-  }, [levels, previewState, mode]);
+    let frame = 0;
+    const paint = () => {
+      drawWaveform(
+        canvas,
+        levelsRef.current,
+        previewStateRef.current,
+        modeRef.current,
+      );
+      frame = window.requestAnimationFrame(paint);
+    };
+    frame = window.requestAnimationFrame(paint);
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
 
   const overlayLabel = (() => {
     if (mode === "paused") return pausedLabel;
@@ -189,6 +225,8 @@ export function LiveMicrophoneWaveform({
         return blockedLabel;
       case "unavailable":
         return unavailableLabel;
+      case "degraded":
+        return degradedLabel;
       case "idle":
         return idleLabel;
       default:

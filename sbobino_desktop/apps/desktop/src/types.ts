@@ -111,6 +111,8 @@ export type SpeakerDiarizationSettings = {
 export type TranscriptionSettings = {
   engine: TranscriptionEngine;
   compute_device: "auto" | "gpu" | "cpu";
+  /** Compute preference for live/realtime jobs; file jobs use compute_device. */
+  live_compute_device: "auto" | "gpu" | "cpu";
   model: SpeechModel;
   parakeet_model: ParakeetModel;
   language: LanguageCode;
@@ -323,6 +325,10 @@ export type JobProgress = {
   percentage: number;
   current_seconds?: number | null;
   total_seconds?: number | null;
+  committed_seconds?: number;
+  processed_seconds?: number;
+  stage_percentage?: number;
+  overall_percentage?: number;
   input_path?: string | null;
   title?: string | null;
   source_origin?: ArtifactSourceOrigin | null;
@@ -563,6 +569,14 @@ export type RealtimeInputLevelEvent = {
   state: string;
   level: number;
   message: string;
+  telemetry?: {
+    captured_seconds: number;
+    processed_seconds: number;
+    backlog_seconds: number;
+    inference_ms?: number | null;
+    first_preview_ms?: number | null;
+    finalization_ms?: number | null;
+  } | null;
 };
 
 export type ProvisioningStatus = {

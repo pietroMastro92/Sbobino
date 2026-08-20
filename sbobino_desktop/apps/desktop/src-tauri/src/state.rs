@@ -12,7 +12,6 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::parakeet_realtime::ParakeetRealtimeEngine;
-use crate::realtime_audio::RealtimeInputPreviewHandle;
 
 pub struct TranscriptionTask {
     pub cancel_token: CancellationToken,
@@ -28,7 +27,6 @@ pub struct RealtimeRuntime {
     pub engine: Arc<Mutex<WhisperStreamEngine>>,
     pub parakeet_engine: Arc<Mutex<Option<ParakeetRealtimeEngine>>>,
     pub active_engine: Arc<Mutex<TranscriptionEngine>>,
-    pub preview: Arc<Mutex<Option<RealtimeInputPreviewHandle>>>,
     pub active_job_id: Arc<Mutex<Option<String>>>,
     pub session_name: Arc<Mutex<Option<String>>>,
     pub model_filename: Arc<Mutex<Option<String>>>,

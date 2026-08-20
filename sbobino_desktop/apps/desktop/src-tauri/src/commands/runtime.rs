@@ -30,7 +30,6 @@ const DEEP_RUNTIME_PROBE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 static DEEP_RUNTIME_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static DEEP_RUNTIME_PROBE_CACHE: OnceLock<Mutex<HashMap<String, CachedRuntimeProbe>>> =
     OnceLock::new();
-static PYANNOTE_PROBE_IN_FLIGHT: OnceLock<Mutex<bool>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct RuntimeProbeFailure {
@@ -171,57 +170,6 @@ fn recover_interrupted_runtime_install(state: &AppState) -> Result<(), CommandEr
 
 fn runtime_probe_cache() -> &'static Mutex<HashMap<String, CachedRuntimeProbe>> {
     DEEP_RUNTIME_PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn schedule_optional_pyannote_probe(
-    state: &AppState,
-    health: &sbobino_infrastructure::RuntimeHealth,
-) {
-    if !health.pyannote.enabled
-        || !health.pyannote.runtime_installed
-        || !health.pyannote.model_installed
-    {
-        return;
-    }
-
-    let in_flight = PYANNOTE_PROBE_IN_FLIGHT.get_or_init(|| Mutex::new(false));
-    let Ok(mut active) = in_flight.lock() else {
-        return;
-    };
-    if *active {
-        return;
-    }
-    *active = true;
-    drop(active);
-
-    let runtime_factory = state.runtime_factory.clone();
-    let in_flight = PYANNOTE_PROBE_IN_FLIGHT
-        .get()
-        .expect("pyannote probe gate initialized");
-    tauri::async_runtime::spawn(async move {
-        let result = crate::commands::provisioning::probe_pyannote_import_and_load(
-            &runtime_factory,
-            &CancellationToken::new(),
-        )
-        .await;
-        match result {
-            Ok(()) => {
-                let _ = runtime_factory.write_managed_pyannote_status(
-                    "ok",
-                    "Pyannote diarization runtime import/load probe passed.",
-                );
-            }
-            Err(error) if error != "cancelled" => {
-                let _ = runtime_factory
-                    .write_managed_pyannote_status("pyannote_import_load_failed", &error);
-                tracing::warn!("Pyannote optional readiness probe failed: {error}");
-            }
-            Err(_) => {}
-        }
-        if let Ok(mut active) = in_flight.lock() {
-            *active = false;
-        }
-    });
 }
 
 fn runtime_probe_cache_key(
@@ -448,9 +396,17 @@ fn parakeet_batch_worker_path(cli_path: &Path) -> PathBuf {
 
 fn write_runtime_probe_manifest(wav_path: &Path) -> Result<PathBuf, RuntimeProbeFailure> {
     let manifest_path = wav_path.with_extension("tsv");
+    // Probe a resumed global interval, not only the initial zero-based row.
+    // v2.0.28 long-file recovery relies on workers accepting manifests that
+    // start at the first uncovered commit edge. Older packaged workers pass a
+    // trivial t=0 smoke but fail every real retry, so readiness must reject
+    // them and offer the transactional runtime repair before ASR starts.
     std::fs::write(
         &manifest_path,
-        format!("0\t0.000\t1.000\t0.000\t1.000\t{}\n", wav_path.display()),
+        format!(
+            "0\t45.000\t46.000\t45.000\t46.000\t{}\n",
+            wav_path.display()
+        ),
     )
     .map_err(|error| RuntimeProbeFailure {
         reason_code: "runtime_probe_fixture_failed".to_string(),
@@ -1262,10 +1218,9 @@ pub async fn get_transcription_start_preflight(
         .transcription
         .compute_device;
 
-    // Pyannote is optional. Probe its Python import/model load in a detached,
-    // bounded task so a broken diarization environment is reported for repair
-    // without delaying or blocking the ASR preflight itself.
-    schedule_optional_pyannote_probe(&state, &health);
+    // Pyannote deep validation is deliberately restricted to explicit
+    // install/repair/update flows.  Startup remains a cheap, idempotent
+    // manifest/receipt check and must never spawn the managed interpreter.
 
     let requested_engine = payload
         .as_ref()
@@ -1531,6 +1486,8 @@ mod tests {
                 source: "disabled".to_string(),
                 reason_code: "disabled".to_string(),
                 message: "disabled".to_string(),
+                receipt_verified: false,
+                deep_probe_required: false,
             },
             setup_complete: parakeet_available,
         }
@@ -1578,6 +1535,24 @@ mod tests {
             .output()
             .expect("shell should run");
         assert!(validate_parakeet_worker_output(&invalid).is_err());
+    }
+
+    #[test]
+    fn parakeet_probe_manifest_requires_resumed_worker_contract() {
+        let temp = tempfile::tempdir().expect("probe tempdir should exist");
+        let wav = temp.path().join("probe.wav");
+        std::fs::write(&wav, b"wav").expect("probe fixture should write");
+
+        let manifest = write_runtime_probe_manifest(&wav)
+            .expect("Parakeet readiness manifest should be written");
+        let contents = std::fs::read_to_string(manifest)
+            .expect("Parakeet readiness manifest should be readable");
+
+        assert!(
+            contents.starts_with("0\t45.000\t46.000\t45.000\t46.000\t"),
+            "readiness must exercise the non-zero resume contract"
+        );
+        assert!(contents.ends_with("probe.wav\n"));
     }
 
     #[test]

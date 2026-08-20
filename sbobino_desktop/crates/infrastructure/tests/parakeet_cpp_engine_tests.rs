@@ -78,6 +78,20 @@ fn write_constant_test_wav(path: &Path, seconds: u32) {
     writer.finalize().expect("failed to finalize constant wav");
 }
 
+fn write_silence_test_wav(path: &Path, seconds: u32) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).expect("failed to create wav");
+    for _ in 0..(seconds * 16_000) {
+        writer.write_sample(0_i16).expect("failed to write silence");
+    }
+    writer.finalize().expect("failed to finalize silence wav");
+}
+
 fn assert_valid_real_parakeet_output(transcript: &sbobino_domain::TranscriptionOutput) {
     assert!(
         !transcript.text.trim().is_empty(),
@@ -146,6 +160,7 @@ struct parakeet_ctx {};
 extern "C" {
 parakeet_ctx* parakeet_capi_load(const char*);
 void parakeet_capi_free(parakeet_ctx*);
+char* parakeet_capi_transcribe_path_json(parakeet_ctx*, const char*, int);
 char* parakeet_capi_transcribe_pcm_batch_json_lang(
     parakeet_ctx*, float*, int*, int, int, int, const char*);
 const char* parakeet_capi_last_error(parakeet_ctx*);
@@ -163,6 +178,9 @@ extern "C" parakeet_ctx* parakeet_capi_load(const char*) {
     return nullptr;
 }
 extern "C" void parakeet_capi_free(parakeet_ctx*) {}
+extern "C" char* parakeet_capi_transcribe_path_json(parakeet_ctx*, const char*, int) {
+    return nullptr;
+}
 extern "C" char* parakeet_capi_transcribe_pcm_batch_json_lang(
     parakeet_ctx*, float*, int*, int, int, int, const char*) { return nullptr; }
 extern "C" const char* parakeet_capi_last_error(parakeet_ctx*) { return "fake"; }
@@ -250,6 +268,134 @@ extern "C" void parakeet_capi_free_string(char*) {}
             );
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn batch_worker_routes_auto_to_path_json_and_explicit_language_to_batch_api() {
+    use std::process::Command;
+
+    let temp = tempdir().expect("failed to create temp dir");
+    let fake_include_dir = temp.path().join("fake-include");
+    let fake_header = fake_include_dir.join("parakeet_capi.h");
+    let fake_capi = temp.path().join("fake_parakeet_capi.cpp");
+    let worker_binary = temp.path().join("parakeet-batch-json-routing-test");
+    let chunk_path = temp.path().join("chunk.wav");
+    let manifest_path = temp.path().join("chunks.tsv");
+    std::fs::create_dir_all(&fake_include_dir).expect("failed to create fake include dir");
+    write_silence_test_wav(&chunk_path, 1);
+    std::fs::write(
+        &manifest_path,
+        format!("0\t0\t1\t0\t1\t{}\n", chunk_path.display()),
+    )
+    .expect("failed to write routing manifest");
+    std::fs::write(
+        &fake_header,
+        r#"#pragma once
+struct parakeet_ctx {};
+extern "C" {
+parakeet_ctx* parakeet_capi_load(const char*);
+void parakeet_capi_free(parakeet_ctx*);
+char* parakeet_capi_transcribe_path_json(parakeet_ctx*, const char*, int);
+char* parakeet_capi_transcribe_pcm_batch_json_lang(
+    parakeet_ctx*, float*, int*, int, int, int, const char*);
+const char* parakeet_capi_last_error(parakeet_ctx*);
+void parakeet_capi_free_string(char*);
+}
+"#,
+    )
+    .expect("failed to write fake parakeet header");
+    std::fs::write(
+        &fake_capi,
+        r#"#include "parakeet_capi.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+static char* copy_json(const char* value) {
+    const std::size_t size = std::strlen(value) + 1;
+    char* result = static_cast<char*>(std::malloc(size));
+    if (result != nullptr) {
+        std::memcpy(result, value, size);
+    }
+    return result;
+}
+
+extern "C" parakeet_ctx* parakeet_capi_load(const char*) {
+    static parakeet_ctx context;
+    return &context;
+}
+extern "C" void parakeet_capi_free(parakeet_ctx*) {}
+extern "C" char* parakeet_capi_transcribe_path_json(
+    parakeet_ctx*, const char*, int) {
+    std::fputs("PATH_JSON\n", stderr);
+    return copy_json("{\"text\":\"path\",\"words\":[],\"tokens\":[]}");
+}
+extern "C" char* parakeet_capi_transcribe_pcm_batch_json_lang(
+    parakeet_ctx*, float*, int*, int, int, int, const char*) {
+    std::fputs("LANG_BATCH\n", stderr);
+    return copy_json("[{\"text\":\"lang\",\"words\":[],\"tokens\":[]}]");
+}
+extern "C" const char* parakeet_capi_last_error(parakeet_ctx*) { return "fake"; }
+extern "C" void parakeet_capi_free_string(char* value) { std::free(value); }
+"#,
+    )
+    .expect("failed to write fake parakeet C API");
+
+    let worker_source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("infrastructure crate should be under desktop workspace")
+        .join("scripts/parakeet_batch_json.cpp");
+    let compile = Command::new("clang++")
+        .arg("-std=c++17")
+        .arg("-I")
+        .arg(&fake_include_dir)
+        .arg(&worker_source)
+        .arg(&fake_capi)
+        .arg("-o")
+        .arg(&worker_binary)
+        .output()
+        .expect("clang++ must be available for the macOS worker build");
+    assert!(
+        compile.status.success(),
+        "fake-CAPI routing worker build failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let auto = Command::new(&worker_binary)
+        .args(["--model", "fake-model.gguf", "--manifest"])
+        .arg(&manifest_path)
+        .output()
+        .expect("failed to launch auto worker");
+    let auto_stdout = String::from_utf8_lossy(&auto.stdout);
+    let auto_stderr = String::from_utf8_lossy(&auto.stderr);
+    assert!(auto.status.success(), "auto worker failed: {auto_stderr}");
+    assert!(
+        auto_stdout.contains("\"result\":{\"text\":\"path\""),
+        "auto worker must preserve path JSON result, got stdout: {auto_stdout}"
+    );
+    assert!(auto_stderr.contains("PATH_JSON"));
+    assert!(!auto_stderr.contains("LANG_BATCH"));
+
+    let explicit = Command::new(&worker_binary)
+        .args(["--model", "fake-model.gguf", "--manifest"])
+        .arg(&manifest_path)
+        .args(["--lang", "it"])
+        .output()
+        .expect("failed to launch explicit-language worker");
+    let explicit_stdout = String::from_utf8_lossy(&explicit.stdout);
+    let explicit_stderr = String::from_utf8_lossy(&explicit.stderr);
+    assert!(
+        explicit.status.success(),
+        "explicit-language worker failed: {explicit_stderr}"
+    );
+    assert!(
+        explicit_stdout.contains("\"result\":{\"text\":\"lang\""),
+        "explicit-language worker must preserve batch result, got stdout: {explicit_stdout}"
+    );
+    assert!(explicit_stderr.contains("LANG_BATCH"));
+    assert!(!explicit_stderr.contains("PATH_JSON"));
 }
 
 #[tokio::test]
@@ -744,7 +890,7 @@ async fn long_file_worker_keeps_valid_empty_final_chunk_without_cli_fallback() {
     std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
     std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
         .expect("failed to create model");
-    write_test_wav(&input_wav, 605);
+    write_silence_test_wav(&input_wav, 605);
 
     write_executable_script(
         &script_path,
@@ -1219,6 +1365,138 @@ exit 0
             "retry planner should generate the {expected}s commit window, got {actual}s"
         );
     }
+}
+
+#[tokio::test]
+async fn long_file_voiced_empty_retry_uses_commit_only_audio_without_replaying_prefix() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("parakeet-cli");
+    let worker_path = temp.path().join("parakeet-batch-json");
+    let models_dir = temp.path().join("parakeet-models");
+    let input_wav = temp.path().join("audio.wav");
+    let worker_log = temp.path().join("worker-log.tsv");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join(DEFAULT_REAL_SMOKE_MODEL), b"fake model")
+        .expect("failed to create model");
+    // Constant non-zero PCM makes the commit-only voiced guard deterministic.
+    write_constant_test_wav(&input_wav, 65);
+
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\necho 'chunk CLI must not run for a worker retry' >&2\nexit 45\n",
+    );
+    write_executable_script(
+        &worker_path,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+manifest=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --manifest) manifest="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+while IFS="$(printf '\t')" read -r idx decode_start decode_end commit_start commit_end path; do
+  [ -n "$idx" ] || continue
+  bytes=$(wc -c < "$path" | tr -d '[:space:]')
+  duration=$(awk -v bytes="$bytes" 'BEGIN {{ printf "%.3f", (bytes - 44) / 32000.0 }}')
+  sample=$(dd if="$path" bs=1 skip=44 count=2 2>/dev/null | od -An -td2 | tr -d '[:space:]')
+  printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$$" "$idx" "$decode_start" "$decode_end" "$commit_start" "$commit_end" "$duration" "$sample" >> "{worker_log}"
+
+  # Simulate Nemotron's context-only empty response. The parent must retain
+  # the confirmed first row and retry this exact commit window in isolation.
+  if [ "$decode_start" = "25.000" ] && [ "$commit_start" = "30.000" ]; then
+    printf '{{"index":%s,"decode_start":%s,"decode_end":%s,"commit_start":%s,"commit_end":%s,"result":{{"text":"","words":[]}}}}\n' \
+      "$idx" "$decode_start" "$decode_end" "$commit_start" "$commit_end"
+    exit 0
+  fi
+
+  label="prefix-$idx"
+  if [ "$decode_start" = "30.000" ] && [ "$commit_start" = "30.000" ]; then
+    label="retry-commit"
+  elif [ "$commit_start" = "60.000" ]; then
+    label="tail"
+  fi
+  word_start=$(awk -v c="$commit_start" -v d="$decode_start" 'BEGIN {{ printf "%.3f", c - d + 1.0 }}')
+  word_end=$(awk -v s="$word_start" 'BEGIN {{ printf "%.3f", s + 0.4 }}')
+  printf '{{"index":%s,"decode_start":%s,"decode_end":%s,"commit_start":%s,"commit_end":%s,"result":{{"text":"%s","words":[{{"w":"%s","start":%s,"end":%s}}]}}}}\n' \
+    "$idx" "$decode_start" "$decode_end" "$commit_start" "$commit_end" "$label" "$label" "$word_start" "$word_end"
+done < "$manifest"
+exit 0
+"#,
+            worker_log = worker_log.display()
+        ),
+    );
+
+    let engine = ParakeetCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let emitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let emitted_ref = emitted.clone();
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            DEFAULT_REAL_SMOKE_MODEL,
+            &transcription_policy("it"),
+            &WhisperOptions::default(),
+            Some(65.0),
+            Arc::new(move |delta: String| {
+                emitted_ref.lock().expect("delta lock poisoned").push(delta);
+            }),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("isolated voiced-empty retry should recover the full file");
+
+    assert!(transcript.text.contains("prefix-0"));
+    assert!(transcript.text.contains("retry-commit"));
+    assert!(transcript.text.contains("tail"));
+    assert_eq!(
+        transcript.text.matches("prefix-0").count(),
+        1,
+        "confirmed prefix must not be replayed by an isolated retry"
+    );
+
+    let log = std::fs::read_to_string(&worker_log).expect("worker should inspect every WAV");
+    let rows = log.lines().collect::<Vec<_>>();
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("|0|0.000|35.000|0.000|30.000|35.000|1024")),
+        "initial confirmed row should contain its 35 s context WAV: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("|1|25.000|65.000|30.000|60.000|40.000|1024")),
+        "first context attempt should contain the 40 s overlap WAV: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("|0|30.000|60.000|30.000|60.000|30.000|1024")),
+        "isolated retry should expose only the 30 s commit WAV with non-zero PCM: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("|0|0.000|35.000|0.000|30.000|35.000|1024"))
+            .count(),
+        1,
+        "confirmed prefix row must be present in exactly one worker manifest"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("|0|55.000|67.000|60.000|65.000|12.000|1024")),
+        "tail should resume at the confirmed commit edge without replaying prefix: {rows:?}"
+    );
+    assert!(
+        emitted
+            .lock()
+            .expect("delta lock poisoned")
+            .iter()
+            .all(|delta| !delta.contains("SBOBINO_PARAKEET")),
+        "retry diagnostics must stay technical and out of transcript deltas"
+    );
 }
 
 #[tokio::test]

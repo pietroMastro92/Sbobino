@@ -292,6 +292,7 @@ function Build-ParakeetBatchWorker {
     $requiredExports = @(
         "parakeet_capi_load",
         "parakeet_capi_free",
+        "parakeet_capi_transcribe_path_json",
         "parakeet_capi_transcribe_pcm_batch_json_lang",
         "parakeet_capi_free_string",
         "parakeet_capi_last_error"

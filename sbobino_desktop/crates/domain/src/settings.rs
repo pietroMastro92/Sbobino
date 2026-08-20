@@ -495,6 +495,12 @@ pub struct TranscriptionSettings {
     pub parakeet_model: ParakeetModel,
     pub language: LanguageCode,
     pub compute_device: TranscriptionComputeDevice,
+    /// Compute preference used only by realtime/live transcription.
+    /// Kept separate from `compute_device` so file jobs retain their setting
+    /// when older settings are migrated. Missing legacy values default to
+    /// automatic backend selection.
+    #[serde(default)]
+    pub live_compute_device: TranscriptionComputeDevice,
     pub whisper_cli_path: String,
     #[serde(alias = "whisper_stream_path")]
     pub whisperkit_cli_path: String,
@@ -515,6 +521,7 @@ impl Default for TranscriptionSettings {
             parakeet_model: ParakeetModel::default(),
             language: LanguageCode::Auto,
             compute_device: TranscriptionComputeDevice::Auto,
+            live_compute_device: TranscriptionComputeDevice::Auto,
             whisper_cli_path: "whisper-cli".to_string(),
             whisperkit_cli_path: "whisper-stream".to_string(),
             parakeet_cli_path: "parakeet-cli".to_string(),
@@ -1254,12 +1261,44 @@ mod language_tests {
     fn transcription_compute_device_defaults_and_round_trips() {
         let defaults = TranscriptionSettings::default();
         assert_eq!(defaults.compute_device, TranscriptionComputeDevice::Auto);
+        assert_eq!(
+            defaults.live_compute_device,
+            TranscriptionComputeDevice::Auto
+        );
 
         let json = serde_json::to_string(&TranscriptionComputeDevice::Cpu).unwrap();
         assert_eq!(json, "\"cpu\"");
         assert_eq!(
             serde_json::from_str::<TranscriptionComputeDevice>("\"gpu\"").unwrap(),
             TranscriptionComputeDevice::Gpu
+        );
+    }
+
+    #[test]
+    fn legacy_transcription_settings_migrate_live_compute_to_auto_without_changing_file_device() {
+        let settings: TranscriptionSettings = serde_json::from_str(
+            r#"{
+                "engine":"whisper_cpp",
+                "model":"base",
+                "parakeet_model":"tdt06b_v3_q4",
+                "language":"auto",
+                "compute_device":"cpu",
+                "whisper_cli_path":"whisper-cli",
+                "whisperkit_cli_path":"whisper-stream",
+                "parakeet_cli_path":"parakeet-cli",
+                "ffmpeg_path":"ffmpeg",
+                "models_dir":"models",
+                "parakeet_models_dir":"parakeet-models",
+                "enable_ai_post_processing":false,
+                "speaker_diarization":{"enabled":false,"device":"cpu","speaker_colors":{}},
+                "whisper_options":{}
+            }"#,
+        )
+        .expect("legacy settings should deserialize");
+        assert_eq!(settings.compute_device, TranscriptionComputeDevice::Cpu);
+        assert_eq!(
+            settings.live_compute_device,
+            TranscriptionComputeDevice::Auto
         );
     }
 }

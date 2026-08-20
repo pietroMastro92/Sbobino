@@ -369,6 +369,35 @@ jobs:
             "$OUTPUT_DIR"
           ./scripts/publish_candidate_release.sh "$VERSION" "$GITHUB_REPOSITORY" "$OUTPUT_DIR"
 
+  release-quality-contract-tests:
+    name: Synthetic ASR/live contract tests (not release evidence)
+    needs: publish-candidate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Evaluate pinned fixtures as contract tests only
+        working-directory: sbobino_desktop
+        run: |
+          python3 scripts/run_release_quality_gates.py \
+            --output-dir "$RUNNER_TEMP/sbobino-release-quality"
+
+      - name: Upload contract-test reports (never folded into proof)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-quality-contract-tests
+          path: ${{ runner.temp }}/sbobino-release-quality/*.json
+          if-no-files-found: error
+          retention-days: 3
+
   distribution-readiness:
     needs: publish-candidate
     strategy:
@@ -593,8 +622,94 @@ jobs:
           name: portability-smoke-${{ matrix.arch }}
           path: sbobino_desktop/${{ matrix.report }}
 
+  intel-pyannote-parakeet-smoke:
+    needs: publish-candidate
+    runs-on: macos-15-intel
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sbobino_desktop/apps/desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache pinned Parakeet readiness model
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/parakeet-readiness-model
+            ${{ runner.temp }}/parakeet-readiness-fixture
+          key: parakeet-readiness-tdt-0.6b-v3-q4-k-993d73feb4206dadda865ab25bd64b50c48dc4d013c3bf6126a721f28b1d5ee8-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
+
+      - name: Run real Intel CPU Parakeet and Pyannote smoke
+        working-directory: sbobino_desktop
+        run: |
+          VERSION="${TAG_NAME#v}"
+          ./scripts/release_intel_pyannote_parakeet_smoke.sh \
+            "$VERSION" "$GITHUB_REPOSITORY" "$PWD/intel-pyannote-parakeet-smoke-proof.json"
+
+      - name: Require real ASR/live reports from the packaged-engine harness
+        working-directory: sbobino_desktop
+        run: |
+          # The Intel smoke above proves packaged Parakeet/Pyannote execution,
+          # but it does not manufacture ASR-reference or live-latency metrics.
+          # A release remains blocked until a real hosted harness writes both
+          # reports with the metadata below.  Never substitute the synthetic
+          # Ubuntu fixture reports for these fields.
+          python3 - "$PWD/intel-pyannote-parakeet-smoke-proof.json" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          proof = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          for key in ("asr_reference", "live_latency"):
+              report = proof.get(key)
+              if not isinstance(report, dict):
+                  raise SystemExit(
+                      f"real hosted packaged-engine proof is missing {key}; "
+                      "candidate remains unpromotable"
+                  )
+              if report.get("evidence_class") != "hosted-packaged-engine":
+                  raise SystemExit(f"{key} is not hosted packaged-engine evidence")
+              if report.get("real_engine") is not True or report.get("real_harness") is not True:
+                  raise SystemExit(f"{key} did not execute the packaged engine and harness")
+              if not str(report.get("runner") or "").startswith("github-hosted "):
+                  raise SystemExit(f"{key} is not from a GitHub-hosted runner")
+              if not str(report.get("harness") or "").strip():
+                  raise SystemExit(f"{key} is missing harness identity")
+              if not re.fullmatch(r"[0-9a-fA-F]{64}", str(report.get("input_audio_sha256") or "")):
+                  raise SystemExit(f"{key} is missing a pinned input audio hash")
+              runtime_hashes = report.get("runtime_artifact_sha256")
+              if not isinstance(runtime_hashes, dict) or not runtime_hashes or any(
+                  not re.fullmatch(r"[0-9a-fA-F]{64}", str(value))
+                  for value in runtime_hashes.values()
+              ):
+                  raise SystemExit(f"{key} is missing packaged runtime hashes")
+              if report.get("status") != "passed" or report.get("failures"):
+                  raise SystemExit(f"{key} did not pass")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: intel-pyannote-parakeet-smoke
+          path: |
+            sbobino_desktop/intel-pyannote-parakeet-smoke-proof.json
+            sbobino_desktop/intel-pyannote-parakeet-smoke-logs/*.log
+          retention-days: 3
+
   upload-validation-assets:
-    needs: [distribution-readiness, windows-distribution-readiness, portability-smoke]
+    needs: [distribution-readiness, windows-distribution-readiness, portability-smoke, intel-pyannote-parakeet-smoke, release-quality-contract-tests]
     if: always()
     runs-on: ubuntu-latest
     env:
@@ -626,6 +741,75 @@ jobs:
           name: portability-smoke-x86_64
           path: validation-assets
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: intel-pyannote-parakeet-smoke
+          path: validation-assets
+
+      - name: Fold Intel CPU/Pyannote smoke into the Intel distribution proof
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          validation_dir = Path("validation-assets")
+          arm_distribution_path = validation_dir / "distribution-readiness-proof.json"
+          distribution_path = validation_dir / "intel-distribution-readiness-proof.json"
+          smoke_path = validation_dir / "intel-pyannote-parakeet-smoke-proof.json"
+          arm_distribution = json.loads(arm_distribution_path.read_text(encoding="utf-8"))
+          distribution = json.loads(distribution_path.read_text(encoding="utf-8"))
+          smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+          if smoke.get("version") != distribution.get("version"):
+              raise SystemExit("Intel smoke version does not match Intel distribution proof")
+          if smoke.get("release_tag") != distribution.get("release_tag"):
+              raise SystemExit("Intel smoke release tag does not match Intel distribution proof")
+          if smoke.get("status") != "passed":
+              raise SystemExit("Intel CPU/Pyannote smoke did not pass")
+          for key in ("asr_reference", "live_latency"):
+              report = smoke.get(key)
+              if not isinstance(report, dict):
+                  raise SystemExit(
+                      f"Intel smoke is missing real hosted {key}; "
+                      "synthetic contract fixtures cannot satisfy release evidence"
+                  )
+              if report.get("evidence_class") != "hosted-packaged-engine":
+                  raise SystemExit(f"Intel smoke {key} is not hosted packaged-engine evidence")
+              if report.get("real_engine") is not True or report.get("real_harness") is not True:
+                  raise SystemExit(f"Intel smoke {key} did not execute a real engine/harness")
+              if not str(report.get("runner") or "").startswith("github-hosted "):
+                  raise SystemExit(f"Intel smoke {key} did not run on a hosted runner")
+              if report.get("status") != "passed" or report.get("failures"):
+                  raise SystemExit(f"Intel smoke {key} did not pass")
+              # ASR/live reports are real hosted evidence and belong in the
+              # existing ARM distribution proof so promotion has one stable
+              # location to validate them.  Synthetic Ubuntu reports never
+              # enter this fold.
+              arm_distribution[key] = report
+          distribution["intel_pyannote_parakeet_smoke"] = {
+              "schema_version": smoke.get("schema_version"),
+              "status": smoke.get("status"),
+              "runner": smoke.get("runner"),
+              "machine_class": smoke.get("machine_class"),
+              "tested_at_utc": smoke.get("tested_at_utc"),
+              "commit_sha": smoke.get("commit_sha"),
+              "parakeet_duration_seconds": smoke.get("parakeet_duration_seconds"),
+              "parakeet_compute_device": smoke.get("parakeet_compute_device"),
+              "parakeet_language": smoke.get("parakeet_language"),
+              "pyannote_deep_smoke": smoke.get("pyannote_deep_smoke"),
+              "asr_reference": smoke.get("asr_reference"),
+              "live_latency": smoke.get("live_latency"),
+              "logs": smoke.get("logs", []),
+          }
+          distribution_path.write_text(json.dumps(distribution, indent=2) + "\n", encoding="utf-8")
+          arm_distribution_path.write_text(json.dumps(arm_distribution, indent=2) + "\n", encoding="utf-8")
+          smoke_path.unlink()
+          PY
+
+      - name: Require exactly the public seven JSON proof assets
+        run: |
+          python3 sbobino_desktop/scripts/run_release_quality_gates.py \
+            --validate-public-proof-assets validation-assets
+
       - name: Upload validation assets to the prerelease
         run: gh release upload "$TAG_NAME" validation-assets/*.json --repo "$GITHUB_REPOSITORY" --clobber
 
@@ -634,3 +818,5 @@ jobs:
           [[ "${{ needs.distribution-readiness.result }}" == "success" ]]
           [[ "${{ needs.windows-distribution-readiness.result }}" == "success" ]]
           [[ "${{ needs.portability-smoke.result }}" == "success" ]]
+          [[ "${{ needs.intel-pyannote-parakeet-smoke.result }}" == "success" ]]
+          [[ "${{ needs.release-quality-contract-tests.result }}" == "success" ]]

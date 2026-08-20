@@ -41,6 +41,51 @@ struct SourceLanguageOptimizationGroup {
     text: String,
 }
 
+/// Per-file progress state.  Engines may internally retry an unconfirmed
+/// interval (for example after a Metal allocation failure), so the visible
+/// job must own the monotonic counters rather than trusting every callback's
+/// local timestamp.
+#[derive(Debug, Clone, Copy, Default)]
+struct ProgressSnapshot {
+    committed_seconds: f32,
+    processed_seconds: f32,
+    stage_percentage: u8,
+    overall_percentage: u8,
+}
+
+impl ProgressSnapshot {
+    fn update(
+        &mut self,
+        stage: &JobStage,
+        desired_overall: u8,
+        desired_stage: u8,
+        current_seconds: Option<f32>,
+        terminal: bool,
+    ) {
+        if let Some(seconds) = current_seconds.filter(|value| value.is_finite()) {
+            let seconds = seconds.max(0.0);
+            // Both values are intentionally max-based: a retry can report a
+            // local timestamp near zero, but that is not a user-visible reset.
+            self.processed_seconds = self.processed_seconds.max(seconds);
+            self.committed_seconds = self.committed_seconds.max(seconds);
+        }
+        if !terminal {
+            self.stage_percentage = desired_stage.min(100);
+        }
+        let desired_overall = desired_overall.min(100);
+        self.overall_percentage = if terminal {
+            // A failed/cancelled job leaves the last confirmed visible value
+            // untouched. In particular, it must not jump to 99/100 merely
+            // because the terminal caller uses its legacy `percentage: 100`.
+            self.overall_percentage
+        } else if matches!(stage, JobStage::Completed) {
+            100
+        } else {
+            self.overall_percentage.max(desired_overall.min(99))
+        };
+    }
+}
+
 #[derive(Clone)]
 pub struct TranscriptionService {
     transcoder: Arc<dyn AudioTranscoder>,
@@ -111,14 +156,17 @@ impl TranscriptionService {
             )));
         }
 
+        let progress_state = Arc::new(Mutex::new(ProgressSnapshot::default()));
         self.emit(
             &emit_progress,
+            &progress_state,
             &request.job_id,
             JobStage::PreparingAudio,
             "Preparing audio",
-            10,
+            0,
             None,
             None,
+            Some(0),
         );
         let job_id = request.job_id.clone();
 
@@ -141,52 +189,78 @@ impl TranscriptionService {
 
             self.emit(
                 &emit_progress,
+                &progress_state,
+                &request.job_id,
+                JobStage::PreparingAudio,
+                "Audio prepared",
+                5,
+                None,
+                total_audio_seconds,
+                Some(100),
+            );
+
+            self.emit(
+                &emit_progress,
+                &progress_state,
                 &request.job_id,
                 JobStage::Transcribing,
                 &transcription_progress_message,
-                0,
+                5,
                 Some(0.0),
                 total_audio_seconds,
+                Some(0),
             );
 
             let progress_callback = {
                 let emit_progress = emit_progress.clone();
                 let job_id = request.job_id.clone();
                 let transcription_progress_message = transcription_progress_message.clone();
-                let last_emitted_seconds = Arc::new(Mutex::new(0_f32));
-                let last_emitted_seconds_ref = last_emitted_seconds.clone();
+                let progress_state = progress_state.clone();
 
                 Arc::new(move |current_seconds: f32| {
                     let sanitized_seconds = current_seconds.max(0.0);
-                    if let Ok(mut last) = last_emitted_seconds_ref.lock() {
-                        // An engine may reset progress to zero before a CPU-safe
-                        // retry. Detect that backward jump and re-anchor the
-                        // monotonic baseline so the retry's early progress is not
-                        // suppressed as "non-monotonic" (which would leave the UI
-                        // stuck at the first attempt's last value).
-                        if sanitized_seconds + 1.0 < *last {
-                            *last = 0.0;
-                        }
-                        if sanitized_seconds <= *last + 0.05 {
-                            return;
-                        }
-                        *last = sanitized_seconds;
-                    }
-
-                    let percentage = match total_audio_seconds {
+                    let stage_percentage = match total_audio_seconds {
                         Some(total) if total > 0.0 => {
                             ((sanitized_seconds / total).clamp(0.0, 1.0) * 100.0).round() as u8
                         }
                         _ => 0,
                     };
 
+                    let mut state = match progress_state.lock() {
+                        Ok(state) => state,
+                        Err(_) => return,
+                    };
+                    // Ignore callbacks that belong to an internal retry and
+                    // point behind the already-confirmed prefix.  This keeps
+                    // both visible seconds and overall percentage monotonic.
+                    if sanitized_seconds <= state.processed_seconds + 0.05 {
+                        return;
+                    }
+                    let overall = match total_audio_seconds {
+                        Some(total) if total > 0.0 => {
+                            (5.0 + (sanitized_seconds / total).clamp(0.0, 1.0) * 80.0).round() as u8
+                        }
+                        _ => 5,
+                    };
+                    state.update(
+                        &JobStage::Transcribing,
+                        overall,
+                        stage_percentage,
+                        Some(sanitized_seconds),
+                        false,
+                    );
+
                     emit_progress(JobProgress {
                         job_id: job_id.clone(),
                         stage: JobStage::Transcribing,
                         message: transcription_progress_message.clone(),
-                        percentage,
+                        percentage: state.overall_percentage,
                         current_seconds: Some(sanitized_seconds),
                         total_seconds: total_audio_seconds,
+                        committed_seconds: state.committed_seconds,
+                        processed_seconds: state.processed_seconds,
+                        stage_percentage: state.stage_percentage,
+                        overall_percentage: state.overall_percentage,
                     });
                 }) as Arc<dyn Fn(f32) + Send + Sync>
             };
@@ -219,12 +293,14 @@ impl TranscriptionService {
             if let Some(total) = total_audio_seconds {
                 self.emit(
                     &emit_progress,
+                    &progress_state,
                     &request.job_id,
                     JobStage::Transcribing,
                     &transcription_progress_message,
-                    100,
+                    85,
                     Some(total),
                     Some(total),
+                    Some(100),
                 );
             }
 
@@ -233,12 +309,14 @@ impl TranscriptionService {
             if let Some(speaker_diarizer) = &self.speaker_diarizer {
                 self.emit(
                     &emit_progress,
+                    &progress_state,
                     &request.job_id,
                     JobStage::Diarizing,
                     "Assigning speakers with pyannote",
-                    60,
+                    85,
                     None,
                     None,
+                    Some(0),
                 );
                 match self
                     .run_cancellable(&cancellation_token, speaker_diarizer.diarize(&wav_path))
@@ -260,6 +338,17 @@ impl TranscriptionService {
                         warn!("speaker diarization skipped after transcription: {error}");
                     }
                 }
+                self.emit(
+                    &emit_progress,
+                    &progress_state,
+                    &request.job_id,
+                    JobStage::Diarizing,
+                    "Speaker assignment complete",
+                    93,
+                    None,
+                    None,
+                    Some(100),
+                );
             }
 
             let (optimized, summary_faq, has_optimized_transcript, generated_outputs) = if request
@@ -267,21 +356,25 @@ impl TranscriptionService {
             {
                 self.emit(
                     &emit_progress,
+                    &progress_state,
                     &request.job_id,
                     JobStage::Optimizing,
                     "Optimizing transcript with AI",
-                    65,
+                    93,
                     None,
                     None,
+                    Some(0),
                 );
                 self.emit(
                     &emit_progress,
+                    &progress_state,
                     &request.job_id,
                     JobStage::Summarizing,
                     "Generating summary and FAQs",
-                    80,
+                    96,
                     None,
                     None,
+                    Some(0),
                 );
 
                 let ai_language = if request.language.is_auto() {
@@ -327,14 +420,41 @@ impl TranscriptionService {
                 )
             };
 
+            if request.enable_ai {
+                self.emit(
+                    &emit_progress,
+                    &progress_state,
+                    &request.job_id,
+                    JobStage::Optimizing,
+                    "Transcript optimization complete",
+                    96,
+                    None,
+                    None,
+                    Some(100),
+                );
+                self.emit(
+                    &emit_progress,
+                    &progress_state,
+                    &request.job_id,
+                    JobStage::Summarizing,
+                    "Summary generation complete",
+                    98,
+                    None,
+                    None,
+                    Some(100),
+                );
+            }
+
             self.emit(
                 &emit_progress,
+                &progress_state,
                 &request.job_id,
                 JobStage::Persisting,
                 "Persisting transcription artifact",
-                90,
+                98,
                 None,
                 None,
+                Some(0),
             );
 
             let mut metadata = request.metadata.clone();
@@ -434,12 +554,14 @@ impl TranscriptionService {
 
             self.emit(
                 &emit_progress,
+                &progress_state,
                 &artifact.job_id,
                 JobStage::Completed,
                 "Transcription completed",
                 100,
                 None,
                 None,
+                Some(100),
             );
 
             Ok(artifact)
@@ -459,10 +581,12 @@ impl TranscriptionService {
             Err(ApplicationError::Cancelled) => {
                 self.emit(
                     &emit_progress,
+                    &progress_state,
                     &job_id,
                     JobStage::Cancelled,
                     "Transcription cancelled",
                     100,
+                    None,
                     None,
                     None,
                 );
@@ -470,10 +594,12 @@ impl TranscriptionService {
             Err(error) => {
                 self.emit(
                     &emit_progress,
+                    &progress_state,
                     &job_id,
                     JobStage::Failed,
                     &format!("Transcription failed: {error}"),
                     100,
+                    None,
                     None,
                     None,
                 );
@@ -779,20 +905,51 @@ impl TranscriptionService {
     fn emit(
         &self,
         callback: &Arc<dyn Fn(JobProgress) + Send + Sync>,
+        progress_state: &Arc<Mutex<ProgressSnapshot>>,
         job_id: &str,
         stage: JobStage,
         message: &str,
         percentage: u8,
         current_seconds: Option<f32>,
         total_seconds: Option<f32>,
+        stage_percentage_override: Option<u8>,
     ) {
+        let stage_percentage = if let Some(override_value) = stage_percentage_override {
+            override_value.min(100)
+        } else if matches!(stage, JobStage::Completed) {
+            100
+        } else if matches!(stage, JobStage::Transcribing) {
+            match (current_seconds, total_seconds) {
+                (Some(current), Some(total)) if total > 0.0 => {
+                    ((current / total).clamp(0.0, 1.0) * 100.0).round() as u8
+                }
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        let terminal = matches!(stage, JobStage::Failed | JobStage::Cancelled);
+        let mut state = progress_state
+            .lock()
+            .expect("transcription progress state lock poisoned");
+        state.update(
+            &stage,
+            percentage,
+            stage_percentage,
+            current_seconds,
+            terminal,
+        );
         callback(JobProgress {
             job_id: job_id.to_string(),
             stage,
             message: message.to_string(),
-            percentage,
+            percentage: state.overall_percentage,
             current_seconds,
             total_seconds,
+            committed_seconds: state.committed_seconds,
+            processed_seconds: state.processed_seconds,
+            stage_percentage: state.stage_percentage,
+            overall_percentage: state.overall_percentage,
         });
     }
 

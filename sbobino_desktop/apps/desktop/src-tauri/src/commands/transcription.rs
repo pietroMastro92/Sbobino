@@ -208,6 +208,10 @@ pub(crate) async fn spawn_transcription_job(
                     percentage: 0,
                     current_seconds: None,
                     total_seconds: None,
+                    committed_seconds: 0.0,
+                    processed_seconds: 0.0,
+                    stage_percentage: 0,
+                    overall_percentage: 0,
                 });
                 tokio::select! {
                     biased;

@@ -40,6 +40,26 @@ struct MockSpeechEngine {
     segments: Vec<TimedSegment>,
 }
 
+struct FailingSpeechEngine;
+
+#[async_trait]
+impl SpeechToTextEngine for FailingSpeechEngine {
+    async fn transcribe(
+        &self,
+        _input_wav: &Path,
+        _model_filename: &str,
+        _language_policy: &TranscriptionLanguagePolicy,
+        _options: &WhisperOptions,
+        _total_audio_seconds: Option<f32>,
+        _emit_partial: Arc<dyn Fn(String) + Send + Sync>,
+        _emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
+    ) -> Result<TranscriptionOutput, ApplicationError> {
+        Err(ApplicationError::SpeechToText(
+            "deterministic engine failure".to_string(),
+        ))
+    }
+}
+
 #[async_trait]
 impl SpeechToTextEngine for MockSpeechEngine {
     async fn transcribe(
@@ -627,11 +647,31 @@ async fn run_file_transcription_without_ai_emits_expected_stages_and_persists() 
         stage_list,
         vec![
             JobStage::PreparingAudio,
+            JobStage::PreparingAudio,
             JobStage::Transcribing,
             JobStage::Persisting,
             JobStage::Completed
         ]
     );
+    {
+        let progress = emitted.lock().expect("emitted lock poisoned");
+        assert_eq!(progress[0].overall_percentage, 0);
+        assert_eq!(progress[1].overall_percentage, 5);
+        assert_eq!(progress[2].overall_percentage, 5);
+        assert_eq!(progress[3].overall_percentage, 98);
+        assert_eq!(progress[4].overall_percentage, 100);
+        assert_eq!(
+            progress
+                .iter()
+                .filter(|event| event.overall_percentage == 100)
+                .count(),
+            1,
+            "a successful job must report overall 100 exactly once"
+        );
+        assert!(progress
+            .windows(2)
+            .all(|pair| pair[1].overall_percentage >= pair[0].overall_percentage));
+    }
 
     assert_eq!(artifact.raw_transcript, "raw transcript");
     assert!(artifact.optimized_transcript.is_empty());
@@ -1577,7 +1617,7 @@ impl SpeechToTextEngine for ProgressReplayEngine {
 }
 
 #[tokio::test]
-async fn progress_callback_lets_through_reset_after_retry_progress() {
+async fn progress_callback_keeps_visible_progress_monotonic_across_retry() {
     let temp = tempdir().expect("failed to create temp dir");
     let input_path = temp.path().join("lecture.mp3");
     tokio::fs::write(&input_path, b"fake mp3 content")
@@ -1585,9 +1625,9 @@ async fn progress_callback_lets_through_reset_after_retry_progress() {
         .expect("failed to create test input file");
 
     let transcoder = Arc::new(MockTranscoder::default());
-    // Sequence simulating: first attempt advances to 10s, then a CPU-safe retry
-    // resets to 0.0 and re-advances through 1.0s -> 2.0s -> 3.0s. Without a
-    // reset-aware throttle, every value after 10.0 would be suppressed.
+    // Sequence simulating: first attempt advances to 10s, then an internal
+    // CPU-safe retry reports local timestamps near zero. Those callbacks are
+    // unconfirmed replay work and must not reset the one visible job.
     let speech = Arc::new(ProgressReplayEngine {
         progress_seconds: vec![10.0, 0.0, 1.0, 2.0, 3.0],
     });
@@ -1639,13 +1679,86 @@ async fn progress_callback_lets_through_reset_after_retry_progress() {
         .filter_map(|event| event.current_seconds)
         .collect();
 
-    // The reset value (1.0, first value after the 0.0 reset) must survive the
-    // throttle and reach the UI instead of being suppressed as non-monotonic.
+    // No callback may move the visible timeline backwards after the first
+    // attempt has established a confirmed prefix.
     assert!(
         progress_seconds
-            .iter()
-            .any(|value| (*value - 1.0).abs() < 0.001),
-        "expected the post-reset progress value 1.0 to reach the UI, got: {:?}",
+            .windows(2)
+            .all(|pair| pair[1] + 0.001 >= pair[0]),
+        "visible progress must stay monotonic across retry callbacks: {:?}",
         progress_seconds
     );
+    assert_eq!(progress_seconds, vec![0.0, 10.0]);
+
+    let events = emitted.lock().expect("emitted lock poisoned");
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[1].overall_percentage >= pair[0].overall_percentage),
+        "overall percentage must stay monotonic: {:?}",
+        events
+            .iter()
+            .map(|event| (event.stage.clone(), event.overall_percentage))
+            .collect::<Vec<_>>()
+    );
+    assert!(events.iter().all(|event| {
+        event.committed_seconds + 0.001 >= event.processed_seconds
+            || (event.stage == JobStage::PreparingAudio && event.processed_seconds == 0.0)
+    }));
+}
+
+#[tokio::test]
+async fn terminal_failure_never_reports_overall_completion() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("failure.wav");
+    tokio::fs::write(&input_path, b"fake wav content")
+        .await
+        .expect("failed to create test input file");
+
+    let service = TranscriptionService::new(
+        Arc::new(MockTranscoder::default()),
+        Arc::new(FailingSpeechEngine),
+        Arc::new(MockEnhancer::default()),
+        Arc::new(InMemoryArtifactRepository::default()),
+    );
+    let emitted: Arc<Mutex<Vec<JobProgress>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_ref = emitted.clone();
+    let result = service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-failure-progress".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Base,
+                engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+            },
+            Arc::new(move |event| {
+                emitted_ref
+                    .lock()
+                    .expect("emitted lock poisoned")
+                    .push(event);
+            }),
+            Arc::new(|_| {}),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(result.is_err());
+    let events = emitted.lock().expect("emitted lock poisoned");
+    let terminal = events
+        .last()
+        .expect("failure must emit a terminal progress event");
+    assert_eq!(terminal.stage, JobStage::Failed);
+    assert!(terminal.overall_percentage < 100);
+    assert!(terminal.percentage < 100);
+    assert!(events
+        .windows(2)
+        .all(|pair| pair[1].overall_percentage >= pair[0].overall_percentage));
 }

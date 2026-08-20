@@ -91,6 +91,11 @@ const REQUIRED_COREML_ENCODERS: [(&str, &str); 5] = [
 
 pub const PYANNOTE_MANIFEST_FILENAME: &str = "manifest.json";
 pub const PYANNOTE_STATUS_FILENAME: &str = "status.json";
+/// Durable receipt written only after the managed Python environment and the
+/// offline diarization model have passed the import/load smoke.  Keeping the
+/// receipt separate from the release manifest lets startup perform a cheap,
+/// idempotent identity check without re-running Python or native probes.
+pub const PYANNOTE_RECEIPT_FILENAME: &str = "receipt.json";
 const PYANNOTE_BUNDLED_OVERRIDE_SOURCE: &str = "bundled_override";
 const PYANNOTE_SWAP_BACKUP_PREFIX: &str = ".pyannote-backup-";
 const PYANNOTE_SWAP_STAGE_PREFIX: &str = ".pyannote-stage-";
@@ -119,6 +124,33 @@ pub struct ManagedPyannoteStatus {
     pub validated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ManagedPyannoteReceipt {
+    #[serde(default = "default_pyannote_receipt_schema_version")]
+    pub schema_version: u32,
+    pub app_version: String,
+    pub platform: String,
+    pub arch: String,
+    pub runtime_asset: String,
+    pub runtime_sha256: String,
+    pub model_asset: String,
+    pub model_sha256: String,
+    /// Version reported by the managed Python environment during the deep
+    /// import/load probe.  These fields are intentionally strings because
+    /// Torch/TorchCodec may include a local build suffix.
+    pub torch_version: String,
+    pub torchcodec_version: String,
+    /// A compact list of bundled FFmpeg ABI families (for example
+    /// `libavcodec.61,libavformat.61`).
+    pub ffmpeg_abi: String,
+    pub deep_smoke: bool,
+    pub verified_at: String,
+}
+
+const fn default_pyannote_receipt_schema_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PyannoteRuntimeHealth {
     pub enabled: bool,
@@ -131,6 +163,14 @@ pub struct PyannoteRuntimeHealth {
     pub source: String,
     pub reason_code: String,
     pub message: String,
+    /// True when the durable receipt matches the current release manifest,
+    /// host platform/architecture, and a previous deep smoke result.
+    #[serde(default)]
+    pub receipt_verified: bool,
+    /// True when an explicit install/update/repair should run the deep probe.
+    /// Normal startup must not use this flag to launch a background probe.
+    #[serde(default)]
+    pub deep_probe_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1602,6 +1642,11 @@ impl RuntimeTranscriptionFactory {
             .join(PYANNOTE_STATUS_FILENAME)
     }
 
+    pub fn managed_pyannote_receipt_path(&self) -> PathBuf {
+        self.managed_pyannote_runtime_dir()
+            .join(PYANNOTE_RECEIPT_FILENAME)
+    }
+
     pub fn read_managed_pyannote_manifest(&self) -> Option<ManagedPyannoteManifest> {
         let path = self.managed_pyannote_manifest_path();
         let content = std::fs::read_to_string(path).ok()?;
@@ -1625,6 +1670,113 @@ impl RuntimeTranscriptionFactory {
         let path = self.managed_pyannote_status_path();
         let content = std::fs::read_to_string(path).ok()?;
         serde_json::from_str::<ManagedPyannoteStatus>(&content).ok()
+    }
+
+    pub fn read_managed_pyannote_receipt(&self) -> Option<ManagedPyannoteReceipt> {
+        let path = self.managed_pyannote_receipt_path();
+        let content = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<ManagedPyannoteReceipt>(&content).ok()
+    }
+
+    pub fn write_managed_pyannote_receipt(
+        &self,
+        receipt: &ManagedPyannoteReceipt,
+    ) -> Result<(), String> {
+        let runtime_dir = self.managed_pyannote_runtime_dir();
+        std::fs::create_dir_all(&runtime_dir)
+            .map_err(|e| format!("failed to create pyannote runtime directory: {e}"))?;
+        let body = serde_json::to_string_pretty(receipt)
+            .map_err(|e| format!("failed to serialize pyannote receipt: {e}"))?;
+        let path = self.managed_pyannote_receipt_path();
+        let temporary = runtime_dir.join(format!(".{PYANNOTE_RECEIPT_FILENAME}.tmp"));
+        std::fs::write(&temporary, body)
+            .map_err(|e| format!("failed to write temporary pyannote receipt: {e}"))?;
+        if let Err(error) = std::fs::rename(&temporary, &path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!("failed to publish pyannote receipt: {error}"));
+        }
+        Ok(())
+    }
+
+    /// Validate the cheap, durable portion of the pyannote installation
+    /// contract.  This intentionally does not spawn Python or inspect native
+    /// binaries; those checks belong to the explicit install/update/repair
+    /// deep probe that creates the receipt.
+    pub fn validate_managed_pyannote_receipt(
+        &self,
+        receipt: &ManagedPyannoteReceipt,
+    ) -> Result<(), String> {
+        if receipt.schema_version != default_pyannote_receipt_schema_version() {
+            return Err(format!(
+                "unsupported Pyannote receipt schema version '{}'.",
+                receipt.schema_version
+            ));
+        }
+        // The app version is retained as audit metadata, not as an identity
+        // key.  Patch releases may keep the exact same managed runtime and
+        // model assets, so requiring this string to equal the running app
+        // version would turn a safe upgrade into an unnecessary deep probe.
+        // Runtime/model asset names and checksums below are the compatibility
+        // boundary; platform and architecture are checked independently.
+        if receipt.app_version.trim().is_empty() {
+            return Err("Pyannote receipt is missing its app version metadata.".to_string());
+        }
+        if receipt.platform.trim() != env::consts::OS {
+            return Err(format!(
+                "Pyannote receipt platform '{}' does not match '{}'.",
+                receipt.platform.trim(),
+                env::consts::OS
+            ));
+        }
+        if !pyannote_runtime_arch_matches_host(receipt.arch.trim()) {
+            return Err(format!(
+                "Pyannote receipt architecture '{}' does not match host '{}'.",
+                receipt.arch.trim(),
+                target_triple_suffix()
+            ));
+        }
+        if !receipt.deep_smoke {
+            return Err("Pyannote receipt is missing a passing deep smoke result.".to_string());
+        }
+        if receipt.torch_version.trim().is_empty()
+            || receipt.torchcodec_version.trim().is_empty()
+            || receipt.ffmpeg_abi.trim().is_empty()
+        {
+            return Err(
+                "Pyannote receipt is missing Torch, TorchCodec, or FFmpeg ABI metadata."
+                    .to_string(),
+            );
+        }
+
+        if let Some(manifest) = self.read_managed_pyannote_manifest() {
+            if !manifest.runtime_asset.trim().is_empty()
+                && manifest.runtime_asset != receipt.runtime_asset
+            {
+                return Err("Pyannote receipt runtime asset does not match manifest.".to_string());
+            }
+            if !manifest.runtime_sha256.trim().is_empty()
+                && !sha256_matches(&manifest.runtime_sha256, &receipt.runtime_sha256)
+            {
+                return Err(
+                    "Pyannote receipt runtime checksum does not match manifest.".to_string()
+                );
+            }
+            if !manifest.model_asset.trim().is_empty()
+                && manifest.model_asset != receipt.model_asset
+            {
+                return Err("Pyannote receipt model asset does not match manifest.".to_string());
+            }
+            if !manifest.model_sha256.trim().is_empty()
+                && !sha256_matches(&manifest.model_sha256, &receipt.model_sha256)
+            {
+                return Err("Pyannote receipt model checksum does not match manifest.".to_string());
+            }
+            if !pyannote_runtime_arch_matches_host(manifest.runtime_arch.trim()) {
+                return Err("Pyannote manifest architecture does not match host.".to_string());
+            }
+        }
+
+        Ok(())
     }
 
     pub fn write_managed_pyannote_status(
@@ -1699,12 +1851,51 @@ impl RuntimeTranscriptionFactory {
             && sha256_matches(manifest.model_sha256.trim(), expected_model_sha256.trim());
 
         if compat_matches && runtime_matches && model_matches {
+            let mut receipt_migration = self.read_managed_pyannote_receipt().and_then(|receipt| {
+                let receipt_matches_expected = receipt.runtime_asset.trim()
+                    == expected_runtime_asset.trim()
+                    && sha256_matches(
+                        receipt.runtime_sha256.trim(),
+                        expected_runtime_sha256.trim(),
+                    )
+                    && receipt.model_asset.trim() == expected_model_asset.trim()
+                    && sha256_matches(receipt.model_sha256.trim(), expected_model_sha256.trim());
+                if !receipt_matches_expected
+                    || self.validate_managed_pyannote_receipt(&receipt).is_err()
+                {
+                    return None;
+                }
+
+                let mut migrated = receipt;
+                migrated.app_version = current_version.to_string();
+                migrated.runtime_asset = expected_runtime_asset.trim().to_string();
+                migrated.runtime_sha256 = expected_runtime_sha256.trim().to_string();
+                migrated.model_asset = expected_model_asset.trim().to_string();
+                migrated.model_sha256 = expected_model_sha256.trim().to_string();
+                Some(migrated)
+            });
+            let receipt_changed = receipt_migration
+                .as_ref()
+                .and_then(|migrated| {
+                    self.read_managed_pyannote_receipt()
+                        .map(|current| (current, migrated))
+                })
+                .is_some_and(|(current, migrated)| current != *migrated);
             let changed = manifest.app_version.trim() != current_version
-                || manifest.compat_level != expected_compat_level;
+                || manifest.compat_level != expected_compat_level
+                || receipt_changed;
             manifest.app_version = current_version.to_string();
             manifest.compat_level = expected_compat_level;
             self.write_managed_pyannote_manifest(&manifest)?;
             self.write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")?;
+            if let Some(receipt) = receipt_migration.take() {
+                if receipt_changed {
+                    // `write_managed_pyannote_receipt` publishes via a
+                    // same-directory temporary file and rename, so a patch
+                    // migration never exposes a partially-written receipt.
+                    self.write_managed_pyannote_receipt(&receipt)?;
+                }
+            }
             return Ok(if changed {
                 ReconcileManagedPyannoteReleaseOutcome::ManifestUpdated
             } else {
@@ -1938,6 +2129,11 @@ impl RuntimeTranscriptionFactory {
         let model_installed = is_pyannote_model_dir(&self.managed_pyannote_model_dir());
         let manifest = self.read_managed_pyannote_manifest();
         let status = self.read_managed_pyannote_status();
+        let receipt = self.read_managed_pyannote_receipt();
+        let receipt_verified = receipt
+            .as_ref()
+            .is_some_and(|value| self.validate_managed_pyannote_receipt(value).is_ok());
+        let deep_probe_required = runtime_installed && model_installed && !receipt_verified;
         let arch = manifest
             .as_ref()
             .map(|value| value.runtime_arch.clone())
@@ -1971,7 +2167,8 @@ impl RuntimeTranscriptionFactory {
             && model_installed
             && cached_runtime_layout_ready
             && manifest_matches_host
-            && status_reason_code == "ok";
+            && status_reason_code == "ok"
+            && receipt_verified;
 
         if should_trust_cached_ready_status {
             if let Some(existing_manifest) = manifest.as_ref() {
@@ -1994,6 +2191,8 @@ impl RuntimeTranscriptionFactory {
                 source,
                 reason_code: "ok".to_string(),
                 message: "Pyannote diarization runtime is installed.".to_string(),
+                receipt_verified,
+                deep_probe_required,
             };
         }
 
@@ -2019,6 +2218,12 @@ impl RuntimeTranscriptionFactory {
                 } else {
                     message
                 },
+            )
+        } else if receipt.is_some() && !receipt_verified {
+            (
+                false,
+                "pyannote_receipt_invalid".to_string(),
+                "Pyannote verification receipt is stale or incomplete. Reinstall or repair the diarization runtime from Settings > Local Models.".to_string(),
             )
         } else if !runtime_installed {
             (
@@ -2062,6 +2267,12 @@ impl RuntimeTranscriptionFactory {
                         PYANNOTE_COMPAT_LEVEL
                     ),
                 )
+            } else if receipt.is_none() {
+                (
+                    false,
+                    "pyannote_receipt_required".to_string(),
+                    "Pyannote runtime predates verification receipts. Run the one-time Repair action from Settings > Local Models to verify Torch, TorchCodec, FFmpeg ABI, and the offline model.".to_string(),
+                )
             } else {
                 (
                     true,
@@ -2089,6 +2300,8 @@ impl RuntimeTranscriptionFactory {
             source,
             reason_code,
             message,
+            receipt_verified,
+            deep_probe_required,
         }
     }
 
@@ -4035,8 +4248,9 @@ mod tests {
         parse_otool_rpath_entries, parse_pyannote_python_framework_version,
         pyannote_native_binary_paths, pyannote_runtime_arch_matches_host,
         pyannote_runtime_validation_script, target_triple_suffix, ManagedPyannoteManifest,
-        ReconcileManagedPyannoteReleaseOutcome, RuntimeSourcePolicy, RuntimeTranscriptionFactory,
-        PYANNOTE_COMPAT_LEVEL, PYANNOTE_STATUS_FILENAME,
+        ManagedPyannoteReceipt, ReconcileManagedPyannoteReleaseOutcome, RuntimeSourcePolicy,
+        RuntimeTranscriptionFactory, PYANNOTE_COMPAT_LEVEL, PYANNOTE_RECEIPT_FILENAME,
+        PYANNOTE_STATUS_FILENAME,
     };
     use sbobino_domain::{
         AiProvider, AppSettings, RemoteServiceConfig, RemoteServiceKind, TranscriptionEngine,
@@ -4144,6 +4358,36 @@ mod tests {
             .expect("collections abc should write");
     }
 
+    fn write_test_pyannote_receipt_with_app_version(
+        factory: &RuntimeTranscriptionFactory,
+        app_version: &str,
+    ) {
+        let manifest = factory
+            .read_managed_pyannote_manifest()
+            .expect("manifest should exist before receipt");
+        factory
+            .write_managed_pyannote_receipt(&ManagedPyannoteReceipt {
+                schema_version: 1,
+                app_version: app_version.to_string(),
+                platform: std::env::consts::OS.to_string(),
+                arch: target_triple_suffix().to_string(),
+                runtime_asset: manifest.runtime_asset,
+                runtime_sha256: manifest.runtime_sha256,
+                model_asset: manifest.model_asset,
+                model_sha256: manifest.model_sha256,
+                torch_version: "2.9.1".to_string(),
+                torchcodec_version: "0.8.1".to_string(),
+                ffmpeg_abi: "libavcodec.61,libavformat.61".to_string(),
+                deep_smoke: true,
+                verified_at: "2026-08-13T00:00:00Z".to_string(),
+            })
+            .expect("receipt should write");
+    }
+
+    fn write_test_pyannote_receipt(factory: &RuntimeTranscriptionFactory) {
+        write_test_pyannote_receipt_with_app_version(factory, env!("CARGO_PKG_VERSION"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn copy_directory_recursive_preserves_symlinks() {
@@ -4177,6 +4421,65 @@ mod tests {
             std::path::PathBuf::from("libavutil.60.8.100.dylib")
         );
         assert!(copied_link.exists());
+    }
+
+    #[test]
+    fn pyannote_receipt_is_atomic_and_validates_identity_and_deep_smoke_metadata() {
+        let (_temp, factory) = build_factory();
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL,
+                runtime_asset: "pyannote-runtime-test.zip".to_string(),
+                runtime_sha256: "abc123".to_string(),
+                model_asset: "pyannote-model-test.zip".to_string(),
+                model_sha256: "def456".to_string(),
+                runtime_arch: target_triple_suffix().to_string(),
+                installed_at: "2026-08-13T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+
+        let receipt = ManagedPyannoteReceipt {
+            schema_version: 1,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: std::env::consts::OS.to_string(),
+            arch: target_triple_suffix().to_string(),
+            runtime_asset: "pyannote-runtime-test.zip".to_string(),
+            runtime_sha256: "abc123".to_string(),
+            model_asset: "pyannote-model-test.zip".to_string(),
+            model_sha256: "def456".to_string(),
+            torch_version: "2.9.1".to_string(),
+            torchcodec_version: "0.8.1".to_string(),
+            ffmpeg_abi: "libavcodec.61,libavformat.61".to_string(),
+            deep_smoke: true,
+            verified_at: "2026-08-13T00:00:01Z".to_string(),
+        };
+        factory
+            .write_managed_pyannote_receipt(&receipt)
+            .expect("receipt should write");
+        assert!(factory.managed_pyannote_receipt_path().is_file());
+        assert_eq!(
+            factory.read_managed_pyannote_receipt(),
+            Some(receipt.clone())
+        );
+        factory
+            .validate_managed_pyannote_receipt(&receipt)
+            .expect("matching receipt should validate");
+
+        let mut mismatched = receipt;
+        mismatched.platform = "windows".to_string();
+        assert!(factory
+            .validate_managed_pyannote_receipt(&mismatched)
+            .expect_err("platform mismatch should fail")
+            .contains("platform"));
+        assert_eq!(
+            factory
+                .managed_pyannote_receipt_path()
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some(PYANNOTE_RECEIPT_FILENAME)
+        );
     }
 
     fn prepare_managed_runtime(
@@ -4362,6 +4665,7 @@ mod tests {
         factory
             .write_managed_pyannote_status("ok", "ready")
             .expect("status should write");
+        write_test_pyannote_receipt(&factory);
 
         let health = factory
             .runtime_health()
@@ -4409,6 +4713,7 @@ mod tests {
         factory
             .write_managed_pyannote_status("ok", "ready")
             .expect("status should write");
+        write_test_pyannote_receipt(&factory);
 
         let health = factory
             .runtime_health()
@@ -4418,7 +4723,66 @@ mod tests {
     }
 
     #[test]
-    fn runtime_health_trusts_legacy_pyannote_ok_status_without_validation() {
+    fn runtime_health_receipt_is_idempotent_across_three_restarts_without_deep_probe() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL,
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "abc".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "def".to_string(),
+                runtime_arch: super::target_triple_suffix().to_string(),
+                installed_at: "2026-03-13T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status("ok", "ready")
+            .expect("status should write");
+        write_test_pyannote_receipt(&factory);
+        let receipt_before = std::fs::read(factory.managed_pyannote_receipt_path())
+            .expect("receipt should be readable");
+        let status_before = std::fs::read(factory.managed_pyannote_status_path())
+            .expect("status should be readable");
+
+        for restart in 1..=3 {
+            let health = factory
+                .runtime_health()
+                .unwrap_or_else(|error| panic!("restart {restart} health failed: {error}"));
+            assert!(health.pyannote.ready);
+            assert!(health.pyannote.receipt_verified);
+            assert!(!health.pyannote.deep_probe_required);
+        }
+
+        assert_eq!(
+            std::fs::read(factory.managed_pyannote_receipt_path())
+                .expect("receipt should remain readable"),
+            receipt_before
+        );
+        assert_eq!(
+            std::fs::read(factory.managed_pyannote_status_path())
+                .expect("status should remain readable"),
+            status_before
+        );
+    }
+
+    #[test]
+    fn runtime_health_requires_receipt_for_legacy_pyannote_ok_status() {
         let (_temp, factory) = build_factory();
         persist_enabled_diarization(&factory);
 
@@ -4455,12 +4819,13 @@ mod tests {
         let health = factory
             .runtime_health()
             .expect("runtime health should load");
-        assert!(health.pyannote.ready);
-        assert_eq!(health.pyannote.reason_code, "ok");
+        assert!(!health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "pyannote_receipt_required");
+        assert!(health.pyannote.deep_probe_required);
     }
 
     #[test]
-    fn runtime_health_accepts_legacy_macos_arch_label_when_otherwise_ready() {
+    fn runtime_health_requires_receipt_for_legacy_macos_arch_label() {
         let (_temp, factory) = build_factory();
         persist_enabled_diarization(&factory);
 
@@ -4502,8 +4867,9 @@ mod tests {
         let health = factory
             .runtime_health()
             .expect("runtime health should load");
-        assert!(health.pyannote.ready);
-        assert_eq!(health.pyannote.reason_code, "ok");
+        assert!(!health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "pyannote_receipt_required");
+        assert!(health.pyannote.deep_probe_required);
     }
 
     #[test]
@@ -4652,8 +5018,9 @@ mod tests {
         let health = factory
             .runtime_health()
             .expect("runtime health should load");
-        assert!(health.pyannote.ready);
-        assert_eq!(health.pyannote.reason_code, "ok");
+        assert!(!health.pyannote.ready);
+        assert_eq!(health.pyannote.reason_code, "pyannote_receipt_required");
+        assert!(health.pyannote.deep_probe_required);
         assert!(
             !stale_native.exists(),
             "stale native modules must not survive bundled runtime repair"
@@ -4861,12 +5228,55 @@ mod tests {
         factory
             .write_managed_pyannote_status("ok", "ready")
             .expect("status should write");
+        write_test_pyannote_receipt(&factory);
 
         let health = factory
             .runtime_health()
             .expect("runtime health should load");
         assert!(health.pyannote.ready);
         assert_eq!(health.pyannote.reason_code, "ok");
+    }
+
+    #[test]
+    fn runtime_health_accepts_patch_upgrade_receipt_when_assets_are_unchanged() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: "2.0.27".to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL,
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "abc123".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "def456".to_string(),
+                runtime_arch: target_triple_suffix().to_string(),
+                installed_at: "2026-08-12T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status("ok", "ready")
+            .expect("status should write");
+        write_test_pyannote_receipt_with_app_version(&factory, "2.0.27");
+
+        let health = factory
+            .runtime_health()
+            .expect("runtime health should load");
+        assert!(health.pyannote.ready);
+        assert!(health.pyannote.receipt_verified);
+        assert!(!health.pyannote.deep_probe_required);
     }
 
     #[test]
@@ -4898,6 +5308,7 @@ mod tests {
         factory
             .write_managed_pyannote_status("ok", "ready")
             .expect("status should write");
+        write_test_pyannote_receipt(&factory);
 
         let health = factory
             .runtime_health()
@@ -4982,6 +5393,12 @@ mod tests {
         factory
             .write_managed_pyannote_status("ok", "ready")
             .expect("status should write");
+        write_test_pyannote_receipt_with_app_version(&factory, "2.0.27");
+
+        let receipt_before = factory
+            .read_managed_pyannote_receipt()
+            .expect("receipt should exist before migration");
+        assert_eq!(receipt_before.app_version, "2.0.27");
 
         let reconciled = factory
             .reconcile_managed_pyannote_release_assets(
@@ -5006,6 +5423,71 @@ mod tests {
             .read_managed_pyannote_status()
             .expect("status should exist");
         assert_eq!(status.reason_code, "ok");
+        let receipt = factory
+            .read_managed_pyannote_receipt()
+            .expect("receipt should exist after migration");
+        assert_eq!(receipt.app_version, env!("CARGO_PKG_VERSION"));
+        factory
+            .validate_managed_pyannote_receipt(&receipt)
+            .expect("migrated receipt should remain valid");
+    }
+
+    #[test]
+    fn reconcile_managed_pyannote_release_assets_keeps_changed_assets_repair_required() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: "2.0.27".to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL,
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "old-runtime-sha".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "old-model-sha".to_string(),
+                runtime_arch: target_triple_suffix().to_string(),
+                installed_at: "2026-08-12T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status("ok", "ready")
+            .expect("status should write");
+        write_test_pyannote_receipt_with_app_version(&factory, "2.0.27");
+
+        let reconciled = factory
+            .reconcile_managed_pyannote_release_assets(
+                env!("CARGO_PKG_VERSION"),
+                PYANNOTE_COMPAT_LEVEL,
+                "pyannote-runtime-macos-aarch64.zip",
+                "new-runtime-sha",
+                "pyannote-model-community-1.zip",
+                "new-model-sha",
+            )
+            .expect("reconcile should succeed");
+
+        assert!(matches!(
+            reconciled,
+            ReconcileManagedPyannoteReleaseOutcome::NeedsMigration { .. }
+        ));
+        assert_eq!(
+            factory
+                .read_managed_pyannote_receipt()
+                .expect("receipt should remain present")
+                .app_version,
+            "2.0.27"
+        );
     }
 
     #[test]

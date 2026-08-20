@@ -275,9 +275,12 @@ exit 0
 
     assert!(transcript.text.contains("cpu fallback transcription"));
     let emitted_lines = emitted.lock().expect("emit lock poisoned");
-    assert!(emitted_lines
-        .iter()
-        .any(|line| line.contains("Whisper fallback CPU-safe mode")));
+    assert!(
+        !emitted_lines
+            .iter()
+            .any(|line| line.contains("Whisper fallback") || line.contains("CPU-safe mode")),
+        "backend continuation must stay invisible in transcript deltas: {emitted_lines:?}"
+    );
 }
 
 #[tokio::test]
@@ -360,10 +363,10 @@ exit 0
 
     let emitted_lines = emitted.lock().expect("emit lock poisoned");
     assert!(
-        emitted_lines
+        !emitted_lines
             .iter()
-            .any(|line| line.contains("Whisper fallback CPU-safe mode")),
-        "expected a CPU-safe fallback notice in the partial stream: {:?}",
+            .any(|line| line.contains("Whisper fallback") || line.contains("CPU-safe mode")),
+        "backend continuation must stay invisible in transcript deltas: {:?}",
         emitted_lines
     );
 }
@@ -379,7 +382,7 @@ async fn nonzero_batch_preserves_written_outputs_and_recovers_only_missing_chunk
     std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
     std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
         .expect("failed to create model");
-    write_speech_wav(&input_wav, 18);
+    write_speech_wav(&input_wav, 40);
 
     let invocations_path = invocations.to_string_lossy().to_string();
     write_executable_script(
@@ -405,10 +408,6 @@ if [ "$of_count" -gt 1 ]; then
   echo "ggml_metal_buffer_init: error: failed to allocate buffer" 1>&2
   exit 139
 fi
-if [ "$cpu" -eq 0 ]; then
-  echo "ggml_metal_buffer_init: error: failed to allocate buffer" 1>&2
-  exit 139
-fi
 printf "cpu isolated\n" > "${{out}}.txt"
 exit 0
 "#,
@@ -420,26 +419,61 @@ exit 0
         script_path.to_string_lossy().to_string(),
         models_dir.to_string_lossy().to_string(),
     );
+    let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let emitted_clone = emitted.clone();
+    let progress: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let progress_clone = progress.clone();
     let transcript = engine
         .transcribe(
             &input_wav,
             "ggml-base.bin",
             &transcription_policy("en"),
             &WhisperOptions::default(),
-            Some(18.0),
-            Arc::new(|_line: String| {}),
-            Arc::new(|_seconds: f32| {}),
+            Some(40.0),
+            Arc::new(move |line: String| {
+                emitted_clone.lock().expect("emit lock poisoned").push(line);
+            }),
+            Arc::new(move |seconds: f32| {
+                progress_clone
+                    .lock()
+                    .expect("progress lock poisoned")
+                    .push(seconds);
+            }),
         )
         .await
         .expect("isolated missing-chunk recovery should succeed");
 
     assert!(transcript.text.contains("batch first"));
     assert!(transcript.text.contains("cpu isolated"));
+    assert!(
+        transcript
+            .segments
+            .windows(2)
+            .all(|pair| pair[1].start_seconds.unwrap_or_default() + 0.001
+                >= pair[0].start_seconds.unwrap_or_default()),
+        "isolated recovery must preserve monotonic segment timestamps: {:?}",
+        transcript.segments
+    );
+    let progress_values = progress.lock().expect("progress lock poisoned").clone();
+    assert!(
+        progress_values
+            .windows(2)
+            .all(|pair| pair[1] + 0.001 >= pair[0]),
+        "isolated recovery must not reset engine progress: {:?}",
+        progress_values
+    );
+    let emitted_lines = emitted.lock().expect("emit lock poisoned");
+    assert!(
+        !emitted_lines.iter().any(|line| {
+            line.contains("fallback") || line.contains("CPU-safe") || line.contains("retry")
+        }),
+        "backend continuation must stay invisible in transcript deltas: {emitted_lines:?}"
+    );
     let invocation_lines =
         std::fs::read_to_string(&invocations).expect("script should record invocations");
     assert!(invocation_lines.contains("inputs=2 cpu=0"));
     assert!(invocation_lines.contains("inputs=1 cpu=0"));
-    assert!(invocation_lines.contains("inputs=1 cpu=1"));
+    assert!(!invocation_lines.contains("inputs=1 cpu=1"));
     assert_eq!(
         invocation_lines
             .lines()
@@ -448,6 +482,321 @@ exit 0
         1,
         "the successful first output must not trigger a full-group CPU replay"
     );
+}
+
+#[tokio::test]
+async fn gpu_partial_batch_fallback_retries_only_persistently_missing_chunks() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+    let invocations = temp.path().join("invocations.log");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    write_speech_wav(&input_wav, 40);
+
+    write_executable_script(
+        &script_path,
+        &format!(
+            r#"#!/bin/sh
+inputs=""
+outputs=""
+input_count=0
+output_count=0
+cpu=0
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-f" ]; then
+    shift
+    input_count=$((input_count + 1))
+    inputs="$inputs $1"
+  elif [ "$1" = "-of" ]; then
+    shift
+    output_count=$((output_count + 1))
+    outputs="$outputs $1"
+  elif [ "$1" = "-ng" ]; then
+    cpu=1
+  fi
+  shift
+done
+echo "cpu=$cpu inputs=$input_count outputs=$output_count inputs:$inputs" >> "{invocations}"
+
+first_output=""
+for out in $outputs; do
+  if [ -z "$first_output" ]; then first_output="$out"; fi
+done
+
+if [ "$cpu" -eq 0 ]; then
+  if [ "$input_count" -gt 1 ]; then
+    # GPU decodes and persists the first chunk, then fails before the later
+    # chunk.  That artifact is a confirmed checkpoint and must survive.
+    printf "gpu confirmed\n" > "${{first_output}}.txt"
+    echo "ggml_metal_buffer_init: error: failed to allocate buffer" 1>&2
+    exit 139
+  fi
+  # GPU recovery for the missing chunk is persistently incomplete.  It exits
+  # cleanly but leaves no artifact, forcing the CPU continuation.
+  exit 0
+fi
+
+# CPU continuation should receive only the missing chunk and complete it.
+printf "cpu recovered\n" > "${{first_output}}.txt"
+exit 0
+"#,
+            invocations = invocations.to_string_lossy(),
+        ),
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            &transcription_policy("auto"),
+            &WhisperOptions::default(),
+            Some(40.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("CPU continuation should complete the missing chunk");
+
+    assert_eq!(transcript.text, "gpu confirmed\ncpu recovered");
+    assert_eq!(
+        transcript
+            .text
+            .lines()
+            .filter(|line| *line == "gpu confirmed")
+            .count(),
+        1,
+        "confirmed GPU text must not be duplicated by CPU fallback"
+    );
+    assert!(transcript.segments.windows(2).all(|pair| {
+        pair[1].start_seconds.unwrap_or_default() + 0.001 >= pair[0].end_seconds.unwrap_or_default()
+    }));
+
+    let invocation_lines = std::fs::read_to_string(&invocations)
+        .expect("script should record GPU and CPU invocations")
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invocation_lines.len(),
+        3,
+        "expected GPU batch, GPU recovery, CPU recovery"
+    );
+    assert!(invocation_lines[0].contains("cpu=0 inputs=2 outputs=2"));
+    assert!(invocation_lines[1].contains("cpu=0 inputs=1 outputs=1"));
+    assert!(invocation_lines[2].contains("cpu=1 inputs=1 outputs=1"));
+    let first_inputs = invocation_lines[0]
+        .split_once("inputs: ")
+        .expect("first invocation should log input paths")
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let cpu_inputs = invocation_lines[2]
+        .split_once("inputs: ")
+        .expect("CPU invocation should log input paths")
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    assert_eq!(first_inputs.len(), 2);
+    assert_eq!(cpu_inputs.len(), 1);
+    assert_ne!(
+        cpu_inputs[0], first_inputs[0],
+        "CPU fallback must not replay the confirmed first GPU input: {invocation_lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn batch_recovery_retries_all_missing_chunks_once_without_individual_invocations() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+    let invocations = temp.path().join("invocations.log");
+    let state_file = temp.path().join("state");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    write_speech_wav(&input_wav, 42);
+    write_executable_script(
+        &script_path,
+        &format!(
+            r#"#!/bin/sh
+outputs=""
+of_count=0
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-of" ]; then
+    shift
+    of_count=$((of_count + 1))
+    outputs="$outputs $1"
+  fi
+  shift
+done
+echo "$of_count" >> "{invocations}"
+attempt=1
+if [ -f "{state}" ]; then attempt=$(cat "{state}"); attempt=$((attempt + 1)); fi
+echo "$attempt" > "{state}"
+if [ "$attempt" -eq 1 ]; then
+  # Simulate a successful process that produced no durable outputs. The
+  # service must recover all unconfirmed inputs together.
+  exit 0
+fi
+index=0
+for out in $outputs; do
+  index=$((index + 1))
+  printf '{{"transcription":[{{"text":"recovered chunk %s","offsets":{{"from":0,"to":1000}}}}]}}' "$index" > "${{out}}.json"
+done
+exit 0
+"#,
+            invocations = invocations.to_string_lossy(),
+            state = state_file.to_string_lossy(),
+        ),
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            &transcription_policy("auto"),
+            &WhisperOptions::default(),
+            Some(42.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(|_seconds: f32| {}),
+        )
+        .await
+        .expect("grouped recovery should succeed");
+
+    assert!(transcript.text.contains("recovered chunk 1"));
+    let invocation_log =
+        std::fs::read_to_string(&invocations).expect("recovery script should record invocations");
+    let invocation_lines = invocation_log
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invocation_lines.len(),
+        2,
+        "expected initial + one recovery batch"
+    );
+    assert_eq!(invocation_lines[0], invocation_lines[1]);
+    let chunk_count = invocation_lines[0]
+        .parse::<usize>()
+        .expect("invocation should record input count");
+    assert!(chunk_count >= 2, "fixture should produce multiple chunks");
+}
+
+#[tokio::test]
+async fn adaptive_batch_cli_progress_is_intermediate_and_grounded_in_chunk_outputs() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-cli");
+    let models_dir = temp.path().join("models");
+    let input_wav = temp.path().join("audio.wav");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    // Continuous voiced audio creates several adaptive chunks. The fake CLI
+    // behaves like whisper.cpp's multi-input mode: it reports callback
+    // percentages while each durable JSON artifact is written.
+    write_speech_wav(&input_wav, 270);
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+outputs=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-of" ]; then
+    shift
+    outputs="$outputs $1"
+  fi
+  shift
+done
+
+index=0
+for out in $outputs; do
+  index=$((index + 1))
+  printf '{"transcription":[{"text":"chunk %s","offsets":{"from":0,"to":1000}}]}' "$index" > "${out}.json"
+  echo "whisper_print_progress_callback: progress = 25%" 1>&2
+  echo "whisper_print_progress_callback: progress = 100%" 1>&2
+  # Leave enough time for the service to observe grounded progress before the
+  # next chunk is confirmed; this is intentionally not an elapsed-time pulse.
+  sleep 0.02
+done
+exit 0
+"#,
+    );
+
+    let engine = WhisperCppEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let progress: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    let progress_clone = progress.clone();
+    let transcript = engine
+        .transcribe(
+            &input_wav,
+            "ggml-base.bin",
+            &transcription_policy("auto"),
+            &WhisperOptions::default(),
+            Some(270.0),
+            Arc::new(|_line: String| {}),
+            Arc::new(move |seconds: f32| {
+                progress_clone
+                    .lock()
+                    .expect("progress lock poisoned")
+                    .push(seconds);
+            }),
+        )
+        .await
+        .expect("fake adaptive batch should succeed");
+
+    let progress = progress.lock().expect("progress lock poisoned").clone();
+    assert!(
+        progress.len() >= 2,
+        "expected intermediate batch progress: {progress:?}"
+    );
+    assert!(
+        progress.first().copied().unwrap_or_default() < 20.0,
+        "the first input must not claim the whole batch completed: {progress:?}"
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|seconds| *seconds > 20.0 && *seconds < 41.9),
+        "a later input should advance the per-input cursor: {progress:?}"
+    );
+    assert!(
+        progress.windows(2).all(|pair| pair[1] + 0.001 >= pair[0]),
+        "batch progress must stay monotonic: {progress:?}"
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|seconds| *seconds > 0.1 && *seconds < 269.9),
+        "progress must include a grounded intermediate value, got {progress:?}"
+    );
+    assert!(
+        progress
+            .iter()
+            .any(|seconds| *seconds > 225.0 && *seconds < 269.9),
+        "a later process group must advance after the first group without claiming total completion: {progress:?}"
+    );
+    assert!(transcript.text.contains("chunk 1"));
+    assert!(transcript.text.contains("chunk 2"));
+    assert!(transcript.segments.windows(2).all(|pair| {
+        pair[1].start_seconds.unwrap_or_default() + 0.001 >= pair[0].end_seconds.unwrap_or_default()
+    }));
 }
 
 #[tokio::test]
@@ -622,7 +971,7 @@ exit 0
 }
 
 #[tokio::test]
-async fn cpu_safe_retry_resets_progress_to_zero_before_retrying() {
+async fn cpu_safe_retry_keeps_engine_progress_monotonic() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("whisper-cli");
     let models_dir = temp.path().join("models");
@@ -692,27 +1041,13 @@ exit 0
         .expect("transcription should succeed after cpu safe retry");
 
     let progress_values = progress.lock().expect("progress lock poisoned").clone();
-    // The retry must reset progress to 0.0 before emitting the low-timestamp
-    // segment, so the UI is not stuck at the first attempt's last value.
     assert!(
         progress_values
-            .iter()
-            .any(|value| (*value - 0.0).abs() < 0.001),
-        "expected progress to be reset to 0.0 before the retry, got: {:?}",
+            .windows(2)
+            .all(|pair| pair[1] + 0.001 >= pair[0]),
+        "engine progress must stay monotonic across the CPU continuation: {:?}",
         progress_values
     );
-    // And the 0.0 reset must come AFTER the first attempt advanced progress.
-    let first_nonzero = progress_values.iter().position(|value| *value > 0.0);
-    let reset_index = progress_values
-        .iter()
-        .position(|value| (*value - 0.0).abs() < 0.001);
-    if let (Some(first), Some(reset)) = (first_nonzero, reset_index) {
-        assert!(
-            reset > first,
-            "the 0.0 reset must come after the first attempt advanced progress, got: {:?}",
-            progress_values
-        );
-    }
 }
 
 #[tokio::test]
@@ -779,8 +1114,8 @@ exit 1
     };
 
     assert!(
-        message.starts_with("Whisper retry in CPU-safe mode failed:"),
-        "final error must be wrapped with the CPU-safe retry prefix, got: {message}"
+        message.starts_with("Whisper transcription failed after a backend retry:"),
+        "final error must remain user-facing without retry mechanics, got: {message}"
     );
 
     let repack_count = message.matches("repack tensor with q8_0_4x4").count();

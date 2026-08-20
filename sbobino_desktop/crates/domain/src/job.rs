@@ -37,6 +37,23 @@ pub struct JobProgress {
     pub percentage: u8,
     pub current_seconds: Option<f32>,
     pub total_seconds: Option<f32>,
+    /// Audio coverage that has been durably confirmed by the engine.
+    ///
+    /// This is additive to the legacy progress fields and defaults to zero
+    /// when deserializing progress events produced by older clients.
+    #[serde(default)]
+    pub committed_seconds: f32,
+    /// Audio that the current engine attempt has processed.  It is monotonic
+    /// for one visible job even when an internal GPU-to-CPU continuation
+    /// starts reading from an earlier timestamp.
+    #[serde(default)]
+    pub processed_seconds: f32,
+    /// Progress within the current stage (0..=100).
+    #[serde(default)]
+    pub stage_percentage: u8,
+    /// Monotonic progress across the complete file lifecycle (0..=100).
+    #[serde(default)]
+    pub overall_percentage: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

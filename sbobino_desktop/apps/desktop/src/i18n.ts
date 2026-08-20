@@ -32,6 +32,8 @@ const translations: AllTranslations = {
     "settings.transcription.engine": "Transcription engine",
     "settings.transcription.computeDevice": "Compute device",
     "settings.transcription.computeDeviceDesc": "Auto uses supported acceleration with a controlled CPU fallback. CPU never starts a GPU backend.",
+    "settings.transcription.liveComputeDevice": "Live compute device",
+    "settings.transcription.liveComputeDeviceDesc": "Used only for live microphone transcription. File jobs keep the setting above.",
     "settings.transcription.computeAuto": "Auto",
     "settings.transcription.computeGpu": "GPU",
     "settings.transcription.computeCpu": "CPU",
@@ -548,6 +550,8 @@ const translations: AllTranslations = {
     "realtime.waveformConnecting": "Connecting to the microphone...",
     "realtime.waveformBlocked": "Microphone preview is blocked. Check microphone permissions.",
     "realtime.waveformUnavailable": "Microphone preview is unavailable on this device.",
+    "realtime.waveformDegraded": "Live preview paused; saved audio is available for file transcription.",
+    "realtime.backlogWarning": "Live preview is behind; continuous audio is being saved.",
   },
   it: {
     // General settings
@@ -571,6 +575,8 @@ const translations: AllTranslations = {
     "settings.transcription.engine": "Motore di trascrizione",
     "settings.transcription.computeDevice": "Dispositivo di calcolo",
     "settings.transcription.computeDeviceDesc": "Auto usa l'accelerazione supportata con fallback CPU controllato. CPU non avvia mai un backend GPU.",
+    "settings.transcription.liveComputeDevice": "Dispositivo live",
+    "settings.transcription.liveComputeDeviceDesc": "Usato solo per la trascrizione live dal microfono. I file mantengono l'impostazione sopra.",
     "settings.transcription.computeAuto": "Auto",
     "settings.transcription.computeGpu": "GPU",
     "settings.transcription.computeCpu": "CPU",
@@ -1032,6 +1038,8 @@ const translations: AllTranslations = {
     "realtime.waveformConnecting": "Connessione al microfono...",
     "realtime.waveformBlocked": "L'anteprima del microfono è bloccata. Controlla i permessi del microfono.",
     "realtime.waveformUnavailable": "L'anteprima del microfono non è disponibile su questo dispositivo.",
+    "realtime.waveformDegraded": "Anteprima live in pausa; l'audio salvato è disponibile per la trascrizione da file.",
+    "realtime.backlogWarning": "L'anteprima live è in ritardo; l'audio continuo viene salvato.",
   },
   es: {
     // General settings
@@ -1057,6 +1065,8 @@ const translations: AllTranslations = {
     "settings.transcription.engine": "Motor de transcripción",
     "settings.transcription.computeDevice": "Dispositivo de cálculo",
     "settings.transcription.computeDeviceDesc": "Auto usa la aceleración compatible con una alternativa CPU controlada. CPU nunca inicia un backend GPU.",
+    "settings.transcription.liveComputeDevice": "Dispositivo de cálculo en vivo",
+    "settings.transcription.liveComputeDeviceDesc": "Se usa solo para la transcripción en vivo. Los archivos mantienen la opción anterior.",
     "settings.transcription.computeAuto": "Auto",
     "settings.transcription.computeGpu": "GPU",
     "settings.transcription.computeCpu": "CPU",
@@ -1574,6 +1584,8 @@ const translations: AllTranslations = {
     "realtime.waveformConnecting": "Conectando al micrófono...",
     "realtime.waveformBlocked": "La vista previa del micrófono está bloqueada. Comprueba los permisos del micrófono.",
     "realtime.waveformUnavailable": "La vista previa del micrófono no está disponible en este dispositivo.",
+    "realtime.waveformDegraded": "La vista previa en vivo está en pausa; el audio guardado está disponible para transcribirlo como archivo.",
+    "realtime.backlogWarning": "La vista previa en vivo se ha retrasado; el audio continuo se está guardando.",
   },
   de: {
     // General settings
@@ -1599,6 +1611,8 @@ const translations: AllTranslations = {
     "settings.transcription.engine": "Transkriptions-Engine",
     "settings.transcription.computeDevice": "Rechengerät",
     "settings.transcription.computeDeviceDesc": "Auto verwendet unterstützte Beschleunigung mit kontrolliertem CPU-Fallback. CPU startet niemals ein GPU-Backend.",
+    "settings.transcription.liveComputeDevice": "Live-Rechengerät",
+    "settings.transcription.liveComputeDeviceDesc": "Nur für Live-Mikrofontranskription. Dateijobs behalten die obige Einstellung.",
     "settings.transcription.computeAuto": "Auto",
     "settings.transcription.computeGpu": "GPU",
     "settings.transcription.computeCpu": "CPU",
@@ -2116,6 +2130,8 @@ const translations: AllTranslations = {
     "realtime.waveformConnecting": "Verbindung mit dem Mikrofon wird hergestellt...",
     "realtime.waveformBlocked": "Die Mikrofonvorschau ist blockiert. Prüfen Sie die Mikrofonberechtigungen.",
     "realtime.waveformUnavailable": "Die Mikrofonvorschau ist auf diesem Gerät nicht verfügbar.",
+    "realtime.waveformDegraded": "Live-Vorschau pausiert; gespeichertes Audio steht für die Dateitranskription bereit.",
+    "realtime.backlogWarning": "Die Live-Vorschau ist im Rückstand; kontinuierliches Audio wird gespeichert.",
   },
 };
 

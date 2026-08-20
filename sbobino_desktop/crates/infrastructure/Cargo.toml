@@ -1,6 +1,6 @@
 [package]
 name = "sbobino-infrastructure"
-version = "2.0.27"
+version = "2.0.28"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -22,9 +22,10 @@ hound.workspace = true
 ring.workspace = true
 lingua = { version = "1.8.0", default-features = false, features = [
     "bulgarian", "croatian", "czech", "danish", "dutch", "english", "estonian",
-    "finnish", "french", "german", "greek", "hungarian", "italian", "latvian",
-    "lithuanian", "polish", "portuguese", "romanian", "slovak", "slovene",
-    "spanish", "swedish", "russian", "ukrainian",
+    "finnish", "french", "german", "greek", "hindi", "hungarian", "italian",
+    "latvian", "lithuanian", "malay", "persian", "polish", "portuguese",
+    "romanian", "slovak", "slovene", "spanish", "swahili", "swedish", "russian",
+    "ukrainian",
 ] }
 tempfile = "3.13"
 sbobino-domain = { path = "../domain" }

@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 3 ]]; then
+  echo "Usage: $0 <version> <repo-slug> <report-json>" >&2
+  exit 1
+fi
+
+VERSION=$1
+REPO_SLUG=$2
+REPORT_PATH=$3
+TAG="v$VERSION"
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+REPORT_PARENT=$(dirname "$REPORT_PATH")
+mkdir -p "$REPORT_PARENT"
+REPORT_DIR=$(cd "$REPORT_PARENT" && pwd -P)
+LOG_DIR="$REPORT_DIR/intel-pyannote-parakeet-smoke-logs"
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sbobino-intel-pyannote-smoke.XXXXXX")
+ASSET_DIR="$RUN_DIR/assets"
+SPEECH_DIR="$RUN_DIR/speech"
+PYANNOTE_DIR="$RUN_DIR/pyannote"
+MODEL_DIR="$RUN_DIR/models"
+mkdir -p "$ASSET_DIR" "$SPEECH_DIR" "$PYANNOTE_DIR" "$MODEL_DIR"
+
+cleanup() {
+  rm -rf "$RUN_DIR"
+}
+trap cleanup EXIT
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "x86_64" ]]; then
+  echo "Intel Pyannote/Parakeet smoke must run on a macOS x86_64 host." >&2
+  exit 1
+fi
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 1
+  }
+}
+for command in gh ditto ffmpeg ffprobe curl shasum python3; do
+  need_cmd "$command"
+done
+
+gh release download "$TAG" \
+  --repo "$REPO_SLUG" \
+  --pattern "speech-runtime-macos-x86_64.zip" \
+  --pattern "pyannote-runtime-macos-x86_64.zip" \
+  --pattern "pyannote-model-community-1.zip" \
+  --dir "$ASSET_DIR"
+
+ditto -x -k "$ASSET_DIR/speech-runtime-macos-x86_64.zip" "$SPEECH_DIR"
+ditto -x -k "$ASSET_DIR/pyannote-runtime-macos-x86_64.zip" "$PYANNOTE_DIR"
+ditto -x -k "$ASSET_DIR/pyannote-model-community-1.zip" "$MODEL_DIR"
+
+SPEECH_ROOT="$SPEECH_DIR/runtime"
+PYTHON_ROOT="$PYANNOTE_DIR/python"
+PYANNOTE_MODEL_ROOT="$MODEL_DIR/model"
+PARAKEET_MODEL="tdt-0.6b-v3-q4_k.gguf"
+PARAKEET_MODELS="$RUN_DIR/parakeet-models"
+mkdir -p "$PARAKEET_MODELS"
+
+PARAKEET_MODEL_SHA256="993d73feb4206dadda865ab25bd64b50c48dc4d013c3bf6126a721f28b1d5ee8"
+CACHE_MODEL_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/parakeet-readiness-model"
+CACHE_MODEL_PATH="$CACHE_MODEL_ROOT/$PARAKEET_MODEL"
+mkdir -p "$CACHE_MODEL_ROOT"
+if [[ ! -f "$CACHE_MODEL_PATH" ]] ||
+   ! printf '%s  %s\n' "$PARAKEET_MODEL_SHA256" "$CACHE_MODEL_PATH" | shasum -a 256 -c - >/dev/null 2>&1; then
+  curl --fail --location --retry 5 --retry-all-errors \
+    "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/bf0af9f425fa01809cadec671b3cb672709d13e9/$PARAKEET_MODEL?download=true" \
+    --output "$CACHE_MODEL_PATH"
+fi
+printf '%s  %s\n' "$PARAKEET_MODEL_SHA256" "$CACHE_MODEL_PATH" | shasum -a 256 -c -
+cp "$CACHE_MODEL_PATH" "$PARAKEET_MODELS/$PARAKEET_MODEL"
+
+# Use the pinned real English LibriSpeech utterance from the Parakeet C++ test
+# fixtures rather than a synthetic tone.  Cache it separately from the model
+# so the hosted Intel job remains repeatable without silently changing the
+# speech input when the upstream repository moves.
+PARAKEET_FIXTURE_REF="9edf17c3ada66e0f881dcff155492867db7ac4cf"
+PARAKEET_FIXTURE_SHA256="5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150"
+PARAKEET_FIXTURE_NAME="speech.wav"
+CACHE_FIXTURE_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/parakeet-readiness-fixture"
+CACHE_FIXTURE_PATH="$CACHE_FIXTURE_ROOT/$PARAKEET_FIXTURE_NAME"
+mkdir -p "$CACHE_FIXTURE_ROOT"
+if [[ ! -f "$CACHE_FIXTURE_PATH" ]] ||
+   ! printf '%s  %s\n' "$PARAKEET_FIXTURE_SHA256" "$CACHE_FIXTURE_PATH" | shasum -a 256 -c - >/dev/null 2>&1; then
+  curl --fail --location --retry 5 --retry-all-errors \
+    "https://raw.githubusercontent.com/mudler/parakeet.cpp/$PARAKEET_FIXTURE_REF/tests/fixtures/$PARAKEET_FIXTURE_NAME" \
+    --output "$CACHE_FIXTURE_PATH"
+fi
+printf '%s  %s\n' "$PARAKEET_FIXTURE_SHA256" "$CACHE_FIXTURE_PATH" | shasum -a 256 -c -
+
+# Loop the utterance without an artificial encoder gap and make the duration
+# deterministic, longer than the production 45s batch-worker threshold.
+LONG_AUDIO="$RUN_DIR/parakeet-long.wav"
+ffmpeg -hide_banner -loglevel error -y -stream_loop -1 \
+  -i "$CACHE_FIXTURE_PATH" \
+  -t 65 -map 0:a:0 -ar 16000 -ac 1 -c:a pcm_s16le "$LONG_AUDIO"
+DURATION_SECONDS=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$LONG_AUDIO")
+python3 - "$DURATION_SECONDS" <<'PY'
+import sys
+if float(sys.argv[1]) <= 60.0:
+    raise SystemExit(f"long Parakeet smoke audio is only {sys.argv[1]} seconds")
+PY
+
+# The Intel hosted runner has no Metal path; keep the contract explicit in
+# the environment and report it as CPU/automatic-language smoke.
+export SBOBINO_PARAKEET_CLI="$SPEECH_ROOT/bin/parakeet-cli"
+export SBOBINO_PARAKEET_MODELS_DIR="$PARAKEET_MODELS"
+export SBOBINO_PARAKEET_MODEL="$PARAKEET_MODEL"
+export SBOBINO_PARAKEET_AUDIO="$LONG_AUDIO"
+export SBOBINO_PARAKEET_REQUIRE_WORKER_RSS_MONITOR=1
+export SBOBINO_PARAKEET_SKIP_NEMOTRON=1
+export SBOBINO_PARAKEET_FORCE_CPU=1
+export SBOBINO_PARAKEET_LANGUAGE=auto
+export SBOBINO_PARAKEET_EXPECTED_DETECTED_LANGUAGE=en
+export SBOBINO_PARAKEET_EXPECTED_PROCESSING_LANGUAGE=en
+export SBOBINO_ASR_SAMPLE=parakeet_fixture
+export SBOBINO_PARAKEET_FIXTURE="$LONG_AUDIO"
+export GGML_METAL=0
+
+"$ROOT_DIR/scripts/smoke_parakeet_real.sh" 2>&1 | tee "$RUN_DIR/parakeet.log"
+
+PYTHON_VERSION_DIR=$(find "$PYTHON_ROOT/lib" -maxdepth 1 -type d -name 'python3.*' -print -quit | xargs -I{} basename {})
+[[ -n "$PYTHON_VERSION_DIR" ]] || { echo "Pyannote Python standard library is missing." >&2; exit 1; }
+PYTHON_BIN="$PYTHON_ROOT/bin/python3"
+PATH="$PYTHON_ROOT/bin:$SPEECH_ROOT/bin:/usr/bin:/bin" \
+PYTHONHOME="$PYTHON_ROOT" \
+PYTHONPATH="$PYTHON_ROOT/lib/$PYTHON_VERSION_DIR:$PYTHON_ROOT/lib/$PYTHON_VERSION_DIR/lib-dynload:$PYTHON_ROOT/lib/$PYTHON_VERSION_DIR/site-packages" \
+PYTHONNOUSERSITE=1 \
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+"$PYTHON_BIN" - "$PYANNOTE_MODEL_ROOT" <<'PY' 2>&1 | tee "$RUN_DIR/pyannote.log"
+import importlib.metadata
+import pathlib
+import re
+import sys
+
+import torch
+import torchcodec
+from pyannote.audio import Pipeline
+
+model = pathlib.Path(sys.argv[1])
+if not (model / "config.yaml").is_file():
+    raise SystemExit("Pyannote model config.yaml is missing")
+if Pipeline.from_pretrained(str(model)) is None:
+    raise SystemExit("Pyannote model deep smoke returned no pipeline")
+print(f"torch_version={torch.__version__}")
+print(f"torchcodec_version={importlib.metadata.version('torchcodec')}")
+print("pyannote_deep_smoke=passed")
+PY
+
+python3 - "$REPORT_PATH" "$VERSION" "$TAG" "$DURATION_SECONDS" <<'PY'
+import json
+import pathlib
+import sys
+from datetime import datetime, timezone
+
+report_path = pathlib.Path(sys.argv[1])
+report = {
+    "schema_version": 1,
+    "version": sys.argv[2],
+    "release_tag": sys.argv[3],
+    "platform": "macos",
+    "architecture": "x86_64",
+    "status": "passed",
+    "runner": "github-hosted macos-15-intel",
+    "machine_class": "HOSTED-CLEANROOM-STANDARD",
+    "tested_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "commit_sha": __import__("subprocess").check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+    "parakeet_duration_seconds": float(sys.argv[4]),
+    "parakeet_compute_device": "cpu",
+    "parakeet_language": "auto",
+    "pyannote_deep_smoke": True,
+    "logs": [
+        "intel-pyannote-parakeet-smoke-logs/parakeet.log",
+        "intel-pyannote-parakeet-smoke-logs/pyannote.log",
+    ],
+}
+report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+PY
+
+mkdir -p "$LOG_DIR"
+cp "$RUN_DIR/parakeet.log" "$LOG_DIR/parakeet.log"
+cp "$RUN_DIR/pyannote.log" "$LOG_DIR/pyannote.log"
+
+echo "Intel Pyannote/Parakeet smoke passed: duration=${DURATION_SECONDS}s compute=cpu language=auto"

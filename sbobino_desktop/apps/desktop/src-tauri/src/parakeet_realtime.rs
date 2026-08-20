@@ -5,7 +5,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
@@ -20,12 +20,38 @@ use libloading::Library;
 use sbobino_application::{ApplicationError, RealtimeDelta, RealtimeDeltaKind};
 use sbobino_domain::{LanguageCode, TimedSegment, TranscriptionComputeDevice};
 
-use crate::realtime_audio::{classify_input_error, RealtimeInputLevelEvent};
+use crate::realtime_audio::{classify_input_error, RealtimeInputLevelEvent, RealtimeTelemetry};
 
 type ParakeetCtx = std::ffi::c_void;
 type ParakeetStream = std::ffi::c_void;
 type ParakeetLiveDeltaPiece = (String, Option<String>, bool);
 type ParakeetLiveDeltaPieces = Vec<ParakeetLiveDeltaPiece>;
+
+const PARAKEET_LIVE_FEED_SAMPLES: usize = 5_120;
+const PARAKEET_LIVE_MAX_BACKLOG_SECONDS: f32 = 2.0;
+
+#[derive(Debug, Default)]
+struct LivePreviewGate {
+    degraded: bool,
+    degraded_events: u32,
+    feeds: u32,
+}
+
+impl LivePreviewGate {
+    fn allow_feed(&mut self, captured_samples: u64, processed_samples: u64) -> bool {
+        if self.degraded {
+            return false;
+        }
+        let backlog_seconds = captured_samples.saturating_sub(processed_samples) as f32 / 16_000.0;
+        if backlog_seconds > PARAKEET_LIVE_MAX_BACKLOG_SECONDS {
+            self.degraded = true;
+            self.degraded_events = self.degraded_events.saturating_add(1);
+            return false;
+        }
+        self.feeds = self.feeds.saturating_add(1);
+        true
+    }
+}
 
 static PARAKEET_DEVICE_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -64,6 +90,7 @@ struct ParakeetRealtimeState {
     transcript: Arc<Mutex<String>>,
     segments: Arc<Mutex<Vec<TimedSegment>>>,
     diagnostics: Arc<Mutex<Vec<String>>>,
+    terminal_error: Arc<Mutex<Option<String>>>,
     saved_audio_path: Option<PathBuf>,
 }
 
@@ -171,6 +198,7 @@ impl ParakeetRealtimeEngine {
         let transcript = Arc::new(Mutex::new(String::new()));
         let segments = Arc::new(Mutex::new(Vec::new()));
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let terminal_error = Arc::new(Mutex::new(None));
         let paused = Arc::new(AtomicBool::new(false));
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let (startup_tx, startup_rx) = mpsc::channel();
@@ -187,6 +215,7 @@ impl ParakeetRealtimeEngine {
         let transcript_for_thread = transcript.clone();
         let segments_for_thread = segments.clone();
         let diagnostics_for_thread = diagnostics.clone();
+        let terminal_error_for_thread = terminal_error.clone();
         let paused_for_thread = paused.clone();
 
         emit_parakeet_input_level(
@@ -226,6 +255,9 @@ impl ParakeetRealtimeEngine {
                     }
                     Ok(Err(error)) => {
                         eprintln!("[parakeet-live] capture loop returned error: {error}");
+                        if let Ok(mut terminal) = terminal_error_for_thread.lock() {
+                            *terminal = Some(error.to_string());
+                        }
                         let _ = startup_tx.send(Err(error));
                     }
                     Err(panic_payload) => {
@@ -237,6 +269,10 @@ impl ParakeetRealtimeEngine {
                             "unknown panic payload".to_string()
                         };
                         eprintln!("[parakeet-live] capture thread PANICKED: {detail}");
+                        if let Ok(mut terminal) = terminal_error_for_thread.lock() {
+                            *terminal =
+                                Some(format!("Parakeet live capture thread panicked: {detail}"));
+                        }
                         let _ = startup_tx_for_panic.send(Err(ApplicationError::SpeechToText(
                             format!("Parakeet live capture thread panicked: {detail}"),
                         )));
@@ -258,6 +294,7 @@ impl ParakeetRealtimeEngine {
                 state.transcript = transcript;
                 state.segments = segments;
                 state.diagnostics = diagnostics;
+                state.terminal_error = terminal_error;
                 state.saved_audio_path = Some(saved_audio_path);
                 Ok(())
             }
@@ -309,12 +346,48 @@ impl ParakeetRealtimeEngine {
         };
 
         if let Some(worker) = worker {
-            let _ = worker.join();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if worker.is_finished() {
+                    let _ = worker.join();
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    // Keep ownership of the live worker in the engine. We do
+                    // not read transcript/audio state or enqueue a save while
+                    // the recorder may still be finalizing its WAV.
+                    if let Ok(mut state) = self.state.lock() {
+                        state.worker = Some(worker);
+                        state.running = false;
+                        if let Ok(mut diagnostics) = state.diagnostics.lock() {
+                            diagnostics.push(
+                                "Parakeet live worker did not stop within the 2s bound; retry stop before saving the WAV.".to_string(),
+                            );
+                        }
+                    }
+                    return Err(ApplicationError::SpeechToText(
+                        "Parakeet live stop exceeded the 2s bound; audio remains owned by the live worker and was not saved yet.".to_string(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
 
         let mut state = self.state.lock().map_err(lock_error)?;
+        let terminal_error = state
+            .terminal_error
+            .lock()
+            .map_err(|_| {
+                ApplicationError::SpeechToText(
+                    "Parakeet terminal error lock poisoned while stopping live audio".to_string(),
+                )
+            })?
+            .clone();
         state.running = false;
         state.paused.store(false, Ordering::Relaxed);
+        if let Some(error) = terminal_error {
+            return Err(ApplicationError::SpeechToText(error));
+        }
         let transcript = state
             .transcript
             .lock()
@@ -340,7 +413,14 @@ impl ParakeetRealtimeEngine {
     pub async fn is_running(&self) -> bool {
         self.state
             .lock()
-            .map(|state| state.running)
+            .map(|state| {
+                state.running
+                    && state
+                        .terminal_error
+                        .lock()
+                        .map(|error| error.is_none())
+                        .unwrap_or(false)
+            })
             .unwrap_or(false)
     }
 
@@ -373,6 +453,9 @@ impl ParakeetRealtimeEngine {
             }
             if let Ok(mut diagnostics) = state.diagnostics.lock() {
                 diagnostics.clear();
+            }
+            if let Ok(mut terminal) = state.terminal_error.lock() {
+                *terminal = None;
             }
         }
     }
@@ -684,6 +767,35 @@ fn emit_parakeet_input_level(
         state: state.to_string(),
         level: level.clamp(0.0, 1.0),
         message: message.into(),
+        telemetry: None,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_parakeet_telemetry(
+    emit_input_level: &(dyn Fn(RealtimeInputLevelEvent) + Send + Sync),
+    captured_samples: u64,
+    processed_samples: u64,
+    inference_ms: Option<f32>,
+    first_preview_ms: Option<f32>,
+    finalization_ms: Option<f32>,
+    state: &str,
+    message: impl Into<String>,
+) {
+    let captured_seconds = captured_samples as f32 / 16_000.0;
+    let processed_seconds = processed_samples as f32 / 16_000.0;
+    emit_input_level(RealtimeInputLevelEvent {
+        state: state.to_string(),
+        level: 0.0,
+        message: message.into(),
+        telemetry: Some(RealtimeTelemetry {
+            captured_seconds,
+            processed_seconds,
+            backlog_seconds: (captured_seconds - processed_seconds).max(0.0),
+            inference_ms,
+            first_preview_ms,
+            finalization_ms,
+        }),
     });
 }
 
@@ -735,6 +847,10 @@ fn run_capture_loop(
         "[parakeet-live] input config: sample_rate={} channels={}",
         sample_rate, channels
     );
+    // Keep the callback non-blocking: it hands every captured callback to the
+    // dedicated recorder queue. The recorder is the WAV authority and forwards
+    // bounded copies to inference; a full inference queue can never drop WAV
+    // samples or back-pressure CoreAudio.
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>();
     let last_capture_error = Arc::new(Mutex::new(None::<String>));
     let input_stream = build_input_stream(
@@ -773,29 +889,34 @@ fn run_capture_loop(
         ))
     })?;
 
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: 16_000,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    let mut writer = hound::WavWriter::create(&session.audio_path, spec).map_err(|error| {
-        ApplicationError::SpeechToText(format!(
-            "failed to create Parakeet live WAV at {}: {error}",
-            session.audio_path.display()
-        ))
-    })?;
+    let (inference_tx, inference_rx) = mpsc::sync_channel::<Vec<f32>>(8);
+    let recorded_samples = Arc::new(AtomicU64::new(0));
+    let inference_backpressure = Arc::new(AtomicBool::new(false));
+    let recorder_error = Arc::new(Mutex::new(None::<String>));
+    let mut recorder = Some(spawn_audio_recorder(
+        audio_rx,
+        inference_tx.clone(),
+        sample_rate,
+        session.audio_path.clone(),
+        recorded_samples.clone(),
+        inference_backpressure.clone(),
+        recorder_error.clone(),
+    ));
 
-    const PARAKEET_LIVE_FEED_SAMPLES: usize = 16_000;
+    // Feed the streaming model at roughly 320 ms. This bounds decoder
+    // latency without coupling capture/WAV persistence to inference speed.
     const PARAKEET_LIVE_FORCE_SEGMENT_SECONDS: f32 = 12.0;
     const PARAKEET_LIVE_NO_DELTA_RESTART_SECONDS: f32 = 10.0;
 
-    let mut resampler = LinearResampler::new(sample_rate, 16_000);
-    let mut captured_samples: u64 = 0;
     let mut fed_samples: u64 = 0;
     let mut pending_feed = Vec::<f32>::with_capacity(PARAKEET_LIVE_FEED_SAMPLES * 2);
     let mut last_delta_seconds = 0.0_f32;
     let mut last_stream_restart_seconds = 0.0_f32;
+    let session_started = Instant::now();
+    let mut first_preview_ms = None::<f32>;
+    let mut backlog_warned = false;
+    let mut preview_degraded = false;
+    let mut preview_gate = LivePreviewGate::default();
     let mut assembler = ParakeetLiveAssembler::new(
         session.transcript.clone(),
         session.segments.clone(),
@@ -825,55 +946,155 @@ fn run_capture_loop(
             }
         }
 
-        let chunk = match audio_rx.recv_timeout(Duration::from_millis(60)) {
+        if let Ok(mut slot) = recorder_error.lock() {
+            if let Some(error) = slot.take() {
+                if let Ok(mut items) = session.diagnostics.lock() {
+                    items.push(error.clone());
+                }
+                return Err(ApplicationError::SpeechToText(error));
+            }
+        }
+        if inference_backpressure.load(Ordering::Relaxed) && !preview_degraded {
+            preview_degraded = true;
+            pending_feed.clear();
+            if !backlog_warned {
+                backlog_warned = true;
+                let captured_seconds = recorded_samples.load(Ordering::Relaxed) as f32 / 16_000.0;
+                emit_parakeet_input_level(
+                    session.emit_input_level.as_ref(),
+                    "degraded",
+                    0.0,
+                    format!(
+                        "Live preview stopped after inference backlog exceeded 2s. Complete audio is saved to {} ({captured_seconds:.1}s) and can be transcribed as a file.",
+                        session.audio_path.display()
+                    ),
+                );
+            }
+        }
+
+        let chunk = match inference_rx.recv_timeout(Duration::from_millis(60)) {
             Ok(value) => value,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        if session.paused.load(Ordering::Relaxed) {
-            emit_parakeet_input_level(
-                session.emit_input_level.as_ref(),
-                "paused",
-                0.0,
-                "Microphone preview paused.",
-            );
-            continue;
-        }
+        let paused = session.paused.load(Ordering::Relaxed);
 
-        pending_input_level = pending_input_level.max(mean_abs_input_level(chunk.iter().copied()));
+        if !paused {
+            pending_input_level =
+                pending_input_level.max(mean_abs_input_level(chunk.iter().copied()));
+        }
         if last_input_level_emit.elapsed() >= Duration::from_millis(45) {
             emit_parakeet_input_level(
                 session.emit_input_level.as_ref(),
-                "running",
+                if paused { "paused" } else { "running" },
                 pending_input_level,
-                format!("Using {device_name}"),
+                if paused {
+                    "Microphone preview paused; audio capture continues.".to_string()
+                } else {
+                    format!("Using {device_name}")
+                },
             );
             pending_input_level = 0.0;
             last_input_level_emit = Instant::now();
         }
 
-        let pcm_16k = resampler.push(&chunk);
-        if pcm_16k.is_empty() {
-            continue;
+        if !paused && !preview_degraded {
+            pending_feed.extend_from_slice(&chunk);
         }
-        captured_samples = captured_samples.saturating_add(pcm_16k.len() as u64);
-        write_pcm_i16(&mut writer, &pcm_16k)?;
-        pending_feed.extend_from_slice(&pcm_16k);
 
         while pending_feed.len() >= PARAKEET_LIVE_FEED_SAMPLES {
+            let captured_for_gate = recorded_samples.load(Ordering::Relaxed);
+            if !preview_gate.allow_feed(captured_for_gate, fed_samples) {
+                preview_degraded = true;
+                pending_feed.clear();
+                if !backlog_warned {
+                    backlog_warned = true;
+                    emit_parakeet_input_level(
+                        session.emit_input_level.as_ref(),
+                        "degraded",
+                        0.0,
+                        format!(
+                            "Live preview stopped after falling behind by more than 2s. The complete audio is saved to {} and can be transcribed as a file.",
+                            session.audio_path.display()
+                        ),
+                    );
+                }
+                break;
+            }
             let feed_chunk = pending_feed
                 .drain(..PARAKEET_LIVE_FEED_SAMPLES)
                 .collect::<Vec<_>>();
             fed_samples = fed_samples.saturating_add(feed_chunk.len() as u64);
             let current_seconds = fed_samples as f32 / 16_000.0;
-            let outcome = feed_parakeet_live_chunk(
+            let inference_started = Instant::now();
+            let outcome = match feed_parakeet_live_chunk(
                 api,
                 ctx,
                 *stream,
                 &feed_chunk,
                 current_seconds,
                 &mut assembler,
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // Even an inference failure must close the input stream,
+                    // drain the recorder, and finalize the WAV before the
+                    // worker reports its terminal error to stop_realtime.
+                    drop(_stream_guard);
+                    drop(inference_tx);
+                    if let Err(recorder_error) =
+                        finish_audio_recorder(recorder.take(), &recorder_error)
+                    {
+                        return Err(ApplicationError::SpeechToText(format!(
+                            "{error}; {recorder_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
+            let inference_ms = inference_started.elapsed().as_secs_f32() * 1_000.0;
+            if first_preview_ms.is_none() && outcome.had_delta {
+                first_preview_ms = Some(session_started.elapsed().as_secs_f32() * 1_000.0);
+            }
+            let captured_for_telemetry = recorded_samples.load(Ordering::Relaxed);
+            let backlog_seconds =
+                captured_for_telemetry.saturating_sub(fed_samples) as f32 / 16_000.0;
+            emit_parakeet_telemetry(
+                session.emit_input_level.as_ref(),
+                captured_for_telemetry,
+                fed_samples,
+                Some(inference_ms),
+                first_preview_ms,
+                None,
+                if backlog_seconds > PARAKEET_LIVE_MAX_BACKLOG_SECONDS {
+                    "degraded"
+                } else {
+                    "running"
+                },
+                if backlog_seconds > PARAKEET_LIVE_MAX_BACKLOG_SECONDS {
+                    format!(
+                        "Live preview is behind by {:.1}s; continuous audio is being saved to {}.",
+                        backlog_seconds,
+                        session.audio_path.display()
+                    )
+                } else {
+                    "Live inference telemetry".to_string()
+                },
+            );
+            if backlog_seconds > PARAKEET_LIVE_MAX_BACKLOG_SECONDS && !backlog_warned {
+                preview_degraded = true;
+                pending_feed.clear();
+                backlog_warned = true;
+                emit_parakeet_input_level(
+                    session.emit_input_level.as_ref(),
+                    "degraded",
+                    0.0,
+                    format!(
+                        "Live preview paused to protect latency. Audio is still being saved to {}.",
+                        session.audio_path.display()
+                    ),
+                );
+            }
             if outcome.had_delta {
                 last_delta_seconds = current_seconds;
             }
@@ -903,14 +1124,48 @@ fn run_capture_loop(
         }
     }
 
-    let tail = resampler.finish();
-    if !tail.is_empty() {
-        captured_samples = captured_samples.saturating_add(tail.len() as u64);
-        write_pcm_i16(&mut writer, &tail)?;
-        pending_feed.extend_from_slice(&tail);
+    // Stop capture first; the recorder drains the capture queue, writes its
+    // resampler tail, finalizes the WAV, then closes the bounded inference
+    // channel. This keeps stop/save ordering deterministic and lossless.
+    drop(_stream_guard);
+    drop(inference_tx);
+    finish_audio_recorder(recorder.take(), &recorder_error)?;
+
+    if inference_backpressure.load(Ordering::Acquire) {
+        preview_degraded = true;
     }
 
-    if !pending_feed.is_empty() {
+    if !preview_degraded {
+        while let Ok(chunk) = inference_rx.try_recv() {
+            pending_feed.extend_from_slice(&chunk);
+            if pending_feed.len() < PARAKEET_LIVE_FEED_SAMPLES {
+                continue;
+            }
+            let feed_chunk = pending_feed
+                .drain(..PARAKEET_LIVE_FEED_SAMPLES)
+                .collect::<Vec<_>>();
+            fed_samples = fed_samples.saturating_add(feed_chunk.len() as u64);
+            let current_seconds = fed_samples as f32 / 16_000.0;
+            let outcome = feed_parakeet_live_chunk(
+                api,
+                ctx,
+                *stream,
+                &feed_chunk,
+                current_seconds,
+                &mut assembler,
+            )?;
+            if outcome.eou
+                || assembler.should_force_finish_segment(
+                    current_seconds,
+                    PARAKEET_LIVE_FORCE_SEGMENT_SECONDS,
+                )
+            {
+                assembler.finish_segment(current_seconds);
+            }
+        }
+    }
+
+    if !preview_degraded && !pending_feed.is_empty() {
         fed_samples = fed_samples.saturating_add(pending_feed.len() as u64);
         let current_seconds = fed_samples as f32 / 16_000.0;
         let outcome = feed_parakeet_live_chunk(
@@ -930,6 +1185,7 @@ fn run_capture_loop(
         pending_feed.clear();
     }
 
+    let finalization_started = Instant::now();
     let ptr = unsafe { (api.stream_finalize)(*stream) };
     let delta = take_c_string(api, ptr).ok_or_else(|| {
         ApplicationError::SpeechToText(format!(
@@ -937,15 +1193,30 @@ fn run_capture_loop(
             last_error(api, ctx)
         ))
     })?;
+    let captured_samples = recorded_samples.load(Ordering::Relaxed);
     let final_seconds = captured_samples.max(fed_samples) as f32 / 16_000.0;
     assembler.push_delta(&delta, final_seconds);
     assembler.finish_segment(final_seconds);
-    writer.finalize().map_err(|error| {
-        ApplicationError::SpeechToText(format!(
-            "failed to finalize Parakeet live WAV at {}: {error}",
+    emit_parakeet_telemetry(
+        session.emit_input_level.as_ref(),
+        captured_samples,
+        fed_samples,
+        None,
+        first_preview_ms,
+        Some(finalization_started.elapsed().as_secs_f32() * 1_000.0),
+        "finalizing",
+        format!("Finalizing live audio at {}.", session.audio_path.display()),
+    );
+    if preview_degraded {
+        let message = format!(
+            "Parakeet live preview degraded because inference fell behind. Complete audio was preserved at {}. Transcribe that WAV as a file to recover the session; no partial live transcript was saved.",
             session.audio_path.display()
-        ))
-    })?;
+        );
+        if let Ok(mut diagnostics) = session.diagnostics.lock() {
+            diagnostics.push(message.clone());
+        }
+        return Err(ApplicationError::SpeechToText(message));
+    }
     Ok(())
 }
 
@@ -1328,6 +1599,104 @@ fn is_parakeet_language_marker(token: &str) -> bool {
         })
 }
 
+fn finish_audio_recorder(
+    recorder: Option<JoinHandle<()>>,
+    recorder_error: &Arc<Mutex<Option<String>>>,
+) -> Result<(), ApplicationError> {
+    if let Some(recorder) = recorder {
+        recorder.join().map_err(|_| {
+            ApplicationError::SpeechToText(
+                "Parakeet live recorder thread panicked while finalizing WAV".to_string(),
+            )
+        })?;
+    }
+    if let Ok(mut slot) = recorder_error.lock() {
+        if let Some(error) = slot.take() {
+            return Err(ApplicationError::SpeechToText(error));
+        }
+    }
+    Ok(())
+}
+
+fn spawn_audio_recorder(
+    capture_rx: mpsc::Receiver<Vec<f32>>,
+    inference_tx: mpsc::SyncSender<Vec<f32>>,
+    input_sample_rate: u32,
+    audio_path: PathBuf,
+    recorded_samples: Arc<AtomicU64>,
+    inference_backpressure: Arc<AtomicBool>,
+    recorder_error: Arc<Mutex<Option<String>>>,
+) -> JoinHandle<()> {
+    thread::Builder::new()
+        .name("parakeet-live-wav-recorder".to_string())
+        .spawn(move || {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = match hound::WavWriter::create(&audio_path, spec) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    if let Ok(mut slot) = recorder_error.lock() {
+                        *slot = Some(format!(
+                            "failed to create Parakeet live WAV at {}: {error}",
+                            audio_path.display()
+                        ));
+                    }
+                    return;
+                }
+            };
+            let mut resampler = LinearResampler::new(input_sample_rate, 16_000);
+            while let Ok(chunk) = capture_rx.recv() {
+                let pcm = resampler.push(&chunk);
+                if pcm.is_empty() {
+                    continue;
+                }
+                if let Err(error) = write_pcm_i16(&mut writer, &pcm) {
+                    if let Ok(mut slot) = recorder_error.lock() {
+                        *slot = Some(error.to_string());
+                    }
+                    return;
+                }
+                recorded_samples.fetch_add(pcm.len() as u64, Ordering::Relaxed);
+                match inference_tx.try_send(pcm) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        // The WAV remains complete; inference is explicitly
+                        // degraded rather than allowed to grow unbounded.
+                        inference_backpressure.store(true, Ordering::Release);
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                }
+            }
+
+            let tail = resampler.finish();
+            if !tail.is_empty() {
+                if let Err(error) = write_pcm_i16(&mut writer, &tail) {
+                    if let Ok(mut slot) = recorder_error.lock() {
+                        *slot = Some(error.to_string());
+                    }
+                    return;
+                }
+                recorded_samples.fetch_add(tail.len() as u64, Ordering::Relaxed);
+                if let Err(mpsc::TrySendError::Full(_)) = inference_tx.try_send(tail) {
+                    inference_backpressure.store(true, Ordering::Release);
+                }
+            }
+            if let Err(error) = writer.finalize() {
+                if let Ok(mut slot) = recorder_error.lock() {
+                    *slot = Some(format!(
+                        "failed to finalize Parakeet live WAV at {}: {error}",
+                        audio_path.display()
+                    ));
+                }
+            }
+        })
+        .expect("Parakeet live recorder thread should spawn")
+}
+
 fn build_input_stream(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -1340,7 +1709,8 @@ fn build_input_stream(
         SampleFormat::F32 => device.build_input_stream(
             config,
             move |data: &[f32], _| {
-                let _ = audio_tx.send(mix_to_mono(data, channels));
+                let mono = mix_to_mono(data, channels);
+                let _ = audio_tx.send(mono);
             },
             move |error| store_capture_error(&last_error, error.to_string()),
             None,
@@ -1352,7 +1722,8 @@ fn build_input_stream(
                     .iter()
                     .map(|sample| *sample as f32 / i16::MAX as f32)
                     .collect::<Vec<_>>();
-                let _ = audio_tx.send(mix_to_mono(&samples, channels));
+                let mono = mix_to_mono(&samples, channels);
+                let _ = audio_tx.send(mono);
             },
             move |error| store_capture_error(&last_error, error.to_string()),
             None,
@@ -1364,7 +1735,8 @@ fn build_input_stream(
                     .iter()
                     .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
                     .collect::<Vec<_>>();
-                let _ = audio_tx.send(mix_to_mono(&samples, channels));
+                let mono = mix_to_mono(&samples, channels);
+                let _ = audio_tx.send(mono);
             },
             move |error| store_capture_error(&last_error, error.to_string()),
             None,
@@ -1473,6 +1845,11 @@ mod tests {
             !env.iter().any(|(name, _)| *name == "PARAKEET_DEVICE"),
             "Metal safety must not force the CPU backend"
         );
+    }
+
+    #[test]
+    fn live_feed_window_is_approximately_320ms_at_16khz() {
+        assert_eq!(PARAKEET_LIVE_FEED_SAMPLES, 16_000 * 320 / 1_000);
     }
 
     #[test]
@@ -1742,6 +2119,149 @@ mod tests {
         assert!(emitted[1].level <= 1.0);
         assert_eq!(emitted[2].state, "paused");
         assert_eq!(emitted[3].state, "idle");
+    }
+
+    #[test]
+    fn slow_fake_inference_keeps_continuous_wav_and_degrades_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("slow-live.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).expect("create wav");
+        let mut gate = LivePreviewGate::default();
+        let mut captured = 0_u64;
+        let mut processed = 0_u64;
+        let mut terminal_events = Vec::<RealtimeInputLevelEvent>::new();
+        let mut feeds_after_degrade = 0_u32;
+        let samples_per_tick = PARAKEET_LIVE_FEED_SAMPLES as u64;
+
+        // A fake decoder consumes one 320ms window every three capture ticks,
+        // i.e. slower than realtime. Recording remains continuous regardless
+        // of the decoder backlog.
+        for tick in 0..24_u32 {
+            let samples = vec![0.25_f32; PARAKEET_LIVE_FEED_SAMPLES];
+            write_pcm_i16(&mut writer, &samples).expect("write captured audio");
+            captured += samples_per_tick;
+
+            let allowed = gate.allow_feed(captured, processed);
+            if !allowed {
+                if gate.degraded_events == 1 && terminal_events.is_empty() {
+                    terminal_events.push(RealtimeInputLevelEvent {
+                        state: "degraded".to_string(),
+                        level: 0.0,
+                        message: "saved WAV fallback".to_string(),
+                        telemetry: Some(RealtimeTelemetry {
+                            captured_seconds: captured as f32 / 16_000.0,
+                            processed_seconds: processed as f32 / 16_000.0,
+                            backlog_seconds: (captured - processed) as f32 / 16_000.0,
+                            inference_ms: Some(640.0),
+                            first_preview_ms: None,
+                            finalization_ms: None,
+                        }),
+                    });
+                }
+                feeds_after_degrade += 1;
+                continue;
+            }
+
+            // Deliberately slow fake inference: one completed feed per 3 ticks.
+            if tick % 3 == 2 {
+                processed += samples_per_tick;
+            }
+        }
+        writer.finalize().expect("finalize wav");
+
+        let reader = hound::WavReader::open(&path).expect("open wav");
+        assert_eq!(reader.duration(), 24 * PARAKEET_LIVE_FEED_SAMPLES as u32);
+        assert!(
+            gate.degraded,
+            "slow inference must enter saved-audio fallback"
+        );
+        assert_eq!(
+            gate.degraded_events, 1,
+            "degraded is terminal and emitted once"
+        );
+        assert_eq!(terminal_events.len(), 1);
+        assert_eq!(terminal_events[0].state, "degraded");
+        assert!(terminal_events[0]
+            .telemetry
+            .as_ref()
+            .is_some_and(|telemetry| telemetry.backlog_seconds > 2.0));
+        assert!(
+            feeds_after_degrade > 0,
+            "later capture ticks must not feed inference"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_timeout_retains_worker_ownership_and_refuses_save_state() {
+        let engine = ParakeetRealtimeEngine::new(
+            PathBuf::from("missing-libparakeet"),
+            PathBuf::from("missing-models"),
+        );
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel();
+        let worker = thread::spawn(|| thread::sleep(Duration::from_millis(2_150)));
+        {
+            let mut state = engine.state.lock().expect("state lock");
+            state.running = true;
+            state.shutdown_tx = Some(shutdown_tx);
+            state.worker = Some(worker);
+        }
+
+        let error = engine.stop().await.expect_err("stop must be bounded");
+        assert!(error.to_string().contains("2s bound"));
+        let worker = engine
+            .state
+            .lock()
+            .expect("state lock")
+            .worker
+            .take()
+            .expect("timed-out worker remains owned by the engine");
+        worker
+            .join()
+            .expect("worker should finish before test teardown");
+    }
+
+    #[tokio::test]
+    async fn degraded_worker_error_propagates_through_stop_without_partial_result() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let audio_path = temp.path().join("parakeet-live.wav");
+        std::fs::write(&audio_path, b"complete wav placeholder").expect("write audio marker");
+        let engine = ParakeetRealtimeEngine::new(
+            PathBuf::from("missing-libparakeet"),
+            PathBuf::from("missing-models"),
+        );
+        {
+            let mut state = engine.state.lock().expect("state lock");
+            state.running = true;
+            state.saved_audio_path = Some(audio_path.clone());
+            *state.terminal_error.lock().expect("terminal lock") = Some(format!(
+                "Parakeet live preview degraded; complete audio was preserved at {}. Transcribe that WAV as a file; no partial live transcript was saved.",
+                audio_path.display()
+            ));
+        }
+
+        let error = engine
+            .stop()
+            .await
+            .expect_err("degraded worker must fail stop");
+        let message = error.to_string();
+        assert!(
+            message.contains("complete audio was preserved"),
+            "{message}"
+        );
+        assert!(
+            message.contains(audio_path.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(
+            message.contains("no partial live transcript was saved"),
+            "{message}"
+        );
     }
 
     #[test]

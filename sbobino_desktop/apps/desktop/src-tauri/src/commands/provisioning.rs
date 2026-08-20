@@ -28,8 +28,8 @@ use crate::{
 };
 use sbobino_domain::TranscriptionEngine;
 use sbobino_infrastructure::{
-    background_process::tokio_background_command, ManagedPyannoteManifest, ManagedRuntimeHealth,
-    ReconcileManagedPyannoteReleaseOutcome, RuntimeTranscriptionFactory,
+    background_process::tokio_background_command, ManagedPyannoteManifest, ManagedPyannoteReceipt,
+    ManagedRuntimeHealth, ReconcileManagedPyannoteReleaseOutcome, RuntimeTranscriptionFactory,
     PYANNOTE_MANIFEST_FILENAME,
 };
 
@@ -438,10 +438,12 @@ fn cleanup_pyannote_workdir(runtime_factory: &RuntimeTranscriptionFactory) -> Re
     let python_dir = runtime_factory.managed_pyannote_python_dir();
     let model_dir = runtime_factory.managed_pyannote_model_dir();
     let manifest_path = runtime_factory.managed_pyannote_manifest_path();
+    let receipt_path = runtime_factory.managed_pyannote_receipt_path();
 
     remove_path_if_exists(&python_dir)?;
     remove_path_if_exists(&model_dir)?;
     remove_path_if_exists(&manifest_path)?;
+    remove_path_if_exists(&receipt_path)?;
 
     if runtime_dir.is_dir() {
         for entry in std::fs::read_dir(&runtime_dir)
@@ -452,7 +454,10 @@ fn cleanup_pyannote_workdir(runtime_factory: &RuntimeTranscriptionFactory) -> Re
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(".download-") || name.starts_with(".stage-") {
+            if name.starts_with(".download-")
+                || name.starts_with(".stage-")
+                || name.starts_with(".receipt.json.tmp")
+            {
                 remove_path_if_exists(&path)?;
             }
         }
@@ -1309,6 +1314,11 @@ pub async fn provisioning_install_pyannote(
         .runtime_health()
         .map_err(|e| CommandError::new("runtime_health", e))?;
     let repair_required = force || is_pyannote_repair_reason(&health.pyannote.reason_code);
+    // A legacy or stale-receipt install is not ready for diarization, but its
+    // runtime/model tree is still valuable rollback state.  Preserve it while
+    // the one-time receipt migration runs so an interrupted repair cannot
+    // delete the last known installation.
+    let has_existing_install = health.pyannote.runtime_installed && health.pyannote.model_installed;
 
     if health.pyannote.ready && !repair_required {
         emit_provisioning_status(
@@ -1329,7 +1339,7 @@ pub async fn provisioning_install_pyannote(
             state.runtime_factory.clone(),
             cancel_token,
             slot_guard,
-            health.pyannote.ready,
+            has_existing_install,
             repair_required,
         );
     } else {
@@ -1338,7 +1348,7 @@ pub async fn provisioning_install_pyannote(
             state.runtime_factory.clone(),
             cancel_token,
             slot_guard,
-            health.pyannote.ready,
+            has_existing_install,
             repair_required,
         );
     }
@@ -1701,10 +1711,20 @@ fn managed_pyannote_python_path_env(python_root: &Path) -> Option<std::ffi::OsSt
         .flatten()
 }
 
-pub(crate) async fn probe_pyannote_import_and_load(
+#[derive(Debug, Deserialize)]
+struct PyannoteProbeReceiptPayload {
+    torch_version: String,
+    torchcodec_version: String,
+    ffmpeg_abi: String,
+}
+
+/// Run the expensive Pyannote import/model-load probe and return the metadata
+/// captured from the same managed interpreter.  The caller persists the
+/// resulting receipt only after this function succeeds.
+pub(crate) async fn probe_pyannote_import_and_load_receipt(
     runtime_factory: &RuntimeTranscriptionFactory,
     cancel_token: &CancellationToken,
-) -> Result<(), String> {
+) -> Result<ManagedPyannoteReceipt, String> {
     if cancel_token.is_cancelled() {
         return Err("cancelled".to_string());
     }
@@ -1722,10 +1742,40 @@ pub(crate) async fn probe_pyannote_import_and_load(
     }
 
     let probe_script = r#"
+import importlib.metadata
+import json
+import pathlib
+import re
 import sys
+
 from pyannote.audio import Pipeline
+import torch
+import torchcodec
+
 Pipeline.from_pretrained(sys.argv[1])
-print("pyannote-import-load-ok")
+
+def ffmpeg_abi():
+    roots = []
+    package_root = pathlib.Path(torchcodec.__file__).resolve().parent
+    roots.extend((package_root / ".dylibs", package_root, package_root.parent.parent / "embedded-dylibs"))
+    names = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for candidate in root.iterdir():
+            if not candidate.is_file() and not candidate.is_symlink():
+                continue
+            match = re.match(r"(?:lib)?(av(?:util|codec|format|device|filter|swscale|swresample))(?:[.]|[-])([0-9]+)", candidate.name)
+            if match:
+                names.add(f"lib{match.group(1)}.{match.group(2)}")
+    return ",".join(sorted(names))
+
+payload = {
+    "torch_version": str(torch.__version__),
+    "torchcodec_version": importlib.metadata.version("torchcodec"),
+    "ffmpeg_abi": ffmpeg_abi(),
+}
+print("sbobino-pyannote-receipt=" + json.dumps(payload, sort_keys=True))
 "#;
     let mut command = tokio_background_command(&python_path);
     command
@@ -1784,12 +1834,53 @@ print("pyannote-import-load-ok")
                 .map_err(|error| format!("Pyannote import/load probe could not be collected: {error}"))?
         }
     };
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if output.status.success() {
-        return Ok(());
+        let marker = "sbobino-pyannote-receipt=";
+        let payload = stdout
+            .lines()
+            .rev()
+            .find_map(|line| line.strip_prefix(marker))
+            .ok_or_else(|| {
+                "Pyannote deep smoke passed but did not return receipt metadata.".to_string()
+            })?;
+        let payload =
+            serde_json::from_str::<PyannoteProbeReceiptPayload>(payload).map_err(|error| {
+                format!("Pyannote deep smoke returned invalid receipt metadata: {error}")
+            })?;
+        if payload.torch_version.trim().is_empty()
+            || payload.torchcodec_version.trim().is_empty()
+            || payload.ffmpeg_abi.trim().is_empty()
+        {
+            return Err(
+                "Pyannote deep smoke returned incomplete Torch/TorchCodec/FFmpeg ABI metadata."
+                    .to_string(),
+            );
+        }
+        let manifest = runtime_factory
+            .read_managed_pyannote_manifest()
+            .ok_or_else(|| {
+                "Pyannote deep smoke passed but the managed release manifest is missing."
+                    .to_string()
+            })?;
+        return Ok(ManagedPyannoteReceipt {
+            schema_version: 1,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: std::env::consts::OS.to_string(),
+            arch: host_pyannote_arch_label().to_string(),
+            runtime_asset: manifest.runtime_asset,
+            runtime_sha256: manifest.runtime_sha256,
+            model_asset: manifest.model_asset,
+            model_sha256: manifest.model_sha256,
+            torch_version: payload.torch_version,
+            torchcodec_version: payload.torchcodec_version,
+            ffmpeg_abi: payload.ffmpeg_abi,
+            deep_smoke: true,
+            verified_at: Utc::now().to_rfc3339(),
+        });
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let detail = if stderr.is_empty() { stdout } else { stderr };
     let detail = if detail.len() > 600 {
         format!("{}…", detail.chars().take(600).collect::<String>())
@@ -1907,26 +1998,55 @@ fn spawn_pyannote_bundled_install(
 
         match runtime_factory.validate_managed_pyannote_runtime() {
             Ok(()) => {
-                if let Err(error) =
-                    probe_pyannote_import_and_load(&runtime_factory, &cancel_token).await
+                let receipt = match probe_pyannote_import_and_load_receipt(
+                    &runtime_factory,
+                    &cancel_token,
+                )
+                .await
                 {
-                    let reason_code = if error == "cancelled" {
-                        "cancelled"
-                    } else {
-                        "pyannote_import_load_failed"
-                    };
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        let reason_code = if error == "cancelled" {
+                            "cancelled"
+                        } else {
+                            "pyannote_import_load_failed"
+                        };
+                        if let Err(restore_error) = rollback_pyannote_runtime_swap(
+                            &runtime_dir,
+                            backup_runtime_dir.as_deref(),
+                        ) {
+                            tracing::warn!(
+                            "failed to rollback bundled pyannote runtime after probe error: {restore_error}"
+                        );
+                        }
+                        emit_provisioning_status(&app, "error", &error, Some(reason_code));
+                        persist_pyannote_install_failure(
+                            runtime_factory.as_ref(),
+                            had_ready_install,
+                            reason_code,
+                            &error,
+                        );
+                        return;
+                    }
+                };
+                if let Err(error) = runtime_factory.write_managed_pyannote_receipt(&receipt) {
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_install_incomplete"),
+                    );
                     if let Err(restore_error) =
                         rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
                     {
                         tracing::warn!(
-                            "failed to rollback bundled pyannote runtime after probe error: {restore_error}"
+                            "failed to rollback bundled pyannote runtime after receipt error: {restore_error}"
                         );
                     }
-                    emit_provisioning_status(&app, "error", &error, Some(reason_code));
                     persist_pyannote_install_failure(
                         runtime_factory.as_ref(),
                         had_ready_install,
-                        reason_code,
+                        "pyannote_install_incomplete",
                         &error,
                     );
                     return;
@@ -2310,24 +2430,53 @@ fn spawn_pyannote_provisioning_download(
 
         match runtime_factory.validate_managed_pyannote_runtime() {
             Ok(()) => {
-                if let Err(error) =
-                    probe_pyannote_import_and_load(&runtime_factory, &cancel_token).await
+                let receipt = match probe_pyannote_import_and_load_receipt(
+                    &runtime_factory,
+                    &cancel_token,
+                )
+                .await
                 {
-                    let reason_code = if error == "cancelled" {
-                        "cancelled"
-                    } else {
-                        "pyannote_import_load_failed"
-                    };
-                    emit_provisioning_status(&app, "error", &error, Some(reason_code));
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        let reason_code = if error == "cancelled" {
+                            "cancelled"
+                        } else {
+                            "pyannote_import_load_failed"
+                        };
+                        emit_provisioning_status(&app, "error", &error, Some(reason_code));
+                        if let Err(restore_error) = rollback_pyannote_runtime_swap(
+                            &runtime_dir,
+                            backup_runtime_dir.as_deref(),
+                        ) {
+                            tracing::warn!("failed to rollback pyannote runtime after import/load probe error: {restore_error}");
+                        }
+                        persist_pyannote_install_failure(
+                            runtime_factory.as_ref(),
+                            had_ready_install,
+                            reason_code,
+                            &error,
+                        );
+                        return;
+                    }
+                };
+                if let Err(error) = runtime_factory.write_managed_pyannote_receipt(&receipt) {
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_install_incomplete"),
+                    );
                     if let Err(restore_error) =
                         rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
                     {
-                        tracing::warn!("failed to rollback pyannote runtime after import/load probe error: {restore_error}");
+                        tracing::warn!(
+                            "failed to rollback pyannote runtime after receipt error: {restore_error}"
+                        );
                     }
                     persist_pyannote_install_failure(
                         runtime_factory.as_ref(),
                         had_ready_install,
-                        reason_code,
+                        "pyannote_install_incomplete",
                         &error,
                     );
                     return;
@@ -3048,6 +3197,8 @@ fn is_pyannote_repair_reason(reason_code: &str) -> bool {
             | "pyannote_repair_required"
             | "pyannote_install_incomplete"
             | "pyannote_checksum_invalid"
+            | "pyannote_receipt_required"
+            | "pyannote_receipt_invalid"
             | "pyannote_import_load_failed"
     )
 }
@@ -4029,14 +4180,15 @@ mod tests {
         estimate_pyannote_required_free_bytes, install_pyannote_archive, install_runtime_archive,
         persist_pyannote_install_failure, plan_pyannote_background_action_inner,
         prepare_pyannote_runtime_stage, prepare_pyannote_runtime_swap,
-        probe_pyannote_import_and_load, promote_staged_pyannote_runtime, pyannote_reconcile_action,
-        recover_interrupted_runtime_install, remove_path_if_exists, rollback_pyannote_runtime_swap,
-        rollback_runtime_install_transaction, runtime_install_journal_backup_path,
-        runtime_install_journal_path, runtime_install_transaction_lock, sha256_file_hex,
-        transcription_runtime_install_complete, validate_arch_descriptors,
-        validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
-        write_runtime_install_journal, PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
-        RuntimeInstallCommitError, RuntimeInstallJournal, RuntimeInstallTransaction,
+        probe_pyannote_import_and_load_receipt, promote_staged_pyannote_runtime,
+        pyannote_reconcile_action, recover_interrupted_runtime_install, remove_path_if_exists,
+        rollback_pyannote_runtime_swap, rollback_runtime_install_transaction,
+        runtime_install_journal_backup_path, runtime_install_journal_path,
+        runtime_install_transaction_lock, sha256_file_hex, transcription_runtime_install_complete,
+        validate_arch_descriptors, validate_manifest_asset_descriptor, validate_setup_manifest,
+        verify_file_sha256, write_runtime_install_journal, PyannoteAssetSelection,
+        PyannoteBackgroundActionTrigger, RuntimeInstallCommitError, RuntimeInstallJournal,
+        RuntimeInstallTransaction,
     };
     use crate::release_assets::{
         PyannoteReleaseAsset, PyannoteReleaseManifest, ReleaseAssetDescriptor, RuntimeReleaseAsset,
@@ -4708,7 +4860,7 @@ mod tests {
         std::fs::create_dir_all(factory.managed_pyannote_model_dir())
             .expect("model directory should exist");
 
-        let error = probe_pyannote_import_and_load(&factory, &CancellationToken::new())
+        let error = probe_pyannote_import_and_load_receipt(&factory, &CancellationToken::new())
             .await
             .expect_err("failed Python import should be surfaced");
         assert!(error.contains("synthetic pyannote import failure"));

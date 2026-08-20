@@ -7,7 +7,9 @@ use std::time::Duration;
 use tempfile::tempdir;
 
 use sbobino_application::{RealtimeDelta, RealtimeDeltaKind};
-use sbobino_infrastructure::adapters::whisper_stream::WhisperStreamEngine;
+use sbobino_infrastructure::adapters::whisper_stream::{
+    WhisperStreamEngine, WhisperStreamTelemetry,
+};
 
 const STREAM_SETTLE_ATTEMPTS: usize = 320;
 const STREAM_SETTLE_DELAY: Duration = Duration::from_millis(25);
@@ -91,6 +93,75 @@ exit 0
         "expected final delta from stderr, got: {deltas:?}"
     );
     assert_eq!(stop_result.transcript.trim(), "final from stderr");
+}
+
+#[tokio::test]
+async fn realtime_emits_diagnostic_telemetry_with_first_preview_and_finalization() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-stream");
+    let models_dir = temp.path().join("models");
+
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+printf '\033[2Kpreview telemetry\n' 1>&2
+sleep 0.08
+printf 'final telemetry\n' 1>&2
+sleep 0.08
+exit 0
+"#,
+    );
+
+    let engine = WhisperStreamEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let telemetry: Arc<Mutex<Vec<WhisperStreamTelemetry>>> = Arc::new(Mutex::new(Vec::new()));
+    let telemetry_clone = telemetry.clone();
+    engine
+        .start_with_telemetry(
+            "ggml-base.bin",
+            "en",
+            Arc::new(|_delta: RealtimeDelta| {}),
+            Some(Arc::new(move |event| {
+                telemetry_clone
+                    .lock()
+                    .expect("telemetry lock poisoned")
+                    .push(event);
+            })),
+        )
+        .await
+        .expect("realtime start should succeed");
+
+    for _ in 0..STREAM_SETTLE_ATTEMPTS {
+        if !engine.is_running().await {
+            break;
+        }
+        tokio::time::sleep(STREAM_SETTLE_DELAY).await;
+    }
+    let _ = engine.stop().await.expect("realtime stop should succeed");
+
+    let events = telemetry.lock().expect("telemetry lock poisoned").clone();
+    assert!(
+        events.len() >= 2,
+        "expected preview and final telemetry: {events:?}"
+    );
+    let first_preview = events
+        .iter()
+        .find(|event| event.first_preview_ms.is_some())
+        .expect("first preview timing should be populated");
+    assert!(first_preview.captured_seconds.is_finite());
+    assert!(first_preview.processed_seconds.is_finite());
+    assert!(first_preview.backlog_seconds >= 0.0);
+    assert!(first_preview.inference_ms.is_some());
+    let final_event = events
+        .last()
+        .expect("final telemetry event should be emitted");
+    assert!(final_event.finalization_ms.is_some());
+    assert!(final_event.finalization_ms.unwrap_or_default() >= 0.0);
 }
 
 #[tokio::test]

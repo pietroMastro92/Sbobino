@@ -51,11 +51,12 @@ fi
 
 python3 - <<'PY' "$RELEASE_JSON" "$VERSION"
 import json
+import pathlib
 import sys
 
 release = json.loads(sys.argv[1])
 version = sys.argv[2]
-expected_assets = {
+expected_json_assets = {
     "release-readiness-proof.json",
     "distribution-readiness-proof.json",
     "intel-distribution-readiness-proof.json",
@@ -63,18 +64,30 @@ expected_assets = {
     "windows-gui-smoke-report.json",
     "portability-smoke-report.json",
     "intel-portability-smoke-report.json",
-    "release-notes.md",
 }
+required_non_json_assets = {"release-notes.md"}
 present_assets = {
     asset.get("name", "").strip()
     for asset in release.get("assets", [])
     if isinstance(asset, dict)
 }
-missing = sorted(expected_assets - present_assets)
-if missing:
+present_json_assets = {
+    name for name in present_assets if pathlib.PurePosixPath(name).suffix.lower() == ".json"
+}
+missing_json = sorted(expected_json_assets - present_json_assets)
+unexpected_json = sorted(present_json_assets - expected_json_assets)
+missing_non_json = sorted(required_non_json_assets - present_assets)
+if missing_json or unexpected_json:
+    details = ["Stable promotion blocked: public JSON proof assets must be exactly the reviewed seven names."]
+    if missing_json:
+        details.append("missing=" + ",".join(missing_json))
+    if unexpected_json:
+        details.append("unexpected=" + ",".join(unexpected_json))
+    raise SystemExit(" ".join(details))
+if missing_non_json:
     raise SystemExit(
-        "Stable promotion blocked: missing validation report assets: "
-        + ", ".join(missing)
+        "Stable promotion blocked: missing required release metadata assets: "
+        + ", ".join(missing_non_json)
     )
 if release.get("tagName") != f"v{version}":
     raise SystemExit("Release tag does not match the requested version.")
@@ -104,8 +117,10 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
   "$TMP_DIR/release-notes.md"
 
 python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG"
+import math
 import json
 import pathlib
+import re
 import sys
 
 report_dir = pathlib.Path(sys.argv[1])
@@ -141,6 +156,73 @@ if str(distribution.get("status", "")).strip().lower() != "passed":
     raise SystemExit("Stable promotion blocked: distribution-readiness-proof.json is not marked passed.")
 if str(distribution.get("gate", "")).strip() != "distribution_readiness.sh":
     raise SystemExit("Stable promotion blocked: distribution-readiness-proof.json gate mismatch.")
+
+def validate_quality_gate(key: str, label: str) -> dict:
+    report = distribution.get(key)
+    if not isinstance(report, dict):
+        raise SystemExit(f"Stable promotion blocked: distribution proof is missing {label} results.")
+    if int(report.get("schema_version", 0)) != 1:
+        raise SystemExit(f"Stable promotion blocked: {label} report has unsupported schema_version.")
+    if str(report.get("status", "")).strip().lower() != "passed":
+        raise SystemExit(f"Stable promotion blocked: {label} report did not pass.")
+    if report.get("evidence_class") != "hosted-packaged-engine":
+        raise SystemExit(
+            f"Stable promotion blocked: {label} is not real hosted packaged-engine evidence."
+        )
+    if report.get("real_engine") is not True or report.get("real_harness") is not True:
+        raise SystemExit(
+            f"Stable promotion blocked: {label} did not execute a real packaged engine/harness."
+        )
+    if not str(report.get("runner", "")).strip().startswith("github-hosted "):
+        raise SystemExit(f"Stable promotion blocked: {label} is not from a hosted runner.")
+    if not str(report.get("engine", "")).strip() or str(report.get("engine")).strip().lower() == "fixture":
+        raise SystemExit(f"Stable promotion blocked: {label} is missing a packaged engine identity.")
+    if not str(report.get("harness", "")).strip():
+        raise SystemExit(f"Stable promotion blocked: {label} report is missing harness identity.")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", str(report.get("input_audio_sha256", "")).strip()):
+        raise SystemExit(f"Stable promotion blocked: {label} report is missing an input audio hash.")
+    runtime_hashes = report.get("runtime_artifact_sha256")
+    if not isinstance(runtime_hashes, dict) or not runtime_hashes or any(
+        not re.fullmatch(r"[0-9a-fA-F]{64}", str(value).strip())
+        for value in runtime_hashes.values()
+    ):
+        raise SystemExit(f"Stable promotion blocked: {label} report is missing packaged runtime hashes.")
+    failures = report.get("failures")
+    if not isinstance(failures, list) or failures:
+        raise SystemExit(f"Stable promotion blocked: {label} report contains failures.")
+    metrics = report.get("metrics")
+    if not isinstance(metrics, dict):
+        raise SystemExit(f"Stable promotion blocked: {label} report is missing metrics.")
+    return metrics
+
+asr_metrics = validate_quality_gate("asr_reference", "ASR reference")
+for metric, maximum in (
+    ("wer", 0.35),
+    ("cer", 0.25),
+    ("largest_uncovered_seconds", 2.0),
+):
+    value = asr_metrics.get(metric)
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
+        raise SystemExit(
+            f"Stable promotion blocked: ASR reference {metric} exceeds the release threshold."
+        )
+
+live_metrics = validate_quality_gate("live_latency", "live-latency")
+for metric, maximum in (
+    ("first_preview_seconds", 2.0),
+    ("preview_latency_p95_seconds", 2.0),
+    ("backlog_p95_seconds", 2.0),
+    ("finalization_seconds", 2.0),
+    ("rss_growth_mib", 256.0),
+):
+    value = live_metrics.get(metric)
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
+        raise SystemExit(
+            f"Stable promotion blocked: live-latency {metric} exceeds the release threshold."
+        )
+for metric in ("dropped_samples", "missing_segments", "duplicate_segments"):
+    if int(live_metrics.get(metric, -1)) != 0:
+        raise SystemExit(f"Stable promotion blocked: live-latency {metric} is non-zero.")
 
 intel_distribution = load_json(
     report_dir / "intel-distribution-readiness-proof.json",
@@ -231,6 +313,30 @@ if intel_portability.get("version") != version or intel_portability.get("release
     raise SystemExit("Stable promotion blocked: Intel portability smoke report version mismatch.")
 if str(intel_portability.get("status", "")).strip().lower() != "passed":
     raise SystemExit("Stable promotion blocked: Intel portability smoke report is not marked passed.")
+
+intel_pyannote = intel_distribution.get("intel_pyannote_parakeet_smoke")
+if not isinstance(intel_pyannote, dict):
+    raise SystemExit(
+        "Stable promotion blocked: Intel distribution proof is missing the CPU/Pyannote smoke fields."
+    )
+if int(intel_pyannote.get("schema_version", 0)) != 1:
+    raise SystemExit(
+        "Stable promotion blocked: Intel CPU/Pyannote smoke fields have unsupported schema_version."
+    )
+if str(intel_pyannote.get("status", "")).strip().lower() != "passed":
+    raise SystemExit("Stable promotion blocked: Intel CPU/Pyannote smoke did not pass.")
+if intel_pyannote.get("runner") != "github-hosted macos-15-intel":
+    raise SystemExit("Stable promotion blocked: Intel smoke did not use macos-15-intel.")
+if intel_pyannote.get("machine_class") != "HOSTED-CLEANROOM-STANDARD":
+    raise SystemExit("Stable promotion blocked: Intel smoke machine class is not standard hosted.")
+if float(intel_pyannote.get("parakeet_duration_seconds", 0)) <= 60:
+    raise SystemExit("Stable promotion blocked: Intel Parakeet smoke did not exceed 60 seconds of audio.")
+if str(intel_pyannote.get("parakeet_compute_device", "")).strip().lower() != "cpu":
+    raise SystemExit("Stable promotion blocked: Intel Parakeet smoke was not CPU-only.")
+if str(intel_pyannote.get("parakeet_language", "")).strip().lower() != "auto":
+    raise SystemExit("Stable promotion blocked: Intel Parakeet smoke was not automatic-language mode.")
+if intel_pyannote.get("pyannote_deep_smoke") is not True:
+    raise SystemExit("Stable promotion blocked: Intel Pyannote deep smoke did not pass.")
 PY
 
 if [[ "${SBOBINO_PROMOTION_DRY_RUN:-0}" == "1" ]]; then

@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -16,11 +16,83 @@ use sbobino_domain::{
 
 use crate::commands::transcription::{JobFailedEvent, JobProgressEvent};
 use crate::parakeet_realtime::ParakeetRealtimeEngine;
-use crate::realtime_audio::{emit_level_event, start_input_preview, RealtimeInputLevelEvent};
-use crate::{error::CommandError, state::AppState};
+use crate::realtime_audio::{emit_level_event, RealtimeInputLevelEvent};
+use crate::{
+    error::CommandError,
+    state::{AppState, RealtimeRuntime},
+};
+use sbobino_infrastructure::adapters::whisper_stream::WhisperStreamTelemetry;
 
 const REALTIME_INPUT_PATH: &str = "realtime://microphone";
 const REALTIME_SOURCE_LABEL: &str = "Live microphone";
+
+// The realtime state is owned by one desktop AppState, but stop/finalization
+// is deliberately spawned in the background.  This process-wide gate keeps
+// command invocations serialized across that async boundary without changing
+// the shared AppState shape used by the other command modules.
+static REALTIME_COMMAND_TRANSITION: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static REALTIME_STOPS_IN_PROGRESS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+fn realtime_command_transition() -> &'static tokio::sync::Mutex<()> {
+    REALTIME_COMMAND_TRANSITION.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn realtime_stops_in_progress() -> &'static StdMutex<HashSet<String>> {
+    REALTIME_STOPS_IN_PROGRESS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn stop_in_progress_error(job_id: Option<&str>) -> CommandError {
+    let message = match job_id {
+        Some(job_id) => format!(
+            "Realtime stop/finalization is already in progress for session '{job_id}'; retry after it finishes."
+        ),
+        None => "Realtime stop/finalization is still in progress; wait for it to finish before starting another live session.".to_string(),
+    };
+    CommandError::new("realtime_stop_in_progress", message)
+}
+
+fn reject_if_realtime_stop_in_progress() -> Result<(), CommandError> {
+    let stops = realtime_stops_in_progress().lock().map_err(|_| {
+        CommandError::new(
+            "realtime",
+            "Realtime stop state is unavailable because its lock is poisoned.",
+        )
+    })?;
+    if stops.is_empty() {
+        Ok(())
+    } else {
+        Err(stop_in_progress_error(
+            stops.iter().next().map(String::as_str),
+        ))
+    }
+}
+
+fn reserve_realtime_stop(job_id: &str) -> Result<RealtimeStopMarker, CommandError> {
+    let mut stops = realtime_stops_in_progress().lock().map_err(|_| {
+        CommandError::new(
+            "realtime",
+            "Realtime stop state is unavailable because its lock is poisoned.",
+        )
+    })?;
+    if !stops.insert(job_id.to_string()) {
+        return Err(stop_in_progress_error(Some(job_id)));
+    }
+    Ok(RealtimeStopMarker {
+        job_id: job_id.to_string(),
+    })
+}
+
+struct RealtimeStopMarker {
+    job_id: String,
+}
+
+impl Drop for RealtimeStopMarker {
+    fn drop(&mut self) {
+        if let Ok(mut stops) = realtime_stops_in_progress().lock() {
+            stops.remove(&self.job_id);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParakeetLiveLibraryPlatform {
@@ -48,17 +120,17 @@ impl ParakeetLiveLibraryPlatform {
 fn resolve_realtime_engine(
     state: &AppState,
 ) -> Result<sbobino_infrastructure::adapters::whisper_stream::WhisperStreamEngine, CommandError> {
+    let settings = state
+        .runtime_factory
+        .load_settings()
+        .map_err(|load_error| CommandError::new("settings", load_error))?;
     match state.runtime_factory.build_whisper_stream_engine() {
-        Ok(engine) => Ok(engine),
+        Ok(engine) => Ok(engine.with_compute_device(settings.transcription.live_compute_device)),
         Err(error) => {
             if state.runtime_factory.managed_runtime_required() {
                 return Err(CommandError::from(ApplicationError::SpeechToText(error)));
             }
 
-            let settings = state
-                .runtime_factory
-                .load_settings()
-                .map_err(|load_error| CommandError::new("settings", load_error))?;
             let whisper_stream_path = state.runtime_factory.resolve_binary_path(
                 &settings.transcription.whisperkit_cli_path,
                 "whisper-stream",
@@ -71,7 +143,7 @@ fn resolve_realtime_engine(
                     whisper_stream_path,
                     models_dir,
                 )
-                .with_compute_device(settings.transcription.compute_device),
+                .with_compute_device(settings.transcription.live_compute_device),
             )
         }
     }
@@ -84,7 +156,7 @@ fn resolve_parakeet_live_engine(state: &AppState) -> Result<ParakeetRealtimeEngi
         .load_settings()
         .map_err(|load_error| CommandError::new("settings", load_error))?;
     Ok(ParakeetRealtimeEngine::new(lib_path, models_dir.into())
-        .with_compute_device(settings.transcription.compute_device))
+        .with_compute_device(settings.transcription.live_compute_device))
 }
 
 fn resolve_parakeet_live_runtime_paths(
@@ -307,6 +379,10 @@ fn realtime_job_progress(
         percentage,
         current_seconds,
         total_seconds,
+        committed_seconds: current_seconds.unwrap_or(0.0),
+        processed_seconds: current_seconds.unwrap_or(0.0),
+        stage_percentage: percentage,
+        overall_percentage: percentage,
     }
 }
 
@@ -528,28 +604,6 @@ mod artifact_tests {
     }
 }
 
-async fn stop_realtime_preview(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    final_state: &str,
-    message: &str,
-) {
-    if let Some(preview) = state.realtime.preview.lock().await.take() {
-        preview.stop(app, final_state, message);
-    }
-}
-
-async fn start_realtime_preview(
-    app: &tauri::AppHandle,
-    state: &AppState,
-) -> Result<(), CommandError> {
-    stop_realtime_preview(app, state, "idle", "Microphone preview reset.").await;
-    let preview = start_input_preview(app)
-        .map_err(|error| CommandError::from(ApplicationError::SpeechToText(error.message)))?;
-    *state.realtime.preview.lock().await = Some(preview);
-    Ok(())
-}
-
 async fn clear_active_realtime_metadata(state: &AppState) {
     *state.realtime.active_job_id.lock().await = None;
     *state.realtime.session_name.lock().await = None;
@@ -558,12 +612,83 @@ async fn clear_active_realtime_metadata(state: &AppState) {
     *state.realtime.language.lock().await = None;
 }
 
+/// Clear the command-side session only after the engine has stopped cleanly.
+///
+/// `stop_realtime` runs the potentially slow engine teardown in a background
+/// task.  Keeping the metadata until that task completes is important: a
+/// Parakeet worker can outlive the first bounded stop attempt and the user
+/// must be able to retry the same session.  The job-id check also prevents an
+/// old stop task from clearing a newer session that was started meanwhile.
+async fn clear_completed_realtime_session(
+    realtime: &RealtimeRuntime,
+    active_engine: &TranscriptionEngine,
+    job_id: &str,
+) {
+    let same_session = {
+        let active_job_id = realtime.active_job_id.lock().await;
+        active_job_id
+            .as_deref()
+            .map(|active_job_id| active_job_id == job_id)
+            .unwrap_or(true)
+    };
+    if !same_session {
+        return;
+    }
+
+    *realtime.active_job_id.lock().await = None;
+    *realtime.session_name.lock().await = None;
+    *realtime.model_filename.lock().await = None;
+    *realtime.model.lock().await = None;
+    *realtime.language.lock().await = None;
+    if matches!(active_engine, TranscriptionEngine::ParakeetCpp) {
+        *realtime.parakeet_engine.lock().await = None;
+    }
+}
+
+/// Put a failed Parakeet stop back in the shared runtime state.
+///
+/// `ParakeetRealtimeEngine::stop` deliberately keeps ownership of a worker
+/// when the two-second bound expires.  The command must therefore keep the
+/// exact same engine (and its session metadata) reachable from AppState;
+/// dropping this clone would make a retry impossible.  We only reinsert when
+/// the original job is still current so a late failure cannot overwrite a
+/// newly-started live session.
+async fn retain_failed_parakeet_session(
+    realtime: &RealtimeRuntime,
+    job_id: &str,
+    engine: ParakeetRealtimeEngine,
+) {
+    let same_session = {
+        let active_job_id = realtime.active_job_id.lock().await;
+        active_job_id
+            .as_deref()
+            .map(|active_job_id| active_job_id == job_id)
+            .unwrap_or(true)
+    };
+    if same_session {
+        *realtime.parakeet_engine.lock().await = Some(engine);
+    }
+}
+
+async fn ensure_realtime_start_allowed(state: &AppState) -> Result<(), CommandError> {
+    reject_if_realtime_stop_in_progress()?;
+    if state.realtime.active_job_id.lock().await.is_some() {
+        return Err(CommandError::new(
+            "realtime_active",
+            "A live session is already active or awaiting stop recovery; stop it before starting another session.",
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn start_realtime(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     payload: Option<StartRealtimePayload>,
 ) -> Result<StartRealtimeResponse, CommandError> {
+    let _transition_guard = realtime_command_transition().lock().await;
+    ensure_realtime_start_allowed(&state).await?;
     eprintln!("[realtime-start] command received payload={payload:?}");
     let payload = payload.unwrap_or(StartRealtimePayload {
         engine: None,
@@ -620,6 +745,30 @@ pub async fn start_realtime(
     let emit_input_level = Arc::new(move |event: RealtimeInputLevelEvent| {
         let _ = app_handle.emit("realtime://input_level", event);
     });
+    let app_handle = app.clone();
+    let emit_whisper_telemetry = Arc::new(move |telemetry: WhisperStreamTelemetry| {
+        let finalizing = telemetry.finalization_ms.is_some();
+        let _ = app_handle.emit(
+            "realtime://input_level",
+            RealtimeInputLevelEvent {
+                state: if finalizing { "finalizing" } else { "running" }.to_string(),
+                level: 0.0,
+                message: if finalizing {
+                    "Finalizing Whisper live audio".to_string()
+                } else {
+                    "Whisper live telemetry".to_string()
+                },
+                telemetry: Some(crate::realtime_audio::RealtimeTelemetry {
+                    captured_seconds: telemetry.captured_seconds,
+                    processed_seconds: telemetry.processed_seconds,
+                    backlog_seconds: telemetry.backlog_seconds,
+                    inference_ms: telemetry.inference_ms,
+                    first_preview_ms: telemetry.first_preview_ms,
+                    finalization_ms: telemetry.finalization_ms,
+                }),
+            },
+        );
+    });
     let mut running_message = "Live listening".to_string();
 
     eprintln!(
@@ -646,27 +795,23 @@ pub async fn start_realtime(
             }
             *state.realtime.model_filename.lock().await = Some(model.ggml_filename().to_string());
 
-            if let Err(error) = start_realtime_preview(&app, &state).await {
-                clear_active_realtime_metadata(&state).await;
-                return Err(error);
-            }
-
             if let Err(error) = engine
-                .start(
+                .start_with_telemetry(
                     model.ggml_filename(),
                     language.as_whisper_code(),
                     emit_delta,
+                    Some(emit_whisper_telemetry),
                 )
                 .await
             {
                 clear_active_realtime_metadata(&state).await;
-                stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+                emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
                 return Err(CommandError::from(error));
             }
         }
         TranscriptionEngine::ParakeetCpp => {
             eprintln!("[realtime-start] parakeet branch entered");
-            stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+            emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
             let parakeet_engine = match resolve_parakeet_live_engine(&state) {
                 Ok(engine) => engine,
                 Err(error) => {
@@ -745,7 +890,7 @@ pub async fn start_realtime(
         clear_active_realtime_metadata(&state).await;
         match engine_kind.clone() {
             TranscriptionEngine::WhisperCpp => {
-                stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+                emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
             }
             TranscriptionEngine::ParakeetCpp => {
                 emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
@@ -810,7 +955,7 @@ pub async fn pause_realtime(
         TranscriptionEngine::WhisperCpp => {
             let engine = state.realtime.engine.lock().await.clone();
             engine.pause().await.map_err(CommandError::from)?;
-            stop_realtime_preview(&app, &state, "paused", "Microphone preview paused.").await;
+            emit_level_event(&app, "paused", 0.0, "Microphone preview paused.");
         }
         TranscriptionEngine::ParakeetCpp => {
             if let Some(engine) = state.realtime.parakeet_engine.lock().await.clone() {
@@ -839,7 +984,7 @@ pub async fn resume_realtime(
     match state.realtime.active_engine.lock().await.clone() {
         TranscriptionEngine::WhisperCpp => {
             let engine = state.realtime.engine.lock().await.clone();
-            start_realtime_preview(&app, &state).await?;
+            emit_level_event(&app, "running", 0.0, "Microphone preview resumed.");
             engine.resume().await.map_err(CommandError::from)?;
         }
         TranscriptionEngine::ParakeetCpp => {
@@ -861,6 +1006,7 @@ pub async fn resume_realtime(
     Ok(())
 }
 
+#[derive(Clone)]
 enum RealtimeEngineHandle {
     Whisper(sbobino_infrastructure::adapters::whisper_stream::WhisperStreamEngine),
     Parakeet(ParakeetRealtimeEngine),
@@ -895,6 +1041,7 @@ pub async fn stop_realtime(
     state: State<'_, AppState>,
     payload: Option<StopRealtimePayload>,
 ) -> Result<StopRealtimeResponse, CommandError> {
+    let _transition_guard = realtime_command_transition().lock().await;
     let payload = payload.unwrap_or(StopRealtimePayload {
         save: Some(true),
         title: None,
@@ -907,6 +1054,17 @@ pub async fn stop_realtime(
         .load_settings()
         .map_err(|e| CommandError::new("settings", e))?;
     let active_engine = state.realtime.active_engine.lock().await.clone();
+    let job_id = state
+        .realtime
+        .active_job_id
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    // This check happens before touching the engine. A duplicate command must
+    // be rejected as an in-progress stop, not observe a transiently stopped
+    // Parakeet engine and launch a second finalization task.
+    reject_if_realtime_stop_in_progress()?;
     let engine = match active_engine.clone() {
         TranscriptionEngine::WhisperCpp => {
             RealtimeEngineHandle::Whisper(state.realtime.engine.lock().await.clone())
@@ -926,14 +1084,7 @@ pub async fn stop_realtime(
         TranscriptionEngine::WhisperCpp => "whisper_stream".to_string(),
         TranscriptionEngine::ParakeetCpp => "parakeet_cpp".to_string(),
     };
-    let job_id = state
-        .realtime
-        .active_job_id
-        .lock()
-        .await
-        .take()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let existing_session_title = state.realtime.session_name.lock().await.take();
+    let existing_session_title = state.realtime.session_name.lock().await.clone();
     let session_title = clean_optional_title(payload.title.clone())
         .or(existing_session_title)
         .unwrap_or_else(fallback_live_title);
@@ -957,17 +1108,16 @@ pub async fn stop_realtime(
         .model_filename
         .lock()
         .await
-        .take()
+        .clone()
         .unwrap_or_else(|| model.ggml_filename().to_string());
-    *state.realtime.model.lock().await = None;
-    *state.realtime.language.lock().await = None;
 
-    match active_engine {
+    let stop_marker = reserve_realtime_stop(&job_id)?;
+
+    match active_engine.clone() {
         TranscriptionEngine::WhisperCpp => {
-            stop_realtime_preview(&app, &state, "idle", "Microphone preview stopped.").await;
+            emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
         }
         TranscriptionEngine::ParakeetCpp => {
-            *state.realtime.parakeet_engine.lock().await = None;
             emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
         }
     }
@@ -1005,12 +1155,42 @@ pub async fn stop_realtime(
 
     let app_handle = app.clone();
     let artifact_service = state.artifact_service.clone();
+    let realtime = state.realtime.clone();
     let elapsed_seconds = payload.elapsed_seconds;
     let job_id_for_task = job_id.clone();
+    let active_engine_for_task = active_engine.clone();
+    let engine_for_retry = engine.clone();
     tauri::async_runtime::spawn(async move {
+        let _stop_marker = stop_marker;
         let stop_result = match engine.stop().await {
-            Ok(result) => result,
+            Ok(result) => {
+                // A clean stop owns a complete WAV/transcript snapshot.  It
+                // is now safe to retire the command-side session.  Until
+                // this point the engine and metadata stay in AppState so a
+                // bounded timeout can be retried.
+                clear_completed_realtime_session(
+                    &realtime,
+                    &active_engine_for_task,
+                    &job_id_for_task,
+                )
+                .await;
+                result
+            }
             Err(error) => {
+                if matches!(&active_engine_for_task, TranscriptionEngine::ParakeetCpp) {
+                    if let RealtimeEngineHandle::Parakeet(engine) = engine_for_retry {
+                        retain_failed_parakeet_session(&realtime, &job_id_for_task, engine).await;
+                    }
+                } else {
+                    // Whisper has no retryable worker ownership contract.  Do
+                    // not leave stale command metadata after a failed stop.
+                    clear_completed_realtime_session(
+                        &realtime,
+                        &active_engine_for_task,
+                        &job_id_for_task,
+                    )
+                    .await;
+                }
                 let _ = app_handle.emit(
                     "transcription://failed",
                     JobFailedEvent {
@@ -1349,5 +1529,120 @@ mod tests {
             windows_resolved.display()
         );
         assert!(!windows_resolved.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_parakeet_stop_keeps_same_session_for_retry() {
+        let engine = ParakeetRealtimeEngine::new(
+            PathBuf::from("missing-libparakeet"),
+            PathBuf::from("missing-models"),
+        );
+        let realtime = RealtimeRuntime {
+            engine: Arc::new(tokio::sync::Mutex::new(
+                sbobino_infrastructure::adapters::whisper_stream::WhisperStreamEngine::new(
+                    "missing-whisper-stream".to_string(),
+                    "missing-models".to_string(),
+                ),
+            )),
+            parakeet_engine: Arc::new(tokio::sync::Mutex::new(None)),
+            active_engine: Arc::new(tokio::sync::Mutex::new(TranscriptionEngine::ParakeetCpp)),
+            active_job_id: Arc::new(tokio::sync::Mutex::new(Some("live-retry-job".to_string()))),
+            session_name: Arc::new(tokio::sync::Mutex::new(Some("Retry me".to_string()))),
+            model_filename: Arc::new(tokio::sync::Mutex::new(Some(
+                "nemotron-3.5-asr-streaming-0.6b-q8_0.gguf".to_string(),
+            ))),
+            language_code: Arc::new(tokio::sync::Mutex::new("auto".to_string())),
+            model: Arc::new(tokio::sync::Mutex::new(Some(SpeechModel::default()))),
+            language: Arc::new(tokio::sync::Mutex::new(Some(LanguageCode::Auto))),
+        };
+
+        // A bounded Parakeet stop can fail while the engine still owns its
+        // capture worker. The command must retain that exact engine and all
+        // session metadata so a second stop command can finish the WAV.
+        retain_failed_parakeet_session(&realtime, "live-retry-job", engine.clone()).await;
+
+        assert!(realtime.parakeet_engine.lock().await.is_some());
+        assert_eq!(
+            realtime.active_job_id.lock().await.as_deref(),
+            Some("live-retry-job")
+        );
+        assert_eq!(
+            realtime.session_name.lock().await.as_deref(),
+            Some("Retry me")
+        );
+        assert_eq!(
+            realtime.model_filename.lock().await.as_deref(),
+            Some("nemotron-3.5-asr-streaming-0.6b-q8_0.gguf")
+        );
+
+        // A late failure from an older stop task cannot overwrite a newer
+        // session, and successful completion is the only path that clears it.
+        *realtime.active_job_id.lock().await = Some("new-job".to_string());
+        retain_failed_parakeet_session(&realtime, "live-retry-job", engine).await;
+        assert!(realtime.parakeet_engine.lock().await.is_some());
+        clear_completed_realtime_session(
+            &realtime,
+            &TranscriptionEngine::ParakeetCpp,
+            "live-retry-job",
+        )
+        .await;
+        assert!(realtime.parakeet_engine.lock().await.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_stop_reservation_allows_only_one_finalizer() {
+        let job_id = format!("duplicate-stop-{}", Uuid::new_v4());
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let first_job_id = job_id.clone();
+        let first = tokio::spawn(async move {
+            first_barrier.wait().await;
+            reserve_realtime_stop(&first_job_id)
+        });
+        let second_barrier = barrier.clone();
+        let second_job_id = job_id.clone();
+        let second = tokio::spawn(async move {
+            second_barrier.wait().await;
+            reserve_realtime_stop(&second_job_id)
+        });
+
+        barrier.wait().await;
+        let first = first.await.expect("first stop task should finish");
+        let second = second.await.expect("second stop task should finish");
+        let (marker, rejected) = match (first, second) {
+            (Ok(marker), Err(rejected)) | (Err(rejected), Ok(marker)) => (marker, rejected),
+            (Ok(_), Ok(_)) => panic!("duplicate stops must not both finalize"),
+            (Err(_), Err(_)) => panic!("one stop must be allowed to finalize"),
+        };
+        assert_eq!(rejected.code, "realtime_stop_in_progress");
+
+        // Releasing the first marker permits exactly one later retry.
+        drop(rejected);
+        drop(marker);
+        let retry_marker = reserve_realtime_stop(&job_id).expect("retry should be allowed");
+        drop(retry_marker);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_during_stop_finalization_is_rejected_until_marker_drops() {
+        let job_id = format!("start-during-stop-{}", Uuid::new_v4());
+        let marker = reserve_realtime_stop(&job_id).expect("stop should reserve the session");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let task_barrier = barrier.clone();
+        let start_attempt = tokio::spawn(async move {
+            task_barrier.wait().await;
+            reject_if_realtime_stop_in_progress()
+        });
+
+        barrier.wait().await;
+        let error = start_attempt
+            .await
+            .expect("start attempt should finish")
+            .expect_err("new start must wait for stop/finalization");
+        assert_eq!(error.code, "realtime_stop_in_progress");
+        drop(marker);
+
+        let retry_marker = reserve_realtime_stop(&job_id).expect("marker should clear after stop");
+        drop(retry_marker);
     }
 }

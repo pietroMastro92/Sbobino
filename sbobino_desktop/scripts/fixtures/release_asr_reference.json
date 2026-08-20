@@ -1,0 +1,32 @@
+{
+  "fixture_id": "sbobino-v2.0.28-release-quality",
+  "fixture_source": "repo-redistributable",
+  "review_status": "reviewed",
+  "duration_seconds": 8.0,
+  "segments": [
+    {
+      "start_seconds": 0.0,
+      "end_seconds": 2.0,
+      "language_code": "it",
+      "text": "Ciao mondo"
+    },
+    {
+      "start_seconds": 2.0,
+      "end_seconds": 4.0,
+      "language_code": "it",
+      "text": "questa è una prova"
+    },
+    {
+      "start_seconds": 4.0,
+      "end_seconds": 6.0,
+      "language_code": "en",
+      "text": "hello world"
+    },
+    {
+      "start_seconds": 6.0,
+      "end_seconds": 8.0,
+      "language_code": "en",
+      "text": "works well"
+    }
+  ]
+}
