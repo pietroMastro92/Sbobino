@@ -540,7 +540,12 @@ if pipeline is None:
 ffmpeg_abi = sorted(
     {
         f"lib{match.group(1)}.{match.group(2)}"
-        for directory in (torchcodec_dir / ".dylibs", torchcodec_dir, root / "lib" / "embedded-dylibs")
+        for directory in (
+            torchcodec_dir / ".dylibs",
+            torchcodec_dir,
+            root / "lib" / "embedded-dylibs",
+            root / "lib",
+        )
         if directory.is_dir()
         for path in directory.iterdir()
         for match in [re.match(r"(?:lib)?(av(?:util|codec|format|device|filter|swscale|swresample))(?:[.]|[-])([0-9]+)", path.name)]

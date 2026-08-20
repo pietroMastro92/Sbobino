@@ -38,7 +38,7 @@ need_cmd() {
     exit 1
   }
 }
-for command in gh ditto ffmpeg ffprobe curl shasum python3; do
+for command in gh ditto curl shasum python3; do
   need_cmd "$command"
 done
 
@@ -54,6 +54,8 @@ ditto -x -k "$ASSET_DIR/pyannote-runtime-macos-x86_64.zip" "$PYANNOTE_DIR"
 ditto -x -k "$ASSET_DIR/pyannote-model-community-1.zip" "$MODEL_DIR"
 
 SPEECH_ROOT="$SPEECH_DIR/runtime"
+FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"
+[[ -x "$FFMPEG_BIN" ]] || { echo "Packaged ffmpeg is missing or not executable." >&2; exit 1; }
 PYTHON_ROOT="$PYANNOTE_DIR/python"
 PYANNOTE_MODEL_ROOT="$MODEL_DIR/model"
 PARAKEET_MODEL="tdt-0.6b-v3-q4_k.gguf"
@@ -94,17 +96,29 @@ printf '%s  %s\n' "$PARAKEET_FIXTURE_SHA256" "$CACHE_FIXTURE_PATH" | shasum -a 2
 # Loop the utterance without an artificial encoder gap and make the duration
 # deterministic, longer than the production 45s batch-worker threshold.
 LONG_AUDIO="$RUN_DIR/parakeet-long.wav"
-ffmpeg -hide_banner -loglevel error -y -stream_loop -1 \
+"$FFMPEG_BIN" -hide_banner -loglevel error -y -stream_loop -1 \
   -i "$CACHE_FIXTURE_PATH" \
   -t 65 -map 0:a:0 -ar 16000 -ac 1 -c:a pcm_s16le "$LONG_AUDIO"
-DURATION_SECONDS=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$LONG_AUDIO")
+DURATION_SECONDS=$(python3 - "$LONG_AUDIO" <<'PY'
+import sys
+import wave
+with wave.open(sys.argv[1], "rb") as audio:
+    print(audio.getnframes() / audio.getframerate())
+PY
+)
 python3 - "$DURATION_SECONDS" <<'PY'
 import sys
 if float(sys.argv[1]) <= 60.0:
     raise SystemExit(f"long Parakeet smoke audio is only {sys.argv[1]} seconds")
 PY
 LONG_AUDIO_SHA256=$(shasum -a 256 "$LONG_AUDIO" | awk '{print $1}')
-FIXTURE_DURATION_SECONDS=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$CACHE_FIXTURE_PATH")
+FIXTURE_DURATION_SECONDS=$(python3 - "$CACHE_FIXTURE_PATH" <<'PY'
+import sys
+import wave
+with wave.open(sys.argv[1], "rb") as audio:
+    print(audio.getnframes() / audio.getframerate())
+PY
+)
 
 # The Intel hosted runner has no Metal path; keep the contract explicit in
 # the environment and report it as CPU/automatic-language smoke.

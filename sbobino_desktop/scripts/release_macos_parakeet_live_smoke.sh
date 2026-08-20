@@ -27,7 +27,7 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   exit 1
 fi
 
-for command in gh ditto ffmpeg ffprobe curl shasum python3 cargo; do
+for command in gh ditto curl shasum python3 cargo; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "Missing required command: $command" >&2
     exit 1
@@ -38,6 +38,8 @@ gh release download "$TAG" --repo "$REPO_SLUG" \
   --pattern "speech-runtime-macos-aarch64.zip" --dir "$ASSET_DIR"
 ditto -x -k "$ASSET_DIR/speech-runtime-macos-aarch64.zip" "$SPEECH_DIR"
 SPEECH_ROOT="$SPEECH_DIR/runtime"
+FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"
+[[ -x "$FFMPEG_BIN" ]] || { echo "Packaged ffmpeg is missing or not executable." >&2; exit 1; }
 PARAKEET_LIB="$SPEECH_ROOT/lib/libparakeet.dylib"
 [[ -f "$PARAKEET_LIB" ]] || { echo "Packaged libparakeet.dylib is missing." >&2; exit 1; }
 
@@ -67,10 +69,22 @@ fi
 printf '%s  %s\n' "$FIXTURE_SHA256" "$FIXTURE_CACHE" | shasum -a 256 -c -
 
 LONG_AUDIO="$RUN_DIR/live-65s.wav"
-ffmpeg -hide_banner -loglevel error -y -stream_loop -1 -i "$FIXTURE_CACHE" \
+"$FFMPEG_BIN" -hide_banner -loglevel error -y -stream_loop -1 -i "$FIXTURE_CACHE" \
   -t 65 -ar 16000 -ac 1 -c:a pcm_s16le "$LONG_AUDIO"
-DURATION_SECONDS=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$LONG_AUDIO")
-FIXTURE_DURATION_SECONDS=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$FIXTURE_CACHE")
+DURATION_SECONDS=$(python3 - "$LONG_AUDIO" <<'PY'
+import sys
+import wave
+with wave.open(sys.argv[1], "rb") as audio:
+    print(audio.getnframes() / audio.getframerate())
+PY
+)
+FIXTURE_DURATION_SECONDS=$(python3 - "$FIXTURE_CACHE" <<'PY'
+import sys
+import wave
+with wave.open(sys.argv[1], "rb") as audio:
+    print(audio.getnframes() / audio.getframerate())
+PY
+)
 INPUT_SHA256=$(shasum -a 256 "$LONG_AUDIO" | awk '{print $1}')
 RAW_REPORT="$RUN_DIR/live-raw.json"
 INPUT_REPORT="$RUN_DIR/live-input.json"

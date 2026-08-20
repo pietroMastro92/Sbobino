@@ -176,7 +176,7 @@ if [[ "${SBOBINO_PARAKEET_SKIP_NEMOTRON:-0}" != "1" && ! -f "$SBOBINO_PARAKEET_M
 fi
 
 need_cmd cargo
-need_cmd ffmpeg
+need_cmd python3
 
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sbobino-parakeet-smoke.XXXXXX")
 WATCHDOG_STOP_FILE=""

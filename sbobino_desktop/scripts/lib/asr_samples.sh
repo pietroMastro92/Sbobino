@@ -88,6 +88,22 @@ asr_resolve_source() {
 
 asr_is_wav_16k_mono_pcm16() {
   local audio=$1
+  if command -v python3 >/dev/null 2>&1 && python3 - "$audio" <<'PY' >/dev/null 2>&1
+import sys
+import wave
+
+with wave.open(sys.argv[1], "rb") as audio:
+    if (
+        audio.getnchannels() != 1
+        or audio.getsampwidth() != 2
+        or audio.getframerate() != 16000
+        or audio.getcomptype() != "NONE"
+    ):
+        raise SystemExit(1)
+PY
+  then
+    return 0
+  fi
   command -v ffprobe >/dev/null 2>&1 || return 1
   local probe
   probe=$(ffprobe -v error \
@@ -103,11 +119,10 @@ asr_prepare_wav() {
   local source_path=$1
   local output_path=$2
 
-  command -v ffmpeg >/dev/null 2>&1 || asr_fail "missing required command: ffmpeg"
-
   if asr_is_wav_16k_mono_pcm16 "$source_path"; then
     ASR_NORMALIZED_WAV=$source_path
   else
+    command -v ffmpeg >/dev/null 2>&1 || asr_fail "missing required command: ffmpeg"
     ffmpeg -y -nostdin \
       -i "$source_path" \
       -map 0:a:0 \
@@ -124,6 +139,21 @@ asr_prepare_wav() {
 
 asr_audio_duration_seconds() {
   local audio=$1
+  if command -v python3 >/dev/null 2>&1; then
+    local wav_duration
+    wav_duration=$(python3 - "$audio" <<'PY' 2>/dev/null || true
+import sys
+import wave
+
+with wave.open(sys.argv[1], "rb") as audio:
+    print(f"{audio.getnframes() / audio.getframerate():.3f}")
+PY
+    )
+    if [[ -n "$wav_duration" ]]; then
+      printf '%s\n' "$wav_duration"
+      return 0
+    fi
+  fi
   command -v ffprobe >/dev/null 2>&1 || asr_fail "missing required command: ffprobe"
   local duration
   duration=$(LC_ALL=C ffprobe -v error \
