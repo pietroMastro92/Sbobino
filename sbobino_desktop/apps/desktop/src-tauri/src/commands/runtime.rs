@@ -144,6 +144,16 @@ fn recover_interrupted_runtime_install_for_slot(
     slot: &std::sync::Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
     data_dir: &Path,
 ) -> Result<(), CommandError> {
+    recover_interrupted_runtime_install_for_slot_with(slot, data_dir, |root| {
+        crate::commands::provisioning::recover_interrupted_runtime_install(root)
+    })
+}
+
+fn recover_interrupted_runtime_install_for_slot_with(
+    slot: &std::sync::Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+    data_dir: &Path,
+    recover: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), CommandError> {
     // Provisioning owns the journal/stage/backup while an install is active.
     // Readiness commands can run concurrently with the download worker, so
     // never let them recover (and delete) an in-flight transaction.  The
@@ -157,8 +167,7 @@ fn recover_interrupted_runtime_install_for_slot(
         // provisioning worker could acquire the slot before recovery starts.
         Ok(_) | Err(_) => return Ok(()),
     };
-    crate::commands::provisioning::recover_interrupted_runtime_install(data_dir)
-        .map_err(|error| CommandError::new("runtime_install_recovery", error))
+    recover(data_dir).map_err(|error| CommandError::new("runtime_install_recovery", error))
 }
 
 fn recover_interrupted_runtime_install(state: &AppState) -> Result<(), CommandError> {
@@ -1687,35 +1696,37 @@ mod tests {
     #[test]
     fn runtime_recovery_holds_idle_slot_through_none_to_some_transition() {
         let temp = tempfile::tempdir().expect("recovery tempdir should exist");
-        let journal = temp.path().join(".runtime-install-journal.json");
-        std::fs::write(&journal, b"not valid json")
-            .expect("malformed journal fixture should write");
         let slot = std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
-        // Hold the transaction lock so the recovery thread must remain inside
-        // the synchronous recovery call after it acquires the initially idle
-        // provisioning slot.  This makes the None -> Some race observable.
-        let transaction_guard = crate::commands::provisioning::runtime_install_transaction_lock()
-            .lock()
-            .expect("runtime transaction lock should be available");
+        // The injected recovery operation signals only after the helper has
+        // acquired the initially idle slot, then waits for an explicit
+        // release. This avoids scheduler-speed assumptions on hosted Windows
+        // while proving that the slot guard lives across synchronous recovery.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let recovery_slot = slot.clone();
         let recovery_root = temp.path().to_path_buf();
         let recovery_thread = std::thread::spawn(move || {
-            recover_interrupted_runtime_install_for_slot(&recovery_slot, &recovery_root)
+            recover_interrupted_runtime_install_for_slot_with(
+                &recovery_slot,
+                &recovery_root,
+                move |_| {
+                    entered_tx
+                        .send(())
+                        .expect("recovery should signal slot acquisition");
+                    release_rx
+                        .recv()
+                        .expect("recovery release should be signalled");
+                    Err("injected recovery failure".to_string())
+                },
+            )
         });
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let mut recovery_holds_slot = false;
-        while std::time::Instant::now() < deadline {
-            if slot.try_lock().is_err() {
-                recovery_holds_slot = true;
-                break;
-            }
-            std::thread::yield_now();
-        }
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recovery should acquire the idle slot");
         assert!(
-            recovery_holds_slot,
-            "recovery should hold the idle provisioning slot while it runs"
+            slot.try_lock().is_err(),
+            "recovery must retain the slot guard"
         );
 
         let (transition_tx, transition_rx) = std::sync::mpsc::channel();
@@ -1740,12 +1751,14 @@ mod tests {
                 .is_err(),
             "provisioning must not acquire the slot during recovery"
         );
-        drop(transaction_guard);
+        release_tx
+            .send(())
+            .expect("recovery should be allowed to finish");
 
         recovery_thread
             .join()
             .expect("recovery thread should join")
-            .expect_err("malformed journal should be reported after the lock is released");
+            .expect_err("injected recovery failure should be reported");
         transition_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("provisioning transition should complete after recovery");

@@ -4175,20 +4175,21 @@ fn extract_zip_archive_with_zip_crate(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::probe_pyannote_import_and_load_receipt;
     use super::{
         commit_runtime_install_transaction, commit_runtime_install_transaction_with_cleanup,
         estimate_pyannote_required_free_bytes, install_pyannote_archive, install_runtime_archive,
         persist_pyannote_install_failure, plan_pyannote_background_action_inner,
         prepare_pyannote_runtime_stage, prepare_pyannote_runtime_swap,
-        probe_pyannote_import_and_load_receipt, promote_staged_pyannote_runtime,
-        pyannote_reconcile_action, recover_interrupted_runtime_install, remove_path_if_exists,
-        rollback_pyannote_runtime_swap, rollback_runtime_install_transaction,
-        runtime_install_journal_backup_path, runtime_install_journal_path,
-        runtime_install_transaction_lock, sha256_file_hex, transcription_runtime_install_complete,
-        validate_arch_descriptors, validate_manifest_asset_descriptor, validate_setup_manifest,
-        verify_file_sha256, write_runtime_install_journal, PyannoteAssetSelection,
-        PyannoteBackgroundActionTrigger, RuntimeInstallCommitError, RuntimeInstallJournal,
-        RuntimeInstallTransaction,
+        promote_staged_pyannote_runtime, pyannote_reconcile_action,
+        recover_interrupted_runtime_install, remove_path_if_exists, rollback_pyannote_runtime_swap,
+        rollback_runtime_install_transaction, runtime_install_journal_backup_path,
+        runtime_install_journal_path, runtime_install_transaction_lock, sha256_file_hex,
+        transcription_runtime_install_complete, validate_arch_descriptors,
+        validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
+        write_runtime_install_journal, PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
+        RuntimeInstallCommitError, RuntimeInstallJournal, RuntimeInstallTransaction,
     };
     use crate::release_assets::{
         PyannoteReleaseAsset, PyannoteReleaseManifest, ReleaseAssetDescriptor, RuntimeReleaseAsset,
@@ -4364,6 +4365,7 @@ mod tests {
             .expect("settings should persist");
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn write_executable_file(path: &std::path::Path, contents: &str) {
         std::fs::create_dir_all(
             path.parent()
