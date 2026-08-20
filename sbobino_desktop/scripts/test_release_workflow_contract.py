@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT.parent / ".github" / "workflows" / "release.yml"
 PROMOTION = ROOT / "scripts" / "promote_candidate_release.sh"
 INTEL_VALIDATION = ROOT.parent / ".github" / "workflows" / "intel-runtime-validation.yml"
+ARM_VALIDATION = ROOT.parent / ".github" / "workflows" / "arm-runtime-validation.yml"
 INTEL_SMOKE = ROOT / "scripts" / "release_intel_pyannote_parakeet_smoke.sh"
 ARM_LIVE_SMOKE = ROOT / "scripts" / "release_macos_parakeet_live_smoke.sh"
 
@@ -53,6 +54,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("PARAKEET_LIVE_FEED_SAMPLES", (ROOT / "apps" / "desktop" / "src-tauri" / "src" / "parakeet_realtime.rs").read_text(encoding="utf-8"))
         self.assertNotIn("poliglot", intel.lower() + live.lower())
         self.assertIn('FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"', intel)
+        self.assertIn('SBOBINO_WHISPER_FFMPEG="$FFMPEG_BIN"', intel)
         self.assertIn('FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"', live)
         self.assertNotIn("need_cmd ffmpeg", intel)
         self.assertNotIn("command in gh ditto ffmpeg", live)
@@ -73,6 +75,14 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("SBOBINO_PARAKEET_FORCE_CPU=1", workflow)
         self.assertIn("SBOBINO_PARAKEET_REQUIRE_WORKER_RSS_MONITOR=1", workflow)
         self.assertIn("SBOBINO_PARAKEET_SMOKE_MODE=service", workflow)
+
+    def test_arm_validation_uses_standard_runner_and_shared_metal_buffers(self):
+        workflow = ARM_VALIDATION.read_text(encoding="utf-8")
+        self.assertIn("runs-on: macos-14", workflow)
+        self.assertNotIn("-large", workflow)
+        self.assertNotIn("larger", workflow.lower())
+        self.assertIn('GGML_METAL_SHARED_BUFFERS_ENABLE: "1"', workflow)
+        self.assertIn("release_macos_parakeet_live_smoke.sh", workflow)
 
     def test_intel_release_smoke_transcribes_the_long_fixture_only_once(self):
         intel = INTEL_SMOKE.read_text(encoding="utf-8")

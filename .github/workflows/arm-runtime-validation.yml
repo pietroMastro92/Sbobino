@@ -1,0 +1,53 @@
+name: ARM Runtime Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing candidate tag whose packaged runtime will be tested
+        required: true
+        default: v2.0.28
+
+permissions:
+  contents: read
+
+jobs:
+  parakeet-live-shared-metal:
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache pinned Parakeet live model and speech fixture
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/parakeet-live-readiness-model
+            ${{ runner.temp }}/parakeet-readiness-fixture
+          key: parakeet-live-nemotron-q4-5ad85eb3f3014c1a300d67b7ccbd23c38c4c952405cbe33a861e19fb2775e84b-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
+
+      - name: Replay packaged Parakeet with shared Metal buffers
+        working-directory: sbobino_desktop
+        env:
+          # The GitHub Apple Silicon runner exposes an Apple Paravirtual device.
+          # ggml defaults unified-memory devices to shared buffers; explicitly
+          # restore that mode because the production safety environment also
+          # carries the older disable flag and ENABLE intentionally wins.
+          GGML_METAL_SHARED_BUFFERS_ENABLE: "1"
+        run: |
+          VERSION="${{ inputs.tag_name }}"
+          ./scripts/release_macos_parakeet_live_smoke.sh \
+            "${VERSION#v}" "${GITHUB_REPOSITORY}" \
+            "$RUNNER_TEMP/arm-parakeet-live-smoke-proof.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arm-parakeet-live-shared-metal
+          path: ${{ runner.temp }}/arm-parakeet-live-smoke-proof.json
+          if-no-files-found: warn
+          retention-days: 3
