@@ -160,6 +160,7 @@ import {
   isProvisionedModelReady,
   shouldBlockMainUiDuringStartup,
 } from "./lib/initialSetup";
+import { isComputeDeviceOptionDisabled } from "./lib/transcriptionCompute";
 import {
   getArtifactDiarizationUiState,
   normalizeJobFailureMessage,
@@ -8123,6 +8124,11 @@ export function App({
       transcription: {
         ...current.transcription,
         engine,
+        live_compute_device:
+          engine === "parakeet_cpp" &&
+          current.transcription.live_compute_device === "cpu"
+            ? "auto"
+            : current.transcription.live_compute_device,
       },
       transcription_engine: engine,
     }));
@@ -15507,7 +15513,14 @@ export function App({
               <option value="gpu">
                 {t("settings.transcription.computeGpu", "GPU")}
               </option>
-              <option value="cpu">
+              <option
+                value="cpu"
+                disabled={isComputeDeviceOptionDisabled(
+                  settings.transcription.engine,
+                  "file",
+                  "cpu",
+                )}
+              >
                 {t("settings.transcription.computeCpu", "CPU")}
               </option>
             </select>
@@ -15546,7 +15559,14 @@ export function App({
               <option value="gpu">
                 {t("settings.transcription.computeGpu", "GPU")}
               </option>
-              <option value="cpu">
+              <option
+                value="cpu"
+                disabled={isComputeDeviceOptionDisabled(
+                  settings.transcription.engine,
+                  "live",
+                  "cpu",
+                )}
+              >
                 {t("settings.transcription.computeCpu", "CPU")}
               </option>
             </select>

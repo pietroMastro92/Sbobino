@@ -420,9 +420,28 @@ jobs:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
+      - name: Cache pinned Parakeet live model and speech fixture
+        if: matrix.arch == 'aarch64'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/parakeet-live-readiness-model
+            ${{ runner.temp }}/parakeet-readiness-fixture
+          key: parakeet-live-nemotron-q4-5ad85eb3f3014c1a300d67b7ccbd23c38c4c952405cbe33a861e19fb2775e84b-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.arch == 'aarch64'
+
       - name: Validate public assets on the matching architecture
         working-directory: sbobino_desktop
         run: ./scripts/distribution_readiness.sh "${TAG_NAME#v}" "$GITHUB_REPOSITORY"
+
+      - name: Run real packaged Parakeet live replay on Apple Silicon
+        if: matrix.arch == 'aarch64'
+        working-directory: sbobino_desktop
+        run: |
+          ./scripts/release_macos_parakeet_live_smoke.sh \
+            "${TAG_NAME#v}" "$GITHUB_REPOSITORY" "$PWD/arm-parakeet-live-smoke-proof.json"
 
       - name: Write architecture proof
         working-directory: sbobino_desktop
@@ -437,6 +456,14 @@ jobs:
         with:
           name: distribution-readiness-${{ matrix.arch }}
           path: sbobino_desktop/${{ matrix.proof }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.arch == 'aarch64'
+        with:
+          name: parakeet-live-aarch64
+          path: sbobino_desktop/arm-parakeet-live-smoke-proof.json
+          if-no-files-found: error
 
   windows-distribution-readiness:
     needs: publish-candidate
@@ -657,14 +684,12 @@ jobs:
           ./scripts/release_intel_pyannote_parakeet_smoke.sh \
             "$VERSION" "$GITHUB_REPOSITORY" "$PWD/intel-pyannote-parakeet-smoke-proof.json"
 
-      - name: Require real ASR/live reports from the packaged-engine harness
+      - name: Require real ASR report from the packaged Intel engine
         working-directory: sbobino_desktop
         run: |
-          # The Intel smoke above proves packaged Parakeet/Pyannote execution,
-          # but it does not manufacture ASR-reference or live-latency metrics.
-          # A release remains blocked until a real hosted harness writes both
-          # reports with the metadata below.  Never substitute the synthetic
-          # Ubuntu fixture reports for these fields.
+          # Intel certifies the packaged long-file engine and Pyannote. The
+          # accelerated live replay is measured separately on macos-14 ARM64.
+          # Never substitute the synthetic Ubuntu fixture reports here.
           python3 - "$PWD/intel-pyannote-parakeet-smoke-proof.json" <<'PY'
           import json
           import re
@@ -672,7 +697,7 @@ jobs:
           from pathlib import Path
 
           proof = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          for key in ("asr_reference", "live_latency"):
+          for key in ("asr_reference",):
               report = proof.get(key)
               if not isinstance(report, dict):
                   raise SystemExit(
@@ -728,6 +753,11 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          name: parakeet-live-aarch64
+          path: validation-assets
+
+      - uses: actions/download-artifact@v4
+        with:
           name: distribution-readiness-windows-x86_64
           path: validation-assets
 
@@ -756,17 +786,21 @@ jobs:
           arm_distribution_path = validation_dir / "distribution-readiness-proof.json"
           distribution_path = validation_dir / "intel-distribution-readiness-proof.json"
           smoke_path = validation_dir / "intel-pyannote-parakeet-smoke-proof.json"
+          live_path = validation_dir / "arm-parakeet-live-smoke-proof.json"
           arm_distribution = json.loads(arm_distribution_path.read_text(encoding="utf-8"))
           distribution = json.loads(distribution_path.read_text(encoding="utf-8"))
           smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
+          live = json.loads(live_path.read_text(encoding="utf-8"))
           if smoke.get("version") != distribution.get("version"):
               raise SystemExit("Intel smoke version does not match Intel distribution proof")
           if smoke.get("release_tag") != distribution.get("release_tag"):
               raise SystemExit("Intel smoke release tag does not match Intel distribution proof")
           if smoke.get("status") != "passed":
               raise SystemExit("Intel CPU/Pyannote smoke did not pass")
-          for key in ("asr_reference", "live_latency"):
-              report = smoke.get(key)
+          for key, report in (
+              ("asr_reference", smoke.get("asr_reference")),
+              ("live_latency", live),
+          ):
               if not isinstance(report, dict):
                   raise SystemExit(
                       f"Intel smoke is missing real hosted {key}; "
@@ -797,12 +831,13 @@ jobs:
               "parakeet_language": smoke.get("parakeet_language"),
               "pyannote_deep_smoke": smoke.get("pyannote_deep_smoke"),
               "asr_reference": smoke.get("asr_reference"),
-              "live_latency": smoke.get("live_latency"),
+              "live_latency": live,
               "logs": smoke.get("logs", []),
           }
           distribution_path.write_text(json.dumps(distribution, indent=2) + "\n", encoding="utf-8")
           arm_distribution_path.write_text(json.dumps(arm_distribution, indent=2) + "\n", encoding="utf-8")
           smoke_path.unlink()
+          live_path.unlink()
           PY
 
       - name: Require exactly the public seven JSON proof assets

@@ -11,7 +11,8 @@ use uuid::Uuid;
 use sbobino_application::{ApplicationError, RealtimeDelta};
 use sbobino_domain::{
     ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel,
-    SpeechModel, TimedSegment, TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
+    SpeechModel, TimedSegment, TranscriptArtifact, TranscriptionComputeDevice, TranscriptionEngine,
+    TranscriptionOutput,
 };
 
 use crate::commands::transcription::{JobFailedEvent, JobProgressEvent};
@@ -65,6 +66,22 @@ fn reject_if_realtime_stop_in_progress() -> Result<(), CommandError> {
             stops.iter().next().map(String::as_str),
         ))
     }
+}
+
+fn ensure_parakeet_live_device_supported(
+    device: TranscriptionComputeDevice,
+) -> Result<(), CommandError> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if !matches!(device, TranscriptionComputeDevice::Cpu) {
+        return Ok(());
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = device;
+
+    Err(CommandError::new(
+        "parakeet_live_realtime_unsupported",
+        "Parakeet live cannot keep real time with the selected device on this computer. Use Whisper live, or record the session and transcribe the saved audio as a file. Parakeet file transcription remains available.",
+    ))
 }
 
 fn reserve_realtime_stop(job_id: &str) -> Result<RealtimeStopMarker, CommandError> {
@@ -709,6 +726,9 @@ pub async fn start_realtime(
     let engine_kind = payload
         .engine
         .unwrap_or_else(|| settings.transcription.engine.clone());
+    if matches!(&engine_kind, TranscriptionEngine::ParakeetCpp) {
+        ensure_parakeet_live_device_supported(settings.transcription.live_compute_device)?;
+    }
     let model = payload.model.unwrap_or(default_model);
     let language = payload.language.unwrap_or(default_language);
     let job_id = Uuid::new_v4().to_string();
@@ -1340,6 +1360,34 @@ pub async fn load_realtime_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parakeet_live_rejects_devices_that_cannot_keep_realtime() {
+        let cpu = ensure_parakeet_live_device_supported(TranscriptionComputeDevice::Cpu)
+            .expect_err("Parakeet CPU live must fail fast instead of accumulating backlog");
+        assert_eq!(cpu.code, "parakeet_live_realtime_unsupported");
+        assert!(cpu.message.contains("Whisper live"));
+        assert!(cpu.message.contains("transcribe the saved audio as a file"));
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            ensure_parakeet_live_device_supported(TranscriptionComputeDevice::Auto)
+                .expect("Apple Silicon Auto uses the certified accelerated live path");
+            ensure_parakeet_live_device_supported(TranscriptionComputeDevice::Gpu)
+                .expect("Apple Silicon GPU uses the certified accelerated live path");
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        for device in [
+            TranscriptionComputeDevice::Auto,
+            TranscriptionComputeDevice::Gpu,
+        ] {
+            assert!(
+                ensure_parakeet_live_device_supported(device).is_err(),
+                "non-Apple-Silicon Parakeet live must fail fast"
+            );
+        }
+    }
 
     #[test]
     fn parakeet_live_uses_installed_multilingual_model_when_tdt_is_selected() {

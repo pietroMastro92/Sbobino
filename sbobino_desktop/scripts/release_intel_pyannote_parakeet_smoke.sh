@@ -103,6 +103,8 @@ import sys
 if float(sys.argv[1]) <= 60.0:
     raise SystemExit(f"long Parakeet smoke audio is only {sys.argv[1]} seconds")
 PY
+LONG_AUDIO_SHA256=$(shasum -a 256 "$LONG_AUDIO" | awk '{print $1}')
+FIXTURE_DURATION_SECONDS=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$CACHE_FIXTURE_PATH")
 
 # The Intel hosted runner has no Metal path; keep the contract explicit in
 # the environment and report it as CPU/automatic-language smoke.
@@ -118,9 +120,53 @@ export SBOBINO_PARAKEET_EXPECTED_DETECTED_LANGUAGE=en
 export SBOBINO_PARAKEET_EXPECTED_PROCESSING_LANGUAGE=en
 export SBOBINO_ASR_SAMPLE=parakeet_fixture
 export SBOBINO_PARAKEET_FIXTURE="$LONG_AUDIO"
+export SBOBINO_ASR_TIMELINE_OUTPUT="$RUN_DIR/parakeet-file-timeline.json"
 export GGML_METAL=0
 
 "$ROOT_DIR/scripts/smoke_parakeet_real.sh" 2>&1 | tee "$RUN_DIR/parakeet.log"
+
+python3 - "$RUN_DIR/parakeet-file-reference.json" "$DURATION_SECONDS" \
+  "$FIXTURE_DURATION_SECONDS" "$LONG_AUDIO_SHA256" <<'PY'
+import json
+import math
+import pathlib
+import sys
+
+output = pathlib.Path(sys.argv[1])
+duration = float(sys.argv[2])
+fixture_duration = float(sys.argv[3])
+audio_sha256 = sys.argv[4]
+text = (
+    "Well, I don't wish to see it any more, observed Phebe, turning away her "
+    "eyes. It is certainly very like the old portrait."
+)
+segments = [
+    {
+        "start_seconds": index * fixture_duration,
+        "end_seconds": (index + 1) * fixture_duration,
+        "language_code": "en",
+        "text": text,
+    }
+    for index in range(math.floor(duration / fixture_duration))
+]
+payload = {
+    "schema_version": 1,
+    "review_status": "reviewed",
+    "reference_source": "parakeet.cpp 9edf17c3 LibriSpeech 2086-149220-0033 NeMo TDT reference",
+    "audio_sha256": audio_sha256,
+    "duration_seconds": duration,
+    "segments": segments,
+}
+output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+
+python3 "$ROOT_DIR/scripts/evaluate_asr_reference.py" \
+  "$RUN_DIR/parakeet-file-reference.json" \
+  "$RUN_DIR/parakeet-file-timeline.json" \
+  --audio "$LONG_AUDIO" \
+  --report "$RUN_DIR/parakeet-asr-report.json" \
+  --max-wer 0.35 --max-cer 0.25 --max-gap-seconds 2.0 \
+  --require-reviewed-reference
 
 PYTHON_VERSION_DIR=$(find "$PYTHON_ROOT/lib" -maxdepth 1 -type d -name 'python3.*' -print -quit | xargs -I{} basename {})
 [[ -n "$PYTHON_VERSION_DIR" ]] || { echo "Pyannote Python standard library is missing." >&2; exit 1; }
@@ -151,13 +197,40 @@ print(f"torchcodec_version={importlib.metadata.version('torchcodec')}")
 print("pyannote_deep_smoke=passed")
 PY
 
-python3 - "$REPORT_PATH" "$VERSION" "$TAG" "$DURATION_SECONDS" <<'PY'
+PARAKEET_CLI_SHA256=$(shasum -a 256 "$SPEECH_ROOT/bin/parakeet-cli" | awk '{print $1}')
+PARAKEET_WORKER_SHA256=$(shasum -a 256 "$SPEECH_ROOT/bin/parakeet-batch-json" | awk '{print $1}')
+PARAKEET_LIB="$SPEECH_ROOT/lib/libparakeet.dylib"
+[[ -f "$PARAKEET_LIB" ]] || { echo "Packaged libparakeet.dylib is missing." >&2; exit 1; }
+PARAKEET_LIB_SHA256=$(shasum -a 256 "$PARAKEET_LIB" | awk '{print $1}')
+python3 - "$REPORT_PATH" "$VERSION" "$TAG" "$DURATION_SECONDS" \
+  "$RUN_DIR/parakeet-asr-report.json" \
+  "$LONG_AUDIO_SHA256" "$PARAKEET_CLI_SHA256" "$PARAKEET_WORKER_SHA256" \
+  "$PARAKEET_LIB_SHA256" "$PARAKEET_MODEL_SHA256" <<'PY'
 import json
 import pathlib
 import sys
 from datetime import datetime, timezone
 
 report_path = pathlib.Path(sys.argv[1])
+asr_report = json.loads(pathlib.Path(sys.argv[5]).read_text(encoding="utf-8"))
+audio_sha256 = sys.argv[6]
+runtime_hashes = {
+    "parakeet_cli": sys.argv[7],
+    "parakeet_batch_json": sys.argv[8],
+    "libparakeet": sys.argv[9],
+    "tdt_model": sys.argv[10],
+}
+common_evidence = {
+    "evidence_class": "hosted-packaged-engine",
+    "real_engine": True,
+    "real_harness": True,
+    "runner": "github-hosted macos-15-intel",
+    "harness": "release_intel_pyannote_parakeet_smoke.sh@v2",
+    "input_audio_sha256": audio_sha256,
+    "runtime_artifact_sha256": runtime_hashes,
+}
+asr_report.update(common_evidence)
+asr_report["engine"] = "parakeet.cpp/tdt-0.6b-v3-q4_k.gguf"
 report = {
     "schema_version": 1,
     "version": sys.argv[2],
@@ -172,7 +245,9 @@ report = {
     "parakeet_duration_seconds": float(sys.argv[4]),
     "parakeet_compute_device": "cpu",
     "parakeet_language": "auto",
+    "parakeet_live_cpu_compatibility": "not_certified_realtime_on_intel",
     "pyannote_deep_smoke": True,
+    "asr_reference": asr_report,
     "logs": [
         "intel-pyannote-parakeet-smoke-logs/parakeet.log",
         "intel-pyannote-parakeet-smoke-logs/pyannote.log",

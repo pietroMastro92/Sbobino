@@ -1,0 +1,77 @@
+name: Intel Runtime Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parakeet-file-cpu:
+    name: Packaged Parakeet file smoke (Intel CPU)
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build dependencies
+        run: brew install ffmpeg sdl2 nasm
+
+      - name: Cache pinned model and speech fixture
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/parakeet-readiness-model
+            ${{ runner.temp }}/parakeet-readiness-fixture
+          key: intel-parakeet-file-993d73feb4206dadda865ab25bd64b50c48dc4d013c3bf6126a721f28b1d5ee8-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
+
+      - name: Build the exact packaged Intel speech runtime
+        working-directory: sbobino_desktop
+        run: ./scripts/package_macos_runtime_asset.sh "$RUNNER_TEMP/speech-runtime-macos-x86_64.zip"
+
+      - name: Run a real 65-second CPU transcription through the batch worker
+        working-directory: sbobino_desktop
+        run: |
+          RUNTIME_ROOT="$RUNNER_TEMP/runtime-root"
+          MODEL_ROOT="$RUNNER_TEMP/parakeet-readiness-model"
+          FIXTURE_ROOT="$RUNNER_TEMP/parakeet-readiness-fixture"
+          mkdir -p "$RUNTIME_ROOT" "$MODEL_ROOT" "$FIXTURE_ROOT"
+          ditto -x -k "$RUNNER_TEMP/speech-runtime-macos-x86_64.zip" "$RUNTIME_ROOT"
+
+          MODEL="$MODEL_ROOT/tdt-0.6b-v3-q4_k.gguf"
+          MODEL_SHA="993d73feb4206dadda865ab25bd64b50c48dc4d013c3bf6126a721f28b1d5ee8"
+          if [[ ! -f "$MODEL" ]] || ! printf '%s  %s\n' "$MODEL_SHA" "$MODEL" | shasum -a 256 -c - >/dev/null 2>&1; then
+            curl --fail --location --retry 5 --retry-all-errors \
+              "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/bf0af9f425fa01809cadec671b3cb672709d13e9/tdt-0.6b-v3-q4_k.gguf?download=true" \
+              --output "$MODEL"
+          fi
+          printf '%s  %s\n' "$MODEL_SHA" "$MODEL" | shasum -a 256 -c -
+
+          FIXTURE="$FIXTURE_ROOT/speech.wav"
+          FIXTURE_SHA="5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150"
+          if [[ ! -f "$FIXTURE" ]] || ! printf '%s  %s\n' "$FIXTURE_SHA" "$FIXTURE" | shasum -a 256 -c - >/dev/null 2>&1; then
+            curl --fail --location --retry 5 --retry-all-errors \
+              "https://raw.githubusercontent.com/mudler/parakeet.cpp/9edf17c3ada66e0f881dcff155492867db7ac4cf/tests/fixtures/speech.wav" \
+              --output "$FIXTURE"
+          fi
+          printf '%s  %s\n' "$FIXTURE_SHA" "$FIXTURE" | shasum -a 256 -c -
+
+          LONG_AUDIO="$RUNNER_TEMP/parakeet-intel-65s.wav"
+          ffmpeg -hide_banner -loglevel error -y -stream_loop -1 -i "$FIXTURE" \
+            -t 65 -ar 16000 -ac 1 -c:a pcm_s16le "$LONG_AUDIO"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target"
+          export CARGO_INCREMENTAL=0
+          export SBOBINO_PARAKEET_CLI="$RUNTIME_ROOT/runtime/bin/parakeet-cli"
+          export SBOBINO_PARAKEET_MODELS_DIR="$MODEL_ROOT"
+          export SBOBINO_PARAKEET_MODEL="tdt-0.6b-v3-q4_k.gguf"
+          export SBOBINO_PARAKEET_AUDIO="$LONG_AUDIO"
+          export SBOBINO_PARAKEET_FIXTURE="$LONG_AUDIO"
+          export SBOBINO_ASR_SAMPLE=parakeet_fixture
+          export SBOBINO_PARAKEET_SKIP_NEMOTRON=1
+          export SBOBINO_PARAKEET_FORCE_CPU=1
+          export SBOBINO_PARAKEET_REQUIRE_WORKER_RSS_MONITOR=1
+          export SBOBINO_PARAKEET_EXPECTED_DETECTED_LANGUAGE=en
+          export SBOBINO_PARAKEET_EXPECTED_PROCESSING_LANGUAGE=en
+          ./scripts/smoke_parakeet_real.sh

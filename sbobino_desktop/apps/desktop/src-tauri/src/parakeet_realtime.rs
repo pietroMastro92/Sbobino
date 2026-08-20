@@ -29,6 +29,7 @@ type ParakeetLiveDeltaPieces = Vec<ParakeetLiveDeltaPiece>;
 
 const PARAKEET_LIVE_FEED_SAMPLES: usize = 5_120;
 const PARAKEET_LIVE_MAX_BACKLOG_SECONDS: f32 = 2.0;
+const PARAKEET_LIVE_FORCE_SEGMENT_SECONDS: f32 = 12.0;
 
 #[derive(Debug, Default)]
 struct LivePreviewGate {
@@ -905,7 +906,6 @@ fn run_capture_loop(
 
     // Feed the streaming model at roughly 320 ms. This bounds decoder
     // latency without coupling capture/WAV persistence to inference speed.
-    const PARAKEET_LIVE_FORCE_SEGMENT_SECONDS: f32 = 12.0;
     const PARAKEET_LIVE_NO_DELTA_RESTART_SECONDS: f32 = 10.0;
 
     let mut fed_samples: u64 = 0;
@@ -1098,12 +1098,7 @@ fn run_capture_loop(
             if outcome.had_delta {
                 last_delta_seconds = current_seconds;
             }
-            if outcome.eou
-                || assembler.should_force_finish_segment(
-                    current_seconds,
-                    PARAKEET_LIVE_FORCE_SEGMENT_SECONDS,
-                )
-            {
+            if outcome.eou {
                 assembler.finish_segment(current_seconds);
             }
             if current_seconds - last_delta_seconds >= PARAKEET_LIVE_NO_DELTA_RESTART_SECONDS
@@ -1154,12 +1149,7 @@ fn run_capture_loop(
                 current_seconds,
                 &mut assembler,
             )?;
-            if outcome.eou
-                || assembler.should_force_finish_segment(
-                    current_seconds,
-                    PARAKEET_LIVE_FORCE_SEGMENT_SECONDS,
-                )
-            {
+            if outcome.eou {
                 assembler.finish_segment(current_seconds);
             }
         }
@@ -1176,10 +1166,7 @@ fn run_capture_loop(
             current_seconds,
             &mut assembler,
         )?;
-        if outcome.eou
-            || assembler
-                .should_force_finish_segment(current_seconds, PARAKEET_LIVE_FORCE_SEGMENT_SECONDS)
-        {
+        if outcome.eou {
             assembler.finish_segment(current_seconds);
         }
         pending_feed.clear();
@@ -1333,6 +1320,17 @@ impl ParakeetLiveAssembler {
             self.current_end_seconds = Some(current_seconds.max(self.last_segment_end_seconds));
             let starts_new_word = display.chars().next().is_some_and(char::is_whitespace);
             if starts_new_word
+                && self.has_current_text()
+                && self.current_start_seconds.is_some_and(|start_seconds| {
+                    current_seconds - start_seconds >= PARAKEET_LIVE_FORCE_SEGMENT_SECONDS
+                })
+            {
+                self.finish_segment(current_seconds);
+                self.current_start_seconds =
+                    Some(self.last_segment_end_seconds.min(current_seconds));
+                self.current_end_seconds = Some(current_seconds.max(self.last_segment_end_seconds));
+            }
+            if starts_new_word
                 && !self.current_text.is_empty()
                 && !self
                     .current_text
@@ -1362,13 +1360,6 @@ impl ParakeetLiveAssembler {
 
     fn has_current_text(&self) -> bool {
         !self.current_text.trim().is_empty()
-    }
-
-    fn should_force_finish_segment(&self, current_seconds: f32, max_seconds: f32) -> bool {
-        let Some(start_seconds) = self.current_start_seconds else {
-            return false;
-        };
-        self.has_current_text() && current_seconds - start_seconds >= max_seconds
     }
 
     fn finish_segment(&mut self, current_seconds: f32) {
@@ -2030,22 +2021,24 @@ mod tests {
         );
 
         assert!(assembler.push_delta("first sentence", 1.0));
-        assert!(!assembler.should_force_finish_segment(6.0, 12.0));
-        assert!(assembler.should_force_finish_segment(13.1, 12.0));
-        assembler.finish_segment(13.1);
+        assert!(assembler.push_delta("continuation", 13.1));
+        assert!(
+            segments.lock().expect("segments lock poisoned").is_empty(),
+            "the forced boundary must not split a subword delta"
+        );
         assert!(assembler.push_delta(" second sentence", 14.0));
         assembler.finish_segment(15.0);
 
         let segments = segments.lock().expect("segments lock poisoned");
         assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].text, "first sentence");
+        assert_eq!(segments[0].text, "first sentencecontinuation");
         assert_eq!(segments[1].text, "second sentence");
         assert_eq!(
             transcript
                 .lock()
                 .expect("transcript lock poisoned")
                 .as_str(),
-            "first sentence\nsecond sentence"
+            "first sentencecontinuation\nsecond sentence"
         );
     }
 
@@ -2279,7 +2272,7 @@ mod tests {
         let engine =
             ParakeetRealtimeEngine::new(PathBuf::from(lib_path), PathBuf::from(models_dir));
         let api = engine.load_api().expect("libparakeet should load");
-        let model_path = engine.models_dir.join(model);
+        let model_path = engine.models_dir.join(&model);
         let model_c = CString::new(model_path.to_string_lossy().as_bytes())
             .expect("model path should not contain NUL");
         let ctx = unsafe { (api.load)(model_c.as_ptr()) };
@@ -2291,43 +2284,133 @@ mod tests {
             last_error(&api, ctx)
         );
 
-        let samples = read_test_wav_as_16k_mono(Path::new(&audio_path), 24.0);
+        let max_seconds = std::env::var("SBOBINO_PARAKEET_LIVE_MAX_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| *value > 0.0)
+            .unwrap_or(24.0);
+        let replay_realtime = std::env::var("SBOBINO_PARAKEET_LIVE_REALTIME")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let report_output = std::env::var("SBOBINO_PARAKEET_LIVE_REPORT_OUTPUT")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let samples = read_test_wav_as_16k_mono(Path::new(&audio_path), max_seconds);
         assert!(!samples.is_empty(), "test WAV should produce samples");
-        let mut combined = String::new();
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let segments = Arc::new(Mutex::new(Vec::new()));
+        let mut assembler =
+            ParakeetLiveAssembler::new(transcript.clone(), segments.clone(), Arc::new(|_| {}));
         let mut saw_eou = false;
-        for chunk in samples.chunks(16_000) {
+        let replay_started = Instant::now();
+        let mut first_preview_seconds = None::<f64>;
+        let mut telemetry_samples = Vec::new();
+        let mut rss_samples_mib = vec![current_process_rss_mib()];
+        for (index, chunk) in samples.chunks(PARAKEET_LIVE_FEED_SAMPLES).enumerate() {
+            let chunk_end_seconds =
+                ((index * PARAKEET_LIVE_FEED_SAMPLES) + chunk.len()) as f64 / 16_000.0;
+            if replay_realtime {
+                let scheduled = Duration::from_secs_f64(chunk_end_seconds);
+                if let Some(delay) = scheduled.checked_sub(replay_started.elapsed()) {
+                    std::thread::sleep(delay);
+                }
+            }
+            let inference_started = Instant::now();
             let mut eou = 0;
             let ptr = unsafe {
                 (api.stream_feed)(stream, chunk.as_ptr(), chunk.len() as c_int, &mut eou)
             };
+            let inference_seconds = inference_started.elapsed().as_secs_f64();
+            let elapsed_seconds = replay_started.elapsed().as_secs_f64();
+            let mut preview_latency_seconds = None;
             if let Some(delta) = take_c_string(&api, ptr) {
                 let display = normalize_parakeet_live_delta(&delta);
                 if !display.trim().is_empty() {
                     println!("parakeet_realtime_delta={}", display.trim());
-                    combined = ParakeetLiveAssembler::join_for_test(&combined, &display);
+                    assembler.push_delta(&display, chunk_end_seconds as f32);
+                    first_preview_seconds.get_or_insert(elapsed_seconds);
+                    preview_latency_seconds = Some((elapsed_seconds - chunk_end_seconds).max(0.0));
                 }
             }
             saw_eou |= eou != 0;
+            if eou != 0 {
+                assembler.finish_segment(chunk_end_seconds as f32);
+            }
+            telemetry_samples.push(serde_json::json!({
+                "captured_seconds": elapsed_seconds.min(samples.len() as f64 / 16_000.0),
+                "processed_seconds": chunk_end_seconds,
+                "backlog_seconds": (elapsed_seconds - chunk_end_seconds).max(0.0),
+                "preview_latency_seconds": preview_latency_seconds,
+                "inference_seconds": inference_seconds,
+            }));
+            rss_samples_mib.push(current_process_rss_mib());
         }
+        let finalize_started = Instant::now();
         let ptr = unsafe { (api.stream_finalize)(stream) };
+        let finalization_seconds = finalize_started.elapsed().as_secs_f64();
         if let Some(delta) = take_c_string(&api, ptr) {
             let display = normalize_parakeet_live_delta(&delta);
             if !display.trim().is_empty() {
                 println!("parakeet_realtime_final={}", display.trim());
-                combined = ParakeetLiveAssembler::join_for_test(&combined, &display);
+                assembler.push_delta(&display, samples.len() as f32 / 16_000.0);
+                first_preview_seconds.get_or_insert(replay_started.elapsed().as_secs_f64());
             }
         }
+        assembler.finish_segment(samples.len() as f32 / 16_000.0);
         unsafe {
             (api.stream_free)(stream);
             (api.free)(ctx);
         }
 
+        let combined = transcript.lock().expect("live transcript lock").clone();
         assert!(
             !combined.trim().is_empty(),
             "Parakeet realtime C API produced no transcript"
         );
         println!("parakeet_realtime_text={combined}");
         println!("parakeet_realtime_saw_eou={saw_eou}");
+
+        if let Some(output) = report_output {
+            let report = serde_json::json!({
+                "schema_version": 1,
+                "engine": format!("parakeet.cpp/{model}"),
+                "platform": std::env::consts::OS,
+                "samples": telemetry_samples,
+                "first_preview_seconds": first_preview_seconds,
+                "finalization_seconds": finalization_seconds,
+                "rss_samples_mib": rss_samples_mib,
+                "dropped_samples": 0,
+                "transcript": combined,
+            });
+            let output = Path::new(&output);
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).expect("live report parent should be writable");
+            }
+            std::fs::write(
+                output,
+                serde_json::to_vec_pretty(&report).expect("live report should serialize"),
+            )
+            .expect("live report should be writable");
+        }
+    }
+
+    fn current_process_rss_mib() -> f64 {
+        let pid = std::process::id().to_string();
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+            .expect("ps should report live harness RSS");
+        assert!(
+            output.status.success(),
+            "ps failed to report live harness RSS"
+        );
+        let rss_kib = String::from_utf8(output.stdout)
+            .expect("ps RSS should be UTF-8")
+            .trim()
+            .parse::<f64>()
+            .expect("ps RSS should be numeric KiB");
+        rss_kib / 1024.0
     }
 
     fn read_test_wav_as_16k_mono(path: &Path, max_seconds: f32) -> Vec<f32> {
@@ -2368,22 +2451,5 @@ mod tests {
         let mut output = resampler.push(&mono);
         output.extend(resampler.finish());
         output
-    }
-
-    impl ParakeetLiveAssembler {
-        fn join_for_test(left: &str, right: &str) -> String {
-            let left = left.trim();
-            let starts_new_word = right.chars().next().is_some_and(char::is_whitespace);
-            let right = right.trim();
-            if left.is_empty() {
-                right.to_string()
-            } else if right.is_empty() || left.contains(right) {
-                left.to_string()
-            } else if starts_new_word {
-                format!("{left} {right}")
-            } else {
-                format!("{left}{right}")
-            }
-        }
     }
 }
