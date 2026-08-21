@@ -71,16 +71,11 @@ fn reject_if_realtime_stop_in_progress() -> Result<(), CommandError> {
 fn ensure_parakeet_live_device_supported(
     device: TranscriptionComputeDevice,
 ) -> Result<(), CommandError> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if !matches!(device, TranscriptionComputeDevice::Cpu) {
-        return Ok(());
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let _ = device;
 
     Err(CommandError::new(
         "parakeet_live_realtime_unsupported",
-        "Parakeet live cannot keep real time with the selected device on this computer. Use Whisper live, or record the session and transcribe the saved audio as a file. Parakeet file transcription remains available.",
+        "Parakeet live is temporarily disabled because the packaged streaming models cannot keep real time on the validated computers. Sbobino uses Whisper for live sessions; Parakeet file transcription remains available.",
     ))
 }
 
@@ -1363,29 +1358,16 @@ mod tests {
 
     #[test]
     fn parakeet_live_rejects_devices_that_cannot_keep_realtime() {
-        let cpu = ensure_parakeet_live_device_supported(TranscriptionComputeDevice::Cpu)
-            .expect_err("Parakeet CPU live must fail fast instead of accumulating backlog");
-        assert_eq!(cpu.code, "parakeet_live_realtime_unsupported");
-        assert!(cpu.message.contains("Whisper live"));
-        assert!(cpu.message.contains("transcribe the saved audio as a file"));
-
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            ensure_parakeet_live_device_supported(TranscriptionComputeDevice::Auto)
-                .expect("Apple Silicon Auto uses the certified accelerated live path");
-            ensure_parakeet_live_device_supported(TranscriptionComputeDevice::Gpu)
-                .expect("Apple Silicon GPU uses the certified accelerated live path");
-        }
-
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         for device in [
+            TranscriptionComputeDevice::Cpu,
             TranscriptionComputeDevice::Auto,
             TranscriptionComputeDevice::Gpu,
         ] {
-            assert!(
-                ensure_parakeet_live_device_supported(device).is_err(),
-                "non-Apple-Silicon Parakeet live must fail fast"
-            );
+            let error = ensure_parakeet_live_device_supported(device)
+                .expect_err("Parakeet live must fail fast instead of accumulating backlog");
+            assert_eq!(error.code, "parakeet_live_realtime_unsupported");
+            assert!(error.message.contains("Whisper"));
+            assert!(error.message.contains("Parakeet file transcription"));
         }
     }
 

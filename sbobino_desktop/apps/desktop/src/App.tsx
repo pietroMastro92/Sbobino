@@ -10104,10 +10104,18 @@ export function App({
       setRealtimePreviewState("connecting");
       setRealtimeInputLevels([]);
       setRealtimeTelemetry(null);
+      // Parakeet/Nemotron currently cannot maintain real time on the hardware
+      // matrix validated for this release. Keep Parakeet available for file
+      // transcription, while live sessions transparently use Whisper instead
+      // of accumulating an ever-growing audio backlog.
+      const liveEngine =
+        settings.transcription.engine === "parakeet_cpp"
+          ? "whisper_cpp"
+          : settings.transcription.engine;
 
       const readiness = await withTimeout(
         fetchRealtimeStartReadiness({
-          engine: settings.transcription.engine,
+          engine: liveEngine,
           model: settings.transcription.model,
           parakeet_model: settings.transcription.parakeet_model,
           language: settings.transcription.language,
@@ -10134,7 +10142,7 @@ export function App({
       setRealtimePreviewSegment(null);
       setRealtimeSessionOpen(false);
       const startResult = await startRealtime({
-        engine: settings.transcription.engine,
+        engine: liveEngine,
         model: settings.transcription.model,
         parakeet_model: settings.transcription.parakeet_model,
         language: settings.transcription.language,
