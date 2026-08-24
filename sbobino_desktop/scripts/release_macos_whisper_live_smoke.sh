@@ -187,7 +187,8 @@ EVALUATE_STATUS=$?
 set -e
 
 LIB_SHA256=$(shasum -a 256 "$WHISPER_BIN" | awk '{print $1}')
-python3 - "$EVALUATED_REPORT" "$RAW_REPORT" "$REPORT_PATH" "$INPUT_SHA256" "$MODEL_SHA256" "$LIB_SHA256" "$DEVICE" "$VERSION" "$TAG" "$RECOVERY_REPORT" "$LIVE_DURATION_SECONDS" <<'PY'
+COMMIT_SHA=$(git rev-parse HEAD)
+python3 - "$EVALUATED_REPORT" "$RAW_REPORT" "$REPORT_PATH" "$INPUT_SHA256" "$MODEL_SHA256" "$LIB_SHA256" "$DEVICE" "$VERSION" "$TAG" "$RECOVERY_REPORT" "$LIVE_DURATION_SECONDS" "$COMMIT_SHA" "$REPO_SLUG" <<'PY'
 import json
 import os
 import pathlib
@@ -218,6 +219,14 @@ evaluated.update({
     "engine": "whisper.cpp/whisper-stream",
     "compute_device": sys.argv[7],
     "duration_seconds": float(sys.argv[11]),
+    "requested_duration_seconds": raw.get("requested_duration_seconds"),
+    "captured_duration_seconds": raw.get("captured_duration_seconds"),
+    "live_mode": "realtime",
+    "realtime_capable": True,
+    "preflight_rejected": False,
+    "preflight": raw.get("preflight"),
+    "commit_sha": sys.argv[12],
+    "repo_slug": sys.argv[13],
     "input_audio_sha256": sys.argv[4],
     "runtime_artifact_sha256": {
         "whisper-stream": sys.argv[6],
@@ -225,6 +234,10 @@ evaluated.update({
     },
     "backlog_recovery": {
         "status": recovery.get("status"),
+        "live_mode": recovery.get("live_mode"),
+        "backlog_recovery_expected": recovery.get("backlog_recovery_expected"),
+        "preflight_rejection_expected": recovery.get("preflight_rejection_expected"),
+        "preflight_rejected": recovery.get("preflight_rejected"),
         "captured_audio_frames": recovery.get("captured_audio_frames"),
         "saved_audio_frames": recovery.get("saved_audio_frames"),
         "dropped_samples": recovery.get("dropped_samples"),

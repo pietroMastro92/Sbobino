@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$RepoSlug,
     [Parameter(Mandatory = $true)][string]$ReportPath,
     [string]$RuntimeZip = "",
-    [int]$DurationSeconds = 900
+    [int]$DurationSeconds = 900,
+    [switch]$ExpectPreflightRejection
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,7 +33,7 @@ try {
     if (-not (Test-Path -PathType Leaf $ffmpeg)) { throw "packaged ffmpeg.exe is missing" }
 
     $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($whisper))
-    foreach ($marker in @("SBOBINO_WHISPER_REPLAY_WAV", "SBOBINO_WHISPER_LIVE_METRIC")) {
+    foreach ($marker in @("SBOBINO_WHISPER_REPLAY_WAV", "SBOBINO_WHISPER_LIVE_METRIC", "SBOBINO_WHISPER_LIVE_PREFLIGHT")) {
         if (-not $binaryText.Contains($marker)) { throw "packaged whisper-stream is missing $marker" }
     }
 
@@ -74,9 +75,14 @@ try {
     $rawReport = Join-Path $runDir "live-input.json"
     $evaluatedReport = Join-Path $runDir "live-evaluated.json"
     $env:PATH = "$(Join-Path $speechRoot 'bin');$env:PATH"
-    python scripts/run_whisper_live_replay.py `
-        --binary $whisper --model $model --audio $audio --fixture $fixture `
-        --report $rawReport --run-dir $runDir --device cpu --platform windows-x86_64
+    $liveArguments = @(
+        "scripts/run_whisper_live_replay.py",
+        "--binary", $whisper, "--model", $model, "--audio", $audio,
+        "--fixture", $fixture, "--report", $rawReport, "--run-dir", $runDir,
+        "--device", "cpu", "--platform", "windows-x86_64"
+    )
+    if ($ExpectPreflightRejection) { $liveArguments += "--expect-preflight-rejection" }
+    python @liveArguments
     $runStatus = $LASTEXITCODE
     $recoveryDir = Join-Path $runDir "backlog-recovery"
     $recoveryReport = Join-Path $runDir "backlog-recovery.json"
@@ -88,13 +94,41 @@ try {
         --platform windows-x86_64 --expect-backlog-recovery
     $recoveryStatus = $LASTEXITCODE
     Remove-Item Env:SBOBINO_WHISPER_TEST_INFERENCE_DELAY_MS -ErrorAction SilentlyContinue
-    python scripts/evaluate_live_latency.py $rawReport --report $evaluatedReport `
-        --max-latency-seconds 2.0 --max-rss-growth-mib 256.0
-    $evaluateStatus = $LASTEXITCODE
-
-    $evaluated = Get-Content $evaluatedReport -Raw | ConvertFrom-Json
     $raw = Get-Content $rawReport -Raw | ConvertFrom-Json
     $recovery = Get-Content $recoveryReport -Raw | ConvertFrom-Json
+    if ($ExpectPreflightRejection) {
+        $evaluateStatus = 0
+        $evaluated = [PSCustomObject]@{
+            schema_version = 1
+            status = $raw.status
+            engine = $raw.engine
+            platform = $raw.platform
+            metrics = [PSCustomObject]@{
+                dropped_samples = $raw.dropped_samples
+                missing_segments = $raw.missing_segments
+                duplicate_segments = $raw.duplicate_segments
+            }
+            failures = @($raw.failures)
+            live_mode = "preflight-rejected-incompatible-cpu"
+            realtime_capable = $false
+            preflight_rejected = $raw.preflight_rejected
+            preflight = $raw.preflight
+            requested_duration_seconds = $raw.requested_duration_seconds
+            captured_duration_seconds = $raw.captured_duration_seconds
+        }
+    }
+    else {
+        python scripts/evaluate_live_latency.py $rawReport --report $evaluatedReport `
+            --max-latency-seconds 2.0 --max-rss-growth-mib 256.0
+        $evaluateStatus = $LASTEXITCODE
+        $evaluated = Get-Content $evaluatedReport -Raw | ConvertFrom-Json
+        $evaluated | Add-Member -Force live_mode "realtime"
+        $evaluated | Add-Member -Force realtime_capable $true
+        $evaluated | Add-Member -Force preflight_rejected $false
+        $evaluated | Add-Member -Force preflight $raw.preflight
+        $evaluated | Add-Member -Force requested_duration_seconds $raw.requested_duration_seconds
+        $evaluated | Add-Member -Force captured_duration_seconds $raw.captured_duration_seconds
+    }
     $evaluated.metrics | Add-Member -Force dropped_samples $raw.dropped_samples
     $evaluated.metrics | Add-Member -Force missing_segments $raw.missing_segments
     $evaluated.metrics | Add-Member -Force duplicate_segments $raw.duplicate_segments
@@ -115,6 +149,8 @@ try {
     $evaluated | Add-Member -Force harness "release_windows_whisper_live_smoke.ps1@v1"
     $evaluated | Add-Member -Force compute_device "cpu"
     $evaluated | Add-Member -Force duration_seconds $DurationSeconds
+    $evaluated | Add-Member -Force commit_sha (git rev-parse HEAD)
+    $evaluated | Add-Member -Force repo_slug $RepoSlug
     $evaluated | Add-Member -Force input_audio_sha256 ((Get-FileHash -Algorithm SHA256 $audio).Hash.ToLowerInvariant())
     $runtimeHashes = [PSCustomObject]@{
         "whisper-stream" = (Get-FileHash -Algorithm SHA256 $whisper).Hash.ToLowerInvariant()
@@ -123,6 +159,10 @@ try {
     $evaluated | Add-Member -Force runtime_artifact_sha256 $runtimeHashes
     $evaluated | Add-Member -Force backlog_recovery ([PSCustomObject]@{
         status = $recovery.status
+        live_mode = $recovery.live_mode
+        backlog_recovery_expected = $recovery.backlog_recovery_expected
+        preflight_rejection_expected = $recovery.preflight_rejection_expected
+        preflight_rejected = $recovery.preflight_rejected
         captured_audio_frames = $recovery.captured_audio_frames
         saved_audio_frames = $recovery.saved_audio_frames
         dropped_samples = $recovery.dropped_samples

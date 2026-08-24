@@ -148,7 +148,16 @@ if (( $# == 0 )); then
     'whisper_live_model.json' \
     'ConvertFrom-Json' \
     'immutable URL and SHA-256' \
-    'manifest.url'; do
+    'manifest.url' \
+    'SBOBINO_WHISPER_LIVE_PREFLIGHT' \
+    'ExpectPreflightRejection' \
+    '--expect-preflight-rejection' \
+    'preflight-rejected-incompatible-cpu' \
+    'realtime_capable' \
+    'backlog_recovery_expected' \
+    'preflight_rejection_expected' \
+    'commit_sha' \
+    'repo_slug'; do
     if ! grep -Fq -- "$required" "$whisper_live_script"; then
       printf 'Windows Whisper live smoke must consume the pinned model manifest: %s\n' "$required" >&2
       exit 1
@@ -164,6 +173,11 @@ if (( $# == 0 )); then
     "$repo_root/.github/workflows/windows-port.yml"; do
     if ! grep -Fq -- '-FfmpegArchivePath' "$workflow"; then
       printf 'Windows workflow does not pass the staged speech runtime to Pyannote: %s\n' \
+        "$workflow" >&2
+      exit 1
+    fi
+    if ! grep -Fq -- '-ExpectPreflightRejection' "$workflow"; then
+      printf 'Windows workflow does not require the pre-capture CPU capability proof: %s\n' \
         "$workflow" >&2
       exit 1
     fi

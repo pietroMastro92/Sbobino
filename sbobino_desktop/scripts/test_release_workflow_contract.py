@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import pathlib
 import os
 import subprocess
@@ -19,6 +20,29 @@ WINDOWS_LIVE_SMOKE = ROOT / "scripts" / "release_windows_whisper_live_smoke.ps1"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_release_readiness_metadata_binds_candidate_revision_and_repository(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            subprocess.run(
+                [
+                    "python3",
+                    str(ROOT / "scripts" / "generate_release_candidate_metadata.py"),
+                    temporary,
+                    "9.8.7",
+                    "--commit-sha",
+                    "a" * 40,
+                    "--repo-slug",
+                    "owner/repo",
+                ],
+                check=True,
+            )
+            proof = json.loads(
+                (pathlib.Path(temporary) / "release-readiness-proof.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(proof["commit_sha"], "a" * 40)
+            self.assertEqual(proof["repo_slug"], "owner/repo")
+
     def test_synthetic_quality_job_is_contract_only(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("release-quality-contract-tests:", workflow)
@@ -81,6 +105,44 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe", live)
         self.assertNotIn("resolve/5359861c739e955e79d9a303bcbc70fb988958b1", windows)
         self.assertNotIn("60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe", windows)
+
+    def test_windows_cpu_live_proves_fail_fast_incompatibility_without_weakening_other_platforms(self):
+        windows = WINDOWS_LIVE_SMOKE.read_text(encoding="utf-8")
+        release_workflow = WORKFLOW.read_text(encoding="utf-8")
+        windows_workflow = (ROOT.parent / ".github" / "workflows" / "windows-port.yml").read_text(
+            encoding="utf-8"
+        )
+        promotion = PROMOTION.read_text(encoding="utf-8")
+        for workflow in (release_workflow, windows_workflow):
+            self.assertIn("-ExpectPreflightRejection", workflow)
+        for contract in (
+            "SBOBINO_WHISPER_LIVE_PREFLIGHT",
+            "--expect-preflight-rejection",
+            "preflight-rejected-incompatible-cpu",
+            "realtime_capable",
+            "requested_duration_seconds",
+            "captured_duration_seconds",
+            "commit_sha",
+            "repo_slug",
+        ):
+            self.assertIn(contract, windows)
+        self.assertIn('-RuntimeZip (Join-Path $staging "speech-runtime-windows-x86_64.zip")', release_workflow)
+        self.assertIn('float(inference_ms) <= float(budget_ms)', promotion)
+        self.assertIn('float(requested_duration) < 900', promotion)
+        self.assertIn('float(captured_duration) != 0.0', promotion)
+        self.assertIn("ARM64 live proof must demonstrate realtime transcription", promotion)
+        self.assertIn("Intel live proof must demonstrate realtime transcription", promotion)
+        self.assertIn('windows_live_mode not in {"realtime", "preflight-rejected-incompatible-cpu"}', promotion)
+        self.assertIn('recovery.get("live_mode") != "backlog-recovery"', promotion)
+        self.assertIn('recovery.get("backlog_recovery_expected") is not True', promotion)
+        self.assertIn("TAG_COMMIT_SHA", promotion)
+        self.assertIn("validate_revision", promotion)
+
+        macos = ARM_LIVE_SMOKE.read_text(encoding="utf-8")
+        self.assertIn('"live_mode": "realtime"', macos)
+        self.assertIn('"realtime_capable": True', macos)
+        self.assertIn('"commit_sha": sys.argv[12]', macos)
+        self.assertIn('"repo_slug": sys.argv[13]', macos)
 
     def test_pyannote_abi_scan_includes_the_packaged_runtime_lib_directory(self):
         readiness = (ROOT / "scripts" / "distribution_readiness.sh").read_text(

@@ -38,6 +38,12 @@ if [[ -z "$RELEASE_JSON" ]]; then
   exit 1
 fi
 
+TAG_COMMIT_SHA=$(gh api "repos/$REPO_SLUG/commits/$TAG" --jq '.sha')
+if [[ ! "$TAG_COMMIT_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  echo "Stable promotion blocked: could not resolve the candidate tag to one commit." >&2
+  exit 1
+fi
+
 IS_PRERELEASE=$(python3 - <<'PY' "$RELEASE_JSON"
 import json, sys
 print("1" if json.loads(sys.argv[1]).get("isPrerelease") else "0")
@@ -122,7 +128,7 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
   "$VERSION" \
   "$TMP_DIR/release-notes.md"
 
-python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG"
+python3 - <<'PY' "$TMP_DIR" "$VERSION" "$TAG" "$TAG_COMMIT_SHA" "$REPO_SLUG"
 import math
 import json
 import pathlib
@@ -132,13 +138,22 @@ import sys
 report_dir = pathlib.Path(sys.argv[1])
 version = sys.argv[2]
 tag = sys.argv[3]
+tag_commit_sha = sys.argv[4].lower()
+repo_slug = sys.argv[5]
 
 def load_json(path: pathlib.Path, label: str) -> dict:
     if not path.is_file():
         raise SystemExit(f"Stable promotion blocked: could not download {label}.")
     return json.loads(path.read_text(encoding="utf-8"))
 
+def validate_revision(source: dict, label: str) -> None:
+    if str(source.get("commit_sha", "")).strip().lower() != tag_commit_sha:
+        raise SystemExit(f"Stable promotion blocked: {label} commit_sha does not match the candidate tag.")
+    if str(source.get("repo_slug", "")).strip().lower() != repo_slug.lower():
+        raise SystemExit(f"Stable promotion blocked: {label} repo_slug mismatch.")
+
 readiness = load_json(report_dir / "release-readiness-proof.json", "release-readiness-proof.json")
+validate_revision(readiness, "release-readiness-proof.json")
 if readiness.get("version") != version:
     raise SystemExit("Stable promotion blocked: release-readiness-proof.json version mismatch.")
 if str(readiness.get("status", "")).strip().lower() != "passed":
@@ -150,6 +165,7 @@ distribution = load_json(
     report_dir / "distribution-readiness-proof.json",
     "distribution-readiness-proof.json",
 )
+validate_revision(distribution, "distribution-readiness-proof.json")
 if int(distribution.get("schema_version", 0)) != 1:
     raise SystemExit(
         "Stable promotion blocked: distribution-readiness-proof.json has unsupported schema_version."
@@ -171,6 +187,7 @@ def validate_quality_gate(key: str, label: str, source: dict | None = None) -> d
         raise SystemExit(f"Stable promotion blocked: {label} report has unsupported schema_version.")
     if str(report.get("status", "")).strip().lower() != "passed":
         raise SystemExit(f"Stable promotion blocked: {label} report did not pass.")
+    validate_revision(report, label)
     if report.get("version") != version or report.get("release_tag") != tag:
         raise SystemExit(f"Stable promotion blocked: {label} report version/tag mismatch.")
     if report.get("evidence_class") != "hosted-packaged-engine":
@@ -209,6 +226,12 @@ def validate_live_recovery(source: dict, label: str) -> None:
         raise SystemExit(f"Stable promotion blocked: {label} is missing backlog recovery evidence.")
     if str(recovery.get("status", "")).strip().lower() != "passed":
         raise SystemExit(f"Stable promotion blocked: {label} backlog recovery did not pass.")
+    if recovery.get("live_mode") != "backlog-recovery":
+        raise SystemExit(f"Stable promotion blocked: {label} recovery mode provenance is invalid.")
+    if recovery.get("backlog_recovery_expected") is not True:
+        raise SystemExit(f"Stable promotion blocked: {label} recovery expectation provenance is missing.")
+    if recovery.get("preflight_rejection_expected") is not False or recovery.get("preflight_rejected") is not False:
+        raise SystemExit(f"Stable promotion blocked: {label} recovery was confused with preflight rejection.")
     captured = recovery.get("captured_audio_frames")
     saved = recovery.get("saved_audio_frames")
     if not isinstance(captured, int) or captured <= 0 or saved != captured:
@@ -239,6 +262,8 @@ for metric, maximum in (
         )
 
 live_metrics = validate_quality_gate("live_latency", "live-latency")
+if distribution["live_latency"].get("live_mode") != "realtime" or distribution["live_latency"].get("realtime_capable") is not True:
+    raise SystemExit("Stable promotion blocked: ARM64 live proof must demonstrate realtime transcription.")
 validate_live_recovery(distribution["live_latency"], "live-latency")
 validate_live_duration(distribution["live_latency"], "live-latency")
 for metric, maximum in (
@@ -264,6 +289,9 @@ intel_distribution = load_json(
 intel_live_metrics = validate_quality_gate(
     "live_latency", "Intel live-latency", intel_distribution
 )
+validate_revision(intel_distribution, "intel-distribution-readiness-proof.json")
+if intel_distribution["live_latency"].get("live_mode") != "realtime" or intel_distribution["live_latency"].get("realtime_capable") is not True:
+    raise SystemExit("Stable promotion blocked: Intel live proof must demonstrate realtime transcription.")
 validate_live_recovery(intel_distribution["live_latency"], "Intel live-latency")
 validate_live_duration(intel_distribution["live_latency"], "Intel live-latency")
 for metric, maximum in (
@@ -296,6 +324,7 @@ windows_distribution = load_json(
     report_dir / "windows-distribution-readiness-proof.json",
     "windows-distribution-readiness-proof.json",
 )
+validate_revision(windows_distribution, "windows-distribution-readiness-proof.json")
 if int(windows_distribution.get("schema_version", 0)) != 1:
     raise SystemExit(
         "Stable promotion blocked: windows-distribution-readiness-proof.json has unsupported schema_version."
@@ -309,20 +338,56 @@ if windows_distribution.get("platform") != "windows" or windows_distribution.get
 windows_live_metrics = validate_quality_gate(
     "live_latency", "Windows live-latency", windows_distribution
 )
-validate_live_recovery(windows_distribution["live_latency"], "Windows live-latency")
-validate_live_duration(windows_distribution["live_latency"], "Windows live-latency")
-for metric, maximum in (
-    ("first_preview_seconds", 2.0),
-    ("preview_latency_p95_seconds", 2.0),
-    ("backlog_p95_seconds", 2.0),
-    ("finalization_seconds", 2.0),
-    ("rss_growth_mib", 256.0),
-):
-    value = windows_live_metrics.get(metric)
-    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
-        raise SystemExit(
-            f"Stable promotion blocked: Windows live-latency {metric} exceeds the release threshold."
-        )
+windows_live = windows_distribution["live_latency"]
+validate_live_recovery(windows_live, "Windows live-latency")
+validate_live_duration(windows_live, "Windows live-latency")
+windows_live_mode = windows_live.get("live_mode")
+if windows_live_mode not in {"realtime", "preflight-rejected-incompatible-cpu"}:
+    raise SystemExit("Stable promotion blocked: Windows live proof has an unknown mode.")
+if windows_live_mode == "preflight-rejected-incompatible-cpu":
+    preflight = windows_live.get("preflight")
+    requested_duration = windows_live.get("requested_duration_seconds")
+    captured_duration = windows_live.get("captured_duration_seconds")
+    if windows_live.get("realtime_capable") is not False:
+        raise SystemExit("Stable promotion blocked: Windows CPU preflight did not attest realtime incompatibility.")
+    if windows_live.get("preflight_rejected") is not True or not isinstance(preflight, dict):
+        raise SystemExit("Stable promotion blocked: Windows CPU preflight rejection evidence is missing.")
+    if str(preflight.get("status", "")).strip().lower() != "rejected":
+        raise SystemExit("Stable promotion blocked: Windows CPU preflight status is not rejected.")
+    inference_ms = preflight.get("inference_ms")
+    budget_ms = preflight.get("budget_ms")
+    if (
+        not isinstance(inference_ms, (int, float))
+        or not isinstance(budget_ms, (int, float))
+        or not math.isfinite(float(inference_ms))
+        or not math.isfinite(float(budget_ms))
+        or float(budget_ms) <= 0
+        or float(inference_ms) <= float(budget_ms)
+    ):
+        raise SystemExit("Stable promotion blocked: Windows CPU preflight did not exceed its measured realtime budget.")
+    if (
+        not isinstance(requested_duration, (int, float))
+        or not math.isfinite(float(requested_duration))
+        or float(requested_duration) < 900
+    ):
+        raise SystemExit("Stable promotion blocked: Windows CPU preflight did not use the 900-second release profile.")
+    if not isinstance(captured_duration, (int, float)) or float(captured_duration) != 0.0:
+        raise SystemExit("Stable promotion blocked: Windows CPU preflight started capture before rejection.")
+else:
+    if windows_live.get("realtime_capable") is not True:
+        raise SystemExit("Stable promotion blocked: Windows realtime proof did not attest capability.")
+    for metric, maximum in (
+        ("first_preview_seconds", 2.0),
+        ("preview_latency_p95_seconds", 2.0),
+        ("backlog_p95_seconds", 2.0),
+        ("finalization_seconds", 2.0),
+        ("rss_growth_mib", 256.0),
+    ):
+        value = windows_live_metrics.get(metric)
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
+            raise SystemExit(
+                f"Stable promotion blocked: Windows live-latency {metric} exceeds the release threshold."
+            )
 for metric in ("dropped_samples", "missing_segments", "duplicate_segments"):
     if int(windows_live_metrics.get(metric, -1)) != 0:
         raise SystemExit(f"Stable promotion blocked: Windows live-latency {metric} is non-zero.")
@@ -331,6 +396,9 @@ windows_gui = load_json(
     report_dir / "windows-gui-smoke-report.json",
     "windows-gui-smoke-report.json",
 )
+validate_revision(windows_gui, "windows-gui-smoke-report.json")
+if windows_gui.get("version") != version or windows_gui.get("release_tag") != tag:
+    raise SystemExit("Stable promotion blocked: Windows GUI smoke version/tag mismatch.")
 if int(windows_gui.get("schema_version", 0)) != 1:
     raise SystemExit("Stable promotion blocked: Windows GUI smoke report schema mismatch.")
 if str(windows_gui.get("status", "")).strip().lower() != "passed":
@@ -363,6 +431,7 @@ portability = load_json(
     report_dir / "portability-smoke-report.json",
     "portability-smoke-report.json",
 )
+validate_revision(portability, "portability-smoke-report.json")
 if int(portability.get("schema_version", 0)) != 1:
     raise SystemExit(
         "Stable promotion blocked: portability-smoke-report.json has unsupported schema_version."
@@ -378,6 +447,7 @@ intel_portability = load_json(
     report_dir / "intel-portability-smoke-report.json",
     "intel-portability-smoke-report.json",
 )
+validate_revision(intel_portability, "intel-portability-smoke-report.json")
 if int(intel_portability.get("schema_version", 0)) != 1:
     raise SystemExit(
         "Stable promotion blocked: intel-portability-smoke-report.json has unsupported schema_version."
@@ -392,6 +462,7 @@ if not isinstance(intel_pyannote, dict):
     raise SystemExit(
         "Stable promotion blocked: Intel distribution proof is missing the CPU/Pyannote smoke fields."
     )
+validate_revision(intel_pyannote, "Intel CPU/Pyannote smoke")
 if int(intel_pyannote.get("schema_version", 0)) != 1:
     raise SystemExit(
         "Stable promotion blocked: Intel CPU/Pyannote smoke fields have unsupported schema_version."

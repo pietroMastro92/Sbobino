@@ -100,6 +100,23 @@ def final_runtime_summary(stderr: str, sample_rate: int) -> tuple[int, int] | No
     return round(float(matches[-1][0]) * sample_rate), int(matches[-1][3])
 
 
+def final_preflight_result(stderr: str) -> dict[str, float | str] | None:
+    matches = re.findall(
+        r"SBOBINO_WHISPER_LIVE_PREFLIGHT\s+status=(passed|rejected)\s+"
+        r"inference_ms=([0-9.]+)\s+budget_ms=([0-9.]+)\s+step_ms=([0-9]+)",
+        stderr,
+    )
+    if not matches:
+        return None
+    status, inference_ms, budget_ms, step_ms = matches[-1]
+    return {
+        "status": status,
+        "inference_ms": float(inference_ms),
+        "budget_ms": float(budget_ms),
+        "step_ms": float(step_ms),
+    }
+
+
 def backlog_threshold_overshoot(stderr: str, sample_rate: int) -> float | None:
     matches = re.findall(
         r"SBOBINO_WHISPER_LIVE_BACKLOG\s+exceeded\s+captured=([0-9]+)\s+"
@@ -224,7 +241,9 @@ def main() -> int:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--device", choices=("auto", "cpu"), default="auto")
     parser.add_argument("--platform", required=True)
-    parser.add_argument("--expect-backlog-recovery", action="store_true")
+    expected_outcome = parser.add_mutually_exclusive_group()
+    expected_outcome.add_argument("--expect-backlog-recovery", action="store_true")
+    expected_outcome.add_argument("--expect-preflight-rejection", action="store_true")
     args = parser.parse_args()
 
     with wave.open(str(args.audio), "rb") as handle:
@@ -245,6 +264,11 @@ def main() -> int:
 
     environment = os.environ.copy()
     environment["SBOBINO_WHISPER_REPLAY_WAV"] = str(args.audio)
+    if args.expect_backlog_recovery:
+        # Test-only bypass: the recovery proof deliberately reaches capture and
+        # injects a stall after the independent capability proof has exercised
+        # the normal, non-bypassed path.
+        environment["SBOBINO_WHISPER_SKIP_LIVE_PREFLIGHT"] = "1"
     started = time.monotonic()
     process = subprocess.Popen(
         command,
@@ -337,16 +361,32 @@ def main() -> int:
     expected_segments = int(duration // fixture_duration)
     observed_segments = count_fixture_utterances(normalized)
     final_summary = final_runtime_summary(stderr, sample_rate)
+    preflight = final_preflight_result(stderr)
     captured_frames = final_summary[0] if final_summary else 0
     final_dropped_samples = final_summary[1] if final_summary else None
     backlog_reaction_seconds = backlog_threshold_overshoot(stderr, sample_rate)
     failures: list[str] = []
     if timed_out:
         failures.append("whisper-stream timed out")
-    if final_summary is None:
+    if final_summary is None and not args.expect_preflight_rejection:
         failures.append("terminal runtime summary is missing")
     backlog_failure = "SBOBINO_WHISPER_LIVE_BACKLOG" in stderr
-    if args.expect_backlog_recovery:
+    if args.expect_preflight_rejection:
+        if return_code != 8:
+            failures.append(f"expected preflight exit 8, got {return_code}")
+        if preflight is None:
+            failures.append("live preflight result is missing")
+        elif preflight["status"] != "rejected":
+            failures.append(f"expected rejected preflight, got {preflight['status']}")
+        if replay_started_wall is not None or "[Start speaking]" in stdout:
+            failures.append("audio capture started after preflight rejection")
+        if final_summary is not None or samples:
+            failures.append("runtime telemetry was emitted after preflight rejection")
+        if output_text:
+            failures.append("preflight rejection emitted transcript text")
+        if saved_audio or saved_frames:
+            failures.append("preflight rejection created captured audio")
+    elif args.expect_backlog_recovery:
         if return_code != 7:
             failures.append(f"expected backlog exit 7, got {return_code}")
         if not backlog_failure:
@@ -362,17 +402,27 @@ def main() -> int:
     else:
         if return_code != 0:
             failures.append(f"whisper-stream exited with status {return_code}")
+        if preflight is None:
+            failures.append("live preflight result is missing")
+        elif preflight["status"] != "passed":
+            failures.append(f"live preflight did not pass: {preflight['status']}")
         if backlog_failure:
             failures.append("whisper-stream reported a real-time backlog")
         if not output_text:
             failures.append("whisper-stream produced no finalized transcript")
-    if not saved_audio:
+    if not saved_audio and not args.expect_preflight_rejection:
         failures.append("whisper-stream did not preserve captured WAV")
     if final_dropped_samples not in (None, 0):
         failures.append(
             f"final runtime summary reported {final_dropped_samples} dropped samples"
         )
-    expected_saved_frames = captured_frames if args.expect_backlog_recovery else input_frames
+    expected_saved_frames = (
+        0
+        if args.expect_preflight_rejection
+        else captured_frames
+        if args.expect_backlog_recovery
+        else input_frames
+    )
     if saved_frames != expected_saved_frames:
         failures.append(
             f"saved WAV frame count mismatch: saved={saved_frames} expected={expected_saved_frames}"
@@ -384,20 +434,38 @@ def main() -> int:
         "engine": "whisper.cpp/whisper-stream",
         "platform": args.platform,
         "duration_seconds": duration,
+        "requested_duration_seconds": duration,
+        "captured_duration_seconds": captured_frames / sample_rate,
+        "live_mode": (
+            "preflight-rejected-incompatible-cpu"
+            if args.expect_preflight_rejection
+            else "backlog-recovery"
+            if args.expect_backlog_recovery
+            else "realtime"
+        ),
         "samples": samples,
-        "first_preview_seconds": (
+        "first_preview_seconds": 0.0 if args.expect_preflight_rejection else (
             max(0.0, first_preview_wall - replay_started_wall - speech_onset)
             if first_preview_wall is not None and replay_started_wall is not None
             else 9999.0
         ),
-        "finalization_seconds": (
+        "finalization_seconds": 0.0 if args.expect_preflight_rejection else (
             max(0.0, finished - last_metric_wall) if last_metric_wall is not None else 9999.0
         ),
         "rss_samples_mib": rss_samples,
-        "dropped_samples": final_dropped_samples if final_dropped_samples is not None else -1,
-        "missing_segments": 0 if args.expect_backlog_recovery else max(0, expected_segments - observed_segments),
-        "duplicate_segments": 0 if args.expect_backlog_recovery else max(0, observed_segments - expected_segments),
+        "dropped_samples": (
+            0
+            if args.expect_preflight_rejection
+            else final_dropped_samples
+            if final_dropped_samples is not None
+            else -1
+        ),
+        "missing_segments": 0 if (args.expect_backlog_recovery or args.expect_preflight_rejection) else max(0, expected_segments - observed_segments),
+        "duplicate_segments": 0 if (args.expect_backlog_recovery or args.expect_preflight_rejection) else max(0, observed_segments - expected_segments),
         "backlog_recovery_expected": args.expect_backlog_recovery,
+        "preflight_rejection_expected": args.expect_preflight_rejection,
+        "preflight_rejected": preflight is not None and preflight["status"] == "rejected",
+        "preflight": preflight,
         "backlog_reaction_seconds": backlog_reaction_seconds,
         "captured_audio_frames": captured_frames,
         "saved_audio_frames": saved_frames,

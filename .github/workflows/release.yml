@@ -543,12 +543,19 @@ jobs:
             -PyannoteRuntimeZip (Join-Path $staging "pyannote-runtime-windows-x86_64.zip") `
             -ReportPath $guiReportPath
           $guiReport = Get-Content $guiReportPath -Raw | ConvertFrom-Json
+          $guiReport | Add-Member -Force version $version
+          $guiReport | Add-Member -Force release_tag $env:TAG_NAME
+          $guiReport | Add-Member -Force commit_sha (git rev-parse HEAD)
+          $guiReport | Add-Member -Force repo_slug $env:GITHUB_REPOSITORY
+          $guiReport | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $guiReportPath
 
           $liveReportPath = Join-Path $PWD "windows-whisper-live-smoke-proof.json"
           ./scripts/release_windows_whisper_live_smoke.ps1 `
             -Version $version `
             -RepoSlug $env:GITHUB_REPOSITORY `
-            -ReportPath $liveReportPath
+            -ReportPath $liveReportPath `
+            -RuntimeZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
+            -ExpectPreflightRejection
           $liveReport = Get-Content $liveReportPath -Raw | ConvertFrom-Json
 
           @{
@@ -562,6 +569,7 @@ jobs:
             machine_class = "WINDOWS-HOSTED-CLEANROOM"
             tested_at_utc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
             commit_sha = (git rev-parse HEAD)
+            repo_slug = $env:GITHUB_REPOSITORY
             visible_console_windows = $guiReport.visible_console_windows
             main_window_count = $guiReport.main_window_count
             main_window_opaque = $guiReport.main_window_opaque
@@ -652,7 +660,8 @@ jobs:
             "runner": "github-hosted ${{ matrix.runner }}",
             "machine_class": "HOSTED-CLEANROOM",
             "tested_at_utc": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "commit_sha": "$(git rev-parse HEAD)"
+            "commit_sha": "$(git rev-parse HEAD)",
+            "repo_slug": "$GITHUB_REPOSITORY"
           }
           EOF
 
@@ -820,6 +829,14 @@ jobs:
           smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
           arm_live = json.loads(arm_live_path.read_text(encoding="utf-8"))
           intel_live = json.loads(intel_live_path.read_text(encoding="utf-8"))
+          expected_commit = distribution.get("commit_sha")
+          expected_repo = distribution.get("repo_slug")
+          for label, report in (
+              ("ARM distribution", arm_distribution),
+              ("Intel smoke", smoke),
+          ):
+              if report.get("commit_sha") != expected_commit or report.get("repo_slug") != expected_repo:
+                  raise SystemExit(f"{label} revision/repository does not match the candidate")
           if smoke.get("version") != distribution.get("version"):
               raise SystemExit("Intel smoke version does not match Intel distribution proof")
           if smoke.get("release_tag") != distribution.get("release_tag"):
@@ -840,6 +857,8 @@ jobs:
                   raise SystemExit(f"Intel smoke {key} did not run on a hosted runner")
               if report.get("status") != "passed" or report.get("failures"):
                   raise SystemExit(f"Intel smoke {key} did not pass")
+              if report.get("commit_sha") != expected_commit or report.get("repo_slug") != expected_repo:
+                  raise SystemExit(f"Intel smoke {key} revision/repository mismatch")
               # The ASR report is real hosted evidence and belongs in the
               # existing ARM distribution proof so promotion has one stable
               # location to validate it. Synthetic Ubuntu reports never enter
@@ -859,6 +878,8 @@ jobs:
                   raise SystemExit(f"{label} platform mismatch")
               if report.get("status") != "passed" or report.get("failures"):
                   raise SystemExit(f"{label} did not pass")
+              if report.get("commit_sha") != expected_commit or report.get("repo_slug") != expected_repo:
+                  raise SystemExit(f"{label} revision/repository mismatch")
           arm_distribution["live_latency"] = arm_live
           distribution["live_latency"] = intel_live
           distribution["intel_pyannote_parakeet_smoke"] = {
@@ -868,6 +889,7 @@ jobs:
               "machine_class": smoke.get("machine_class"),
               "tested_at_utc": smoke.get("tested_at_utc"),
               "commit_sha": smoke.get("commit_sha"),
+              "repo_slug": smoke.get("repo_slug"),
               "parakeet_duration_seconds": smoke.get("parakeet_duration_seconds"),
               "parakeet_compute_device": smoke.get("parakeet_compute_device"),
               "parakeet_language": smoke.get("parakeet_language"),

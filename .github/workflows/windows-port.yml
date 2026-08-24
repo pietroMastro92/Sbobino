@@ -62,7 +62,8 @@ jobs:
             -Version $version `
             -RepoSlug $env:GITHUB_REPOSITORY `
             -ReportPath (Join-Path $staging "windows-whisper-live-smoke-proof.json") `
-            -RuntimeZip (Join-Path $staging "speech-runtime-windows-x86_64.zip")
+            -RuntimeZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
+            -ExpectPreflightRejection
 
       - name: Cache pinned Parakeet readiness model
         uses: actions/cache@v4

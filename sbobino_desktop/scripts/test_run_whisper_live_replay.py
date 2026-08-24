@@ -15,6 +15,7 @@ from run_whisper_live_replay import (
     backlog_threshold_overshoot,
     captured_wav_paths,
     count_fixture_utterances,
+    final_preflight_result,
     final_runtime_summary,
     finalized_transcript,
     first_voiced_frame,
@@ -24,6 +25,29 @@ from run_whisper_live_replay import (
 
 
 class FinalizedTranscriptTests(unittest.TestCase):
+    def test_preflight_parser_uses_the_last_complete_result(self):
+        stderr = (
+            "SBOBINO_WHISPER_LIVE_PREFLIGHT status=passed inference_ms=300.000 budget_ms=720.000 step_ms=1280\n"
+            "SBOBINO_WHISPER_LIVE_PREFLIGHT status=rejected inference_ms=1600.250 budget_ms=720.000 step_ms=1280\n"
+        )
+        self.assertEqual(
+            final_preflight_result(stderr),
+            {
+                "status": "rejected",
+                "inference_ms": 1600.25,
+                "budget_ms": 720.0,
+                "step_ms": 1280.0,
+            },
+        )
+
+    def test_preflight_parser_rejects_malformed_or_unknown_status(self):
+        self.assertIsNone(final_preflight_result("status=rejected inference_ms=1"))
+        self.assertIsNone(
+            final_preflight_result(
+                "SBOBINO_WHISPER_LIVE_PREFLIGHT status=skipped inference_ms=1 budget_ms=2 step_ms=3"
+            )
+        )
+
     def test_captured_wav_discovery_excludes_input_and_fixture_in_the_run_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = pathlib.Path(temporary)
@@ -203,6 +227,56 @@ class FinalizedTranscriptTests(unittest.TestCase):
             self.assertEqual(payload["status"], "failed")
             self.assertEqual(payload["dropped_samples"], -1)
             self.assertIn("terminal runtime summary is missing", payload["failures"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX fake executable is used for this contract test")
+    def test_expected_preflight_rejection_passes_only_before_capture(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            audio = root / "audio.wav"
+            fixture = root / "fixture.wav"
+            for path in (audio, fixture):
+                with wave.open(str(path), "wb") as handle:
+                    handle.setnchannels(1)
+                    handle.setsampwidth(2)
+                    handle.setframerate(16000)
+                    handle.writeframes(b"\x00\x00" * 320)
+            model = root / "model.bin"
+            model.write_bytes(b"fake")
+            report = root / "report.json"
+            binary = root / "fake-whisper"
+            binary.write_text(
+                "#!/bin/sh\n"
+                "printf 'SBOBINO_WHISPER_LIVE_PREFLIGHT status=rejected inference_ms=1600.000 budget_ms=720.000 step_ms=1280\\n' 1>&2\n"
+                "exit 8\n",
+                encoding="utf-8",
+            )
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(pathlib.Path(__file__).with_name("run_whisper_live_replay.py")),
+                    "--binary", str(binary),
+                    "--model", str(model),
+                    "--audio", str(audio),
+                    "--fixture", str(fixture),
+                    "--report", str(report),
+                    "--run-dir", str(run_dir),
+                    "--device", "cpu",
+                    "--platform", "test",
+                    "--expect-preflight-rejection",
+                ],
+                check=False,
+            )
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(payload["status"], "passed")
+            self.assertTrue(payload["preflight_rejected"])
+            self.assertEqual(payload["captured_audio_frames"], 0)
+            self.assertEqual(payload["saved_audio_frames"], 0)
+            self.assertEqual(payload["stdout_transcript"], "")
 
 
 if __name__ == "__main__":

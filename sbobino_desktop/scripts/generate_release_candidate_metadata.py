@@ -26,6 +26,7 @@ def main() -> int:
         default="",
         help="Commit SHA embedded into validation templates",
     )
+    parser.add_argument("--repo-slug", default="pietroMastro92/Sbobino")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).resolve()
@@ -68,6 +69,8 @@ def main() -> int:
         "release_profile": args.release_profile.strip() or "public",
         "status": "passed",
         "gate": "release_readiness.sh",
+        "commit_sha": args.commit_sha.strip(),
+        "repo_slug": args.repo_slug.strip(),
         "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "required_assets": required_assets,
         "optional_assets": optional_assets,

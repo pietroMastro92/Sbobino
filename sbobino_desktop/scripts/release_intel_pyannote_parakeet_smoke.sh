@@ -218,10 +218,11 @@ PARAKEET_WORKER_SHA256=$(shasum -a 256 "$SPEECH_ROOT/bin/parakeet-batch-json" | 
 PARAKEET_LIB="$SPEECH_ROOT/lib/libparakeet.dylib"
 [[ -f "$PARAKEET_LIB" ]] || { echo "Packaged libparakeet.dylib is missing." >&2; exit 1; }
 PARAKEET_LIB_SHA256=$(shasum -a 256 "$PARAKEET_LIB" | awk '{print $1}')
+COMMIT_SHA=$(git rev-parse HEAD)
 python3 - "$REPORT_PATH" "$VERSION" "$TAG" "$DURATION_SECONDS" \
   "$RUN_DIR/parakeet-asr-report.json" \
   "$LONG_AUDIO_SHA256" "$PARAKEET_CLI_SHA256" "$PARAKEET_WORKER_SHA256" \
-  "$PARAKEET_LIB_SHA256" "$PARAKEET_MODEL_SHA256" <<'PY'
+  "$PARAKEET_LIB_SHA256" "$PARAKEET_MODEL_SHA256" "$COMMIT_SHA" "$REPO_SLUG" <<'PY'
 import json
 import pathlib
 import sys
@@ -246,6 +247,8 @@ common_evidence = {
     "harness": "release_intel_pyannote_parakeet_smoke.sh@v2",
     "input_audio_sha256": audio_sha256,
     "runtime_artifact_sha256": runtime_hashes,
+    "commit_sha": sys.argv[11],
+    "repo_slug": sys.argv[12],
 }
 asr_report.update(common_evidence)
 asr_report["engine"] = "parakeet.cpp/tdt-0.6b-v3-q4_k.gguf"
@@ -259,7 +262,8 @@ report = {
     "runner": "github-hosted macos-15-intel",
     "machine_class": "HOSTED-CLEANROOM-STANDARD",
     "tested_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "commit_sha": __import__("subprocess").check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+    "commit_sha": sys.argv[11],
+    "repo_slug": sys.argv[12],
     "parakeet_duration_seconds": float(sys.argv[4]),
     "parakeet_compute_device": "cpu",
     "parakeet_language": "auto",

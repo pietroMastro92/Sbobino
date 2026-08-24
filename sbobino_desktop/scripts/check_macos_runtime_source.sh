@@ -73,7 +73,12 @@ if ! grep -Fq -- 'SBOBINO_WHISPER_LIVE_BACKLOG' "$script_dir/patches/whisper-str
 fi
 for required in \
   'failed to warm up the live transcription backend' \
-  'whisper_reset_timings(ctx)'; do
+  'whisper_reset_timings(ctx)' \
+  'SBOBINO_WHISPER_LIVE_PREFLIGHT' \
+  'SBOBINO_WHISPER_SKIP_LIVE_PREFLIGHT' \
+  'SBOBINO_WHISPER_TEST_PREFLIGHT_DELAY_MS' \
+  'std::min(params.max_tokens, 64)' \
+  'std::remove(capture_filename.c_str())'; do
   if ! grep -Fq -- "$required" "$script_dir/patches/whisper-stream-backlog.patch"; then
     printf 'Whisper live warmup contract is missing: %s\n' "$required" >&2
     exit 1

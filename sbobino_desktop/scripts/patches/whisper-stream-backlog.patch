@@ -1,6 +1,10 @@
 --- a/examples/stream/stream.cpp
 +++ b/examples/stream/stream.cpp
-@@ -145,15 +145,13 @@
+@@ -142,18 +142,16 @@
+     params.no_timestamps  = !use_vad;
+     params.no_context    |= use_vad;
+-    params.max_tokens     = 0;
++    params.max_tokens     = params.max_tokens > 0 ? std::min(params.max_tokens, 64) : 64;
  
      // init audio
  
@@ -26,9 +30,20 @@
  
      bool is_running = true;
  
-@@ -232,6 +232,33 @@
+@@ -224,14 +224,93 @@
+     wav_writer wavWriter;
++    std::string capture_filename;
+     // save wav file
+     if (params.save_audio) {
+         // Get current date/time for filename
+         time_t now = time(0);
+         char buffer[80];
+         strftime(buffer, sizeof(buffer), "%Y%m%d%H%M%S", localtime(&now));
+-        std::string filename = std::string(buffer) + ".wav";
++        capture_filename = std::string(buffer) + ".wav";
  
-         wavWriter.open(filename, WHISPER_SAMPLE_RATE, 16, 1);
+-        wavWriter.open(filename, WHISPER_SAMPLE_RATE, 16, 1);
++        wavWriter.open(capture_filename, WHISPER_SAMPLE_RATE, 16, 1);
      }
 +
 +    // Build the backend graph before capture starts. In particular, the first
@@ -44,6 +59,8 @@
 +        warmup.print_progress   = false;
 +        warmup.print_realtime   = false;
 +        warmup.print_timestamps = false;
++        warmup.max_tokens       = params.max_tokens;
++        warmup.temperature_inc  = 0.0f;
 +        const size_t warmup_samples = std::max<size_t>(
 +            WHISPER_SAMPLE_RATE,
 +            static_cast<size_t>(params.length_ms)*WHISPER_SAMPLE_RATE/1000);
@@ -54,13 +71,62 @@
 +            return 6;
 +        }
 +        whisper_reset_timings(ctx);
++
++        // Silence can bypass expensive decoder paths and is not a valid
++        // realtime capability probe. Run a deterministic speech-like signal
++        // after graph warmup, before opening the microphone, and require both
++        // throughput (inference <= step) and end-to-end preview latency
++        // (step + inference <= 2 seconds).
++        std::vector<float> probe_pcm(warmup_samples);
++        for (size_t i = 0; i < probe_pcm.size(); ++i) {
++            const float carrier = (i / 80U) % 2U == 0U ? 0.08f : -0.08f;
++            const float envelope = 0.35f + 0.65f * float((i / 320U) % 8U) / 7.0f;
++            probe_pcm[i] = carrier * envelope;
++        }
++        warmup.suppress_blank  = false;
++        warmup.no_speech_thold = 1.0f;
++        const bool test_replay = std::getenv("SBOBINO_WHISPER_REPLAY_WAV") != nullptr;
++        const bool skip_probe = test_replay &&
++            std::getenv("SBOBINO_WHISPER_SKIP_LIVE_PREFLIGHT") != nullptr;
++        const auto probe_started = std::chrono::steady_clock::now();
++        if (whisper_full(ctx, warmup, probe_pcm.data(), probe_pcm.size()) != 0) {
++            fprintf(stderr, "%s: failed to benchmark the live transcription backend\n", argv[0]);
++            whisper_free(ctx);
++            return 6;
++        }
++        if (test_replay) {
++            const char * forced_delay = std::getenv("SBOBINO_WHISPER_TEST_PREFLIGHT_DELAY_MS");
++            if (forced_delay != nullptr) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, std::atoi(forced_delay))));
++            }
++        }
++        const double probe_ms = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - probe_started).count();
++        const double latency_budget_ms = params.step_ms < 2000
++            ? 2000.0 - params.step_ms
++            : 0.0;
++        const double budget_ms = std::min<double>(params.step_ms, latency_budget_ms);
++        const bool probe_passed = skip_probe || (budget_ms > 0.0 && probe_ms <= budget_ms);
++        fprintf(stderr,
++                "SBOBINO_WHISPER_LIVE_PREFLIGHT status=%s inference_ms=%.3f budget_ms=%.3f step_ms=%d\n",
++                probe_passed ? "passed" : "rejected", probe_ms, budget_ms, params.step_ms);
++        fflush(stderr);
++        if (!probe_passed) {
++            if (params.save_audio) {
++                wavWriter.close();
++                std::remove(capture_filename.c_str());
++            }
++            whisper_free(ctx);
++            return 8;
++        }
++        whisper_reset_timings(ctx);
 +    }
 +
 +    audio.resume();
      printf("[Start speaking]\n");
      fflush(stdout);
  
-@@ -258,8 +259,26 @@
+@@ -258,8 +337,26 @@
                      is_running = sdl_poll_events();
                  }
                  if (!is_running) {
@@ -87,7 +153,7 @@
                  audio.get(params.step_ms, pcmf32_new);
  
                  if (audio.eof() && pcmf32_new.empty()) {
-@@ -269,15 +288,6 @@
+@@ -269,15 +366,6 @@
  
                  if (params.save_audio && !pcmf32_new.empty()) {
                      wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
@@ -103,7 +169,7 @@
                  }
  
                  if ((int) pcmf32_new.size() >= n_samples_step || audio.eof()) {
-@@ -326,6 +336,8 @@
+@@ -326,6 +414,8 @@
              t_last = t_now;
          }
  
@@ -112,7 +178,7 @@
          // run the inference
          {
              whisper_full_params wparams = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
-@@ -440,8 +452,33 @@
+@@ -440,8 +530,33 @@
              }
              fflush(stdout);
          }
@@ -146,7 +212,7 @@
      if (replay_mode) {
          fprintf(stderr,
                  "SBOBINO_WHISPER_LIVE_METRICS captured_seconds=%.3f processed_seconds=%.3f backlog_seconds=%.3f dropped_samples=%zu\n",
-@@ -456,5 +493,5 @@
+@@ -456,5 +571,5 @@
      whisper_print_timings(ctx);
      whisper_free(ctx);
  

@@ -426,6 +426,20 @@ impl WhisperStreamEngine {
         })
     }
 
+    fn preflight_rejection_message(text: &str) -> Option<String> {
+        if !text.starts_with("SBOBINO_WHISPER_LIVE_PREFLIGHT ")
+            || !text
+                .split_whitespace()
+                .any(|field| field == "status=rejected")
+        {
+            return None;
+        }
+        Some(
+            "This computer cannot keep Whisper live in real time with the selected device. Use Auto/GPU, or record and transcribe the audio as a file."
+                .to_string(),
+        )
+    }
+
     fn is_fatal_startup_diagnostic(text: &str) -> bool {
         let lower = text.to_ascii_lowercase();
         lower.contains("audio.init() failed")
@@ -433,6 +447,7 @@ impl WhisperStreamEngine {
             || lower.contains("couldn't open an audio device")
             || lower.contains("cannot open audio device")
             || lower.contains("failed to warm up the live transcription backend")
+            || lower.contains("failed to benchmark the live transcription backend")
     }
 
     fn commit_line(state: &mut StreamState, cleaned: String) -> Option<RealtimeDeltaKind> {
@@ -515,6 +530,20 @@ impl WhisperStreamEngine {
                     let mut metric = metric;
                     metric.first_preview_ms = state.first_preview_ms;
                     Self::emit_telemetry(telemetry_sink.as_ref(), metric);
+                    return;
+                }
+
+                if cleaned.starts_with("SBOBINO_WHISPER_LIVE_PREFLIGHT ") {
+                    let rejection = Self::preflight_rejection_message(&cleaned);
+                    let mut state = shared_state.lock().await;
+                    state.diagnostics.push(cleaned);
+                    if let Some(message) = rejection {
+                        state.terminal_error = Some(message.clone());
+                        state.running = false;
+                        state.paused = false;
+                        drop(state);
+                        Self::complete_startup(&shared_state, &startup_signal, Err(message)).await;
+                    }
                     return;
                 }
 
@@ -1131,6 +1160,20 @@ mod tests {
         assert_eq!(metric.processed_seconds, 4.32);
         assert_eq!(metric.backlog_seconds, 0.32);
         assert_eq!(metric.inference_ms, Some(188.5));
+    }
+
+    #[test]
+    fn rejected_live_preflight_returns_an_actionable_error() {
+        let message = WhisperStreamEngine::preflight_rejection_message(
+            "SBOBINO_WHISPER_LIVE_PREFLIGHT status=rejected inference_ms=1600.000 budget_ms=720.000 step_ms=1280",
+        )
+        .expect("rejected preflight should be actionable");
+        assert!(message.contains("Auto/GPU"));
+        assert!(message.contains("transcribe the audio as a file"));
+        assert!(WhisperStreamEngine::preflight_rejection_message(
+            "SBOBINO_WHISPER_LIVE_PREFLIGHT status=passed inference_ms=400.000 budget_ms=720.000 step_ms=1280",
+        )
+        .is_none());
     }
 
     #[test]

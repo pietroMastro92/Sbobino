@@ -115,7 +115,8 @@ python3 "$ROOT_DIR/scripts/generate_release_candidate_metadata.py" \
   "$OUTPUT_DIR" \
   "$VERSION" \
   --release-profile public \
-  --commit-sha "$(git -C "$ROOT_DIR/.." rev-parse HEAD)"
+  --commit-sha "$(git -C "$ROOT_DIR/.." rev-parse HEAD)" \
+  --repo-slug "$REPO_SLUG"
 
 python3 "$ROOT_DIR/scripts/generate_codex_style_release_notes.py" \
   "$VERSION" \
