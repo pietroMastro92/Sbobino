@@ -83,7 +83,7 @@ const PARAKEET_MODEL_CATALOG: [(&str, &str); 2] = [
 ];
 const REQUIRED_COREML_ENCODERS: [(&str, &str); 6] = [
     ("ggml-tiny.bin", "ggml-tiny-encoder.mlmodelc"),
-    ("ggml-tiny-q5_1.bin", "ggml-tiny-encoder.mlmodelc"),
+    ("ggml-tiny-q8_0.bin", "ggml-tiny-encoder.mlmodelc"),
     ("ggml-base.bin", "ggml-base-encoder.mlmodelc"),
     ("ggml-small.bin", "ggml-small-encoder.mlmodelc"),
     ("ggml-medium.bin", "ggml-medium-encoder.mlmodelc"),
@@ -3205,7 +3205,7 @@ fn binary_name_variants(base_name: &str) -> Vec<String> {
 
 fn required_initial_setup_models() -> [&'static str; 3] {
     [
-        "ggml-tiny-q5_1.bin",
+        "ggml-tiny-q8_0.bin",
         "ggml-base.bin",
         "ggml-large-v3-turbo-q8_0.bin",
     ]
@@ -4323,7 +4323,7 @@ mod tests {
                 .live_start_health(selected_file_model)
                 .expect("live health should load");
 
-            assert_eq!(health.model_filename, "ggml-tiny-q5_1.bin");
+            assert_eq!(health.model_filename, "ggml-tiny-q8_0.bin");
             assert!(!health.model_present);
         }
     }
@@ -4656,7 +4656,7 @@ mod tests {
 
         let models_dir = std::path::PathBuf::from(factory.resolve_models_dir(""));
         std::fs::create_dir_all(&models_dir).expect("models dir should exist");
-        std::fs::write(models_dir.join("ggml-tiny-q5_1.bin"), b"tiny-live")
+        std::fs::write(models_dir.join("ggml-tiny-q8_0.bin"), b"tiny-live")
             .expect("tiny live model should write");
         std::fs::write(models_dir.join("ggml-base.bin"), b"base").expect("base model should write");
         std::fs::write(
@@ -5568,7 +5568,7 @@ mod tests {
         );
         let models_dir = std::path::PathBuf::from(factory.resolve_models_dir(""));
         std::fs::create_dir_all(&models_dir).expect("models dir should exist");
-        std::fs::write(models_dir.join("ggml-tiny-q5_1.bin"), b"tiny-live")
+        std::fs::write(models_dir.join("ggml-tiny-q8_0.bin"), b"tiny-live")
             .expect("tiny live model should write");
         std::fs::write(models_dir.join("ggml-base.bin"), b"base").expect("base model should write");
         std::fs::write(

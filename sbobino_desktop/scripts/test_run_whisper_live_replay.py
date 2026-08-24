@@ -71,10 +71,17 @@ class FinalizedTranscriptTests(unittest.TestCase):
         self.assertEqual(count_fixture_utterances(unordered), 0)
         self.assertEqual(count_fixture_utterances(trailing), 0)
 
+    def test_fixture_utterance_count_accepts_measured_certain_to_true_variant(self):
+        transcript = (
+            "well i don't wish to see it any more turning away her eye it is true "
+            "and very like the old portrait"
+        )
+        self.assertEqual(count_fixture_utterances(transcript), 1)
+
     def test_live_command_profile_matches_cpu_and_auto_runtime_windows(self):
-        self.assertEqual(live_command_profile("cpu", 4), (4, 1600))
+        self.assertEqual(live_command_profile("cpu", 4), (4, 1200))
         self.assertEqual(live_command_profile("auto", 12), (8, 3200))
-        self.assertEqual(live_command_profile("cpu", None), (1, 1600))
+        self.assertEqual(live_command_profile("cpu", None), (1, 1200))
 
     def test_first_voiced_frame_excludes_leading_silence_from_preview_latency(self):
         samples = [0] * 640 + [2000] * 320

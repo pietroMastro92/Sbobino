@@ -35,7 +35,7 @@ use sbobino_infrastructure::{
 
 const REQUIRED_MODELS: [&str; 6] = [
     "ggml-tiny.bin",
-    "ggml-tiny-q5_1.bin",
+    "ggml-tiny-q8_0.bin",
     "ggml-base.bin",
     "ggml-small.bin",
     "ggml-medium.bin",

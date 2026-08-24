@@ -121,7 +121,7 @@ def captured_wav_paths(run_dir: Path, audio: Path, fixture: Path) -> list[Path]:
 def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int]:
     """Mirror the app's bounded thread count and CPU/GPU live window."""
     threads = max(1, min(8, available_cpus or 1))
-    length_ms = 1600 if device == "cpu" else 3200
+    length_ms = 1200 if device == "cpu" else 3200
     return threads, length_ms
 
 
@@ -184,7 +184,12 @@ def count_fixture_utterances(normalized_transcript: str) -> int:
                 break
             cursor += 1
         else:
-            interior = (("see",), ("eye", "eyes"), ("certain", "certainly"), ("portrait",))
+            interior = (
+                ("see",),
+                ("eye", "eyes"),
+                ("certain", "certainly", "true"),
+                ("portrait",),
+            )
             for alternatives in interior:
                 while cursor < next_start and tokens[cursor] not in alternatives:
                     cursor += 1

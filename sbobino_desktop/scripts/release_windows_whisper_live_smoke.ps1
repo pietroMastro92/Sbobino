@@ -43,7 +43,7 @@ try {
     $manifest = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
     if ($manifest.schema_version -ne 1 -or
         $manifest.model -ne "tiny" -or
-        $manifest.filename -ne "ggml-tiny-q5_1.bin" -or
+        $manifest.filename -ne "ggml-tiny-q8_0.bin" -or
         $manifest.url -match "/resolve/main/" -or
         $manifest.sha256 -notmatch "^[0-9a-fA-F]{64}$") {
         throw "Whisper live model manifest must pin the certified Tiny model with an immutable URL and SHA-256"
