@@ -85,8 +85,8 @@ impl WhisperLiveProfile {
         let large_model = lower.contains("large") || lower.contains("medium");
         match device {
             TranscriptionComputeDevice::Cpu => Self {
-                step_ms: 320,
-                length_ms: if large_model { 2_400 } else { 1_200 },
+                step_ms: 1_280,
+                length_ms: if large_model { 4_800 } else { 3_200 },
             },
             TranscriptionComputeDevice::Gpu | TranscriptionComputeDevice::Auto => Self {
                 step_ms: 320,
@@ -1086,15 +1086,16 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_live_profile_keeps_preview_step_at_320ms_and_scales_window() {
+    fn adaptive_live_profile_scales_cpu_step_without_reducing_context() {
         let cpu = WhisperLiveProfile::for_model("ggml-base.bin", TranscriptionComputeDevice::Cpu);
         let gpu = WhisperLiveProfile::for_model("ggml-base.bin", TranscriptionComputeDevice::Gpu);
         let large =
             WhisperLiveProfile::for_model("ggml-large-v3.bin", TranscriptionComputeDevice::Auto);
-        assert_eq!(cpu.step_ms, 320);
-        assert_eq!(cpu.length_ms, 1_200);
+        assert_eq!(cpu.step_ms, 1_280);
+        assert_eq!(cpu.length_ms, 3_200);
         assert_eq!(gpu.step_ms, 320);
-        assert!(cpu.length_ms < gpu.length_ms);
+        assert_eq!(cpu.length_ms, gpu.length_ms);
+        assert!(cpu.step_ms > gpu.step_ms);
         assert!(large.length_ms > gpu.length_ms);
     }
 

@@ -118,11 +118,15 @@ def captured_wav_paths(run_dir: Path, audio: Path, fixture: Path) -> list[Path]:
     return sorted(path for path in run_dir.glob("*.wav") if path.resolve() not in excluded)
 
 
-def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int]:
+def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int, int]:
     """Mirror the app's bounded thread count and CPU/GPU live window."""
     threads = max(1, min(8, available_cpus or 1))
-    length_ms = 1200 if device == "cpu" else 3200
-    return threads, length_ms
+    step_ms = 1280 if device == "cpu" else 320
+    return threads, step_ms, 3200
+
+
+def preview_latency_seconds(step_ms: int, inference_ms: float) -> float:
+    return (step_ms + inference_ms) / 1000.0
 
 
 def first_voiced_frame(samples: list[int], sample_rate: int, threshold: float = 0.01) -> int:
@@ -231,9 +235,9 @@ def main() -> int:
         fixture_duration = handle.getnframes() / handle.getframerate()
     speech_onset = speech_onset_seconds(args.audio)
 
-    threads, length_ms = live_command_profile(args.device, os.cpu_count())
+    threads, step_ms, length_ms = live_command_profile(args.device, os.cpu_count())
     command = [
-        str(args.binary), "-m", str(args.model), "-t", str(threads), "--step", "320",
+        str(args.binary), "-m", str(args.model), "-t", str(threads), "--step", str(step_ms),
         "--length", str(length_ms), "--no-fallback", "--save-audio", "-l", "auto",
     ]
     if args.device == "cpu":
@@ -315,7 +319,9 @@ def main() -> int:
             "processed_seconds": float(match.group("processed")),
             "backlog_seconds": float(match.group("backlog")),
             "inference_ms": float(match.group("inference")),
-            "preview_latency_seconds": 0.320 + float(match.group("inference")) / 1000.0,
+            "preview_latency_seconds": preview_latency_seconds(
+                step_ms, float(match.group("inference"))
+            ),
             "dropped_samples": int(match.group("dropped")),
         }
         for match in metric_pattern.finditer(stderr)
