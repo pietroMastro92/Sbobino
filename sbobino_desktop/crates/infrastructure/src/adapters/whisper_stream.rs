@@ -748,6 +748,7 @@ impl WhisperStreamEngine {
             .arg(profile.step_ms.to_string())
             .arg("--length")
             .arg(profile.length_ms.to_string())
+            .arg("--no-fallback")
             .arg("--save-audio")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

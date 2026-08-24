@@ -234,7 +234,7 @@ def main() -> int:
     threads, length_ms = live_command_profile(args.device, os.cpu_count())
     command = [
         str(args.binary), "-m", str(args.model), "-t", str(threads), "--step", "320",
-        "--length", str(length_ms), "--save-audio", "-l", "auto",
+        "--length", str(length_ms), "--no-fallback", "--save-audio", "-l", "auto",
     ]
     if args.device == "cpu":
         command.extend(["-ng", "-nfa"])
