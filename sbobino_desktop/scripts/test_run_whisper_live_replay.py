@@ -105,12 +105,12 @@ class FinalizedTranscriptTests(unittest.TestCase):
 
     def test_live_command_profile_matches_cpu_and_auto_runtime_windows(self):
         self.assertEqual(live_command_profile("cpu", 4), (4, 1280, 3200))
-        self.assertEqual(live_command_profile("auto", 12), (8, 320, 3200))
+        self.assertEqual(live_command_profile("auto", 12), (8, 1000, 3200))
         self.assertEqual(live_command_profile("cpu", None), (1, 1280, 3200))
 
     def test_preview_latency_uses_the_selected_profile_step(self):
         self.assertAlmostEqual(preview_latency_seconds(1280, 374.0), 1.654)
-        self.assertAlmostEqual(preview_latency_seconds(320, 374.0), 0.694)
+        self.assertAlmostEqual(preview_latency_seconds(1000, 374.0), 1.374)
 
     def test_first_voiced_frame_excludes_leading_silence_from_preview_latency(self):
         samples = [0] * 640 + [2000] * 320

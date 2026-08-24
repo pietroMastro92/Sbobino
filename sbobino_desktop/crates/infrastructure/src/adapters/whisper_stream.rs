@@ -78,8 +78,9 @@ struct WhisperLiveProfile {
 
 impl WhisperLiveProfile {
     /// Keep the live window short enough for a responsive preview while
-    /// allowing larger models to amortize decoder setup. CPU is deliberately
-    /// more aggressive because it cannot sustain the long default window.
+    /// allowing larger models to amortize decoder setup. A one-second
+    /// accelerated cadence maximizes the preflight throughput/latency budget
+    /// while keeping step + inference within the two-second preview contract.
     fn for_model(model_filename: &str, device: TranscriptionComputeDevice) -> Self {
         let lower = model_filename.to_ascii_lowercase();
         let large_model = lower.contains("large") || lower.contains("medium");
@@ -89,7 +90,7 @@ impl WhisperLiveProfile {
                 length_ms: if large_model { 4_800 } else { 3_200 },
             },
             TranscriptionComputeDevice::Gpu | TranscriptionComputeDevice::Auto => Self {
-                step_ms: 320,
+                step_ms: 1_000,
                 length_ms: if large_model { 4_800 } else { 3_200 },
             },
         }
@@ -1122,7 +1123,7 @@ mod tests {
             WhisperLiveProfile::for_model("ggml-large-v3.bin", TranscriptionComputeDevice::Auto);
         assert_eq!(cpu.step_ms, 1_280);
         assert_eq!(cpu.length_ms, 3_200);
-        assert_eq!(gpu.step_ms, 320);
+        assert_eq!(gpu.step_ms, 1_000);
         assert_eq!(cpu.length_ms, gpu.length_ms);
         assert!(cpu.step_ms > gpu.step_ms);
         assert!(large.length_ms > gpu.length_ms);
