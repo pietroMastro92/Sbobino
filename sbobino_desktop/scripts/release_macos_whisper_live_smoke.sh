@@ -70,11 +70,13 @@ FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"
 
 # A --help probe alone is not release evidence: require the hooks compiled
 # into the exact runtime binary that is about to be exercised.
-strings "$WHISPER_BIN" | grep -Fq "SBOBINO_WHISPER_REPLAY_WAV" || {
+WHISPER_STRINGS="$RUN_DIR/whisper-stream.strings"
+strings "$WHISPER_BIN" > "$WHISPER_STRINGS"
+grep -Fq "SBOBINO_WHISPER_REPLAY_WAV" "$WHISPER_STRINGS" || {
   echo "Packaged whisper-stream has no deterministic WAV replay hook." >&2
   exit 1
 }
-strings "$WHISPER_BIN" | grep -Fq "SBOBINO_WHISPER_LIVE_METRIC" || {
+grep -Fq "SBOBINO_WHISPER_LIVE_METRIC" "$WHISPER_STRINGS" || {
   echo "Packaged whisper-stream has no live telemetry hook." >&2
   exit 1
 }

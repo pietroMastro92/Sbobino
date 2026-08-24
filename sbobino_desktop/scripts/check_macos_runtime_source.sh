@@ -35,6 +35,21 @@ for required in \
   fi
 done
 
+live_smoke="$script_dir/release_macos_whisper_live_smoke.sh"
+if grep -Eq 'strings[[:space:]]+"?\$WHISPER_BIN"?[[:space:]]*\|[[:space:]]*grep' "$live_smoke"; then
+  printf 'macOS Whisper live smoke must not combine strings and early-exit grep under pipefail\n' >&2
+  exit 1
+fi
+for required in \
+  'strings "$WHISPER_BIN" > "$WHISPER_STRINGS"' \
+  'grep -Fq "SBOBINO_WHISPER_REPLAY_WAV" "$WHISPER_STRINGS"' \
+  'grep -Fq "SBOBINO_WHISPER_LIVE_METRIC" "$WHISPER_STRINGS"'; do
+  if ! grep -Fq -- "$required" "$live_smoke"; then
+    printf 'macOS Whisper live smoke is missing pipefail-safe binary hook validation: %s\n' "$required" >&2
+    exit 1
+  fi
+done
+
 if ! grep -Fq -- 'assert_binary_portable "$TARGET_BIN/parakeet-batch-json"' "$source_file"; then
   printf 'standalone worker must remain covered by assert_binary_portable\n' >&2
   exit 1

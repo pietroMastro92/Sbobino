@@ -213,6 +213,50 @@ function Checkout-WhisperSource {
     }
 }
 
+function Find-X64SdlFile {
+    param([string]$Root, [string]$Name)
+
+    $escapedName = [regex]::Escape($Name)
+    $matches = @(
+        Get-ChildItem -Path $Root -Recurse -File -Filter $Name |
+            Where-Object { $_.FullName -match "[\\/]lib[\\/]x64[\\/]${escapedName}$" }
+    )
+    if ($matches.Count -ne 1) {
+        throw "expected exactly one x64 '$Name' below '$Root', found $($matches.Count)"
+    }
+    return $matches[0].FullName
+}
+
+function ConvertTo-CMakePathLiteral {
+    param([string]$Path)
+
+    return $Path.Replace("\", "/").Replace(";", "\;").Replace('"', '\"')
+}
+
+function New-SdlCMakePackage {
+    param([string]$SdlRoot)
+
+    # SDL's official Visual C++ development archive intentionally contains
+    # headers and import libraries, but no SDL2Config.cmake. Supply the small
+    # variable-based package contract consumed by this pinned whisper.cpp.
+    $sdlHeader = Find-OneFile $SdlRoot "SDL.h"
+    $sdlIncludeDir = Split-Path -Parent $sdlHeader
+    $sdlLibrary = Find-X64SdlFile $SdlRoot "SDL2.lib"
+    $configDir = Join-Path $SdlRoot "cmake\SDL2"
+    $configPath = Join-Path $configDir "SDL2Config.cmake"
+    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
+    $includeLiteral = ConvertTo-CMakePathLiteral $sdlIncludeDir
+    $libraryLiteral = ConvertTo-CMakePathLiteral $sdlLibrary
+    $config = @"
+set(SDL2_FOUND TRUE)
+set(SDL2_INCLUDE_DIRS "$includeLiteral")
+set(SDL2_LIBRARIES "$libraryLiteral")
+"@
+    [System.IO.File]::WriteAllText($configPath, $config, [System.Text.UTF8Encoding]::new($false))
+    return $configDir
+}
+
 function Build-WhisperBinaries {
     param(
         [string]$SourceDir,
@@ -226,8 +270,7 @@ function Build-WhisperBinaries {
     $generator = Quote-CmdArg $generatorName
     $sourceArg = Quote-CmdArg $SourceDir
     $buildArg = Quote-CmdArg $BuildDir
-    $sdlCmake = Find-OneFile $SdlRoot "SDL2Config.cmake"
-    $sdlCmakeDir = Split-Path -Parent $sdlCmake
+    $sdlCmakeDir = New-SdlCMakePackage $SdlRoot
     Invoke-VsCommand ("cmake.exe -S {0} -B {1} -G {2} -A x64 -DCMAKE_BUILD_TYPE=Release -DSDL2_DIR={3} -DBUILD_SHARED_LIBS=ON -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=ON -DGGML_NATIVE=OFF" -f `
         $sourceArg, $buildArg, $generator, (Quote-CmdArg $sdlCmakeDir))
     Invoke-VsCommand ("cmake.exe --build {0} --config Release --target whisper-cli whisper-stream" -f $buildArg)

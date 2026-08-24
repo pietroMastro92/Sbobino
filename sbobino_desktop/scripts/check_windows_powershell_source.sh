@@ -91,6 +91,10 @@ if [[ -n "$package_script" ]]; then
   for required in \
     'function Checkout-WhisperSource' \
     'function Build-WhisperBinaries' \
+    'function Find-X64SdlFile' \
+    'function New-SdlCMakePackage' \
+    'set(SDL2_INCLUDE_DIRS' \
+    'set(SDL2_LIBRARIES' \
     'whisper-stream-audio-file.patch' \
     'whisper-stream-fifo.patch' \
     'whisper-stream-backlog.patch' \
@@ -102,6 +106,10 @@ if [[ -n "$package_script" ]]; then
       exit 1
     fi
   done
+  if grep -Fq -- 'Find-OneFile $SdlRoot "SDL2Config.cmake"' "$package_script"; then
+    printf 'Windows Whisper packaging must not require SDL2Config.cmake from the official VC archive\n' >&2
+    exit 1
+  fi
   if ! grep -Fq -- 'SBOBINO_WHISPER_REPLAY_WAV' \
       "$repo_root/sbobino_desktop/scripts/patches/whisper-stream-audio-file.patch"; then
     printf 'Windows Whisper replay patch is missing its deterministic input hook\n' >&2
