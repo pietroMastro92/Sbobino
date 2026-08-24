@@ -86,7 +86,7 @@ impl WhisperLiveProfile {
         match device {
             TranscriptionComputeDevice::Cpu => Self {
                 step_ms: 320,
-                length_ms: if large_model { 2_400 } else { 1_920 },
+                length_ms: if large_model { 2_400 } else { 1_600 },
             },
             TranscriptionComputeDevice::Gpu | TranscriptionComputeDevice::Auto => Self {
                 step_ms: 320,
@@ -1091,6 +1091,7 @@ mod tests {
         let large =
             WhisperLiveProfile::for_model("ggml-large-v3.bin", TranscriptionComputeDevice::Auto);
         assert_eq!(cpu.step_ms, 320);
+        assert_eq!(cpu.length_ms, 1_600);
         assert_eq!(gpu.step_ms, 320);
         assert!(cpu.length_ms < gpu.length_ms);
         assert!(large.length_ms > gpu.length_ms);

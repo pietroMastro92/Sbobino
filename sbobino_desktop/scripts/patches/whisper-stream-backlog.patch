@@ -26,7 +26,7 @@
  
      bool is_running = true;
  
-@@ -232,6 +232,30 @@
+@@ -232,6 +232,33 @@
  
          wavWriter.open(filename, WHISPER_SAMPLE_RATE, 16, 1);
      }
@@ -44,7 +44,10 @@
 +        warmup.print_progress   = false;
 +        warmup.print_realtime   = false;
 +        warmup.print_timestamps = false;
-+        const std::vector<float> warmup_pcm(WHISPER_SAMPLE_RATE, 0.0f);
++        const size_t warmup_samples = std::max<size_t>(
++            WHISPER_SAMPLE_RATE,
++            static_cast<size_t>(params.length_ms)*WHISPER_SAMPLE_RATE/1000);
++        const std::vector<float> warmup_pcm(warmup_samples, 0.0f);
 +        if (whisper_full(ctx, warmup, warmup_pcm.data(), warmup_pcm.size()) != 0) {
 +            fprintf(stderr, "%s: failed to warm up the live transcription backend\n", argv[0]);
 +            whisper_free(ctx);

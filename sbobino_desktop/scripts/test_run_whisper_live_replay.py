@@ -22,9 +22,9 @@ from run_whisper_live_replay import (
 
 class FinalizedTranscriptTests(unittest.TestCase):
     def test_live_command_profile_matches_cpu_and_auto_runtime_windows(self):
-        self.assertEqual(live_command_profile("cpu", 4), (4, 1920))
+        self.assertEqual(live_command_profile("cpu", 4), (4, 1600))
         self.assertEqual(live_command_profile("auto", 12), (8, 3200))
-        self.assertEqual(live_command_profile("cpu", None), (1, 1920))
+        self.assertEqual(live_command_profile("cpu", None), (1, 1600))
 
     def test_first_voiced_frame_excludes_leading_silence_from_preview_latency(self):
         samples = [0] * 640 + [2000] * 320
