@@ -92,9 +92,10 @@ if [[ -n "$package_script" ]]; then
     'function Checkout-WhisperSource' \
     'function Build-WhisperBinaries' \
     'function Find-X64SdlFile' \
-    'function New-SdlCMakePackage' \
-    'set(SDL2_INCLUDE_DIRS' \
-    'set(SDL2_LIBRARIES' \
+    'function Find-SdlCMakePackage' \
+    'Find-OneFile $SdlRoot "sdl2-config.cmake"' \
+    'Find-X64SdlFile $SdlRoot "SDL2main.lib"' \
+    'Find-X64SdlFile $SdlRoot "SDL2.lib"' \
     'whisper-stream-audio-file.patch' \
     'whisper-stream-fifo.patch' \
     'whisper-stream-backlog.patch' \
@@ -107,7 +108,7 @@ if [[ -n "$package_script" ]]; then
     fi
   done
   if grep -Fq -- 'Find-OneFile $SdlRoot "SDL2Config.cmake"' "$package_script"; then
-    printf 'Windows Whisper packaging must not require SDL2Config.cmake from the official VC archive\n' >&2
+    printf 'Windows Whisper packaging must use the official hyphenated sdl2-config.cmake package\n' >&2
     exit 1
   fi
   if ! grep -Fq -- 'SBOBINO_WHISPER_REPLAY_WAV' \
