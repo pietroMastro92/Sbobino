@@ -104,9 +104,9 @@ class FinalizedTranscriptTests(unittest.TestCase):
         self.assertEqual(count_fixture_utterances(transcript), 1)
 
     def test_live_command_profile_matches_cpu_and_auto_runtime_windows(self):
-        self.assertEqual(live_command_profile("cpu", 4), (4, 1280, 3200))
-        self.assertEqual(live_command_profile("auto", 12), (8, 1000, 3200))
-        self.assertEqual(live_command_profile("cpu", None), (1, 1280, 3200))
+        self.assertEqual(live_command_profile("cpu", 4), (4, 1280, 2000))
+        self.assertEqual(live_command_profile("auto", 12), (8, 1000, 2000))
+        self.assertEqual(live_command_profile("cpu", None), (1, 1280, 2000))
 
     def test_preview_latency_uses_the_selected_profile_step(self):
         self.assertAlmostEqual(preview_latency_seconds(1280, 374.0), 1.654)

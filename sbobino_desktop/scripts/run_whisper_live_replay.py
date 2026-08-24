@@ -139,7 +139,7 @@ def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, 
     """Mirror the app's bounded thread count and CPU/GPU live window."""
     threads = max(1, min(8, available_cpus or 1))
     step_ms = 1280 if device == "cpu" else 1000
-    return threads, step_ms, 3200
+    return threads, step_ms, 2000
 
 
 def preview_latency_seconds(step_ms: int, inference_ms: float) -> float:
