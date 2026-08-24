@@ -835,11 +835,12 @@ pub async fn start_realtime(
             } else {
                 engine.reset().await;
             }
-            *state.realtime.model_filename.lock().await = Some(model.ggml_filename().to_string());
+            let live_model_filename = whisper_live_model_manifest().filename;
+            *state.realtime.model_filename.lock().await = Some(live_model_filename.clone());
 
             if let Err(error) = engine
                 .start_with_telemetry(
-                    model.ggml_filename(),
+                    &live_model_filename,
                     language.as_whisper_code(),
                     emit_delta,
                     Some(emit_whisper_telemetry),

@@ -13,6 +13,8 @@ import wave
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from run_whisper_live_replay import (
     backlog_threshold_overshoot,
+    captured_wav_paths,
+    count_fixture_utterances,
     final_runtime_summary,
     finalized_transcript,
     first_voiced_frame,
@@ -21,6 +23,54 @@ from run_whisper_live_replay import (
 
 
 class FinalizedTranscriptTests(unittest.TestCase):
+    def test_captured_wav_discovery_excludes_input_and_fixture_in_the_run_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = pathlib.Path(temporary)
+            audio = run_dir / "live-65s.wav"
+            fixture = run_dir / "speech.wav"
+            captured = run_dir / "captured.wav"
+            for path in (audio, fixture, captured):
+                path.write_bytes(b"wav")
+
+            self.assertEqual(captured_wav_paths(run_dir, audio, fixture), [captured])
+
+    def test_fixture_utterance_count_tolerates_window_repetition_and_line_splits(self):
+        transcript = (
+            "well i don't wish to see it any more turning away her eyes it is certainly like the portrait "
+            "well i don't i don't wish to see it turning away her eyes it is certain like the old portrait "
+            "well well i don't wish to see it any more turning away her eyes it is certainly like the portrait"
+        )
+        self.assertEqual(count_fixture_utterances(transcript), 3)
+
+    def test_fixture_utterance_count_does_not_invent_missing_anchors(self):
+        transcript = (
+            "well perhaps i might wish to see the portrait "
+            "well i don't want to see it well i don't wish to see it"
+        )
+        self.assertEqual(count_fixture_utterances(transcript), 0)
+
+    def test_fixture_utterance_count_rejects_truncated_interior(self):
+        self.assertEqual(count_fixture_utterances("well i don't wish portrait"), 0)
+
+    def test_fixture_utterance_count_does_not_borrow_from_the_next_replay(self):
+        transcript = (
+            "well i don't wish to see it "
+            "well i don't wish to see it turning away her eyes it is certainly like the old portrait"
+        )
+        self.assertEqual(count_fixture_utterances(transcript), 1)
+
+    def test_fixture_utterance_count_requires_ordered_interior_and_closing_anchor(self):
+        unordered = (
+            "well i don't wish portrait filler filler see filler eyes filler certainly "
+            "filler filler filler filler filler filler filler"
+        )
+        trailing = (
+            "well i don't wish to see her eyes it is certainly the portrait then an "
+            "unfinished utterance continues with substantial trailing filler here"
+        )
+        self.assertEqual(count_fixture_utterances(unordered), 0)
+        self.assertEqual(count_fixture_utterances(trailing), 0)
+
     def test_live_command_profile_matches_cpu_and_auto_runtime_windows(self):
         self.assertEqual(live_command_profile("cpu", 4), (4, 1600))
         self.assertEqual(live_command_profile("auto", 12), (8, 3200))
@@ -39,9 +89,21 @@ class FinalizedTranscriptTests(unittest.TestCase):
         )
         self.assertEqual(finalized_transcript(stdout), "old portrait.")
 
-    def test_distinct_final_lines_are_preserved(self):
+    def test_bare_carriage_return_redraws_are_replaceable_previews(self):
+        stdout = "[Start speaking]\nold por\rold portrait\r"
+        self.assertEqual(finalized_transcript(stdout), "old portrait")
+
+    def test_identical_final_lines_are_preserved_for_duplicate_detection(self):
         stdout = "first final\nsecond final\nsecond final\n"
-        self.assertEqual(finalized_transcript(stdout), "first final\nsecond final")
+        self.assertEqual(
+            finalized_transcript(stdout), "first final\nsecond final\nsecond final"
+        )
+
+    def test_ansi_prefixed_newline_finals_are_preserved_for_duplicate_detection(self):
+        stdout = "\x1b[2K repeated utterance\n\x1b[2K repeated utterance\n"
+        self.assertEqual(
+            finalized_transcript(stdout), "repeated utterance\nrepeated utterance"
+        )
 
     def test_final_runtime_summary_uses_authoritative_dropped_counter(self):
         stderr = (

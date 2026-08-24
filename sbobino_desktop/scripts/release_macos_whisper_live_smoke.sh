@@ -96,7 +96,7 @@ import sys
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 if manifest.get("schema_version") != 1:
     raise SystemExit("unsupported Whisper live model manifest schema")
-if manifest.get("model") != "tiny" or manifest.get("filename") != "ggml-tiny.bin":
+if manifest.get("model") != "tiny" or manifest.get("filename") != "ggml-tiny-q5_1.bin":
     raise SystemExit("Whisper live smoke requires the certified Tiny model manifest")
 url = str(manifest.get("url") or "")
 digest = str(manifest.get("sha256") or "").lower()

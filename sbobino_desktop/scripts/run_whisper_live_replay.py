@@ -59,8 +59,12 @@ def rss_mib(pid: int) -> float | None:
 def finalized_transcript(stdout: str) -> str:
     final_lines: list[str] = []
     preview = ""
-    for raw_record in re.split(r"[\r\n]", stdout):
-        is_preview = "[2K]" in raw_record or "\x1b[2K" in raw_record
+    records = re.split(r"(\r\n|\r|\n)", stdout)
+    for index in range(0, len(records), 2):
+        raw_record = records[index]
+        separator = records[index + 1] if index + 1 < len(records) else ""
+        has_redraw_marker = "[2K]" in raw_record or "\x1b[2K" in raw_record
+        is_preview = separator == "\r" or (not separator and has_redraw_marker)
         cleaned = (
             raw_record.replace("\x1b[2K", "")
             .replace("\x1b[0m", "")
@@ -73,8 +77,11 @@ def finalized_transcript(stdout: str) -> str:
         if is_preview:
             preview = cleaned
             continue
-        if not final_lines or final_lines[-1] != cleaned:
-            final_lines.append(cleaned)
+        # A newline is a finalized decoder record. Identical adjacent final
+        # records may be two genuinely repeated utterances and must remain
+        # visible to the loss/duplication gate. Only carriage-return previews
+        # are replaceable UI redraws.
+        final_lines.append(cleaned)
         preview = ""
     if preview and (not final_lines or final_lines[-1] != preview):
         final_lines.append(preview)
@@ -106,6 +113,11 @@ def backlog_threshold_overshoot(stderr: str, sample_rate: int) -> float | None:
     return max(0.0, queued_seconds - 2.0)
 
 
+def captured_wav_paths(run_dir: Path, audio: Path, fixture: Path) -> list[Path]:
+    excluded = {audio.resolve(), fixture.resolve()}
+    return sorted(path for path in run_dir.glob("*.wav") if path.resolve() not in excluded)
+
+
 def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int]:
     """Mirror the app's bounded thread count and CPU/GPU live window."""
     threads = max(1, min(8, available_cpus or 1))
@@ -135,6 +147,62 @@ def speech_onset_seconds(path: Path) -> float:
         pcm = array.array("h")
         pcm.frombytes(handle.readframes(handle.getnframes()))
     return first_voiced_frame(pcm.tolist(), sample_rate) / sample_rate
+
+
+def count_fixture_utterances(normalized_transcript: str) -> int:
+    """Count replayed utterances without treating harmless ASR wording as audio loss.
+
+    The pinned fixture starts with "Well, I don't wish" and ends with "portrait".
+    Whisper may repeat a short token across adjacent stream windows or vary words in
+    between, so require both ordered boundary anchors without requiring an exact
+    transcript. A truncated final fixture repetition is intentionally not complete.
+    """
+    tokens = normalized_transcript.split()
+    anchor_tail = ("i", "don't", "wish")
+    count = 0
+    start = 0
+    while start < len(tokens):
+        if tokens[start] != "well":
+            start += 1
+            continue
+        next_start = start + 1
+        while next_start < len(tokens) and tokens[next_start] != "well":
+            next_start += 1
+        utterance = tokens[start:next_start]
+        # A complete fixture utterance contains substantially more than its
+        # opening/closing anchors. Keep the boundary local so a truncated
+        # utterance cannot borrow evidence from the following replay.
+        if len(utterance) < 18:
+            start = next_start
+            continue
+        cursor = start + 1
+        window_end = min(next_start, start + 9)
+        for expected in anchor_tail:
+            while cursor < window_end and tokens[cursor] != expected:
+                cursor += 1
+            if cursor >= window_end:
+                break
+            cursor += 1
+        else:
+            interior = (("see",), ("eye", "eyes"), ("certain", "certainly"), ("portrait",))
+            for alternatives in interior:
+                while cursor < next_start and tokens[cursor] not in alternatives:
+                    cursor += 1
+                if cursor >= next_start:
+                    break
+                cursor += 1
+            else:
+                # Only punctuation-window repetition may trail the closing
+                # anchor; substantial text after it is an unfinished/misaligned
+                # utterance, not a complete replay.
+                if next_start - cursor > 3:
+                    start = next_start
+                    continue
+                count += 1
+                start = next_start
+                continue
+        start = next_start
+    return count
 
 
 def main() -> int:
@@ -248,7 +316,7 @@ def main() -> int:
         for match in metric_pattern.finditer(stderr)
     ]
     output_text = finalized_transcript(stdout)
-    saved_audio = [path for path in args.run_dir.glob("*.wav") if path != args.audio]
+    saved_audio = captured_wav_paths(args.run_dir, args.audio, args.fixture)
     saved_frames = 0
     for path in saved_audio:
         with wave.open(str(path), "rb") as handle:
@@ -256,7 +324,7 @@ def main() -> int:
     normalized = unicodedata.normalize("NFKC", output_text).casefold()
     normalized = " ".join(re.findall(r"[^\W\d_]+(?:['’][^\W\d_]+)?", normalized))
     expected_segments = int(duration // fixture_duration)
-    observed_segments = normalized.count("old portrait")
+    observed_segments = count_fixture_utterances(normalized)
     final_summary = final_runtime_summary(stderr, sample_rate)
     captured_frames = final_summary[0] if final_summary else 0
     final_dropped_samples = final_summary[1] if final_summary else None

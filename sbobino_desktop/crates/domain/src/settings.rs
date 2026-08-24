@@ -1328,12 +1328,16 @@ mod language_tests {
 
         assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.model, SpeechModel::Tiny);
-        assert_eq!(manifest.filename, SpeechModel::Tiny.ggml_filename());
+        assert_eq!(manifest.filename, "ggml-tiny-q5_1.bin");
         assert!(manifest
             .url
             .contains("/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/"));
         assert!(!manifest.url.contains("/resolve/main/"));
         assert_eq!(manifest.sha256.len(), 64);
+        assert_eq!(
+            manifest.sha256,
+            "818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7"
+        );
         assert!(manifest
             .sha256
             .chars()

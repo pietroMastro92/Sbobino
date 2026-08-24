@@ -81,8 +81,9 @@ const PARAKEET_MODEL_CATALOG: [(&str, &str); 2] = [
         "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual",
     ),
 ];
-const REQUIRED_COREML_ENCODERS: [(&str, &str); 5] = [
+const REQUIRED_COREML_ENCODERS: [(&str, &str); 6] = [
     ("ggml-tiny.bin", "ggml-tiny-encoder.mlmodelc"),
+    ("ggml-tiny-q5_1.bin", "ggml-tiny-encoder.mlmodelc"),
     ("ggml-base.bin", "ggml-base-encoder.mlmodelc"),
     ("ggml-small.bin", "ggml-small-encoder.mlmodelc"),
     ("ggml-medium.bin", "ggml-medium-encoder.mlmodelc"),
@@ -1492,7 +1493,7 @@ impl RuntimeTranscriptionFactory {
         })
     }
 
-    pub fn live_start_health(&self, model: SpeechModel) -> Result<LiveStartHealth, String> {
+    pub fn live_start_health(&self, _model: SpeechModel) -> Result<LiveStartHealth, String> {
         let settings = self.load_settings()?;
         let configured_models_dir = if settings.transcription.models_dir.trim().is_empty() {
             settings.models_dir.clone()
@@ -1526,9 +1527,9 @@ impl RuntimeTranscriptionFactory {
         } else {
             self.binary_path_is_runnable(&whisper_stream_resolution.resolved_path)
         };
-        let model_filename = model.ggml_filename().to_string();
-        let model_path = PathBuf::from(&resolved_models_dir).join(&model_filename);
         let live_manifest = whisper_live_model_manifest();
+        let model_filename = live_manifest.filename.clone();
+        let model_path = PathBuf::from(&resolved_models_dir).join(&model_filename);
         let model_present = if model_filename == live_manifest.filename {
             file_sha256_matches(&model_path, &live_manifest.sha256)
         } else {
@@ -3204,7 +3205,7 @@ fn binary_name_variants(base_name: &str) -> Vec<String> {
 
 fn required_initial_setup_models() -> [&'static str; 3] {
     [
-        "ggml-tiny.bin",
+        "ggml-tiny-q5_1.bin",
         "ggml-base.bin",
         "ggml-large-v3-turbo-q8_0.bin",
     ]
@@ -4285,7 +4286,8 @@ mod tests {
         PYANNOTE_COMPAT_LEVEL, PYANNOTE_RECEIPT_FILENAME, PYANNOTE_STATUS_FILENAME,
     };
     use sbobino_domain::{
-        AiProvider, AppSettings, RemoteServiceConfig, RemoteServiceKind, TranscriptionEngine,
+        AiProvider, AppSettings, RemoteServiceConfig, RemoteServiceKind, SpeechModel,
+        TranscriptionEngine,
     };
     use tempfile::tempdir;
 
@@ -4310,6 +4312,20 @@ mod tests {
         let factory = RuntimeTranscriptionFactory::new_for_tests(&data_dir, None)
             .expect("factory should build");
         (temp, factory)
+    }
+
+    #[test]
+    fn live_start_health_uses_the_pinned_quantized_tiny_model() {
+        let (_temp, factory) = build_factory();
+
+        for selected_file_model in [SpeechModel::Tiny, SpeechModel::Base] {
+            let health = factory
+                .live_start_health(selected_file_model)
+                .expect("live health should load");
+
+            assert_eq!(health.model_filename, "ggml-tiny-q5_1.bin");
+            assert!(!health.model_present);
+        }
     }
 
     fn build_factory_with_bundle_resources() -> (
@@ -4640,7 +4656,8 @@ mod tests {
 
         let models_dir = std::path::PathBuf::from(factory.resolve_models_dir(""));
         std::fs::create_dir_all(&models_dir).expect("models dir should exist");
-        std::fs::write(models_dir.join("ggml-tiny.bin"), b"tiny").expect("tiny model should write");
+        std::fs::write(models_dir.join("ggml-tiny-q5_1.bin"), b"tiny-live")
+            .expect("tiny live model should write");
         std::fs::write(models_dir.join("ggml-base.bin"), b"base").expect("base model should write");
         std::fs::write(
             models_dir.join("ggml-large-v3-turbo-q8_0.bin"),
@@ -5551,7 +5568,8 @@ mod tests {
         );
         let models_dir = std::path::PathBuf::from(factory.resolve_models_dir(""));
         std::fs::create_dir_all(&models_dir).expect("models dir should exist");
-        std::fs::write(models_dir.join("ggml-tiny.bin"), b"tiny").expect("tiny model should write");
+        std::fs::write(models_dir.join("ggml-tiny-q5_1.bin"), b"tiny-live")
+            .expect("tiny live model should write");
         std::fs::write(models_dir.join("ggml-base.bin"), b"base").expect("base model should write");
         std::fs::write(
             models_dir.join("ggml-large-v3-turbo-q8_0.bin"),

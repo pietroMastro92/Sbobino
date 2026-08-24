@@ -33,8 +33,9 @@ use sbobino_infrastructure::{
     PYANNOTE_MANIFEST_FILENAME,
 };
 
-const REQUIRED_MODELS: [&str; 5] = [
+const REQUIRED_MODELS: [&str; 6] = [
     "ggml-tiny.bin",
+    "ggml-tiny-q5_1.bin",
     "ggml-base.bin",
     "ggml-small.bin",
     "ggml-medium.bin",

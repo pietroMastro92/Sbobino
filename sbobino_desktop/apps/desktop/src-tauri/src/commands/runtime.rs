@@ -1130,7 +1130,7 @@ pub async fn get_realtime_start_readiness(
         .live_start_health(selected_model.clone())
         .map_err(|e| CommandError::new("runtime_health", e))?;
 
-    let model_filename = selected_model.ggml_filename().to_string();
+    let model_filename = live_health.model_filename.clone();
     let model_path = PathBuf::from(&live_health.models_dir_resolved)
         .join(&model_filename)
         .to_string_lossy()
