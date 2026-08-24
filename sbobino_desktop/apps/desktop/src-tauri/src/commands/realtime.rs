@@ -10,9 +10,9 @@ use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RealtimeDelta};
 use sbobino_domain::{
-    ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel,
-    SpeechModel, TimedSegment, TranscriptArtifact, TranscriptionComputeDevice, TranscriptionEngine,
-    TranscriptionOutput,
+    whisper_live_model_manifest, ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage,
+    LanguageCode, ParakeetModel, SpeechModel, TimedSegment, TranscriptArtifact,
+    TranscriptionComputeDevice, TranscriptionEngine, TranscriptionOutput,
 };
 
 use crate::commands::transcription::{JobFailedEvent, JobProgressEvent};
@@ -312,6 +312,8 @@ pub(crate) fn select_parakeet_live_model(
 pub struct StartRealtimePayload {
     #[serde(default)]
     pub engine: Option<TranscriptionEngine>,
+    /// File model preference. Whisper live currently uses the certified Base
+    /// model regardless of this value; file transcription keeps all models.
     pub model: Option<SpeechModel>,
     #[serde(default)]
     pub parakeet_model: Option<ParakeetModel>,
@@ -724,7 +726,22 @@ pub async fn start_realtime(
     if matches!(&engine_kind, TranscriptionEngine::ParakeetCpp) {
         ensure_parakeet_live_device_supported(settings.transcription.live_compute_device)?;
     }
-    let model = payload.model.unwrap_or(default_model);
+    let model = if engine_kind == TranscriptionEngine::WhisperCpp {
+        let certified_model = whisper_live_model_manifest().model;
+        if payload
+            .model
+            .as_ref()
+            .is_some_and(|requested| requested != &certified_model)
+        {
+            eprintln!(
+                "[realtime-start] ignoring unvalidated Whisper live model {:?}; using certified {:?}",
+                payload.model, certified_model
+            );
+        }
+        certified_model
+    } else {
+        payload.model.unwrap_or(default_model)
+    };
     let language = payload.language.unwrap_or(default_language);
     let job_id = Uuid::new_v4().to_string();
     let requested_title = clean_optional_title(payload.title.clone());
@@ -763,13 +780,23 @@ pub async fn start_realtime(
     let app_handle = app.clone();
     let emit_whisper_telemetry = Arc::new(move |telemetry: WhisperStreamTelemetry| {
         let finalizing = telemetry.finalization_ms.is_some();
+        let degraded = telemetry.backlog_seconds > 2.0;
         let _ = app_handle.emit(
             "realtime://input_level",
             RealtimeInputLevelEvent {
-                state: if finalizing { "finalizing" } else { "running" }.to_string(),
+                state: if finalizing {
+                    "finalizing"
+                } else if degraded {
+                    "degraded"
+                } else {
+                    "running"
+                }
+                .to_string(),
                 level: 0.0,
                 message: if finalizing {
                     "Finalizing Whisper live audio".to_string()
+                } else if degraded {
+                    "Whisper live could not keep up. The complete audio is saved; stop and transcribe the WAV as a file, or choose a faster device.".to_string()
                 } else {
                     "Whisper live telemetry".to_string()
                 },

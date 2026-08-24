@@ -39,6 +39,10 @@ struct StreamState {
     stop_requested: bool,
     telemetry_sink: Option<WhisperTelemetrySink>,
     first_preview_ms: Option<f32>,
+    captured_seconds: f32,
+    processed_seconds: f32,
+    backlog_seconds: f32,
+    last_inference_ms: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,18 +329,28 @@ impl WhisperStreamEngine {
     }
 
     fn telemetry_snapshot(state: &StreamState) -> WhisperStreamTelemetry {
-        let captured_seconds = Self::elapsed_seconds(state).max(state.last_segment_end_seconds);
-        // whisper-stream does not expose a hardware sample cursor. The end
-        // timestamp assigned when a segment arrives is the processed cursor;
-        // the difference to the session clock is an explicit inference-lag
-        // proxy, rather than hidden in transcript text.
-        let processed_seconds = state.last_segment_end_seconds.min(captured_seconds);
-        let backlog_seconds = (captured_seconds - processed_seconds).max(0.0);
+        let fallback_captured = Self::elapsed_seconds(state).max(state.last_segment_end_seconds);
+        let has_runtime_cursors = state.captured_seconds > 0.0 || state.processed_seconds > 0.0;
+        let captured_seconds = if has_runtime_cursors {
+            state.captured_seconds.max(state.processed_seconds)
+        } else {
+            fallback_captured
+        };
+        let processed_seconds = if has_runtime_cursors {
+            state.processed_seconds.min(captured_seconds)
+        } else {
+            state.last_segment_end_seconds.min(captured_seconds)
+        };
+        let backlog_seconds = if has_runtime_cursors {
+            state.backlog_seconds.max(0.0)
+        } else {
+            (captured_seconds - processed_seconds).max(0.0)
+        };
         WhisperStreamTelemetry {
             captured_seconds,
             processed_seconds,
             backlog_seconds,
-            inference_ms: Some(backlog_seconds * 1_000.0),
+            inference_ms: state.last_inference_ms.or(Some(backlog_seconds * 1_000.0)),
             first_preview_ms: state.first_preview_ms,
             finalization_ms: None,
         }
@@ -355,6 +369,29 @@ impl WhisperStreamEngine {
             || lower.contains("capture device")
             || lower.contains("audio device")
             || lower.contains("microphone")
+    }
+
+    fn parse_runtime_metric(text: &str) -> Option<WhisperStreamTelemetry> {
+        if !text.starts_with("SBOBINO_WHISPER_LIVE_METRIC ") {
+            return None;
+        }
+        let value = |key: &str| {
+            text.split_whitespace().find_map(|field| {
+                let (name, value) = field.split_once('=')?;
+                (name == key)
+                    .then(|| value.trim_end_matches(':').parse::<f32>().ok())
+                    .flatten()
+                    .filter(|value| value.is_finite())
+            })
+        };
+        Some(WhisperStreamTelemetry {
+            captured_seconds: value("captured_seconds")?,
+            processed_seconds: value("processed_seconds")?,
+            backlog_seconds: value("backlog_seconds")?,
+            inference_ms: value("inference_ms"),
+            first_preview_ms: None,
+            finalization_ms: None,
+        })
     }
 
     fn is_fatal_startup_diagnostic(text: &str) -> bool {
@@ -426,6 +463,34 @@ impl WhisperStreamEngine {
                     let is_preview = raw_line.contains("[2K]") || raw_line.contains("\u{001b}[2K");
                     let cleaned = Self::clean_line(&raw_line);
                     if cleaned.is_empty() {
+                        return;
+                    }
+
+                    if let Some(metric) = Self::parse_runtime_metric(&cleaned) {
+                        let mut state = shared_state.lock().await;
+                        state.captured_seconds =
+                            state.captured_seconds.max(metric.captured_seconds);
+                        state.processed_seconds =
+                            state.processed_seconds.max(metric.processed_seconds);
+                        state.backlog_seconds = metric.backlog_seconds.max(0.0);
+                        state.last_inference_ms = metric.inference_ms;
+                        let mut metric = metric;
+                        metric.first_preview_ms = state.first_preview_ms;
+                        Self::emit_telemetry(telemetry_sink.as_ref(), metric);
+                        return;
+                    }
+
+                    if cleaned.starts_with("SBOBINO_WHISPER_LIVE_BACKLOG ") {
+                        let mut state = shared_state.lock().await;
+                        let message = "Whisper live could not keep up in real time. The complete captured audio was preserved; transcribe it as a file or choose a faster model/device.".to_string();
+                        state.diagnostics.push(cleaned);
+                        state.terminal_error = Some(message);
+                        state.running = false;
+                        state.paused = false;
+                        state.backlog_seconds = state.backlog_seconds.max(2.001);
+                        let telemetry = Self::telemetry_snapshot(&state);
+                        drop(state);
+                        Self::emit_telemetry(telemetry_sink.as_ref(), telemetry);
                         return;
                     }
 
@@ -694,6 +759,10 @@ impl WhisperStreamEngine {
         state.last_segment_end_seconds = 0.0;
         state.telemetry_sink = telemetry_sink.clone();
         state.first_preview_ms = None;
+        state.captured_seconds = 0.0;
+        state.processed_seconds = 0.0;
+        state.backlog_seconds = 0.0;
+        state.last_inference_ms = None;
         drop(state);
 
         let reader_tasks = vec![
@@ -876,6 +945,10 @@ impl WhisperStreamEngine {
         state.last_segment_end_seconds = 0.0;
         state.terminal_error = None;
         state.stop_requested = false;
+        state.captured_seconds = 0.0;
+        state.processed_seconds = 0.0;
+        state.backlog_seconds = 0.0;
+        state.last_inference_ms = None;
     }
 
     pub async fn snapshot_text(&self) -> String {
@@ -897,6 +970,10 @@ impl WhisperStreamEngine {
         state.language_detections.clear();
         state.session_started_at = None;
         state.last_segment_end_seconds = 0.0;
+        state.captured_seconds = 0.0;
+        state.processed_seconds = 0.0;
+        state.backlog_seconds = 0.0;
+        state.last_inference_ms = None;
     }
 }
 
@@ -951,6 +1028,34 @@ mod tests {
             "whisper_full_with_state: auto-detected language: en (p = 0.83)",
         );
         assert_eq!(parsed, Some(("en".to_string(), 0.83)));
+    }
+
+    #[test]
+    fn parses_packaged_live_runtime_metrics_without_exposing_them_as_text() {
+        let metric = WhisperStreamEngine::parse_runtime_metric(
+            "SBOBINO_WHISPER_LIVE_METRIC captured_seconds=4.640 processed_seconds=4.320 backlog_seconds=0.320 inference_ms=188.500 dropped_samples=0",
+        )
+        .expect("packaged runtime metric should parse");
+        assert_eq!(metric.captured_seconds, 4.64);
+        assert_eq!(metric.processed_seconds, 4.32);
+        assert_eq!(metric.backlog_seconds, 0.32);
+        assert_eq!(metric.inference_ms, Some(188.5));
+    }
+
+    #[test]
+    fn runtime_cursors_are_not_inflated_by_wall_clock_fallback() {
+        let state = StreamState {
+            captured_seconds: 4.64,
+            processed_seconds: 4.32,
+            backlog_seconds: 0.32,
+            last_segment_end_seconds: 99.0,
+            ..StreamState::default()
+        };
+
+        let telemetry = WhisperStreamEngine::telemetry_snapshot(&state);
+        assert_eq!(telemetry.captured_seconds, 4.64);
+        assert_eq!(telemetry.processed_seconds, 4.32);
+        assert_eq!(telemetry.backlog_seconds, 0.32);
     }
 
     #[tokio::test]

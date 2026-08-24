@@ -64,6 +64,12 @@ expected_json_assets = {
     "windows-gui-smoke-report.json",
     "portability-smoke-report.json",
     "intel-portability-smoke-report.json",
+    # Operational update/setup manifests are JSON too, but they are not proof
+    # channels and are required by every installable candidate.
+    "latest.json",
+    "setup-manifest.json",
+    "runtime-manifest.json",
+    "pyannote-manifest.json",
 }
 required_non_json_assets = {"release-notes.md"}
 present_assets = {
@@ -78,7 +84,7 @@ missing_json = sorted(expected_json_assets - present_json_assets)
 unexpected_json = sorted(present_json_assets - expected_json_assets)
 missing_non_json = sorted(required_non_json_assets - present_assets)
 if missing_json or unexpected_json:
-    details = ["Stable promotion blocked: public JSON proof assets must be exactly the reviewed seven names."]
+    details = ["Stable promotion blocked: public JSON assets must be the reviewed seven proofs plus four operational manifests."]
     if missing_json:
         details.append("missing=" + ",".join(missing_json))
     if unexpected_json:
@@ -157,14 +163,16 @@ if str(distribution.get("status", "")).strip().lower() != "passed":
 if str(distribution.get("gate", "")).strip() != "distribution_readiness.sh":
     raise SystemExit("Stable promotion blocked: distribution-readiness-proof.json gate mismatch.")
 
-def validate_quality_gate(key: str, label: str) -> dict:
-    report = distribution.get(key)
+def validate_quality_gate(key: str, label: str, source: dict | None = None) -> dict:
+    report = (source or distribution).get(key)
     if not isinstance(report, dict):
         raise SystemExit(f"Stable promotion blocked: distribution proof is missing {label} results.")
     if int(report.get("schema_version", 0)) != 1:
         raise SystemExit(f"Stable promotion blocked: {label} report has unsupported schema_version.")
     if str(report.get("status", "")).strip().lower() != "passed":
         raise SystemExit(f"Stable promotion blocked: {label} report did not pass.")
+    if report.get("version") != version or report.get("release_tag") != tag:
+        raise SystemExit(f"Stable promotion blocked: {label} report version/tag mismatch.")
     if report.get("evidence_class") != "hosted-packaged-engine":
         raise SystemExit(
             f"Stable promotion blocked: {label} is not real hosted packaged-engine evidence."
@@ -195,6 +203,29 @@ def validate_quality_gate(key: str, label: str) -> dict:
         raise SystemExit(f"Stable promotion blocked: {label} report is missing metrics.")
     return metrics
 
+def validate_live_recovery(source: dict, label: str) -> None:
+    recovery = source.get("backlog_recovery")
+    if not isinstance(recovery, dict):
+        raise SystemExit(f"Stable promotion blocked: {label} is missing backlog recovery evidence.")
+    if str(recovery.get("status", "")).strip().lower() != "passed":
+        raise SystemExit(f"Stable promotion blocked: {label} backlog recovery did not pass.")
+    captured = recovery.get("captured_audio_frames")
+    saved = recovery.get("saved_audio_frames")
+    if not isinstance(captured, int) or captured <= 0 or saved != captured:
+        raise SystemExit(
+            f"Stable promotion blocked: {label} backlog recovery did not preserve every captured frame."
+        )
+    if int(recovery.get("dropped_samples", -1)) != 0:
+        raise SystemExit(f"Stable promotion blocked: {label} backlog recovery dropped audio.")
+    reaction = recovery.get("backlog_reaction_seconds")
+    if not isinstance(reaction, (int, float)) or not math.isfinite(float(reaction)) or float(reaction) > 0.05:
+        raise SystemExit(f"Stable promotion blocked: {label} backlog recovery reacted too late.")
+
+def validate_live_duration(source: dict, label: str) -> None:
+    duration = source.get("duration_seconds")
+    if not isinstance(duration, (int, float)) or not math.isfinite(float(duration)) or float(duration) < 900:
+        raise SystemExit(f"Stable promotion blocked: {label} did not attest a 900-second live run.")
+
 asr_metrics = validate_quality_gate("asr_reference", "ASR reference")
 for metric, maximum in (
     ("wer", 0.35),
@@ -208,6 +239,8 @@ for metric, maximum in (
         )
 
 live_metrics = validate_quality_gate("live_latency", "live-latency")
+validate_live_recovery(distribution["live_latency"], "live-latency")
+validate_live_duration(distribution["live_latency"], "live-latency")
 for metric, maximum in (
     ("first_preview_seconds", 2.0),
     ("preview_latency_p95_seconds", 2.0),
@@ -228,6 +261,26 @@ intel_distribution = load_json(
     report_dir / "intel-distribution-readiness-proof.json",
     "intel-distribution-readiness-proof.json",
 )
+intel_live_metrics = validate_quality_gate(
+    "live_latency", "Intel live-latency", intel_distribution
+)
+validate_live_recovery(intel_distribution["live_latency"], "Intel live-latency")
+validate_live_duration(intel_distribution["live_latency"], "Intel live-latency")
+for metric, maximum in (
+    ("first_preview_seconds", 2.0),
+    ("preview_latency_p95_seconds", 2.0),
+    ("backlog_p95_seconds", 2.0),
+    ("finalization_seconds", 2.0),
+    ("rss_growth_mib", 256.0),
+):
+    value = intel_live_metrics.get(metric)
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
+        raise SystemExit(
+            f"Stable promotion blocked: Intel live-latency {metric} exceeds the release threshold."
+        )
+for metric in ("dropped_samples", "missing_segments", "duplicate_segments"):
+    if int(intel_live_metrics.get(metric, -1)) != 0:
+        raise SystemExit(f"Stable promotion blocked: Intel live-latency {metric} is non-zero.")
 if int(intel_distribution.get("schema_version", 0)) != 1:
     raise SystemExit(
         "Stable promotion blocked: intel-distribution-readiness-proof.json has unsupported schema_version."
@@ -253,6 +306,26 @@ if str(windows_distribution.get("status", "")).strip().lower() != "passed":
     raise SystemExit("Stable promotion blocked: Windows distribution readiness proof is not marked passed.")
 if windows_distribution.get("platform") != "windows" or windows_distribution.get("architecture") != "x86_64":
     raise SystemExit("Stable promotion blocked: Windows distribution readiness proof target mismatch.")
+windows_live_metrics = validate_quality_gate(
+    "live_latency", "Windows live-latency", windows_distribution
+)
+validate_live_recovery(windows_distribution["live_latency"], "Windows live-latency")
+validate_live_duration(windows_distribution["live_latency"], "Windows live-latency")
+for metric, maximum in (
+    ("first_preview_seconds", 2.0),
+    ("preview_latency_p95_seconds", 2.0),
+    ("backlog_p95_seconds", 2.0),
+    ("finalization_seconds", 2.0),
+    ("rss_growth_mib", 256.0),
+):
+    value = windows_live_metrics.get(metric)
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
+        raise SystemExit(
+            f"Stable promotion blocked: Windows live-latency {metric} exceeds the release threshold."
+        )
+for metric in ("dropped_samples", "missing_segments", "duplicate_segments"):
+    if int(windows_live_metrics.get(metric, -1)) != 0:
+        raise SystemExit(f"Stable promotion blocked: Windows live-latency {metric} is non-zero.")
 
 windows_gui = load_json(
     report_dir / "windows-gui-smoke-report.json",

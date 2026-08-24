@@ -165,6 +165,70 @@ exit 0
 }
 
 #[tokio::test]
+async fn realtime_backlog_failure_emits_immediate_degraded_telemetry() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-stream");
+    let models_dir = temp.path().join("models");
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+printf 'SBOBINO_WHISPER_LIVE_METRIC captured_seconds=3.000 processed_seconds=0.500 backlog_seconds=2.500 inference_ms=2500.000 dropped_samples=0\n' 1>&2
+printf 'SBOBINO_WHISPER_LIVE_BACKLOG exceeded captured=48000 inferred=8000 buffered=40000 dropped=0\n' 1>&2
+exit 7
+"#,
+    );
+
+    let engine = WhisperStreamEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let telemetry: Arc<Mutex<Vec<WhisperStreamTelemetry>>> = Arc::new(Mutex::new(Vec::new()));
+    let telemetry_clone = telemetry.clone();
+    engine
+        .start_with_telemetry(
+            "ggml-base.bin",
+            "auto",
+            Arc::new(|_delta: RealtimeDelta| {}),
+            Some(Arc::new(move |event| {
+                telemetry_clone
+                    .lock()
+                    .expect("telemetry lock poisoned")
+                    .push(event);
+            })),
+        )
+        .await
+        .expect("realtime start should succeed before the simulated backlog");
+
+    for _ in 0..STREAM_SETTLE_ATTEMPTS {
+        if telemetry
+            .lock()
+            .expect("telemetry lock poisoned")
+            .iter()
+            .any(|event| event.backlog_seconds > 2.0)
+        {
+            break;
+        }
+        tokio::time::sleep(STREAM_SETTLE_DELAY).await;
+    }
+    assert!(
+        telemetry
+            .lock()
+            .expect("telemetry lock poisoned")
+            .iter()
+            .any(|event| event.backlog_seconds > 2.0),
+        "the UI telemetry sink must be notified before Stop"
+    );
+    let error = engine
+        .stop()
+        .await
+        .expect_err("backlog failure must remain terminal");
+    assert!(error.to_string().contains("could not keep up"));
+}
+
+#[tokio::test]
 async fn realtime_splits_carriage_return_live_updates_like_python_text_mode() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("whisper-stream");

@@ -26,7 +26,7 @@ use crate::{
     },
     state::AppState,
 };
-use sbobino_domain::TranscriptionEngine;
+use sbobino_domain::{whisper_live_model_manifest, TranscriptionEngine, WhisperLiveModelManifest};
 use sbobino_infrastructure::{
     background_process::tokio_background_command, ManagedPyannoteManifest, ManagedPyannoteReceipt,
     ManagedRuntimeHealth, ReconcileManagedPyannoteReleaseOutcome, RuntimeTranscriptionFactory,
@@ -174,6 +174,7 @@ struct ProvisioningDownloadBatch {
     missing_encoders: Vec<(String, String)>,
     model_base_url: &'static str,
     model_asset_kind: &'static str,
+    verified_model: Option<WhisperLiveModelManifest>,
 }
 
 impl Drop for ProvisioningSlotGuard {
@@ -740,12 +741,25 @@ fn transcription_runtime_install_complete(health: &sbobino_infrastructure::Runti
     }
 }
 
+fn whisper_live_model_is_valid(models_dir: &Path) -> bool {
+    let manifest = whisper_live_model_manifest();
+    let model_path = models_dir.join(&manifest.filename);
+    model_path.is_file() && verify_file_sha256(&model_path, &manifest.sha256).is_ok()
+}
+
+fn whisper_model_is_installed(models_dir: &Path, model_filename: &str) -> bool {
+    if model_filename == whisper_live_model_manifest().filename {
+        whisper_live_model_is_valid(models_dir)
+    } else {
+        models_dir.join(model_filename).is_file()
+    }
+}
+
 fn collect_missing_models(models_dir: &Path) -> Vec<String> {
     REQUIRED_MODELS
         .iter()
         .filter_map(|filename| {
-            let path = models_dir.join(filename);
-            if path.exists() {
+            if whisper_model_is_installed(models_dir, filename) {
                 None
             } else {
                 Some((*filename).to_string())
@@ -833,7 +847,7 @@ pub async fn provisioning_models(
                 key: (*key).to_string(),
                 label: (*label).to_string(),
                 model_file: (*model_file).to_string(),
-                installed: models_dir.join(model_file).exists(),
+                installed: whisper_model_is_installed(&models_dir, model_file),
                 coreml_installed: models_dir.join(encoder_dir).is_dir(),
                 engine: "whisper_cpp".to_string(),
                 experimental: false,
@@ -1175,6 +1189,7 @@ pub async fn provisioning_start(
             missing_encoders,
             model_base_url: MODEL_BASE_URL,
             model_asset_kind: "whisper_model",
+            verified_model: Some(whisper_live_model_manifest()),
         },
         cancel_token,
         slot_guard,
@@ -1245,6 +1260,7 @@ pub async fn provisioning_download_model(
                 missing_encoders: Vec::new(),
                 model_base_url: PARAKEET_MODEL_BASE_URL,
                 model_asset_kind: "parakeet_model",
+                verified_model: None,
             },
             cancel_token,
             slot_guard,
@@ -1263,7 +1279,7 @@ pub async fn provisioning_download_model(
     };
 
     let mut missing_models = Vec::new();
-    if !models_dir.join(model_file).exists() {
+    if !whisper_model_is_installed(&models_dir, model_file) {
         missing_models.push((*model_file).to_string());
     }
 
@@ -1294,6 +1310,7 @@ pub async fn provisioning_download_model(
             missing_encoders,
             model_base_url: MODEL_BASE_URL,
             model_asset_kind: "whisper_model",
+            verified_model: Some(whisper_live_model_manifest()),
         },
         cancel_token,
         slot_guard,
@@ -1497,6 +1514,7 @@ fn spawn_provisioning_download(
             missing_encoders,
             model_base_url,
             model_asset_kind,
+            verified_model,
         } = batch;
         let client = provisioning_http_client();
         let mut current = 0usize;
@@ -1528,9 +1546,28 @@ fn spawn_provisioning_download(
                 return;
             }
 
-            let url = format!("{model_base_url}{model}");
+            let pinned_model = verified_model
+                .as_ref()
+                .filter(|manifest| manifest.filename == model);
+            let (url, expected_sha256) = pinned_model.map_or_else(
+                || (format!("{model_base_url}{model}"), None),
+                |manifest| (manifest.url.clone(), Some(manifest.sha256.as_str())),
+            );
             let destination = models_dir.join(&model);
-            match download_to_path(&client, &url, &destination, &cancel_token).await {
+            let download_result = match expected_sha256 {
+                Some(expected_sha256) => {
+                    download_to_path_with_checksum(
+                        &client,
+                        &url,
+                        &destination,
+                        &cancel_token,
+                        expected_sha256,
+                    )
+                    .await
+                }
+                None => download_to_path(&client, &url, &destination, &cancel_token).await,
+            };
+            match download_result {
                 Ok(()) => emit_progress(model, model_asset_kind, "downloaded".to_string()),
                 Err(error) => {
                     if error == "cancelled" {
@@ -4017,6 +4054,35 @@ async fn download_to_path(
     destination: &Path,
     cancel_token: &CancellationToken,
 ) -> Result<(), String> {
+    download_to_path_inner(client, url, destination, cancel_token, None, false).await
+}
+
+async fn download_to_path_with_checksum(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    cancel_token: &CancellationToken,
+    expected_sha256: &str,
+) -> Result<(), String> {
+    download_to_path_inner(
+        client,
+        url,
+        destination,
+        cancel_token,
+        Some(expected_sha256),
+        true,
+    )
+    .await
+}
+
+async fn download_to_path_inner(
+    client: &reqwest::Client,
+    url: &str,
+    destination: &Path,
+    cancel_token: &CancellationToken,
+    expected_sha256: Option<&str>,
+    replace_existing: bool,
+) -> Result<(), String> {
     let temp_path = download_temp_path(destination);
     let mut last_error = None;
 
@@ -4033,27 +4099,39 @@ async fn download_to_path(
                     let _ = cleanup_download_temp(&temp_path).await;
                     return Err("cancelled".to_string());
                 }
-                if destination.exists() {
+                if let Some(expected_sha256) = expected_sha256 {
+                    if let Err(error) = verify_file_sha256(&temp_path, expected_sha256) {
+                        let _ = cleanup_download_temp(&temp_path).await;
+                        return Err(format!(
+                            "downloaded model failed checksum verification: {error}"
+                        ));
+                    }
+                }
+                if destination.exists() && !replace_existing {
                     let _ = cleanup_download_temp(&temp_path).await;
                     return Err(format!(
                         "download destination appeared while installing '{}'; refusing to overwrite it",
                         destination.display()
                     ));
                 }
-                return match tokio::fs::rename(&temp_path, destination).await {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        let cleanup = cleanup_download_temp(&temp_path).await.err();
-                        Err(match cleanup {
-                            Some(cleanup_error) => format!(
-                                "failed to finalize download '{}': {error}; {cleanup_error}",
-                                destination.display()
-                            ),
-                            None => format!(
-                                "failed to finalize download '{}': {error}",
-                                destination.display()
-                            ),
-                        })
+                return if replace_existing {
+                    replace_downloaded_file(&temp_path, destination).await
+                } else {
+                    match tokio::fs::rename(&temp_path, destination).await {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            let cleanup = cleanup_download_temp(&temp_path).await.err();
+                            Err(match cleanup {
+                                Some(cleanup_error) => format!(
+                                    "failed to finalize download '{}': {error}; {cleanup_error}",
+                                    destination.display()
+                                ),
+                                None => format!(
+                                    "failed to finalize download '{}': {error}",
+                                    destination.display()
+                                ),
+                            })
+                        }
                     }
                 };
             }
@@ -4088,6 +4166,64 @@ async fn download_to_path(
         "download failed after {MODEL_DOWNLOAD_MAX_ATTEMPTS} attempts: {}",
         last_error.unwrap_or_else(|| "unknown error".to_string())
     ))
+}
+
+async fn replace_downloaded_file(temp_path: &Path, destination: &Path) -> Result<(), String> {
+    let backup_path = if destination.exists() {
+        let parent = destination.parent().ok_or_else(|| {
+            format!(
+                "cannot replace downloaded model without a parent directory: {}",
+                destination.display()
+            )
+        })?;
+        Some(provisioning_swap_path(parent, "model-backup"))
+    } else {
+        None
+    };
+
+    if let Some(backup_path) = &backup_path {
+        tokio::fs::rename(destination, backup_path)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to stage existing model '{}' for replacement: {error}",
+                    destination.display()
+                )
+            })?;
+    }
+
+    match tokio::fs::rename(temp_path, destination).await {
+        Ok(()) => {
+            if let Some(backup_path) = backup_path {
+                if let Err(error) = tokio::fs::remove_file(&backup_path).await {
+                    return Err(format!(
+                        "model installed at '{}' but failed to remove backup '{}': {error}",
+                        destination.display(),
+                        backup_path.display()
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let rollback_error = if let Some(backup_path) = backup_path.as_ref() {
+                tokio::fs::rename(backup_path, destination).await.err()
+            } else {
+                None
+            };
+            let _ = cleanup_download_temp(temp_path).await;
+            match rollback_error {
+                Some(rollback_error) => Err(format!(
+                    "failed to finalize downloaded model '{}': {error}; rollback failed: {rollback_error}",
+                    destination.display()
+                )),
+                None => Err(format!(
+                    "failed to finalize downloaded model '{}': {error}",
+                    destination.display()
+                )),
+            }
+        }
+    }
 }
 
 fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), String> {
@@ -4185,8 +4321,8 @@ mod tests {
         promote_staged_pyannote_runtime, pyannote_reconcile_action,
         recover_interrupted_runtime_install, remove_path_if_exists, rollback_pyannote_runtime_swap,
         rollback_runtime_install_transaction, runtime_install_journal_backup_path,
-        runtime_install_journal_path, runtime_install_transaction_lock, sha256_file_hex,
-        transcription_runtime_install_complete, validate_arch_descriptors,
+        runtime_install_journal_path, runtime_install_transaction_lock, sha256_bytes_hex,
+        sha256_file_hex, transcription_runtime_install_complete, validate_arch_descriptors,
         validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
         write_runtime_install_journal, PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
         RuntimeInstallCommitError, RuntimeInstallJournal, RuntimeInstallTransaction,
@@ -4306,6 +4442,69 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .contains(".whisper.bin.part-")));
+    }
+
+    #[tokio::test]
+    async fn pinned_model_checksum_is_verified_before_replacing_existing_file() {
+        let (url, server) = spawn_download_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nmodel-bytes",
+        ]);
+        let temp = tempdir().expect("download tempdir should create");
+        let destination = temp.path().join("ggml-base.bin");
+        std::fs::write(&destination, b"known-good-old-model").expect("old model should write");
+        let client = reqwest::Client::new();
+
+        let error = super::download_to_path_with_checksum(
+            &client,
+            &url,
+            &destination,
+            &CancellationToken::new(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        .await
+        .expect_err("checksum mismatch must block model replacement");
+        server.join().expect("download server should finish");
+
+        assert!(error.contains("checksum verification"), "error: {error}");
+        assert_eq!(
+            std::fs::read(&destination).expect("old model should remain"),
+            b"known-good-old-model"
+        );
+        assert!(std::fs::read_dir(temp.path())
+            .expect("download tempdir should read")
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("model-backup")));
+    }
+
+    #[tokio::test]
+    async fn pinned_model_checksum_commits_verified_bytes_and_removes_backup() {
+        let (url, server) = spawn_download_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nmodel-bytes",
+        ]);
+        let temp = tempdir().expect("download tempdir should create");
+        let destination = temp.path().join("ggml-base.bin");
+        std::fs::write(&destination, b"old-model").expect("old model should write");
+        let expected = sha256_bytes_hex(b"model-bytes");
+
+        super::download_to_path_with_checksum(
+            &reqwest::Client::new(),
+            &url,
+            &destination,
+            &CancellationToken::new(),
+            &expected,
+        )
+        .await
+        .expect("verified model should replace the old model");
+        server.join().expect("download server should finish");
+
+        assert_eq!(
+            std::fs::read(&destination).expect("new model should exist"),
+            b"model-bytes"
+        );
+        assert!(std::fs::read_dir(temp.path())
+            .expect("download tempdir should read")
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("model-backup")));
     }
 
     #[tokio::test]

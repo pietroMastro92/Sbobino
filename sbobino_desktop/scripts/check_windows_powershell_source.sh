@@ -11,6 +11,7 @@ else
     "$repo_root/sbobino_desktop/scripts/package_windows_runtime_asset.ps1"
     "$repo_root/sbobino_desktop/scripts/package_windows_pyannote_runtime.ps1"
     "$repo_root/sbobino_desktop/scripts/windows_release_readiness.ps1"
+    "$repo_root/sbobino_desktop/scripts/release_windows_whisper_live_smoke.ps1"
     "$repo_root/.github/workflows/release.yml"
     "$repo_root/.github/workflows/windows-port.yml"
   )
@@ -87,6 +88,35 @@ if [[ -n "$package_script" ]]; then
       exit 1
     fi
   done
+  for required in \
+    'function Checkout-WhisperSource' \
+    'function Build-WhisperBinaries' \
+    'whisper-stream-audio-file.patch' \
+    'whisper-stream-fifo.patch' \
+    'whisper-stream-backlog.patch' \
+    'whisper-stream-finalization.patch' \
+    'whisper-stream-lossless-drain.patch' \
+    '-DWHISPER_SDL2=ON'; do
+    if ! grep -Fq -- "$required" "$package_script"; then
+      printf 'missing patched Windows Whisper live contract: %s\n' "$required" >&2
+      exit 1
+    fi
+  done
+  if ! grep -Fq -- 'SBOBINO_WHISPER_REPLAY_WAV' \
+      "$repo_root/sbobino_desktop/scripts/patches/whisper-stream-audio-file.patch"; then
+    printf 'Windows Whisper replay patch is missing its deterministic input hook\n' >&2
+    exit 1
+  fi
+  lossless_patch="$repo_root/sbobino_desktop/scripts/patches/whisper-stream-lossless-drain.patch"
+  for required in \
+    'std::vector<float> expanded' \
+    'std::thread backlog_monitor' \
+    'inference_backlog_failed = true'; do
+    if ! grep -Fq -- "$required" "$lossless_patch"; then
+      printf 'Windows Whisper lossless watchdog contract is missing: %s\n' "$required" >&2
+      exit 1
+    fi
+  done
   regex_literal="'^Visual Studio (?<version>\d+) (?<year>\d{4})\$'"
   if ! grep -Fq -- "$regex_literal" "$package_script"; then
     printf 'missing exact Visual Studio generator name regex contract\n' >&2
@@ -95,6 +125,17 @@ if [[ -n "$package_script" ]]; then
 fi
 
 if (( $# == 0 )); then
+  whisper_live_script="$repo_root/sbobino_desktop/scripts/release_windows_whisper_live_smoke.ps1"
+  for required in \
+    'whisper_live_model.json' \
+    'ConvertFrom-Json' \
+    'immutable URL and SHA-256' \
+    'manifest.url'; do
+    if ! grep -Fq -- "$required" "$whisper_live_script"; then
+      printf 'Windows Whisper live smoke must consume the pinned model manifest: %s\n' "$required" >&2
+      exit 1
+    fi
+  done
   pyannote_script="$repo_root/sbobino_desktop/scripts/package_windows_pyannote_runtime.ps1"
   if ! grep -Fq -- '$ffmpegArchive = $FfmpegArchivePath' "$pyannote_script"; then
     printf 'Windows Pyannote packaging must reuse the staged speech runtime archive\n' >&2

@@ -43,7 +43,7 @@ need_cmd() {
   fi
 }
 
-for command in clang clang++ cmake codesign curl find git lipo make otool python3 tar xcrun; do
+for command in clang clang++ cmake codesign curl find git lipo make otool patch python3 tar xcrun; do
   need_cmd "$command"
 done
 
@@ -254,6 +254,12 @@ build_whisper_binaries() {
     "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v${WHISPER_CPP_VERSION}.tar.gz" \
     "$archive"
   extract_source_archive "$archive" "$BUILD_DIR"
+
+  patch -d "$source_root" -p1 < "$SCRIPT_DIR/patches/whisper-stream-audio-file.patch"
+  patch -d "$source_root" -p1 < "$SCRIPT_DIR/patches/whisper-stream-fifo.patch"
+  patch -d "$source_root" -p1 < "$SCRIPT_DIR/patches/whisper-stream-backlog.patch"
+  patch -d "$source_root" -p1 < "$SCRIPT_DIR/patches/whisper-stream-finalization.patch"
+  patch -d "$source_root" -p1 < "$SCRIPT_DIR/patches/whisper-stream-lossless-drain.patch"
 
   PKG_CONFIG_PATH="$INSTALL_PREFIX/lib/pkgconfig" \
   cmake -S "$source_root" -B "$build_root" \

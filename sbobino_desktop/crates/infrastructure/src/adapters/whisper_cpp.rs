@@ -156,7 +156,12 @@ struct WhisperCliAttemptError {
     /// multi-input whisper process can write some `-of` artifacts and then
     /// crash (or leave a later artifact missing), so the backend retry must
     /// carry this state forward instead of replaying the whole input group.
-    partial_output: Option<TranscriptionOutput>,
+    // Keep the recovery snapshot off the error's inline layout. This error
+    // crosses several async `Result` boundaries and Clippy's
+    // `result_large_err` lint otherwise rejects the 128-byte value. Boxing
+    // the optional snapshot preserves ownership and recovery semantics while
+    // keeping those boundaries cheap to pass.
+    partial_output: Option<Box<TranscriptionOutput>>,
     /// The exact chunks whose artifacts are still missing or unconfirmed.
     /// Keeping the original chunk descriptors preserves their absolute
     /// timeline offsets for a CPU continuation.
@@ -1723,7 +1728,8 @@ impl WhisperCppEngine {
                         all_segments,
                         text_parts,
                         total_audio_seconds,
-                    ),
+                    )
+                    .map(Box::new),
                     missing_chunks,
                 });
             }
@@ -1775,7 +1781,8 @@ impl WhisperCppEngine {
                             retained_segments,
                             retained_text_parts,
                             total_audio_seconds,
-                        );
+                        )
+                        .map(Box::new);
                         retry_error.missing_chunks = unresolved_chunks;
                         return Err(retry_error);
                     }
@@ -2142,10 +2149,10 @@ impl WhisperCppEngine {
                     };
                     match (retained_output, fallback_output) {
                         (Some(confirmed), Some(recovered)) => Self::merge_whisper_group_outputs(
-                            &[confirmed, recovered],
+                            &[*confirmed, recovered],
                             total_audio_seconds,
                         )?,
-                        (Some(confirmed), None) => confirmed,
+                        (Some(confirmed), None) => *confirmed,
                         (None, Some(recovered)) => recovered,
                         (None, None) => {
                             return Err(ApplicationError::SpeechToText(

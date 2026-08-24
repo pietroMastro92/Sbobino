@@ -11,7 +11,8 @@ use tauri::State;
 use tracing::warn;
 
 use sbobino_domain::{
-    LanguageCode, ParakeetModel, SpeechModel, TranscriptionComputeDevice, TranscriptionEngine,
+    whisper_live_model_manifest, LanguageCode, ParakeetModel, SpeechModel,
+    TranscriptionComputeDevice, TranscriptionEngine,
 };
 use sbobino_infrastructure::{
     background_process::tokio_background_command, ManagedRuntimeHealth, PyannoteRuntimeHealth,
@@ -1113,10 +1114,17 @@ pub async fn get_realtime_start_readiness(
             input_device_name,
         });
     }
-    let selected_model = payload
-        .as_ref()
-        .map(|value| value.model.clone())
-        .unwrap_or_else(|| settings.transcription.model.clone());
+    // Keep realtime readiness aligned with start_realtime: only the pinned
+    // Base model is currently certified for Whisper live. File transcription
+    // continues to support every model in the catalog.
+    let selected_model = if selected_engine == TranscriptionEngine::WhisperCpp {
+        whisper_live_model_manifest().model
+    } else {
+        payload
+            .as_ref()
+            .map(|value| value.model.clone())
+            .unwrap_or_else(|| settings.transcription.model.clone())
+    };
     let live_health = state
         .runtime_factory
         .live_start_health(selected_model.clone())

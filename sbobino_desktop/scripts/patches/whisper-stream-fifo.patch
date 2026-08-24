@@ -1,0 +1,29 @@
+--- a/examples/common-sdl.cpp
++++ b/examples/common-sdl.cpp
+@@ -355,13 +355,19 @@
+ 
+     {
+         std::lock_guard<std::mutex> lock(m_mutex);
+-
+-        if (ms <= 0) {
+-            ms = m_len_ms;
+-        }
+ 
+-        size_t n_samples = (m_sample_rate * ms) / 1000;
+-        if (n_samples > m_audio_len) {
++        const bool drain_all = ms <= 0;
++        size_t n_samples = drain_all
++            ? m_audio_len
++            : static_cast<size_t>((m_sample_rate * ms) / 1000);
++        if (!drain_all && n_samples > m_audio_len) {
++            // A live step is atomic: wait for the complete step instead of
++            // consuming tiny callback fragments that can never reach the
++            // inference threshold. Replay may consume its final short tail.
++            if (!(m_replay_mode && m_replay_eof)) {
++                result.clear();
++                return;
++            }
+             n_samples = m_audio_len;
+         }
+ 
+

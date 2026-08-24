@@ -237,6 +237,8 @@ runtime_hashes = {
     "tdt_model": sys.argv[10],
 }
 common_evidence = {
+    "version": sys.argv[2],
+    "release_tag": sys.argv[3],
     "evidence_class": "hosted-packaged-engine",
     "real_engine": True,
     "real_harness": True,

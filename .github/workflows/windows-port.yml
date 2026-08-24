@@ -52,6 +52,18 @@ jobs:
             -OutputZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
             -SidecarDir (Join-Path $PWD "src-tauri\binaries")
 
+      - name: Run real packaged Whisper live replay on Windows CPU
+        shell: pwsh
+        working-directory: sbobino_desktop
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP "sbobino-windows"
+          $version = (Get-Content apps/desktop/package.json | ConvertFrom-Json).version
+          ./scripts/release_windows_whisper_live_smoke.ps1 `
+            -Version $version `
+            -RepoSlug $env:GITHUB_REPOSITORY `
+            -ReportPath (Join-Path $staging "windows-whisper-live-smoke-proof.json") `
+            -RuntimeZip (Join-Path $staging "speech-runtime-windows-x86_64.zip")
+
       - name: Cache pinned Parakeet readiness model
         uses: actions/cache@v4
         with:

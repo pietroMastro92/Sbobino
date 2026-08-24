@@ -1,0 +1,437 @@
+--- a/examples/common-sdl.h
++++ b/examples/common-sdl.h
+@@ -5,8 +5,9 @@
+ 
+ #include <atomic>
+ #include <cstdint>
+-#include <vector>
+ #include <mutex>
++#include <thread>
++#include <vector>
+ 
+ //
+ // SDL Audio capture
+@@ -31,6 +32,18 @@
+     // get audio data from the circular buffer
+     void get(int ms, std::vector<float> & audio);
+ 
++    // True only for an explicit replay input after its final buffered sample
++    // has been consumed. Normal microphone capture never reaches EOF.
++    bool eof();
++
++    // The input queue is FIFO. These counters let the stream fail closed when
++    // inference cannot keep up instead of silently overwriting old audio.
++    size_t buffered_samples();
++    size_t captured_samples() const;
++    size_t processed_samples() const;
++    size_t dropped_samples() const;
++    bool overrun() const;
++
+ private:
+     SDL_AudioDeviceID m_dev_id_in = 0;
+ 
+@@ -40,6 +53,16 @@
+     std::atomic_bool m_running;
+     std::mutex       m_mutex;
+ 
++    bool              m_replay_mode = false;
++    std::atomic_bool  m_replay_eof { false };
++    std::atomic<size_t> m_captured_samples { 0 };
++    std::atomic<size_t> m_processed_samples { 0 };
++    std::atomic<size_t> m_dropped_samples { 0 };
++    std::atomic_bool  m_overrun { false };
++    std::thread       m_replay_thread;
++    std::vector<float> m_replay_samples;
++    size_t             m_replay_pos = 0;
++
+     std::vector<float> m_audio;
+     size_t             m_audio_pos = 0;
+     size_t             m_audio_len = 0;
+--- a/examples/common-sdl.cpp
++++ b/examples/common-sdl.cpp
+@@ -1,7 +1,95 @@
+ #include "common-sdl.h"
+ 
++#include <algorithm>
++#include <chrono>
+ #include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <string>
+ 
++namespace {
++
++bool load_replay_wav(const char * path, int sample_rate, std::vector<float> & samples) {
++    std::ifstream file(path, std::ios::binary);
++    if (!file) {
++        fprintf(stderr, "audio replay: failed to open '%s'\n", path);
++        return false;
++    }
++
++    char riff[4] = {};
++    char wave[4] = {};
++    uint32_t riff_size = 0;
++    file.read(riff, sizeof(riff));
++    file.read(reinterpret_cast<char *>(&riff_size), sizeof(riff_size));
++    file.read(wave, sizeof(wave));
++    if (!file || std::string(riff, 4) != "RIFF" || std::string(wave, 4) != "WAVE") {
++        fprintf(stderr, "audio replay: '%s' is not a RIFF/WAVE file\n", path);
++        return false;
++    }
++
++    bool have_format = false;
++    bool have_data = false;
++    uint16_t format = 0;
++    uint16_t channels = 0;
++    uint16_t bits_per_sample = 0;
++    uint32_t wav_sample_rate = 0;
++    std::vector<uint8_t> data;
++    while (file && (!have_format || !have_data)) {
++        char chunk_id[4] = {};
++        uint32_t chunk_size = 0;
++        file.read(chunk_id, sizeof(chunk_id));
++        file.read(reinterpret_cast<char *>(&chunk_size), sizeof(chunk_size));
++        if (!file) {
++            break;
++        }
++        if (std::string(chunk_id, 4) == "fmt ") {
++            if (chunk_size < 16) {
++                fprintf(stderr, "audio replay: invalid fmt chunk in '%s'\n", path);
++                return false;
++            }
++            uint32_t byte_rate = 0;
++            uint16_t block_align = 0;
++            file.read(reinterpret_cast<char *>(&format), sizeof(format));
++            file.read(reinterpret_cast<char *>(&channels), sizeof(channels));
++            file.read(reinterpret_cast<char *>(&wav_sample_rate), sizeof(wav_sample_rate));
++            file.read(reinterpret_cast<char *>(&byte_rate), sizeof(byte_rate));
++            file.read(reinterpret_cast<char *>(&block_align), sizeof(block_align));
++            file.read(reinterpret_cast<char *>(&bits_per_sample), sizeof(bits_per_sample));
++            if (chunk_size > 16) {
++                file.seekg(static_cast<std::streamoff>(chunk_size - 16), std::ios::cur);
++            }
++            have_format = true;
++        } else if (std::string(chunk_id, 4) == "data") {
++            data.resize(chunk_size);
++            file.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(data.size()));
++            have_data = true;
++        } else {
++            file.seekg(static_cast<std::streamoff>(chunk_size), std::ios::cur);
++        }
++        if (chunk_size & 1U) {
++            file.seekg(1, std::ios::cur);
++        }
++    }
++
++    if (!file || !have_format || !have_data || format != 1 || channels != 1 ||
++        wav_sample_rate != static_cast<uint32_t>(sample_rate) || bits_per_sample != 16 ||
++        data.size() % sizeof(int16_t) != 0) {
++        fprintf(stderr, "audio replay: '%s' must be PCM16 mono %d Hz\n", path, sample_rate);
++        return false;
++    }
++
++    samples.resize(data.size() / sizeof(int16_t));
++    for (size_t i = 0; i < samples.size(); ++i) {
++        int16_t value = 0;
++        memcpy(&value, data.data() + i * sizeof(value), sizeof(value));
++        samples[i] = static_cast<float>(value) / 32768.0f;
++    }
++    return !samples.empty();
++}
++
++} // namespace
++
+ audio_async::audio_async(int len_ms) {
+     m_len_ms = len_ms;
+ 
+@@ -9,12 +97,31 @@
+ }
+ 
+ audio_async::~audio_async() {
++    pause();
+     if (m_dev_id_in) {
+         SDL_CloseAudioDevice(m_dev_id_in);
+     }
+ }
+ 
+ bool audio_async::init(int capture_id, int sample_rate) {
++    const char * replay_path = std::getenv("SBOBINO_WHISPER_REPLAY_WAV");
++    if (replay_path && *replay_path) {
++        if (!load_replay_wav(replay_path, sample_rate, m_replay_samples)) {
++            return false;
++        }
++        m_replay_mode = true;
++        m_sample_rate = sample_rate;
++        m_audio.assign((m_sample_rate * m_len_ms) / 1000, 0.0f);
++        m_replay_pos = 0;
++        m_replay_eof = false;
++        m_captured_samples = 0;
++        m_processed_samples = 0;
++        m_dropped_samples = 0;
++        m_overrun = false;
++        fprintf(stderr, "audio replay: streaming '%s' at %d Hz\n", replay_path, sample_rate);
++        return true;
++    }
++
+     SDL_LogSetPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO);
+ 
+     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
+@@ -75,10 +182,46 @@
+ 
+     m_audio.resize((m_sample_rate*m_len_ms)/1000);
+ 
++    m_captured_samples = 0;
++    m_processed_samples = 0;
++    m_dropped_samples = 0;
++    m_overrun = false;
++
+     return true;
+ }
+ 
+ bool audio_async::resume() {
++    if (m_replay_mode) {
++        if (m_running) {
++            fprintf(stderr, "%s: already running!\n", __func__);
++            return false;
++        }
++        m_running = true;
++        m_replay_thread = std::thread([this]() {
++            constexpr size_t replay_block = 160; // 10 ms at 16 kHz
++            while (m_running) {
++                size_t count = 0;
++                size_t start = 0;
++                {
++                    std::lock_guard<std::mutex> lock(m_mutex);
++                    if (m_replay_pos >= m_replay_samples.size()) {
++                        m_replay_eof = true;
++                        break;
++                    }
++                    count = std::min(replay_block, m_replay_samples.size() - m_replay_pos);
++                    start = m_replay_pos;
++                    m_replay_pos += count;
++                }
++                callback(reinterpret_cast<uint8_t *>(m_replay_samples.data() + start),
++                         static_cast<int>(count * sizeof(float)));
++                std::this_thread::sleep_for(std::chrono::milliseconds(
++                    static_cast<int>(count * 1000 / m_sample_rate)));
++            }
++            m_replay_eof = true;
++        });
++        return true;
++    }
++
+     if (!m_dev_id_in) {
+         fprintf(stderr, "%s: no audio device to resume!\n", __func__);
+         return false;
+@@ -97,6 +240,14 @@
+ }
+ 
+ bool audio_async::pause() {
++    if (m_replay_mode) {
++        m_running = false;
++        if (m_replay_thread.joinable()) {
++            m_replay_thread.join();
++        }
++        return true;
++    }
++
+     if (!m_dev_id_in) {
+         fprintf(stderr, "%s: no audio device to pause!\n", __func__);
+         return false;
+@@ -115,6 +266,17 @@
+ }
+ 
+ bool audio_async::clear() {
++    if (m_replay_mode) {
++        if (!m_running) {
++            fprintf(stderr, "%s: not running!\n", __func__);
++            return false;
++        }
++        std::lock_guard<std::mutex> lock(m_mutex);
++        m_audio_pos = 0;
++        m_audio_len = 0;
++        return true;
++    }
++
+     if (!m_dev_id_in) {
+         fprintf(stderr, "%s: no audio device to clear!\n", __func__);
+         return false;
+@@ -154,6 +316,16 @@
+     {
+         std::lock_guard<std::mutex> lock(m_mutex);
+ 
++        if (m_audio.size() == 0) {
++            return;
++        }
++
++        const size_t available = m_audio_len;
++        if (available + n_samples > m_audio.size()) {
++            m_dropped_samples += available + n_samples - m_audio.size();
++            m_overrun = true;
++        }
++
+         if (m_audio_pos + n_samples > m_audio.size()) {
+             const size_t n0 = m_audio.size() - m_audio_pos;
+ 
+@@ -164,11 +336,12 @@
+         }
+         m_audio_pos = (m_audio_pos + n_samples) % m_audio.size();
+         m_audio_len = std::min(m_audio_len + n_samples, m_audio.size());
++        m_captured_samples += n_samples;
+     }
+ }
+ 
+ void audio_async::get(int ms, std::vector<float> & result) {
+-    if (!m_dev_id_in) {
++    if (!m_replay_mode && !m_dev_id_in) {
+         fprintf(stderr, "%s: no audio device to get audio from!\n", __func__);
+         return;
+     }
+@@ -194,11 +367,7 @@
+ 
+         result.resize(n_samples);
+ 
+-        int s0 = m_audio_pos - n_samples;
+-        if (s0 < 0) {
+-            s0 += m_audio.size();
+-        }
+-
++        const size_t s0 = (m_audio_pos + m_audio.size() - m_audio_len) % m_audio.size();
+         if (s0 + n_samples > m_audio.size()) {
+             const size_t n0 = m_audio.size() - s0;
+ 
+@@ -207,9 +376,40 @@
+         } else {
+             memcpy(result.data(), &m_audio[s0], n_samples * sizeof(float));
+         }
++        m_audio_len -= n_samples;
++        m_processed_samples += n_samples;
+     }
+ }
+ 
++bool audio_async::eof() {
++    if (!m_replay_mode) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(m_mutex);
++    return m_replay_eof;
++}
++
++size_t audio_async::buffered_samples() {
++    std::lock_guard<std::mutex> lock(m_mutex);
++    return m_audio_len;
++}
++
++size_t audio_async::captured_samples() const {
++    return m_captured_samples.load();
++}
++
++size_t audio_async::processed_samples() const {
++    return m_processed_samples.load();
++}
++
++size_t audio_async::dropped_samples() const {
++    return m_dropped_samples.load();
++}
++
++bool audio_async::overrun() const {
++    return m_overrun.load();
++}
++
+ bool sdl_poll_events() {
+     SDL_Event event;
+     while (SDL_PollEvent(&event)) {
+--- a/examples/stream/stream.cpp
++++ b/examples/stream/stream.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <fstream>
+ #include <string>
+ #include <thread>
+@@ -145,6 +146,7 @@
+     // init audio
+ 
+     audio_async audio(params.length_ms);
++    const bool replay_mode = std::getenv("SBOBINO_WHISPER_REPLAY_WAV") != nullptr;
+     if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
+         fprintf(stderr, "%s: audio.init() failed!\n", __func__);
+         return 1;
+@@ -238,11 +240,10 @@
+ 
+     // main audio loop
+     while (is_running) {
+-        if (params.save_audio) {
+-            wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
+-        }
+         // handle Ctrl + C
+-        is_running = sdl_poll_events();
++        if (!replay_mode) {
++            is_running = sdl_poll_events();
++        }
+ 
+         if (!is_running) {
+             break;
+@@ -253,23 +254,36 @@
+         if (!use_vad) {
+             while (true) {
+                 // handle Ctrl + C
+-                is_running = sdl_poll_events();
++                if (!replay_mode) {
++                    is_running = sdl_poll_events();
++                }
+                 if (!is_running) {
+                     break;
+                 }
+                 audio.get(params.step_ms, pcmf32_new);
+ 
+-                if ((int) pcmf32_new.size() > 2*n_samples_step) {
+-                    fprintf(stderr, "\n\n%s: WARNING: cannot process audio fast enough, dropping audio ...\n\n", __func__);
+-                    audio.clear();
+-                    continue;
++                if (audio.eof() && pcmf32_new.empty()) {
++                    is_running = false;
++                    break;
+                 }
+ 
+-                if ((int) pcmf32_new.size() >= n_samples_step) {
+-                    audio.clear();
++                if (params.save_audio && !pcmf32_new.empty()) {
++                    wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
++                }
++
++                if (audio.overrun() || audio.buffered_samples() > 2 * WHISPER_SAMPLE_RATE) {
++                    fprintf(stderr,
++                            "SBOBINO_WHISPER_LIVE_BACKLOG exceeded captured=%zu processed=%zu buffered=%zu dropped=%zu\n",
++                            audio.captured_samples(), audio.processed_samples(),
++                            audio.buffered_samples(), audio.dropped_samples());
++                    is_running = false;
+                     break;
+                 }
+ 
++                if ((int) pcmf32_new.size() >= n_samples_step || audio.eof()) {
++                    break;
++                }
++
+                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+             }
+ 
+@@ -428,6 +442,15 @@
+         }
+     }
+ 
++    if (replay_mode) {
++        fprintf(stderr,
++                "SBOBINO_WHISPER_LIVE_METRICS captured_seconds=%.3f processed_seconds=%.3f backlog_seconds=%.3f dropped_samples=%zu\n",
++                audio.captured_samples() / float(WHISPER_SAMPLE_RATE),
++                audio.processed_samples() / float(WHISPER_SAMPLE_RATE),
++                audio.buffered_samples() / float(WHISPER_SAMPLE_RATE),
++                audio.dropped_samples());
++    }
++
+     audio.pause();
+ 
+     whisper_print_timings(ctx);

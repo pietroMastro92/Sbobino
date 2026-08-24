@@ -7,8 +7,11 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$WhisperUrl = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.4/whisper-bin-x64.zip"
-$WhisperSha256 = "74f973345cb52ef5ba3ec9e7e7af8e48cc8c71722d1528603b80588a11f82e3e"
+$WhisperSourceUrl = "https://github.com/ggml-org/whisper.cpp.git"
+$WhisperSourceRef = "9386f239401074690479731c1e41683fbbeac557"
+$SdlVersion = "2.32.10"
+$SdlUrl = "https://github.com/libsdl-org/SDL/releases/download/release-$SdlVersion/SDL2-devel-$SdlVersion-VC.zip"
+$SdlSha256 = "af347939395a58b365846aaea27391e69f9ec9d4dd650d6ac40802159b418a6e"
 $ParakeetVersion = "0.4.0"
 $ParakeetUrl = "https://github.com/mudler/parakeet.cpp/releases/download/v$ParakeetVersion/parakeet-v$ParakeetVersion-bin-win-cpu-x64.zip"
 $ParakeetSha256 = "2880150a1bad2944baed46f2e6bb9f1bc55263a9f2bb85573785a7ec4fa35f27"
@@ -180,6 +183,68 @@ function Checkout-ParakeetSource {
     }
 }
 
+function Checkout-WhisperSource {
+    param([string]$Destination)
+
+    & git clone --filter=blob:none $WhisperSourceUrl $Destination
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to clone pinned Whisper source from $WhisperSourceUrl"
+    }
+    & git -C $Destination checkout --detach $WhisperSourceRef
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to checkout pinned Whisper source ref $WhisperSourceRef"
+    }
+    $resolved = (& git -C $Destination rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $resolved -ne $WhisperSourceRef) {
+        throw "pinned Whisper source resolved to '$resolved', expected '$WhisperSourceRef'"
+    }
+    foreach ($patchName in @(
+        "whisper-stream-audio-file.patch",
+        "whisper-stream-fifo.patch",
+        "whisper-stream-backlog.patch",
+        "whisper-stream-finalization.patch",
+        "whisper-stream-lossless-drain.patch"
+    )) {
+        $patchPath = Join-Path $PSScriptRoot "patches\$patchName"
+        & git -C $Destination apply --check $patchPath
+        if ($LASTEXITCODE -ne 0) { throw "Whisper patch check failed: $patchName" }
+        & git -C $Destination apply $patchPath
+        if ($LASTEXITCODE -ne 0) { throw "Whisper patch apply failed: $patchName" }
+    }
+}
+
+function Build-WhisperBinaries {
+    param(
+        [string]$SourceDir,
+        [string]$BuildDir,
+        [string]$SdlRoot,
+        [string]$Destination
+    )
+
+    New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+    $generatorName = Find-CMakeVisualStudioGenerator
+    $generator = Quote-CmdArg $generatorName
+    $sourceArg = Quote-CmdArg $SourceDir
+    $buildArg = Quote-CmdArg $BuildDir
+    $sdlCmake = Find-OneFile $SdlRoot "SDL2Config.cmake"
+    $sdlCmakeDir = Split-Path -Parent $sdlCmake
+    Invoke-VsCommand ("cmake.exe -S {0} -B {1} -G {2} -A x64 -DCMAKE_BUILD_TYPE=Release -DSDL2_DIR={3} -DBUILD_SHARED_LIBS=ON -DWHISPER_BUILD_EXAMPLES=ON -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=ON -DGGML_NATIVE=OFF" -f `
+        $sourceArg, $buildArg, $generator, (Quote-CmdArg $sdlCmakeDir))
+    Invoke-VsCommand ("cmake.exe --build {0} --config Release --target whisper-cli whisper-stream" -f $buildArg)
+
+    Copy-Item (Find-OneFile $BuildDir "whisper-cli.exe") (Join-Path $Destination "whisper-cli.exe") -Force
+    Copy-Item (Find-OneFile $BuildDir "whisper-stream.exe") (Join-Path $Destination "whisper-stream.exe") -Force
+    Get-ChildItem -Path $BuildDir -Recurse -File -Filter "*.dll" |
+        Sort-Object Name, FullName |
+        ForEach-Object { Copy-Item $_.FullName (Join-Path $Destination $_.Name) -Force }
+    $sdlDll = @(Get-ChildItem -Path $SdlRoot -Recurse -File -Filter "SDL2.dll" |
+        Where-Object { $_.FullName -match '[\\/]lib[\\/]x64[\\/]SDL2\.dll$' })
+    if ($sdlDll.Count -ne 1) {
+        throw "expected exactly one x64 SDL2.dll below '$SdlRoot', found $($sdlDll.Count)"
+    }
+    Copy-Item $sdlDll[0].FullName (Join-Path $Destination "SDL2.dll") -Force
+}
+
 function Build-ParakeetSharedLibrary {
     param(
         [string]$SourceDir,
@@ -326,6 +391,8 @@ $downloads = Join-Path $stage "downloads"
 $extract = Join-Path $stage "extract"
 $parakeetSource = Join-Path $stage "parakeet-source"
 $parakeetBuild = Join-Path $stage "parakeet-build"
+$whisperSource = Join-Path $stage "whisper-source"
+$whisperBuild = Join-Path $stage "whisper-build"
 $runtimeRoot = Join-Path $stage "runtime"
 $binDir = Join-Path $runtimeRoot "bin"
 $libDir = Join-Path $runtimeRoot "lib"
@@ -333,22 +400,22 @@ $libDir = Join-Path $runtimeRoot "lib"
 try {
     New-Item -ItemType Directory -Force -Path $downloads, $extract, $binDir, $libDir | Out-Null
 
-    $whisperArchive = Join-Path $downloads "whisper.zip"
+    $sdlArchive = Join-Path $downloads "sdl2.zip"
     $parakeetArchive = Join-Path $downloads "parakeet.zip"
     $ffmpegArchive = Join-Path $downloads "ffmpeg.zip"
-    Download-VerifiedArchive $WhisperUrl $whisperArchive $WhisperSha256
+    Download-VerifiedArchive $SdlUrl $sdlArchive $SdlSha256
     Download-VerifiedArchive $ParakeetUrl $parakeetArchive $ParakeetSha256
     Download-VerifiedArchive $FfmpegUrl $ffmpegArchive $FfmpegSha256
 
-    $whisperExtract = Join-Path $extract "whisper"
+    $sdlExtract = Join-Path $extract "sdl2"
     $parakeetExtract = Join-Path $extract "parakeet"
     $ffmpegExtract = Join-Path $extract "ffmpeg"
-    Expand-Archive -Path $whisperArchive -DestinationPath $whisperExtract
+    Expand-Archive -Path $sdlArchive -DestinationPath $sdlExtract
     Expand-Archive -Path $parakeetArchive -DestinationPath $parakeetExtract
     Expand-Archive -Path $ffmpegArchive -DestinationPath $ffmpegExtract
 
-    Copy-Item (Find-OneFile $whisperExtract "whisper-cli.exe") (Join-Path $binDir "whisper-cli.exe")
-    Copy-Item (Find-OneFile $whisperExtract "whisper-stream.exe") (Join-Path $binDir "whisper-stream.exe")
+    Checkout-WhisperSource $whisperSource
+    Build-WhisperBinaries $whisperSource $whisperBuild $sdlExtract $binDir
     Copy-Item (Find-OneFile $parakeetExtract "parakeet-cli.exe") (Join-Path $binDir "parakeet-cli.exe")
     Copy-Item (Find-OneFile $ffmpegExtract "ffmpeg.exe") (Join-Path $binDir "ffmpeg.exe")
 
@@ -377,9 +444,6 @@ try {
     # Windows resolves dependencies from the executable directory before PATH.
     # Keep every native dependency app-local so clean machines do not need a
     # preinstalled VC++ runtime and never display one missing-DLL dialog per tool.
-    Get-ChildItem -Path $whisperExtract -Recurse -File -Filter "*.dll" |
-        Sort-Object Name, FullName |
-        ForEach-Object { Copy-Item $_.FullName (Join-Path $binDir $_.Name) -Force }
     Get-ChildItem -Path $ffmpegExtract -Recurse -File -Filter "*.dll" |
         Sort-Object Name, FullName |
         ForEach-Object { Copy-Item $_.FullName (Join-Path $binDir $_.Name) -Force }
@@ -390,6 +454,7 @@ try {
     @(
         "runtime_arch=$TargetTriple"
         "whisper_cpp_version=1.8.4"
+        "whisper_cpp_source_ref=$WhisperSourceRef"
         "parakeet_cpp_version=0.4.0"
         "parakeet_cpp_source_ref=$ParakeetSourceRef"
         "ffmpeg_version=8.1"

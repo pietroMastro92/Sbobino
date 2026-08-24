@@ -30,6 +30,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format check
         run: cargo fmt --all -- --check
+      - name: Release/runtime contract tests
+        run: |
+          ./scripts/check_macos_runtime_source.sh
+          bash ./scripts/check_windows_powershell_source.sh
+          python3 -m unittest \
+            scripts/test_release_workflow_contract.py \
+            scripts/test_evaluate_live_latency.py \
+            scripts/test_run_whisper_live_replay.py
       - name: Clippy
         run: cargo clippy -p sbobino-domain -p sbobino-application -p sbobino-infrastructure --all-targets -- -D warnings
       - name: Tests

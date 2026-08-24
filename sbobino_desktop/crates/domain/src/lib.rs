@@ -17,15 +17,16 @@ pub use emotion_analysis::{
 pub use error::DomainError;
 pub use job::{JobProgress, JobStage, JobStatus, TranscriptionJob};
 pub use settings::{
-    default_prompt_templates, transcription_language_catalog, AiProvider, AiSettings, AppLanguage,
-    AppSettings, AppearanceMode, AutomaticImportActivityEntry, AutomaticImportActivityLevel,
-    AutomaticImportPostProcessingSettings, AutomaticImportPreset, AutomaticImportQuarantineItem,
-    AutomaticImportSettings, AutomaticImportSource, AutomaticImportSourceHealth,
-    AutomaticImportSourceStatus, GeneralSettings, LanguageCode, OrganizationSettings,
-    ParakeetModel, PromptBindings, PromptCategory, PromptSettings, PromptTask, PromptTemplate,
-    RemoteServiceConfig, RemoteServiceKind, SpeakerDiarizationSettings, SpeechModel,
-    TranscriptionComputeDevice, TranscriptionEngine, TranscriptionLanguageOption,
-    TranscriptionLanguagePolicy, TranscriptionSettings, WhisperOptions, WorkspaceConfig,
+    default_prompt_templates, transcription_language_catalog, whisper_live_model_manifest,
+    AiProvider, AiSettings, AppLanguage, AppSettings, AppearanceMode, AutomaticImportActivityEntry,
+    AutomaticImportActivityLevel, AutomaticImportPostProcessingSettings, AutomaticImportPreset,
+    AutomaticImportQuarantineItem, AutomaticImportSettings, AutomaticImportSource,
+    AutomaticImportSourceHealth, AutomaticImportSourceStatus, GeneralSettings, LanguageCode,
+    OrganizationSettings, ParakeetModel, PromptBindings, PromptCategory, PromptSettings,
+    PromptTask, PromptTemplate, RemoteServiceConfig, RemoteServiceKind, SpeakerDiarizationSettings,
+    SpeechModel, TranscriptionComputeDevice, TranscriptionEngine, TranscriptionLanguageOption,
+    TranscriptionLanguagePolicy, TranscriptionSettings, WhisperLiveModelManifest, WhisperOptions,
+    WorkspaceConfig,
 };
 pub use transcript_cleanup::{
     collapse_consecutive_repeated_segments, constrain_transcript_edit,

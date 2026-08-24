@@ -1,0 +1,129 @@
+--- a/examples/stream/stream.cpp
++++ b/examples/stream/stream.cpp
+@@ -145,15 +145,13 @@
+ 
+     // init audio
+ 
+-    audio_async audio(params.length_ms);
++    audio_async audio(std::max(params.length_ms, params.step_ms + 2100));
+     const bool replay_mode = std::getenv("SBOBINO_WHISPER_REPLAY_WAV") != nullptr;
+     if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
+         fprintf(stderr, "%s: audio.init() failed!\n", __func__);
+         return 1;
+     }
+ 
+-    audio.resume();
+-
+     // whisper init
+     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1){
+         fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
+@@ -209,6 +207,8 @@
+     }
+ 
+     int n_iter = 0;
++    uint64_t n_samples_inferred = 0;
++    bool backlog_failed = false;
+ 
+     bool is_running = true;
+ 
+@@ -232,6 +232,7 @@
+ 
+         wavWriter.open(filename, WHISPER_SAMPLE_RATE, 16, 1);
+     }
++    audio.resume();
+     printf("[Start speaking]\n");
+     fflush(stdout);
+ 
+@@ -258,8 +259,26 @@
+                     is_running = sdl_poll_events();
+                 }
+                 if (!is_running) {
++                    break;
++                }
++                const uint64_t captured_before = audio.captured_samples();
++                const uint64_t backlog_before = captured_before > n_samples_inferred
++                    ? captured_before - n_samples_inferred
++                    : 0;
++                if (audio.overrun() || backlog_before > 2U * WHISPER_SAMPLE_RATE) {
++                    audio.get(0, pcmf32_new);
++                    if (params.save_audio && !pcmf32_new.empty()) {
++                        wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
++                    }
++                    fprintf(stderr,
++                            "SBOBINO_WHISPER_LIVE_BACKLOG exceeded captured=%zu inferred=%zu buffered=%zu dropped=%zu\n",
++                            audio.captured_samples(), size_t(n_samples_inferred),
++                            audio.buffered_samples(), audio.dropped_samples());
++                    backlog_failed = true;
++                    is_running = false;
+                     break;
+                 }
++
+                 audio.get(params.step_ms, pcmf32_new);
+ 
+                 if (audio.eof() && pcmf32_new.empty()) {
+@@ -269,15 +288,6 @@
+ 
+                 if (params.save_audio && !pcmf32_new.empty()) {
+                     wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
+-                }
+-
+-                if (audio.overrun() || audio.buffered_samples() > 2 * WHISPER_SAMPLE_RATE) {
+-                    fprintf(stderr,
+-                            "SBOBINO_WHISPER_LIVE_BACKLOG exceeded captured=%zu processed=%zu buffered=%zu dropped=%zu\n",
+-                            audio.captured_samples(), audio.processed_samples(),
+-                            audio.buffered_samples(), audio.dropped_samples());
+-                    is_running = false;
+-                    break;
+                 }
+ 
+                 if ((int) pcmf32_new.size() >= n_samples_step || audio.eof()) {
+@@ -326,6 +336,8 @@
+             t_last = t_now;
+         }
+ 
++        const auto inference_started = std::chrono::steady_clock::now();
++
+         // run the inference
+         {
+             whisper_full_params wparams = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
+@@ -440,8 +452,33 @@
+             }
+             fflush(stdout);
+         }
++
++        n_samples_inferred += pcmf32_new.size();
++        const auto inference_finished = std::chrono::steady_clock::now();
++        const double inference_ms = std::chrono::duration<double, std::milli>(
++            inference_finished - inference_started).count();
++        const uint64_t captured = audio.captured_samples();
++        const uint64_t backlog = captured > n_samples_inferred
++            ? captured - n_samples_inferred
++            : 0;
++        fprintf(stderr,
++                "SBOBINO_WHISPER_LIVE_METRIC captured_seconds=%.3f processed_seconds=%.3f backlog_seconds=%.3f inference_ms=%.3f dropped_samples=%zu\n",
++                captured / float(WHISPER_SAMPLE_RATE),
++                n_samples_inferred / float(WHISPER_SAMPLE_RATE),
++                backlog / float(WHISPER_SAMPLE_RATE),
++                inference_ms,
++                audio.dropped_samples());
++        fflush(stderr);
+     }
+ 
++    // Stop capture before the final drain so no callback can append samples
++    // between saving the FIFO tail and closing the WAV.
++    audio.pause();
++    audio.get(0, pcmf32_new);
++    if (params.save_audio && !pcmf32_new.empty()) {
++        wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
++    }
++
+     if (replay_mode) {
+         fprintf(stderr,
+                 "SBOBINO_WHISPER_LIVE_METRICS captured_seconds=%.3f processed_seconds=%.3f backlog_seconds=%.3f dropped_samples=%zu\n",
+@@ -456,5 +493,5 @@
+     whisper_print_timings(ctx);
+     whisper_free(ctx);
+ 
+-    return 0;
++    return backlog_failed ? 7 : 0;
+ }

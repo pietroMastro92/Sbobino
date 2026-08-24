@@ -6,9 +6,12 @@ pub mod secure_storage;
 use chrono::Utc;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     env,
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -22,8 +25,8 @@ use sbobino_application::{
     TranscriptEnhancer, TranscriptionService,
 };
 use sbobino_domain::{
-    AiProvider, AppSettings, PromptTask, RemoteServiceConfig, RemoteServiceKind, SpeechModel,
-    TranscriptionEngine,
+    whisper_live_model_manifest, AiProvider, AppSettings, PromptTask, RemoteServiceConfig,
+    RemoteServiceKind, SpeechModel, TranscriptionEngine,
 };
 
 use adapters::{
@@ -1524,9 +1527,13 @@ impl RuntimeTranscriptionFactory {
             self.binary_path_is_runnable(&whisper_stream_resolution.resolved_path)
         };
         let model_filename = model.ggml_filename().to_string();
-        let model_present = PathBuf::from(&resolved_models_dir)
-            .join(&model_filename)
-            .exists();
+        let model_path = PathBuf::from(&resolved_models_dir).join(&model_filename);
+        let live_manifest = whisper_live_model_manifest();
+        let model_present = if model_filename == live_manifest.filename {
+            file_sha256_matches(&model_path, &live_manifest.sha256)
+        } else {
+            model_path.is_file()
+        };
 
         Ok(LiveStartHealth {
             managed_runtime_required: self.managed_runtime_required(),
@@ -3124,6 +3131,29 @@ fn sha256_matches(left: &str, right: &str) -> bool {
         && left.trim().eq_ignore_ascii_case(right.trim())
 }
 
+fn file_sha256_matches(path: &Path, expected: &str) -> bool {
+    if expected.len() != 64
+        || !expected
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => hasher.update(&buffer[..count]),
+            Err(_) => return false,
+        }
+    }
+    format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected)
+}
+
 fn normalize_pyannote_compat_level(value: u32) -> u32 {
     if value == 0 {
         PYANNOTE_COMPAT_LEVEL
@@ -4241,18 +4271,32 @@ fn expand_home(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_external_python_framework_reference, parse_otool_linked_library_entries,
-        parse_otool_rpath_entries, parse_pyannote_python_framework_version,
-        pyannote_native_binary_paths, pyannote_runtime_arch_matches_host,
-        pyannote_runtime_validation_script, target_triple_suffix, ManagedPyannoteManifest,
-        ManagedPyannoteReceipt, ReconcileManagedPyannoteReleaseOutcome, RuntimeSourcePolicy,
-        RuntimeTranscriptionFactory, PYANNOTE_COMPAT_LEVEL, PYANNOTE_RECEIPT_FILENAME,
-        PYANNOTE_STATUS_FILENAME,
+        file_sha256_matches, parse_external_python_framework_reference,
+        parse_otool_linked_library_entries, parse_otool_rpath_entries,
+        parse_pyannote_python_framework_version, pyannote_native_binary_paths,
+        pyannote_runtime_arch_matches_host, pyannote_runtime_validation_script,
+        target_triple_suffix, ManagedPyannoteManifest, ManagedPyannoteReceipt,
+        ReconcileManagedPyannoteReleaseOutcome, RuntimeSourcePolicy, RuntimeTranscriptionFactory,
+        PYANNOTE_COMPAT_LEVEL, PYANNOTE_RECEIPT_FILENAME, PYANNOTE_STATUS_FILENAME,
     };
     use sbobino_domain::{
         AiProvider, AppSettings, RemoteServiceConfig, RemoteServiceKind, TranscriptionEngine,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn live_model_integrity_check_rejects_corrupted_bytes() {
+        use sha2::{Digest, Sha256};
+
+        let temp = tempdir().expect("failed to create tempdir");
+        let model = temp.path().join("ggml-base.bin");
+        std::fs::write(&model, b"certified-model").expect("model fixture should write");
+        let expected = format!("{:x}", Sha256::digest(b"certified-model"));
+        assert!(file_sha256_matches(&model, &expected));
+
+        std::fs::write(&model, b"corrupted-model").expect("corrupt fixture should write");
+        assert!(!file_sha256_matches(&model, &expected));
+    }
 
     fn build_factory() -> (tempfile::TempDir, RuntimeTranscriptionFactory) {
         std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");

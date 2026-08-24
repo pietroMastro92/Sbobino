@@ -420,28 +420,34 @@ jobs:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
-      - name: Cache pinned Parakeet live model and speech fixture
-        if: matrix.arch == 'aarch64'
+      - name: Cache pinned Whisper live model and speech fixture
         uses: actions/cache@v4
         with:
           path: |
-            ${{ runner.temp }}/parakeet-live-readiness-model
-            ${{ runner.temp }}/parakeet-readiness-fixture
-          key: parakeet-live-nemotron-q4-5ad85eb3f3014c1a300d67b7ccbd23c38c4c952405cbe33a861e19fb2775e84b-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
+            ${{ runner.temp }}/whisper-live-readiness-model
+            ${{ runner.temp }}/whisper-live-readiness-fixture
+          key: whisper-live-ggml-base-60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
 
       - uses: dtolnay/rust-toolchain@stable
-        if: matrix.arch == 'aarch64'
 
       - name: Validate public assets on the matching architecture
         working-directory: sbobino_desktop
         run: ./scripts/distribution_readiness.sh "${TAG_NAME#v}" "$GITHUB_REPOSITORY"
 
-      - name: Run real packaged Parakeet live replay on Apple Silicon
-        if: matrix.arch == 'aarch64'
+      - name: Run real packaged Whisper live replay on the matching architecture
         working-directory: sbobino_desktop
         run: |
-          ./scripts/release_macos_parakeet_live_smoke.sh \
-            "${TAG_NAME#v}" "$GITHUB_REPOSITORY" "$PWD/arm-parakeet-live-smoke-proof.json"
+          DEVICE=auto
+          NATIVE_ARCH=arm64
+          if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
+            DEVICE=cpu
+            NATIVE_ARCH=x86_64
+          fi
+          SBOBINO_WHISPER_LIVE_ARCH="$NATIVE_ARCH" \
+          SBOBINO_WHISPER_LIVE_DEVICE="$DEVICE" \
+          SBOBINO_LIVE_RUNNER="github-hosted ${{ matrix.runner }}" \
+          ./scripts/release_macos_whisper_live_smoke.sh \
+            "${TAG_NAME#v}" "$GITHUB_REPOSITORY" "$PWD/${{ matrix.arch }}-whisper-live-smoke-proof.json"
 
       - name: Write architecture proof
         working-directory: sbobino_desktop
@@ -459,10 +465,9 @@ jobs:
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
-        if: matrix.arch == 'aarch64'
         with:
-          name: parakeet-live-aarch64
-          path: sbobino_desktop/arm-parakeet-live-smoke-proof.json
+          name: whisper-live-${{ matrix.arch }}
+          path: sbobino_desktop/${{ matrix.arch }}-whisper-live-smoke-proof.json
           if-no-files-found: error
 
   windows-distribution-readiness:
@@ -539,6 +544,13 @@ jobs:
             -ReportPath $guiReportPath
           $guiReport = Get-Content $guiReportPath -Raw | ConvertFrom-Json
 
+          $liveReportPath = Join-Path $PWD "windows-whisper-live-smoke-proof.json"
+          ./scripts/release_windows_whisper_live_smoke.ps1 `
+            -Version $version `
+            -RepoSlug $env:GITHUB_REPOSITORY `
+            -ReportPath $liveReportPath
+          $liveReport = Get-Content $liveReportPath -Raw | ConvertFrom-Json
+
           @{
             schema_version = 1
             version = $version
@@ -554,7 +566,8 @@ jobs:
             main_window_count = $guiReport.main_window_count
             main_window_opaque = $guiReport.main_window_opaque
             macos_transparency_preserved = $guiReport.macos_transparency_preserved
-          } | ConvertTo-Json | Set-Content windows-distribution-readiness-proof.json
+            live_latency = $liveReport
+          } | ConvertTo-Json -Depth 10 | Set-Content windows-distribution-readiness-proof.json
 
       - uses: actions/upload-artifact@v4
         with:
@@ -741,6 +754,8 @@ jobs:
       TAG_NAME: ${{ inputs.tag_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: distribution-readiness-aarch64
@@ -753,7 +768,12 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: parakeet-live-aarch64
+          name: whisper-live-aarch64
+          path: validation-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: whisper-live-x86_64
           path: validation-assets
 
       - uses: actions/download-artifact@v4
@@ -776,6 +796,13 @@ jobs:
           name: intel-pyannote-parakeet-smoke
           path: validation-assets
 
+      - name: Stage the candidate readiness proof
+        run: |
+          gh release download "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "release-readiness-proof.json" \
+            --dir validation-assets
+
       - name: Fold Intel CPU/Pyannote smoke into the Intel distribution proof
         run: |
           python3 - <<'PY'
@@ -786,21 +813,20 @@ jobs:
           arm_distribution_path = validation_dir / "distribution-readiness-proof.json"
           distribution_path = validation_dir / "intel-distribution-readiness-proof.json"
           smoke_path = validation_dir / "intel-pyannote-parakeet-smoke-proof.json"
-          live_path = validation_dir / "arm-parakeet-live-smoke-proof.json"
+          arm_live_path = validation_dir / "aarch64-whisper-live-smoke-proof.json"
+          intel_live_path = validation_dir / "x86_64-whisper-live-smoke-proof.json"
           arm_distribution = json.loads(arm_distribution_path.read_text(encoding="utf-8"))
           distribution = json.loads(distribution_path.read_text(encoding="utf-8"))
           smoke = json.loads(smoke_path.read_text(encoding="utf-8"))
-          live = json.loads(live_path.read_text(encoding="utf-8"))
+          arm_live = json.loads(arm_live_path.read_text(encoding="utf-8"))
+          intel_live = json.loads(intel_live_path.read_text(encoding="utf-8"))
           if smoke.get("version") != distribution.get("version"):
               raise SystemExit("Intel smoke version does not match Intel distribution proof")
           if smoke.get("release_tag") != distribution.get("release_tag"):
               raise SystemExit("Intel smoke release tag does not match Intel distribution proof")
           if smoke.get("status") != "passed":
               raise SystemExit("Intel CPU/Pyannote smoke did not pass")
-          for key, report in (
-              ("asr_reference", smoke.get("asr_reference")),
-              ("live_latency", live),
-          ):
+          for key, report in (("asr_reference", smoke.get("asr_reference")),):
               if not isinstance(report, dict):
                   raise SystemExit(
                       f"Intel smoke is missing real hosted {key}; "
@@ -814,11 +840,27 @@ jobs:
                   raise SystemExit(f"Intel smoke {key} did not run on a hosted runner")
               if report.get("status") != "passed" or report.get("failures"):
                   raise SystemExit(f"Intel smoke {key} did not pass")
-              # ASR/live reports are real hosted evidence and belong in the
+              # The ASR report is real hosted evidence and belongs in the
               # existing ARM distribution proof so promotion has one stable
-              # location to validate them.  Synthetic Ubuntu reports never
-              # enter this fold.
+              # location to validate it. Synthetic Ubuntu reports never enter
+              # this fold.
               arm_distribution[key] = report
+          for label, report, expected_platform in (
+              ("ARM live", arm_live, "macos-arm64"),
+              ("Intel live", intel_live, "macos-x86_64"),
+          ):
+              if not isinstance(report, dict):
+                  raise SystemExit(f"{label} proof is missing")
+              if report.get("evidence_class") != "hosted-packaged-engine":
+                  raise SystemExit(f"{label} is not hosted packaged-engine evidence")
+              if report.get("real_engine") is not True or report.get("real_harness") is not True:
+                  raise SystemExit(f"{label} did not execute a real engine/harness")
+              if report.get("platform") != expected_platform:
+                  raise SystemExit(f"{label} platform mismatch")
+              if report.get("status") != "passed" or report.get("failures"):
+                  raise SystemExit(f"{label} did not pass")
+          arm_distribution["live_latency"] = arm_live
+          distribution["live_latency"] = intel_live
           distribution["intel_pyannote_parakeet_smoke"] = {
               "schema_version": smoke.get("schema_version"),
               "status": smoke.get("status"),
@@ -831,13 +873,14 @@ jobs:
               "parakeet_language": smoke.get("parakeet_language"),
               "pyannote_deep_smoke": smoke.get("pyannote_deep_smoke"),
               "asr_reference": smoke.get("asr_reference"),
-              "live_latency": live,
+              "live_latency": intel_live,
               "logs": smoke.get("logs", []),
           }
           distribution_path.write_text(json.dumps(distribution, indent=2) + "\n", encoding="utf-8")
           arm_distribution_path.write_text(json.dumps(arm_distribution, indent=2) + "\n", encoding="utf-8")
           smoke_path.unlink()
-          live_path.unlink()
+          arm_live_path.unlink()
+          intel_live_path.unlink()
           PY
 
       - name: Require exactly the public seven JSON proof assets

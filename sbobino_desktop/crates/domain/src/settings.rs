@@ -240,6 +240,26 @@ impl SpeechModel {
     }
 }
 
+/// The only Whisper model currently certified for the live path.
+///
+/// Keep this manifest in the domain crate so the application provisioning
+/// path and release smoke harness consume the same immutable URL and digest.
+/// Other Whisper models remain available for file transcription, but must not
+/// silently become an unvalidated live runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WhisperLiveModelManifest {
+    pub schema_version: u32,
+    pub model: SpeechModel,
+    pub filename: String,
+    pub url: String,
+    pub sha256: String,
+}
+
+pub fn whisper_live_model_manifest() -> WhisperLiveModelManifest {
+    serde_json::from_str(include_str!("whisper_live_model.json"))
+        .expect("bundled Whisper live model manifest must be valid")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ParakeetModel {
@@ -1300,5 +1320,23 @@ mod language_tests {
             settings.live_compute_device,
             TranscriptionComputeDevice::Auto
         );
+    }
+
+    #[test]
+    fn whisper_live_manifest_is_pinned_to_the_certified_base_model() {
+        let manifest = whisper_live_model_manifest();
+
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.model, SpeechModel::Base);
+        assert_eq!(manifest.filename, SpeechModel::Base.ggml_filename());
+        assert!(manifest
+            .url
+            .contains("/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/"));
+        assert!(!manifest.url.contains("/resolve/main/"));
+        assert_eq!(manifest.sha256.len(), 64);
+        assert!(manifest
+            .sha256
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
     }
 }

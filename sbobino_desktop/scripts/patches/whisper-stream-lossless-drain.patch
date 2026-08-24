@@ -1,0 +1,97 @@
+diff --git a/examples/common-sdl.cpp b/examples/common-sdl.cpp
+index fc1de26b..76c546d1 100644
+--- a/examples/common-sdl.cpp
++++ b/examples/common-sdl.cpp
+@@ -322,8 +322,18 @@ void audio_async::callback(uint8_t * stream, int len) {
+ 
+         const size_t available = m_audio_len;
+         if (available + n_samples > m_audio.size()) {
+-            m_dropped_samples += available + n_samples - m_audio.size();
+-            m_overrun = true;
++            const size_t old_size = m_audio.size();
++            const size_t oldest = (m_audio_pos + old_size - available) % old_size;
++            std::vector<float> expanded(std::max(old_size * 2, available + n_samples));
++            const size_t first = std::min(available, old_size - oldest);
++            if (available > 0) {
++                memcpy(expanded.data(), &m_audio[oldest], first * sizeof(float));
++                if (available > first) {
++                    memcpy(&expanded[first], &m_audio[0], (available - first) * sizeof(float));
++                }
++            }
++            m_audio.swap(expanded);
++            m_audio_pos = available;
+         }
+ 
+         if (m_audio_pos + n_samples > m_audio.size()) {
+@@ -346,7 +356,7 @@ void audio_async::get(int ms, std::vector<float> & result) {
+         return;
+     }
+ 
+-    if (!m_running) {
++    if (!m_running && ms > 0) {
+         fprintf(stderr, "%s: not running!\n", __func__);
+         return;
+     }
+diff --git a/examples/stream/stream.cpp b/examples/stream/stream.cpp
+index 5ca51e23..9786eff5 100644
+--- a/examples/stream/stream.cpp
++++ b/examples/stream/stream.cpp
+@@ -341,6 +341,27 @@ int main(int argc, char ** argv) {
+         }
+ 
+         const auto inference_started = std::chrono::steady_clock::now();
++        std::atomic_bool inference_monitor_done { false };
++        std::atomic_bool inference_backlog_failed { false };
++        std::thread backlog_monitor([&]() {
++            while (!inference_monitor_done.load()) {
++                const uint64_t captured = audio.captured_samples();
++                const uint64_t backlog = captured > n_samples_inferred
++                    ? captured - n_samples_inferred
++                    : 0;
++                if (backlog > 2U * WHISPER_SAMPLE_RATE) {
++                    audio.pause();
++                    fprintf(stderr,
++                            "SBOBINO_WHISPER_LIVE_BACKLOG exceeded captured=%zu inferred=%zu buffered=%zu dropped=%zu\n",
++                            audio.captured_samples(), size_t(n_samples_inferred),
++                            audio.buffered_samples(), audio.dropped_samples());
++                    fflush(stderr);
++                    inference_backlog_failed = true;
++                    break;
++                }
++                std::this_thread::sleep_for(std::chrono::milliseconds(10));
++            }
++        });
+ 
+         // run the inference
+         {
+@@ -370,6 +391,9 @@ int main(int argc, char ** argv) {
+ 
+             if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
+                 fprintf(stderr, "%s: failed to process audio\n", argv[0]);
++                inference_monitor_done = true;
++                backlog_monitor.join();
++                audio.pause();
+                 return 6;
+             }
+ 
+@@ -457,6 +481,20 @@ int main(int argc, char ** argv) {
+             fflush(stdout);
+         }
+ 
++        if (const char * delay = std::getenv("SBOBINO_WHISPER_TEST_INFERENCE_DELAY_MS")) {
++            const int delay_ms = std::atoi(delay);
++            if (delay_ms > 0) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(std::min(delay_ms, 10000)));
++            }
++        }
++
++        inference_monitor_done = true;
++        backlog_monitor.join();
++        if (inference_backlog_failed) {
++            backlog_failed = true;
++            is_running = false;
++        }
++
+         n_samples_inferred += pcmf32_new.size();
+         const auto inference_finished = std::chrono::steady_clock::now();
+         const double inference_ms = std::chrono::duration<double, std::milli>(

@@ -2,17 +2,12 @@ name: ARM Runtime Validation
 
 on:
   workflow_dispatch:
-    inputs:
-      tag_name:
-        description: Existing candidate tag whose packaged runtime will be tested
-        required: true
-        default: v2.0.28
 
 permissions:
   contents: read
 
 jobs:
-  parakeet-live-shared-metal:
+  whisper-live-replay:
     runs-on: macos-14
     timeout-minutes: 45
     env:
@@ -22,32 +17,35 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache pinned Parakeet live model and speech fixture
+      - name: Install native build dependencies
+        run: brew install ffmpeg sdl2 nasm
+
+      - name: Cache pinned Whisper live model and speech fixture
         uses: actions/cache@v4
         with:
           path: |
-            ${{ runner.temp }}/parakeet-live-readiness-model
-            ${{ runner.temp }}/parakeet-readiness-fixture
-          key: parakeet-live-nemotron-q4-5ad85eb3f3014c1a300d67b7ccbd23c38c4c952405cbe33a861e19fb2775e84b-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
+            ${{ runner.temp }}/whisper-live-readiness-model
+            ${{ runner.temp }}/whisper-live-readiness-fixture
+          key: whisper-live-ggml-base-60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
 
-      - name: Replay packaged Parakeet with shared Metal buffers
+      - name: Build the exact packaged Apple Silicon speech runtime
         working-directory: sbobino_desktop
-        env:
-          # The GitHub Apple Silicon runner exposes an Apple Paravirtual device.
-          # ggml defaults unified-memory devices to shared buffers; explicitly
-          # restore that mode because the production safety environment also
-          # carries the older disable flag and ENABLE intentionally wins.
-          GGML_METAL_SHARED_BUFFERS_ENABLE: "1"
+        run: ./scripts/package_macos_runtime_asset.sh "$RUNNER_TEMP/speech-runtime-macos-aarch64.zip"
+
+      - name: Replay packaged Whisper through the production stream binary
+        working-directory: sbobino_desktop
         run: |
-          VERSION="${{ inputs.tag_name }}"
-          ./scripts/release_macos_parakeet_live_smoke.sh \
-            "${VERSION#v}" "${GITHUB_REPOSITORY}" \
-            "$RUNNER_TEMP/arm-parakeet-live-smoke-proof.json"
+          SBOBINO_WHISPER_LIVE_ARCH=arm64 \
+          SBOBINO_WHISPER_LIVE_RUNTIME_ZIP="$RUNNER_TEMP/speech-runtime-macos-aarch64.zip" \
+          SBOBINO_LIVE_RUNNER="github-hosted macos-14" \
+          ./scripts/release_macos_whisper_live_smoke.sh \
+            "source-validation" "${GITHUB_REPOSITORY}" \
+            "$RUNNER_TEMP/arm-whisper-live-smoke-proof.json"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: arm-parakeet-live-shared-metal
-          path: ${{ runner.temp }}/arm-parakeet-live-smoke-proof.json
+          name: arm-whisper-live-replay
+          path: ${{ runner.temp }}/arm-whisper-live-smoke-proof.json
           if-no-files-found: warn
           retention-days: 3

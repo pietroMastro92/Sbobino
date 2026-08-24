@@ -14,7 +14,8 @@ PROMOTION = ROOT / "scripts" / "promote_candidate_release.sh"
 INTEL_VALIDATION = ROOT.parent / ".github" / "workflows" / "intel-runtime-validation.yml"
 ARM_VALIDATION = ROOT.parent / ".github" / "workflows" / "arm-runtime-validation.yml"
 INTEL_SMOKE = ROOT / "scripts" / "release_intel_pyannote_parakeet_smoke.sh"
-ARM_LIVE_SMOKE = ROOT / "scripts" / "release_macos_parakeet_live_smoke.sh"
+ARM_LIVE_SMOKE = ROOT / "scripts" / "release_macos_whisper_live_smoke.sh"
+WINDOWS_LIVE_SMOKE = ROOT / "scripts" / "release_windows_whisper_live_smoke.ps1"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
@@ -35,6 +36,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("Require exactly the public seven JSON proof assets", workflow)
         self.assertIn("--validate-public-proof-assets validation-assets", workflow)
+        self.assertIn("Stage the candidate readiness proof", workflow)
+        self.assertIn('--pattern "release-readiness-proof.json"', workflow)
         self.assertIn("release-quality-contract-tests.result", workflow)
         self.assertIn("release-notes.md", (ROOT / "docs" / "release-notes" / "v2.0.28.md").read_text(encoding="utf-8"))
 
@@ -42,22 +45,42 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         intel = INTEL_SMOKE.read_text(encoding="utf-8")
         live = ARM_LIVE_SMOKE.read_text(encoding="utf-8")
+        live_runner = (ROOT / "scripts" / "run_whisper_live_replay.py").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("release_intel_pyannote_parakeet_smoke.sh", workflow)
-        self.assertIn("release_macos_parakeet_live_smoke.sh", workflow)
+        self.assertIn("release_macos_whisper_live_smoke.sh", workflow)
         self.assertIn('(\"asr_reference\", smoke.get(\"asr_reference\"))', workflow)
-        self.assertIn('(\"live_latency\", live)', workflow)
+        self.assertIn('arm_distribution["live_latency"] = arm_live', workflow)
+        self.assertIn('distribution["live_latency"] = intel_live', workflow)
+        self.assertIn("release_windows_whisper_live_smoke.ps1", workflow)
         self.assertIn("evaluate_asr_reference.py", intel)
         self.assertIn("SBOBINO_ASR_TIMELINE_OUTPUT", intel)
         self.assertIn("review_status", intel)
-        self.assertIn("parakeet_realtime_c_api_streams_real_wav", live)
-        self.assertIn("SBOBINO_PARAKEET_LIVE_REALTIME=1", live)
-        self.assertIn("PARAKEET_LIVE_FEED_SAMPLES", (ROOT / "apps" / "desktop" / "src-tauri" / "src" / "parakeet_realtime.rs").read_text(encoding="utf-8"))
+        self.assertIn("SBOBINO_WHISPER_REPLAY_WAV", live)
+        self.assertIn("SBOBINO_WHISPER_LIVE_METRIC", live)
+        self.assertIn("run_whisper_live_replay.py", live)
+        self.assertIn("--step", live_runner)
+        self.assertIn("--length", live_runner)
+        self.assertIn("--save-audio", live_runner)
+        self.assertNotIn("release_macos_parakeet_live_smoke.sh", workflow)
         self.assertNotIn("poliglot", intel.lower() + live.lower())
         self.assertIn('FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"', intel)
         self.assertIn('SBOBINO_WHISPER_FFMPEG="$FFMPEG_BIN"', intel)
         self.assertIn('FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"', live)
         self.assertNotIn("need_cmd ffmpeg", intel)
         self.assertNotIn("command in gh ditto ffmpeg", live)
+
+    def test_whisper_live_smokes_consume_the_shared_pinned_model_manifest(self):
+        live = ARM_LIVE_SMOKE.read_text(encoding="utf-8")
+        windows = WINDOWS_LIVE_SMOKE.read_text(encoding="utf-8")
+        for smoke in (live, windows):
+            self.assertIn("whisper_live_model.json", smoke)
+            self.assertIn("immutable URL", smoke)
+        self.assertNotIn("resolve/5359861c739e955e79d9a303bcbc70fb988958b1", live)
+        self.assertNotIn("60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe", live)
+        self.assertNotIn("resolve/5359861c739e955e79d9a303bcbc70fb988958b1", windows)
+        self.assertNotIn("60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe", windows)
 
     def test_pyannote_abi_scan_includes_the_packaged_runtime_lib_directory(self):
         readiness = (ROOT / "scripts" / "distribution_readiness.sh").read_text(
@@ -81,8 +104,10 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("runs-on: macos-14", workflow)
         self.assertNotIn("-large", workflow)
         self.assertNotIn("larger", workflow.lower())
-        self.assertIn('GGML_METAL_SHARED_BUFFERS_ENABLE: "1"', workflow)
-        self.assertIn("release_macos_parakeet_live_smoke.sh", workflow)
+        self.assertIn("release_macos_whisper_live_smoke.sh", workflow)
+        self.assertIn("SBOBINO_WHISPER_LIVE_ARCH=arm64", workflow)
+        self.assertIn("arm-whisper-live-smoke-proof.json", workflow)
+        self.assertNotIn("GGML_METAL_SHARED_BUFFERS_ENABLE", workflow)
 
     def test_intel_release_smoke_transcribes_the_long_fixture_only_once(self):
         intel = INTEL_SMOKE.read_text(encoding="utf-8")
@@ -135,11 +160,22 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         promotion = PROMOTION.read_text(encoding="utf-8")
         self.assertIn('validate_quality_gate("asr_reference", "ASR reference")', promotion)
         self.assertIn('validate_quality_gate("live_latency", "live-latency")', promotion)
+        self.assertIn('"live_latency", "Intel live-latency", intel_distribution', promotion)
+        self.assertIn('"live_latency", "Windows live-latency", windows_distribution', promotion)
         self.assertIn("expected_json_assets", promotion)
         self.assertIn("unexpected_json", promotion)
         self.assertIn('pathlib.PurePosixPath(name).suffix.lower() == ".json"', promotion)
         self.assertIn('evidence_class") != "hosted-packaged-engine"', promotion)
         self.assertIn('real_engine") is not True', promotion)
+        self.assertIn("validate_live_recovery", promotion)
+        self.assertIn('recovery.get("captured_audio_frames")', promotion)
+        self.assertIn('recovery.get("saved_audio_frames")', promotion)
+        self.assertIn('recovery.get("dropped_samples", -1)', promotion)
+        self.assertIn('recovery.get("backlog_reaction_seconds")', promotion)
+        self.assertIn("validate_live_duration", promotion)
+        for manifest in ("latest.json", "setup-manifest.json", "runtime-manifest.json", "pyannote-manifest.json"):
+            self.assertIn(manifest, promotion)
+        self.assertIn("ConvertTo-Json -Depth 10", WORKFLOW.read_text(encoding="utf-8"))
         for threshold in ("0.35", "0.25", "256.0"):
             self.assertIn(threshold, promotion)
         self.assertIn('release-notes.md', promotion)
