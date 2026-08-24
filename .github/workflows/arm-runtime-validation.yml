@@ -26,7 +26,7 @@ jobs:
           path: |
             ${{ runner.temp }}/whisper-live-readiness-model
             ${{ runner.temp }}/whisper-live-readiness-fixture
-          key: whisper-live-ggml-base-60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
+          key: whisper-live-model-${{ hashFiles('sbobino_desktop/crates/domain/src/whisper_live_model.json') }}-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
 
       - name: Build the exact packaged Apple Silicon speech runtime
         working-directory: sbobino_desktop

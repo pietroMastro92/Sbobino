@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import array
 import ctypes
 import json
 import os
@@ -105,6 +106,37 @@ def backlog_threshold_overshoot(stderr: str, sample_rate: int) -> float | None:
     return max(0.0, queued_seconds - 2.0)
 
 
+def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int]:
+    """Mirror the app's bounded thread count and CPU/GPU live window."""
+    threads = max(1, min(8, available_cpus or 1))
+    length_ms = 1920 if device == "cpu" else 3200
+    return threads, length_ms
+
+
+def first_voiced_frame(samples: list[int], sample_rate: int, threshold: float = 0.01) -> int:
+    """Return the first 20 ms block whose PCM16 RMS crosses the speech floor."""
+    block_size = max(1, sample_rate // 50)
+    threshold_pcm = threshold * 32768.0
+    for start in range(0, len(samples), block_size):
+        block = samples[start : start + block_size]
+        if not block:
+            break
+        rms = (sum(float(sample) * sample for sample in block) / len(block)) ** 0.5
+        if rms >= threshold_pcm:
+            return start
+    return 0
+
+
+def speech_onset_seconds(path: Path) -> float:
+    with wave.open(str(path), "rb") as handle:
+        if handle.getnchannels() != 1 or handle.getsampwidth() != 2:
+            return 0.0
+        sample_rate = handle.getframerate()
+        pcm = array.array("h")
+        pcm.frombytes(handle.readframes(handle.getnframes()))
+    return first_voiced_frame(pcm.tolist(), sample_rate) / sample_rate
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
@@ -124,10 +156,12 @@ def main() -> int:
         duration = input_frames / sample_rate
     with wave.open(str(args.fixture), "rb") as handle:
         fixture_duration = handle.getnframes() / handle.getframerate()
+    speech_onset = speech_onset_seconds(args.audio)
 
+    threads, length_ms = live_command_profile(args.device, os.cpu_count())
     command = [
-        str(args.binary), "-m", str(args.model), "-t", "8", "--step", "320",
-        "--length", "3200", "--save-audio", "-l", "auto",
+        str(args.binary), "-m", str(args.model), "-t", str(threads), "--step", "320",
+        "--length", str(length_ms), "--save-audio", "-l", "auto",
     ]
     if args.device == "cpu":
         command.extend(["-ng", "-nfa"])
@@ -178,7 +212,10 @@ def main() -> int:
     deadline = started + max(180.0, duration * 3.0)
     while process.poll() is None and time.monotonic() < deadline:
         value = rss_mib(process.pid)
-        if value is not None:
+        # Model loading and backend warmup happen before capture begins. The
+        # release contract measures sustained-session growth, not expected
+        # one-time model allocation.
+        if value is not None and replay_started_wall is not None:
             rss_samples.append(value)
         time.sleep(0.25)
     timed_out = process.poll() is None
@@ -227,6 +264,8 @@ def main() -> int:
     failures: list[str] = []
     if timed_out:
         failures.append("whisper-stream timed out")
+    if final_summary is None:
+        failures.append("terminal runtime summary is missing")
     backlog_failure = "SBOBINO_WHISPER_LIVE_BACKLOG" in stderr
     if args.expect_backlog_recovery:
         if return_code != 7:
@@ -268,7 +307,7 @@ def main() -> int:
         "duration_seconds": duration,
         "samples": samples,
         "first_preview_seconds": (
-            max(0.0, first_preview_wall - replay_started_wall)
+            max(0.0, first_preview_wall - replay_started_wall - speech_onset)
             if first_preview_wall is not None and replay_started_wall is not None
             else 9999.0
         ),
@@ -276,11 +315,7 @@ def main() -> int:
             max(0.0, finished - last_metric_wall) if last_metric_wall is not None else 9999.0
         ),
         "rss_samples_mib": rss_samples,
-        "dropped_samples": (
-            final_dropped_samples
-            if final_dropped_samples is not None
-            else max((sample["dropped_samples"] for sample in samples), default=0)
-        ),
+        "dropped_samples": final_dropped_samples if final_dropped_samples is not None else -1,
         "missing_segments": 0 if args.expect_backlog_recovery else max(0, expected_segments - observed_segments),
         "duplicate_segments": 0 if args.expect_backlog_recovery else max(0, observed_segments - expected_segments),
         "backlog_recovery_expected": args.expect_backlog_recovery,

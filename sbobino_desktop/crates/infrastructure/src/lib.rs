@@ -3202,12 +3202,17 @@ fn binary_name_variants(base_name: &str) -> Vec<String> {
     variants
 }
 
-fn required_initial_setup_models() -> [&'static str; 2] {
-    ["ggml-base.bin", "ggml-large-v3-turbo-q8_0.bin"]
+fn required_initial_setup_models() -> [&'static str; 3] {
+    [
+        "ggml-tiny.bin",
+        "ggml-base.bin",
+        "ggml-large-v3-turbo-q8_0.bin",
+    ]
 }
 
-fn required_initial_setup_encoders() -> [&'static str; 2] {
+fn required_initial_setup_encoders() -> [&'static str; 3] {
     [
+        "ggml-tiny-encoder.mlmodelc",
         "ggml-base-encoder.mlmodelc",
         "ggml-large-v3-turbo-encoder.mlmodelc",
     ]
@@ -4635,12 +4640,15 @@ mod tests {
 
         let models_dir = std::path::PathBuf::from(factory.resolve_models_dir(""));
         std::fs::create_dir_all(&models_dir).expect("models dir should exist");
+        std::fs::write(models_dir.join("ggml-tiny.bin"), b"tiny").expect("tiny model should write");
         std::fs::write(models_dir.join("ggml-base.bin"), b"base").expect("base model should write");
         std::fs::write(
             models_dir.join("ggml-large-v3-turbo-q8_0.bin"),
             b"large-turbo",
         )
         .expect("large turbo model should write");
+        std::fs::create_dir_all(models_dir.join("ggml-tiny-encoder.mlmodelc"))
+            .expect("tiny encoder dir should exist");
         std::fs::create_dir_all(models_dir.join("ggml-base-encoder.mlmodelc"))
             .expect("base encoder dir should exist");
         std::fs::create_dir_all(models_dir.join("ggml-large-v3-turbo-encoder.mlmodelc"))
@@ -5543,12 +5551,15 @@ mod tests {
         );
         let models_dir = std::path::PathBuf::from(factory.resolve_models_dir(""));
         std::fs::create_dir_all(&models_dir).expect("models dir should exist");
+        std::fs::write(models_dir.join("ggml-tiny.bin"), b"tiny").expect("tiny model should write");
         std::fs::write(models_dir.join("ggml-base.bin"), b"base").expect("base model should write");
         std::fs::write(
             models_dir.join("ggml-large-v3-turbo-q8_0.bin"),
             b"large-turbo",
         )
         .expect("large turbo model should write");
+        std::fs::create_dir_all(models_dir.join("ggml-tiny-encoder.mlmodelc"))
+            .expect("tiny encoder dir should exist");
         std::fs::create_dir_all(models_dir.join("ggml-base-encoder.mlmodelc"))
             .expect("base encoder dir should exist");
         std::fs::create_dir_all(models_dir.join("ggml-large-v3-turbo-encoder.mlmodelc"))

@@ -107,6 +107,15 @@ if [[ -n "$package_script" ]]; then
       exit 1
     fi
   done
+  for required in \
+    'failed to warm up the live transcription backend' \
+    'whisper_reset_timings(ctx)'; do
+    if ! grep -Fq -- "$required" \
+        "$repo_root/sbobino_desktop/scripts/patches/whisper-stream-backlog.patch"; then
+      printf 'Windows Whisper live warmup contract is missing: %s\n' "$required" >&2
+      exit 1
+    fi
+  done
   if grep -Fq -- 'Find-OneFile $SdlRoot "SDL2Config.cmake"' "$package_script"; then
     printf 'Windows Whisper packaging must use the official hyphenated sdl2-config.cmake package\n' >&2
     exit 1

@@ -26,10 +26,33 @@
  
      bool is_running = true;
  
-@@ -232,6 +232,7 @@
+@@ -232,6 +232,30 @@
  
          wavWriter.open(filename, WHISPER_SAMPLE_RATE, 16, 1);
      }
++
++    // Build the backend graph before capture starts. In particular, the first
++    // Metal inference can include shader/graph setup that is not representative
++    // of steady-state realtime performance and must not become microphone backlog.
++    {
++        whisper_full_params warmup = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
++        warmup.n_threads        = params.n_threads;
++        warmup.language         = params.language.c_str();
++        warmup.no_context       = true;
++        warmup.single_segment   = true;
++        warmup.print_special    = false;
++        warmup.print_progress   = false;
++        warmup.print_realtime   = false;
++        warmup.print_timestamps = false;
++        const std::vector<float> warmup_pcm(WHISPER_SAMPLE_RATE, 0.0f);
++        if (whisper_full(ctx, warmup, warmup_pcm.data(), warmup_pcm.size()) != 0) {
++            fprintf(stderr, "%s: failed to warm up the live transcription backend\n", argv[0]);
++            whisper_free(ctx);
++            return 6;
++        }
++        whisper_reset_timings(ctx);
++    }
++
 +    audio.resume();
      printf("[Start speaking]\n");
      fflush(stdout);

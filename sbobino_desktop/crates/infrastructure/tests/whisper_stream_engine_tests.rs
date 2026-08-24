@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::tempdir;
 
@@ -23,6 +23,117 @@ fn write_executable_script(path: &Path, content: &str) {
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(path, permissions).expect("failed to chmod script");
+}
+
+#[tokio::test]
+async fn realtime_start_waits_for_post_warmup_capture_marker() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-stream");
+    let models_dir = temp.path().join("models");
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    write_executable_script(
+        &script_path,
+        r#"#!/bin/sh
+printf 'whisper_init: warming up\n' 1>&2
+sleep 0.25
+printf '[Start speaking]\n'
+sleep 1
+"#,
+    );
+
+    let engine = WhisperStreamEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let started = Instant::now();
+    engine
+        .start(
+            "ggml-base.bin",
+            "auto",
+            Arc::new(|_delta: RealtimeDelta| {}),
+        )
+        .await
+        .expect("start should resolve after the capture-ready marker");
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "start returned before the delayed capture-ready marker"
+    );
+    assert!(engine.is_running().await);
+    let _ = engine
+        .stop()
+        .await
+        .expect("ready session should stop cleanly");
+}
+
+#[tokio::test]
+async fn realtime_start_reports_exit_before_capture_ready() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-stream");
+    let models_dir = temp.path().join("models");
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\nprintf 'whisper_init: failed before capture\\n' 1>&2\nexit 9\n",
+    );
+
+    let engine = WhisperStreamEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let error = engine
+        .start(
+            "ggml-base.bin",
+            "auto",
+            Arc::new(|_delta: RealtimeDelta| {}),
+        )
+        .await
+        .expect_err("pre-marker exit must fail the start command");
+    assert!(
+        error
+            .to_string()
+            .contains("before microphone capture became ready")
+            || error.to_string().contains("failed before capture")
+            || error.to_string().contains("status 9"),
+        "unexpected startup error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn realtime_start_rejects_exact_backend_warmup_failure() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let script_path = temp.path().join("whisper-stream");
+    let models_dir = temp.path().join("models");
+    std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
+    std::fs::write(models_dir.join("ggml-base.bin"), b"fake model")
+        .expect("failed to create model");
+    write_executable_script(
+        &script_path,
+        "#!/bin/sh\nprintf '%s: failed to warm up the live transcription backend\\n' \"$0\" 1>&2\nexit 6\n",
+    );
+
+    let engine = WhisperStreamEngine::new(
+        script_path.to_string_lossy().to_string(),
+        models_dir.to_string_lossy().to_string(),
+    );
+    let error = engine
+        .start(
+            "ggml-base.bin",
+            "auto",
+            Arc::new(|_delta: RealtimeDelta| {}),
+        )
+        .await
+        .expect_err("warmup failure must never be accepted as transcript readiness");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to warm up the live transcription backend"),
+        "unexpected warmup error: {error}"
+    );
+    assert!(!engine.is_running().await);
 }
 
 #[tokio::test]
@@ -581,17 +692,11 @@ exit 1
         models_dir.to_string_lossy().to_string(),
     );
 
-    engine
+    let error = engine
         .start("ggml-base.bin", "it", Arc::new(|_delta: RealtimeDelta| {}))
         .await
-        .expect("realtime start should succeed before the child exits");
-
-    for _ in 0..STREAM_SETTLE_ATTEMPTS {
-        if !engine.is_running().await {
-            break;
-        }
-        tokio::time::sleep(STREAM_SETTLE_DELAY).await;
-    }
+        .expect_err("fatal pre-capture diagnostics must fail start immediately");
+    assert!(error.to_string().contains("capture devices"));
 
     assert!(
         !engine.is_running().await,

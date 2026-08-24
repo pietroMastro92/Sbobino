@@ -312,7 +312,7 @@ pub(crate) fn select_parakeet_live_model(
 pub struct StartRealtimePayload {
     #[serde(default)]
     pub engine: Option<TranscriptionEngine>,
-    /// File model preference. Whisper live currently uses the certified Base
+    /// File model preference. Whisper live uses the certified realtime model
     /// model regardless of this value; file transcription keeps all models.
     pub model: Option<SpeechModel>,
     #[serde(default)]
@@ -913,13 +913,15 @@ pub async fn start_realtime(
         }
     }
 
-    sleep(Duration::from_millis(350)).await;
     let running = match engine_kind.clone() {
         TranscriptionEngine::WhisperCpp => {
+            // Whisper start returns only after the patched runtime has emitted
+            // its post-warmup capture-ready marker.
             let engine = state.realtime.engine.lock().await.clone();
             engine.is_running().await
         }
         TranscriptionEngine::ParakeetCpp => {
+            sleep(Duration::from_millis(350)).await;
             let engine = state.realtime.parakeet_engine.lock().await.clone();
             match engine {
                 Some(engine) => engine.is_running().await,
@@ -929,19 +931,14 @@ pub async fn start_realtime(
     };
     eprintln!("[realtime-start] post-start running={running}");
     if !running {
-        clear_active_realtime_metadata(&state).await;
-        match engine_kind.clone() {
-            TranscriptionEngine::WhisperCpp => {
-                emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
-            }
-            TranscriptionEngine::ParakeetCpp => {
-                emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
-            }
-        }
         let diagnostics = match engine_kind {
             TranscriptionEngine::WhisperCpp => {
                 let engine = state.realtime.engine.lock().await.clone();
-                engine.snapshot_diagnostics().await
+                let diagnostics = engine.snapshot_diagnostics().await;
+                // The worker can exit after its ready marker but before the
+                // command publishes the running state. Always reap it here.
+                let _ = engine.stop().await;
+                diagnostics
             }
             TranscriptionEngine::ParakeetCpp => {
                 let engine = state.realtime.parakeet_engine.lock().await.clone();
@@ -951,6 +948,8 @@ pub async fn start_realtime(
                 }
             }
         };
+        clear_active_realtime_metadata(&state).await;
+        emit_level_event(&app, "idle", 0.0, "Microphone preview stopped.");
         let detail = if diagnostics.is_empty() {
             "Realtime transcription stopped immediately. Verify microphone access and that at least one audio input device is available.".to_string()
         } else {

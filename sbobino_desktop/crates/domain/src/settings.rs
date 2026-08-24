@@ -1323,12 +1323,12 @@ mod language_tests {
     }
 
     #[test]
-    fn whisper_live_manifest_is_pinned_to_the_certified_base_model() {
+    fn whisper_live_manifest_is_pinned_to_the_certified_realtime_model() {
         let manifest = whisper_live_model_manifest();
 
         assert_eq!(manifest.schema_version, 1);
-        assert_eq!(manifest.model, SpeechModel::Base);
-        assert_eq!(manifest.filename, SpeechModel::Base.ggml_filename());
+        assert_eq!(manifest.model, SpeechModel::Tiny);
+        assert_eq!(manifest.filename, SpeechModel::Tiny.ggml_filename());
         assert!(manifest
             .url
             .contains("/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/"));

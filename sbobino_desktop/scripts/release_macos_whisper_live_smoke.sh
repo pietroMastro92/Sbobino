@@ -96,8 +96,8 @@ import sys
 manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 if manifest.get("schema_version") != 1:
     raise SystemExit("unsupported Whisper live model manifest schema")
-if manifest.get("model") != "base" or manifest.get("filename") != "ggml-base.bin":
-    raise SystemExit("Whisper live smoke requires the certified Base model manifest")
+if manifest.get("model") != "tiny" or manifest.get("filename") != "ggml-tiny.bin":
+    raise SystemExit("Whisper live smoke requires the certified Tiny model manifest")
 url = str(manifest.get("url") or "")
 digest = str(manifest.get("sha256") or "").lower()
 if "/resolve/main/" in url or not re.fullmatch(r"[0-9a-f]{64}", digest):

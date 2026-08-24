@@ -1114,9 +1114,9 @@ pub async fn get_realtime_start_readiness(
             input_device_name,
         });
     }
-    // Keep realtime readiness aligned with start_realtime: only the pinned
-    // Base model is currently certified for Whisper live. File transcription
-    // continues to support every model in the catalog.
+    // Keep realtime readiness aligned with start_realtime: Tiny is certified
+    // for responsive CPU-only live use. File transcription continues to
+    // support every model in the catalog.
     let selected_model = if selected_engine == TranscriptionEngine::WhisperCpp {
         whisper_live_model_manifest().model
     } else {

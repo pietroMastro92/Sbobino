@@ -71,6 +71,14 @@ if ! grep -Fq -- 'SBOBINO_WHISPER_LIVE_BACKLOG' "$script_dir/patches/whisper-str
   printf 'Whisper live backlog patch must fail closed instead of dropping audio\n' >&2
   exit 1
 fi
+for required in \
+  'failed to warm up the live transcription backend' \
+  'whisper_reset_timings(ctx)'; do
+  if ! grep -Fq -- "$required" "$script_dir/patches/whisper-stream-backlog.patch"; then
+    printf 'Whisper live warmup contract is missing: %s\n' "$required" >&2
+    exit 1
+  fi
+done
 
 if ! awk '
   /^\+[[:space:]]+audio\.pause\(\);/ {

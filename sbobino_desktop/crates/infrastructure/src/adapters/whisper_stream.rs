@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
@@ -19,6 +19,9 @@ use crate::background_process::std_background_command;
 use crate::background_process::tokio_background_command;
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+const LIVE_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+type StartupSignal = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
 
 #[derive(Default)]
 struct StreamState {
@@ -121,6 +124,17 @@ impl WhisperStreamEngine {
             TranscriptionComputeDevice::Cpu => &["-ng", "-nfa"],
             TranscriptionComputeDevice::Auto | TranscriptionComputeDevice::Gpu => &[],
         }
+    }
+
+    fn bounded_thread_count(available: usize) -> usize {
+        available.clamp(1, 8)
+    }
+
+    fn live_thread_count() -> usize {
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        Self::bounded_thread_count(available)
     }
 
     fn child_exit_diagnostic(status: Option<&ExitStatus>) -> String {
@@ -286,6 +300,24 @@ impl WhisperStreamEngine {
             )
     }
 
+    fn is_start_marker(text: &str) -> bool {
+        matches!(text, "[Start speaking]" | "[Start speaking...]")
+    }
+
+    async fn complete_startup(
+        shared_state: &Arc<Mutex<StreamState>>,
+        startup_signal: &StartupSignal,
+        result: Result<(), String>,
+    ) {
+        if result.is_ok() {
+            let mut state = shared_state.lock().await;
+            state.session_started_at.get_or_insert_with(Instant::now);
+        }
+        if let Some(sender) = startup_signal.lock().await.take() {
+            let _ = sender.send(result);
+        }
+    }
+
     fn parse_language_detection(text: &str) -> Option<(String, f32)> {
         let marker = "auto-detected language:";
         let start = text.to_ascii_lowercase().find(marker)? + marker.len();
@@ -400,6 +432,7 @@ impl WhisperStreamEngine {
             || lower.contains("found 0 capture devices")
             || lower.contains("couldn't open an audio device")
             || lower.contains("cannot open audio device")
+            || lower.contains("failed to warm up the live transcription backend")
     }
 
     fn commit_line(state: &mut StreamState, cleaned: String) -> Option<RealtimeDeltaKind> {
@@ -446,6 +479,7 @@ impl WhisperStreamEngine {
         reader: R,
         emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
         telemetry_sink: Option<WhisperTelemetrySink>,
+        startup_signal: StartupSignal,
     ) -> JoinHandle<()>
     where
         R: AsyncRead + Unpin + Send + 'static,
@@ -455,136 +489,137 @@ impl WhisperStreamEngine {
             let mut pending = Vec::<u8>::new();
             let mut buffer = [0_u8; 2048];
 
-            let process_record =
-                |raw_line: String,
-                 shared_state: Arc<Mutex<StreamState>>,
-                 emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
-                 telemetry_sink: Option<WhisperTelemetrySink>| async move {
-                    let is_preview = raw_line.contains("[2K]") || raw_line.contains("\u{001b}[2K");
-                    let cleaned = Self::clean_line(&raw_line);
-                    if cleaned.is_empty() {
-                        return;
-                    }
+            let process_record = |raw_line: String,
+                                  shared_state: Arc<Mutex<StreamState>>,
+                                  emit_delta: Arc<dyn Fn(RealtimeDelta) + Send + Sync>,
+                                  telemetry_sink: Option<WhisperTelemetrySink>,
+                                  startup_signal: StartupSignal| async move {
+                let is_preview = raw_line.contains("[2K]") || raw_line.contains("\u{001b}[2K");
+                let cleaned = Self::clean_line(&raw_line);
+                if cleaned.is_empty() {
+                    return;
+                }
 
-                    if let Some(metric) = Self::parse_runtime_metric(&cleaned) {
-                        let mut state = shared_state.lock().await;
-                        state.captured_seconds =
-                            state.captured_seconds.max(metric.captured_seconds);
-                        state.processed_seconds =
-                            state.processed_seconds.max(metric.processed_seconds);
-                        state.backlog_seconds = metric.backlog_seconds.max(0.0);
-                        state.last_inference_ms = metric.inference_ms;
-                        let mut metric = metric;
-                        metric.first_preview_ms = state.first_preview_ms;
-                        Self::emit_telemetry(telemetry_sink.as_ref(), metric);
-                        return;
-                    }
+                if Self::is_start_marker(&cleaned) {
+                    Self::complete_startup(&shared_state, &startup_signal, Ok(())).await;
+                    return;
+                }
 
-                    if cleaned.starts_with("SBOBINO_WHISPER_LIVE_BACKLOG ") {
-                        let mut state = shared_state.lock().await;
-                        let message = "Whisper live could not keep up in real time. The complete captured audio was preserved; transcribe it as a file or choose a faster model/device.".to_string();
-                        state.diagnostics.push(cleaned);
-                        state.terminal_error = Some(message);
-                        state.running = false;
-                        state.paused = false;
-                        state.backlog_seconds = state.backlog_seconds.max(2.001);
-                        let telemetry = Self::telemetry_snapshot(&state);
-                        drop(state);
-                        Self::emit_telemetry(telemetry_sink.as_ref(), telemetry);
-                        return;
-                    }
-
-                    if let Some((language, probability)) = Self::parse_language_detection(&cleaned)
-                    {
-                        let mut state = shared_state.lock().await;
-                        state.language_detections.push((language, probability));
-                        if state.language_detections.len() > 8 {
-                            let excess = state.language_detections.len() - 8;
-                            state.language_detections.drain(0..excess);
-                        }
-                        return;
-                    }
-
-                    if Self::should_skip_line(&cleaned) {
-                        if Self::should_store_diagnostic(&cleaned) {
-                            let mut state = shared_state.lock().await;
-                            state.diagnostics.push(cleaned);
-                            if state.lines.is_empty()
-                                && state.preview.trim().is_empty()
-                                && state.running
-                                && Self::is_fatal_startup_diagnostic(
-                                    state
-                                        .diagnostics
-                                        .last()
-                                        .map(String::as_str)
-                                        .unwrap_or_default(),
-                                )
-                            {
-                                state.running = false;
-                                state.paused = false;
-                                state.terminal_error = state.diagnostics.last().cloned();
-                            }
-                        }
-                        return;
-                    }
-
+                if let Some(metric) = Self::parse_runtime_metric(&cleaned) {
+                    Self::complete_startup(&shared_state, &startup_signal, Ok(())).await;
                     let mut state = shared_state.lock().await;
-                    if state.paused {
-                        return;
-                    }
+                    state.captured_seconds = state.captured_seconds.max(metric.captured_seconds);
+                    state.processed_seconds = state.processed_seconds.max(metric.processed_seconds);
+                    state.backlog_seconds = metric.backlog_seconds.max(0.0);
+                    state.last_inference_ms = metric.inference_ms;
+                    let mut metric = metric;
+                    metric.first_preview_ms = state.first_preview_ms;
+                    Self::emit_telemetry(telemetry_sink.as_ref(), metric);
+                    return;
+                }
 
-                    if is_preview {
-                        state.preview = cleaned.clone();
-                        if state.first_preview_ms.is_none() {
-                            state.first_preview_ms = Some(Self::elapsed_seconds(&state) * 1_000.0);
-                        }
-                        let telemetry = Self::telemetry_snapshot(&state);
-                        emit_delta(RealtimeDelta {
-                            kind: RealtimeDeltaKind::UpdatePreview,
-                            text: cleaned,
-                            start_seconds: None,
-                            end_seconds: None,
-                            language_code: None,
-                            language_confidence: None,
-                        });
-                        Self::emit_telemetry(telemetry_sink.as_ref(), telemetry);
-                        return;
-                    }
+                if cleaned.starts_with("SBOBINO_WHISPER_LIVE_BACKLOG ") {
+                    let mut state = shared_state.lock().await;
+                    let message = "Whisper live could not keep up in real time. The complete captured audio was preserved; transcribe it as a file or choose a faster model/device.".to_string();
+                    state.diagnostics.push(cleaned);
+                    state.terminal_error = Some(message);
+                    state.running = false;
+                    state.paused = false;
+                    state.backlog_seconds = state.backlog_seconds.max(2.001);
+                    let telemetry = Self::telemetry_snapshot(&state);
+                    drop(state);
+                    Self::emit_telemetry(telemetry_sink.as_ref(), telemetry);
+                    return;
+                }
 
-                    if let Some(kind) = Self::commit_line(&mut state, cleaned.clone()) {
-                        let detected_language = Self::confirmed_language(&state);
-                        if detected_language.is_some() {
-                            state.language_detections.clear();
-                        }
-                        let end_seconds = Self::elapsed_seconds(&state)
-                            .max(state.last_segment_end_seconds + 0.001);
-                        let start_seconds = state.last_segment_end_seconds.min(end_seconds);
-                        let (language_code, language_confidence) = detected_language
-                            .map(|(code, confidence)| (Some(code), Some(confidence)))
-                            .unwrap_or((None, None));
-                        state.segments.push(TimedSegment {
-                            text: cleaned.clone(),
-                            start_seconds: Some(start_seconds),
-                            end_seconds: Some(end_seconds),
-                            speaker_id: None,
-                            speaker_label: None,
-                            language_code: language_code.clone(),
-                            language_confidence,
-                            words: Vec::new(),
-                        });
-                        state.last_segment_end_seconds = end_seconds;
-                        let telemetry = Self::telemetry_snapshot(&state);
-                        emit_delta(RealtimeDelta {
-                            kind,
-                            text: cleaned,
-                            start_seconds: Some(start_seconds),
-                            end_seconds: Some(end_seconds),
-                            language_code,
-                            language_confidence,
-                        });
-                        Self::emit_telemetry(telemetry_sink.as_ref(), telemetry);
+                if let Some((language, probability)) = Self::parse_language_detection(&cleaned) {
+                    let mut state = shared_state.lock().await;
+                    state.language_detections.push((language, probability));
+                    if state.language_detections.len() > 8 {
+                        let excess = state.language_detections.len() - 8;
+                        state.language_detections.drain(0..excess);
                     }
-                };
+                    return;
+                }
+
+                if Self::is_fatal_startup_diagnostic(&cleaned) {
+                    let mut state = shared_state.lock().await;
+                    state.diagnostics.push(cleaned.clone());
+                    state.running = false;
+                    state.paused = false;
+                    state.terminal_error = Some(cleaned.clone());
+                    drop(state);
+                    Self::complete_startup(&shared_state, &startup_signal, Err(cleaned)).await;
+                    return;
+                }
+
+                if Self::should_skip_line(&cleaned) {
+                    if Self::should_store_diagnostic(&cleaned) {
+                        let mut state = shared_state.lock().await;
+                        state.diagnostics.push(cleaned);
+                    }
+                    return;
+                }
+
+                Self::complete_startup(&shared_state, &startup_signal, Ok(())).await;
+
+                let mut state = shared_state.lock().await;
+                if state.paused {
+                    return;
+                }
+
+                if is_preview {
+                    state.preview = cleaned.clone();
+                    if state.first_preview_ms.is_none() {
+                        state.first_preview_ms = Some(Self::elapsed_seconds(&state) * 1_000.0);
+                    }
+                    let telemetry = Self::telemetry_snapshot(&state);
+                    emit_delta(RealtimeDelta {
+                        kind: RealtimeDeltaKind::UpdatePreview,
+                        text: cleaned,
+                        start_seconds: None,
+                        end_seconds: None,
+                        language_code: None,
+                        language_confidence: None,
+                    });
+                    Self::emit_telemetry(telemetry_sink.as_ref(), telemetry);
+                    return;
+                }
+
+                if let Some(kind) = Self::commit_line(&mut state, cleaned.clone()) {
+                    let detected_language = Self::confirmed_language(&state);
+                    if detected_language.is_some() {
+                        state.language_detections.clear();
+                    }
+                    let end_seconds =
+                        Self::elapsed_seconds(&state).max(state.last_segment_end_seconds + 0.001);
+                    let start_seconds = state.last_segment_end_seconds.min(end_seconds);
+                    let (language_code, language_confidence) = detected_language
+                        .map(|(code, confidence)| (Some(code), Some(confidence)))
+                        .unwrap_or((None, None));
+                    state.segments.push(TimedSegment {
+                        text: cleaned.clone(),
+                        start_seconds: Some(start_seconds),
+                        end_seconds: Some(end_seconds),
+                        speaker_id: None,
+                        speaker_label: None,
+                        language_code: language_code.clone(),
+                        language_confidence,
+                        words: Vec::new(),
+                    });
+                    state.last_segment_end_seconds = end_seconds;
+                    let telemetry = Self::telemetry_snapshot(&state);
+                    emit_delta(RealtimeDelta {
+                        kind,
+                        text: cleaned,
+                        start_seconds: Some(start_seconds),
+                        end_seconds: Some(end_seconds),
+                        language_code,
+                        language_confidence,
+                    });
+                    Self::emit_telemetry(telemetry_sink.as_ref(), telemetry);
+                }
+            };
 
             loop {
                 match reader.read(&mut buffer).await {
@@ -608,6 +643,7 @@ impl WhisperStreamEngine {
                                     shared_state.clone(),
                                     emit_delta.clone(),
                                     telemetry_sink.clone(),
+                                    startup_signal.clone(),
                                 )
                                 .await;
                             }
@@ -631,6 +667,7 @@ impl WhisperStreamEngine {
                     shared_state.clone(),
                     emit_delta.clone(),
                     telemetry_sink.clone(),
+                    startup_signal.clone(),
                 )
                 .await;
             }
@@ -652,6 +689,11 @@ impl WhisperStreamEngine {
                 }
                 state.running = false;
                 state.paused = false;
+                let error = state.terminal_error.clone().unwrap_or_else(|| {
+                    "Whisper live exited before microphone capture became ready".to_string()
+                });
+                drop(state);
+                Self::complete_startup(&shared_state, &startup_signal, Err(error)).await;
             }
         })
     }
@@ -695,12 +737,13 @@ impl WhisperStreamEngine {
         let session_dir = Self::create_session_dir()?;
         let mut command = tokio_background_command(&self.binary_path);
         let profile = WhisperLiveProfile::for_model(model_filename, self.compute_device);
+        let thread_count = Self::live_thread_count();
         command
             .kill_on_drop(true)
             .arg("-m")
             .arg(&model_path)
             .arg("-t")
-            .arg("8")
+            .arg(thread_count.to_string())
             .arg("--step")
             .arg(profile.step_ms.to_string())
             .arg("--length")
@@ -755,7 +798,7 @@ impl WhisperStreamEngine {
         state.session_dir = Some(session_dir);
         state.segments.clear();
         state.language_detections.clear();
-        state.session_started_at = Some(Instant::now());
+        state.session_started_at = None;
         state.last_segment_end_seconds = 0.0;
         state.telemetry_sink = telemetry_sink.clone();
         state.first_preview_ms = None;
@@ -765,20 +808,58 @@ impl WhisperStreamEngine {
         state.last_inference_ms = None;
         drop(state);
 
+        let (startup_sender, startup_receiver) = oneshot::channel();
+        let startup_signal = Arc::new(Mutex::new(Some(startup_sender)));
         let reader_tasks = vec![
             Self::spawn_reader_task(
                 self.state.clone(),
                 stdout,
                 emit_delta.clone(),
                 telemetry_sink.clone(),
+                startup_signal.clone(),
             ),
-            Self::spawn_reader_task(self.state.clone(), stderr, emit_delta, telemetry_sink),
+            Self::spawn_reader_task(
+                self.state.clone(),
+                stderr,
+                emit_delta,
+                telemetry_sink,
+                startup_signal,
+            ),
         ];
 
         let mut state = self.state.lock().await;
         state.reader_tasks = reader_tasks;
+        drop(state);
 
-        Ok(())
+        let startup_result = timeout(LIVE_STARTUP_TIMEOUT, startup_receiver).await;
+        match startup_result {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => {
+                let _ = self.stop().await;
+                Err(ApplicationError::SpeechToText(error))
+            }
+            Ok(Err(_)) => {
+                let diagnostics = self.snapshot_diagnostics().await;
+                let _ = self.stop().await;
+                Err(ApplicationError::SpeechToText(if diagnostics.is_empty() {
+                    "Whisper live exited before microphone capture became ready".to_string()
+                } else {
+                    diagnostics.join(" ")
+                }))
+            }
+            Err(_) => {
+                let message = format!(
+                    "Whisper live did not become ready within {} seconds",
+                    LIVE_STARTUP_TIMEOUT.as_secs()
+                );
+                {
+                    let mut state = self.state.lock().await;
+                    state.terminal_error = Some(message.clone());
+                }
+                let _ = self.stop().await;
+                Err(ApplicationError::SpeechToText(message))
+            }
+        }
     }
 
     pub async fn pause(&self) -> Result<(), ApplicationError> {
@@ -994,6 +1075,13 @@ mod tests {
         assert!(
             WhisperStreamEngine::compute_device_args(TranscriptionComputeDevice::Gpu).is_empty()
         );
+    }
+
+    #[test]
+    fn live_threads_are_bounded_to_available_parallelism() {
+        assert_eq!(WhisperStreamEngine::bounded_thread_count(0), 1);
+        assert_eq!(WhisperStreamEngine::bounded_thread_count(4), 4);
+        assert_eq!(WhisperStreamEngine::bounded_thread_count(32), 8);
     }
 
     #[test]
