@@ -9,7 +9,7 @@ use uuid::Uuid;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 use sbobino_application::{ApplicationError, ArtifactQuery};
-use sbobino_domain::{AppSettings, ArtifactChatMessage, TranscriptArtifact};
+use sbobino_domain::{AppSettings, ArtifactChatMessage, PersonalizationEntry, TranscriptArtifact};
 use sbobino_infrastructure::{
     repositories::sqlite_artifact_repository::SqliteArtifactRepository,
     secure_storage::{decrypt_file_with_password, encrypt_file_with_password},
@@ -17,7 +17,7 @@ use sbobino_infrastructure::{
 
 use crate::{error::CommandError, state::AppState};
 
-const BACKUP_FORMAT_VERSION: u32 = 2;
+const BACKUP_FORMAT_VERSION: u32 = 3;
 const BACKUP_BATCH_SIZE: usize = 500;
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +32,7 @@ pub struct ExportAppBackupResponse {
     pub artifact_count: usize,
     pub deleted_artifact_count: usize,
     pub audio_file_count: usize,
+    pub personalization_entry_count: usize,
     pub exported_at: String,
 }
 
@@ -45,6 +46,7 @@ pub struct ImportAppBackupPayload {
 pub struct ImportAppBackupResponse {
     pub artifact_count: usize,
     pub deleted_artifact_count: usize,
+    pub personalization_entry_count: usize,
     pub imported_at: String,
 }
 
@@ -56,6 +58,8 @@ struct PortableBackupManifest {
     artifact_count: usize,
     deleted_artifact_count: usize,
     audio_file_count: usize,
+    #[serde(default)]
+    personalization_entry_count: usize,
     includes_settings_secrets: bool,
 }
 
@@ -115,6 +119,7 @@ impl PortableBackupRecord {
 struct PreparedImport {
     settings: AppSettings,
     records: Vec<PortableBackupRecord>,
+    personalization_entries: Vec<PersonalizationEntry>,
     temp_root: PathBuf,
     staging_dir: PathBuf,
 }
@@ -140,6 +145,11 @@ pub async fn export_app_backup(
         .map_err(CommandError::from)?;
     let active_artifacts = collect_all_artifacts(&state, false).await?;
     let deleted_artifacts = collect_all_artifacts(&state, true).await?;
+    let personalization_entries = state
+        .artifact_service
+        .list_personalization_entries()
+        .await
+        .map_err(CommandError::from)?;
 
     let mut records = Vec::with_capacity(active_artifacts.len() + deleted_artifacts.len());
     let mut audio_entries: Vec<(String, Vec<u8>)> = Vec::new();
@@ -232,11 +242,13 @@ pub async fn export_app_backup(
         artifact_count: records.iter().filter(|record| !record.is_deleted).count(),
         deleted_artifact_count: records.iter().filter(|record| record.is_deleted).count(),
         audio_file_count: audio_entries.len(),
+        personalization_entry_count: personalization_entries.len(),
         includes_settings_secrets: true,
     };
     let artifact_count = manifest.artifact_count;
     let deleted_artifact_count = manifest.deleted_artifact_count;
     let audio_file_count = manifest.audio_file_count;
+    let personalization_entry_count = manifest.personalization_entry_count;
 
     let destination_for_task = destination_path.clone();
     let password = payload.password;
@@ -250,6 +262,7 @@ pub async fn export_app_backup(
                 &manifest_for_task,
                 &settings,
                 &records,
+                &personalization_entries,
                 &audio_entries,
             )?;
             encrypt_file_with_password(&zip_path, &destination_for_task, &password)?;
@@ -271,6 +284,7 @@ pub async fn export_app_backup(
         artifact_count,
         deleted_artifact_count,
         audio_file_count,
+        personalization_entry_count,
         exported_at,
     })
 }
@@ -291,17 +305,20 @@ pub async fn import_app_backup(
         .map_err(CommandError::from)?;
     let backup_path = normalized_path(&payload.backup_path, "backup path")?;
     let password = payload.password;
-
-    let prepared = tokio::task::spawn_blocking(move || prepare_import(&backup_path, &password))
-        .await
-        .map_err(|e| {
-            CommandError::from(ApplicationError::Persistence(format!(
-                "backup import preparation join error: {e}"
-            )))
-        })?
-        .map_err(CommandError::from)?;
-
     let data_dir = state.runtime_factory.data_dir().to_path_buf();
+    let secure_storage_root = data_dir.clone();
+
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_import(&backup_path, &password, &secure_storage_root)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(ApplicationError::Persistence(format!(
+            "backup import preparation join error: {e}"
+        )))
+    })?
+    .map_err(CommandError::from)?;
+
     let staging_dir = prepared.staging_dir.clone();
     let swapped =
         tokio::task::spawn_blocking(move || swap_storage_with_rollback(&data_dir, &staging_dir))
@@ -325,6 +342,7 @@ pub async fn import_app_backup(
         .iter()
         .filter(|record| record.is_deleted)
         .count();
+    let personalization_entry_count = prepared.personalization_entries.len();
 
     match state.settings_service.update(imported_settings).await {
         Ok(updated) => {
@@ -340,6 +358,7 @@ pub async fn import_app_backup(
             Ok(ImportAppBackupResponse {
                 artifact_count,
                 deleted_artifact_count,
+                personalization_entry_count,
                 imported_at,
             })
         }
@@ -472,6 +491,7 @@ fn write_backup_zip(
     manifest: &PortableBackupManifest,
     settings: &AppSettings,
     records: &[PortableBackupRecord],
+    personalization_entries: &[PersonalizationEntry],
     audio_entries: &[(String, Vec<u8>)],
 ) -> Result<(), ApplicationError> {
     let file = File::create(zip_path).map_err(|e| {
@@ -488,6 +508,12 @@ fn write_backup_zip(
     write_zip_json(&mut archive, "manifest.json", manifest, options)?;
     write_zip_json(&mut archive, "settings.json", settings, options)?;
     write_zip_json(&mut archive, "artifacts.json", records, options)?;
+    write_zip_json(
+        &mut archive,
+        "personalization.json",
+        personalization_entries,
+        options,
+    )?;
     for (entry_name, bytes) in audio_entries {
         archive.start_file(entry_name, options).map_err(|e| {
             ApplicationError::Persistence(format!(
@@ -529,7 +555,11 @@ fn write_zip_json<T: Serialize + ?Sized>(
     })
 }
 
-fn prepare_import(backup_path: &Path, password: &str) -> Result<PreparedImport, ApplicationError> {
+fn prepare_import(
+    backup_path: &Path,
+    password: &str,
+    secure_storage_root: &Path,
+) -> Result<PreparedImport, ApplicationError> {
     let temp_root = temp_work_dir("backup-import")?;
     let decrypted_zip = temp_root.join("portable-backup.zip");
     decrypt_file_with_password(backup_path, &decrypted_zip, password)?;
@@ -548,7 +578,7 @@ fn prepare_import(backup_path: &Path, password: &str) -> Result<PreparedImport, 
     })?;
 
     let manifest: PortableBackupManifest = read_zip_json(&mut archive, "manifest.json")?;
-    if !matches!(manifest.format_version, 1 | BACKUP_FORMAT_VERSION) {
+    if !matches!(manifest.format_version, 1 | 2 | BACKUP_FORMAT_VERSION) {
         return Err(ApplicationError::Validation(format!(
             "unsupported backup format version {}",
             manifest.format_version
@@ -557,6 +587,11 @@ fn prepare_import(backup_path: &Path, password: &str) -> Result<PreparedImport, 
 
     let settings: AppSettings = read_zip_json(&mut archive, "settings.json")?;
     let records: Vec<PortableBackupRecord> = read_zip_json(&mut archive, "artifacts.json")?;
+    let personalization_entries: Vec<PersonalizationEntry> = if manifest.format_version >= 3 {
+        read_zip_json(&mut archive, "personalization.json")?
+    } else {
+        Vec::new()
+    };
     let staging_dir = temp_root.join("staging");
     fs::create_dir_all(&staging_dir).map_err(|e| {
         ApplicationError::Persistence(format!(
@@ -564,6 +599,7 @@ fn prepare_import(backup_path: &Path, password: &str) -> Result<PreparedImport, 
             staging_dir.display()
         ))
     })?;
+    copy_local_master_key_if_present(secure_storage_root, &staging_dir)?;
     let repo = SqliteArtifactRepository::new(staging_dir.join("artifacts.db"))?;
 
     for record in &records {
@@ -603,13 +639,43 @@ fn prepare_import(backup_path: &Path, password: &str) -> Result<PreparedImport, 
             repo.import_backup_chat_summary(&artifact.id, summary)?;
         }
     }
+    for entry in &personalization_entries {
+        repo.import_backup_personalization_entry(entry)?;
+    }
 
     Ok(PreparedImport {
         settings,
         records,
+        personalization_entries,
         temp_root,
         staging_dir,
     })
+}
+
+fn copy_local_master_key_if_present(
+    source_root: &Path,
+    destination_root: &Path,
+) -> Result<(), ApplicationError> {
+    let relative_key_path = Path::new(".sbobino-secure-storage").join("master_key_v1");
+    let source = source_root.join(&relative_key_path);
+    if !source.exists() {
+        return Ok(());
+    }
+    let destination = destination_root.join(relative_key_path);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            ApplicationError::Persistence(format!(
+                "failed to prepare backup staging secure storage {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    fs::copy(&source, &destination).map_err(|error| {
+        ApplicationError::Persistence(format!(
+            "failed to copy the local encryption key into backup staging: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn read_zip_json<T: DeserializeOwned>(
@@ -822,7 +888,8 @@ mod tests {
     use sbobino_application::ArtifactRepository;
     use sbobino_domain::{
         AiProvider, AppSettings, ArtifactAudioBackfillStatus, ArtifactChatMessage, ArtifactKind,
-        ArtifactSourceOrigin, RemoteServiceConfig, RemoteServiceKind, TranscriptArtifact,
+        ArtifactSourceOrigin, PersonalizationEntry, PersonalizationEntryKind, RemoteServiceConfig,
+        RemoteServiceKind, TranscriptArtifact,
     };
     use sbobino_infrastructure::{
         repositories::sqlite_artifact_repository::SqliteArtifactRepository,
@@ -941,24 +1008,47 @@ mod tests {
             artifact_count: 1,
             deleted_artifact_count: 1,
             audio_file_count: 2,
+            personalization_entry_count: 0,
             includes_settings_secrets: true,
         };
         let audio_entries = vec![
             (backup_audio_entry_name(&active), active_audio.clone()),
             (backup_audio_entry_name(&deleted), deleted_audio.clone()),
         ];
+        let personalization_entries = vec![PersonalizationEntry::new(
+            PersonalizationEntryKind::Correction,
+            "Sbobinoo",
+            Some("Sbobino".to_string()),
+            Some("en".to_string()),
+        )];
+        let manifest = PortableBackupManifest {
+            personalization_entry_count: personalization_entries.len(),
+            ..manifest
+        };
 
-        write_backup_zip(&zip_path, &manifest, &settings, &records, &audio_entries)
-            .expect("write backup zip");
+        write_backup_zip(
+            &zip_path,
+            &manifest,
+            &settings,
+            &records,
+            &personalization_entries,
+            &audio_entries,
+        )
+        .expect("write backup zip");
         encrypt_file_with_password(&zip_path, &backup_path, "test-password")
             .expect("encrypt backup");
 
-        let prepared = prepare_import(&backup_path, "test-password").expect("prepare import");
+        let live_storage_root = temp.path().join("live-storage");
+        let live_repo = SqliteArtifactRepository::new(live_storage_root.join("artifacts.db"))
+            .expect("live repo should establish the active encryption key");
+        let prepared = prepare_import(&backup_path, "test-password", &live_storage_root)
+            .expect("prepare import");
         assert_eq!(
             prepared.settings.ai.providers.gemini.api_key.as_deref(),
             Some("gemini-secret")
         );
         assert_eq!(prepared.records.len(), 2);
+        assert_eq!(prepared.personalization_entries, personalization_entries);
 
         let repo = SqliteArtifactRepository::new(prepared.staging_dir.join("artifacts.db"))
             .expect("staging repo");
@@ -1016,6 +1106,29 @@ mod tests {
                 .expect("read deleted audio"),
             Some(deleted_audio)
         );
+        assert_eq!(
+            repo.list_personalization_entries()
+                .await
+                .expect("list restored personalization"),
+            personalization_entries
+        );
+
+        let swapped = swap_storage_with_rollback(&live_storage_root, &prepared.staging_dir)
+            .expect("swap prepared storage into live root");
+        let live_loaded = live_repo
+            .get_by_id(&active.id)
+            .await
+            .expect("live repository should decrypt imported artifact")
+            .expect("imported artifact should exist");
+        assert_eq!(live_loaded.raw_transcript, active.raw_transcript);
+        assert_eq!(
+            live_repo
+                .list_personalization_entries()
+                .await
+                .expect("live repository should decrypt imported personalization"),
+            personalization_entries
+        );
+        let _ = super::remove_path_if_exists(&swapped.rollback_dir);
     }
 
     #[test]

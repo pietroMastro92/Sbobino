@@ -93,6 +93,7 @@ import {
   listAiServiceModels,
   listDeletedArtifacts,
   listGeminiModels,
+  listPersonalizationEntries,
   listRecentArtifacts,
   openSettingsWindow,
   pauseRealtime,
@@ -138,6 +139,10 @@ import {
   testAiService,
   updateArtifact,
   updateArtifactTimeline,
+  upsertPersonalizationEntry,
+  deletePersonalizationEntry,
+  clearPersonalizationEntries,
+  applyArtifactReview,
   writeTrimmedAudio,
   writeSetupReport,
 } from "./lib/tauri";
@@ -228,6 +233,10 @@ import {
 } from "./lib/artifactExportFlow";
 import { buildExportFileName } from "./lib/exportFileName";
 import { buildConfidenceTranscript } from "./lib/whisperConfidence";
+import {
+  buildTranscriptReviewQueue,
+  parseTranscriptReviewDecisions,
+} from "./lib/transcriptReview";
 import { SerialTaskQueue } from "./lib/serialTaskQueue";
 import { useAppStore } from "./state/useAppStore";
 import type {
@@ -248,6 +257,7 @@ import type {
   LanguageCode,
   OrganizationSettings,
   ParakeetModel,
+  PersonalizationEntry,
   PromptTask,
   PromptTemplate,
   ProvisioningProgressEvent,
@@ -288,6 +298,11 @@ import type {
 } from "./components/chat/chatTypes";
 import { buildChatClipboardText } from "./components/chat/chatUtils";
 import { ConfidenceTranscript } from "./components/ConfidenceTranscript";
+import { PersonalizationSettingsPanel } from "./components/PersonalizationSettingsPanel";
+import {
+  TranscriptReviewQueue,
+  type TranscriptReviewAction,
+} from "./components/TranscriptReviewQueue";
 import {
   ExportSheet,
   type ExportPreview,
@@ -358,6 +373,7 @@ type StartupRequirementsSnapshot = {
 };
 type SettingsPane =
   | "general"
+  | "personalization"
   | "automatic_import"
   | "transcription"
   | "whisper_cpp"
@@ -371,6 +387,26 @@ const EMOTION_ANALYSIS_GENERATED_AT_METADATA_KEY =
   "emotion_analysis_generated_at";
 const STUDY_PACK_METADATA_KEY = "study_pack_v1";
 const MEETING_PACK_METADATA_KEY = "meeting_intelligence_v1";
+const PERSONALIZATION_REVIEW_METADATA_KEY = "personalization_review_v1";
+const PERSONALIZATION_HITS_METADATA_KEY = "personalization_hits_v1";
+const PERSONALIZATION_SUGGESTIONS_METADATA_KEY = "personalization_suggestions_v1";
+
+function parseMetadataRecordArray(
+  value: string | null | undefined,
+): Array<Record<string, unknown>> {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter(
+          (entry): entry is Record<string, unknown> =>
+            typeof entry === "object" && entry !== null,
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
 
 type PersistedArtifactPack = {
   kind: "study_pack" | "meeting_intelligence";
@@ -379,6 +415,7 @@ type PersistedArtifactPack = {
 };
 const SETTINGS_PANES: SettingsPane[] = [
   "general",
+  "personalization",
   "automatic_import",
   "transcription",
   "whisper_cpp",
@@ -1039,6 +1076,16 @@ function getSettingsPaneDefinitions(): SettingsPaneDefinition[] {
       description: t("settings.general.desc"),
       group: "General",
       icon: House,
+    },
+    {
+      key: "personalization",
+      label: t("nav.personalization", "Personalization"),
+      description: t(
+        "settings.personalization.desc",
+        "Keep vocabulary and correction memory encrypted on this device.",
+      ),
+      group: "General",
+      icon: Database,
     },
     {
       key: "automatic_import",
@@ -2428,6 +2475,11 @@ function normalizeSettings(settings: AppSettings): AppSettings {
     },
     automation: normalizedAutomation,
     organization: normalizedOrganization,
+    personalization: {
+      enabled: settings.personalization?.enabled ?? true,
+      auto_apply_safe_corrections:
+        settings.personalization?.auto_apply_safe_corrections ?? false,
+    },
     ai: {
       ...settings.ai,
       active_remote_service_id: settings.ai.active_remote_service_id ?? null,
@@ -3190,6 +3242,11 @@ export function App({
     initialStandaloneSettingsPane,
   );
   const [settingsQuery, setSettingsQuery] = useState("");
+  const [personalizationEntries, setPersonalizationEntries] = useState<
+    PersonalizationEntry[]
+  >([]);
+  const [personalizationBusy, setPersonalizationBusy] = useState(false);
+  const [reviewBusy, setReviewBusy] = useState(false);
   const [transcriptionLanguageCatalog, setTranscriptionLanguageCatalog] =
     useState<TranscriptionLanguageOption[]>(fallbackTranscriptionLanguageCatalog);
   const [transcriptionLanguageSearch, setTranscriptionLanguageSearch] =
@@ -4509,6 +4566,11 @@ export function App({
 
     setSettingsPane(parseStandaloneSettingsPaneFromLocation());
   }, [standaloneSettingsWindow]);
+
+  useEffect(() => {
+    if (!settings) return;
+    void refreshPersonalizationEntries();
+  }, [Boolean(settings)]);
 
   useEffect(() => {
     if (!settings) {
@@ -6295,6 +6357,28 @@ export function App({
     [activeArtifact?.metadata?.timeline_v2, activeRawTranscript],
   );
   const confidenceColorsAvailable = Boolean(confidenceTranscriptDocument);
+  const transcriptReviewItems = useMemo(
+    () => buildTranscriptReviewQueue(activeArtifact?.metadata?.timeline_v2),
+    [activeArtifact?.metadata?.timeline_v2],
+  );
+  const transcriptReviewDecisions = useMemo(
+    () => parseTranscriptReviewDecisions(
+      activeArtifact?.metadata?.[PERSONALIZATION_REVIEW_METADATA_KEY],
+    ),
+    [activeArtifact?.metadata],
+  );
+  const personalizationHits = useMemo(
+    () => parseMetadataRecordArray(
+      activeArtifact?.metadata?.[PERSONALIZATION_HITS_METADATA_KEY],
+    ),
+    [activeArtifact?.metadata],
+  );
+  const personalizationSuggestions = useMemo(
+    () => parseMetadataRecordArray(
+      activeArtifact?.metadata?.[PERSONALIZATION_SUGGESTIONS_METADATA_KEY],
+    ),
+    [activeArtifact?.metadata],
+  );
   const showingConfidenceTranscript =
     showConfidenceColors &&
     transcriptViewMode === "original" &&
@@ -6962,6 +7046,132 @@ export function App({
       const next = normalizeSettings(mutator(normalizeSettings(current)));
       return persistSettings(next, previous);
     });
+  }
+
+  async function refreshPersonalizationEntries(): Promise<void> {
+    setPersonalizationBusy(true);
+    try {
+      setPersonalizationEntries(await listPersonalizationEntries());
+    } catch (personalizationError) {
+      setError(
+        formatUiError(
+          "error.personalizationLoad",
+          "Could not load personalization data",
+          personalizationError,
+        ),
+      );
+    } finally {
+      setPersonalizationBusy(false);
+    }
+  }
+
+  async function handlePersonalizationUpsert(
+    entry: PersonalizationEntry,
+  ): Promise<void> {
+    setPersonalizationBusy(true);
+    try {
+      await upsertPersonalizationEntry(entry);
+      setPersonalizationEntries(await listPersonalizationEntries());
+    } catch (personalizationError) {
+      setError(
+        formatUiError(
+          "error.personalizationSave",
+          "Could not save personalization entry",
+          personalizationError,
+        ),
+      );
+    } finally {
+      setPersonalizationBusy(false);
+    }
+  }
+
+  async function handlePersonalizationDelete(id: string): Promise<void> {
+    setPersonalizationBusy(true);
+    try {
+      await deletePersonalizationEntry(id);
+      setPersonalizationEntries((current) =>
+        current.filter((entry) => entry.id !== id),
+      );
+    } catch (personalizationError) {
+      setError(
+        formatUiError(
+          "error.personalizationDelete",
+          "Could not delete personalization entry",
+          personalizationError,
+        ),
+      );
+    } finally {
+      setPersonalizationBusy(false);
+    }
+  }
+
+  async function handlePersonalizationClear(): Promise<void> {
+    const confirmed = await confirmDialog(
+      t(
+        "settings.personalization.clearConfirm",
+        "Delete every saved vocabulary and correction entry?",
+      ),
+      { kind: "warning" },
+    );
+    if (!confirmed) return;
+    setPersonalizationBusy(true);
+    try {
+      await clearPersonalizationEntries();
+      setPersonalizationEntries([]);
+    } catch (personalizationError) {
+      setError(
+        formatUiError(
+          "error.personalizationDelete",
+          "Could not delete personalization data",
+          personalizationError,
+        ),
+      );
+    } finally {
+      setPersonalizationBusy(false);
+    }
+  }
+
+  async function handleTranscriptReview(
+    item: (typeof transcriptReviewItems)[number],
+    action: TranscriptReviewAction,
+    replacementText: string,
+    rememberCorrection: boolean,
+  ): Promise<void> {
+    if (!activeArtifact) return;
+    setReviewBusy(true);
+    try {
+      const updated = await applyArtifactReview({
+        artifact_id: activeArtifact.id,
+        expected_revision: activeArtifact.revision,
+        review_item_id: item.id,
+        action,
+        original_text: item.originalText,
+        replacement_text:
+          action === "corrected" ? replacementText.trim() : null,
+        remember_correction: action === "corrected" && rememberCorrection,
+        language_code: null,
+      });
+      setActiveArtifact(updated);
+      setDraftTranscript(
+        updated.optimized_transcript || updated.raw_transcript,
+      );
+      setOptimizedTranscriptAvailable(
+        Boolean(updated.optimized_transcript.trim()),
+      );
+      if (rememberCorrection) {
+        await refreshPersonalizationEntries();
+      }
+    } catch (reviewError) {
+      setError(
+        formatUiError(
+          "error.reviewSave",
+          "Could not save the transcript review",
+          reviewError,
+        ),
+      );
+    } finally {
+      setReviewBusy(false);
+    }
   }
 
   async function patchAiSettings(
@@ -12709,6 +12919,38 @@ export function App({
           </div>
         ) : null}
 
+        {detailMode === "transcript" ? (
+          <TranscriptReviewQueue
+            items={transcriptReviewItems}
+            decisions={transcriptReviewDecisions}
+            busy={reviewBusy}
+            onReview={handleTranscriptReview}
+          />
+        ) : null}
+
+        {detailMode === "transcript"
+        && (personalizationHits.length > 0 || personalizationSuggestions.length > 0) ? (
+          <div className="inspector-block personalization-quality-card">
+            <h4>{t("quality.personalization", "Personalization")}</h4>
+            <div className="property-line">
+              <span>{t("quality.personalizationApplied", "Applied safely")}</span>
+              <strong>{personalizationHits.length}</strong>
+            </div>
+            <div className="property-line">
+              <span>{t("quality.personalizationSuggestions", "Suggestions")}</span>
+              <strong>{personalizationSuggestions.length}</strong>
+            </div>
+            {personalizationSuggestions.length > 0 ? (
+              <small>
+                {t(
+                  "quality.personalizationSuggestionHint",
+                  "Suggestions were not applied automatically. Review the optimized transcript before accepting them.",
+                )}
+              </small>
+            ) : null}
+          </div>
+        ) : null}
+
         <div className="inspector-block">
           <h4>{t("inspector.audio")}</h4>
           <div className="property-line">
@@ -18034,6 +18276,31 @@ export function App({
     );
   }
 
+  function renderSettingsPersonalization(): JSX.Element {
+    if (!settings) {
+      return (
+        <div className="settings-placeholder">{t("settings.unavailable")}</div>
+      );
+    }
+
+    return (
+      <PersonalizationSettingsPanel
+        settings={settings.personalization}
+        entries={personalizationEntries}
+        busy={personalizationBusy}
+        onSettingsChange={async (personalization) => {
+          await patchSettings((current) => ({
+            ...current,
+            personalization,
+          }));
+        }}
+        onUpsert={handlePersonalizationUpsert}
+        onDelete={handlePersonalizationDelete}
+        onClear={handlePersonalizationClear}
+      />
+    );
+  }
+
   function renderSettingsPane(pane: SettingsPane): JSX.Element {
     if (pane === "automatic_import") return renderSettingsAutomaticImport();
     if (pane === "transcription") return renderSettingsTranscription();
@@ -18041,6 +18308,7 @@ export function App({
     if (pane === "local_models") return renderSettingsLocalModels();
     if (pane === "advanced") return renderSettingsAdvanced();
     if (pane === "general") return renderSettingsGeneral();
+    if (pane === "personalization") return renderSettingsPersonalization();
     if (pane === "ai_services") return renderSettingsAiServices();
     if (pane === "prompts") return renderSettingsPrompts();
     return (

@@ -20,6 +20,7 @@ import type {
   PostUpdateReconcileResponse,
   PromptTask,
   PromptTemplate,
+  PersonalizationEntry,
   ProvisioningProgressEvent,
   ProvisioningModelCatalogEntry,
   ProvisioningStatus,
@@ -159,6 +160,35 @@ export async function deletePromptTemplate(id: string): Promise<PromptTemplate[]
 
 export async function resetPromptTemplates(): Promise<PromptTemplate[]> {
   return invoke<PromptTemplate[]>("reset_prompts");
+}
+
+export async function listPersonalizationEntries(): Promise<PersonalizationEntry[]> {
+  return invoke<PersonalizationEntry[]>("list_personalization_entries");
+}
+
+export async function upsertPersonalizationEntry(entry: PersonalizationEntry): Promise<void> {
+  return invoke<void>("upsert_personalization_entry", { entry });
+}
+
+export async function deletePersonalizationEntry(id: string): Promise<void> {
+  return invoke<void>("delete_personalization_entry", { id });
+}
+
+export async function clearPersonalizationEntries(): Promise<void> {
+  return invoke<void>("clear_personalization_entries");
+}
+
+export async function applyArtifactReview(payload: {
+  artifact_id: string;
+  expected_revision: number;
+  review_item_id: string;
+  action: "confirmed" | "corrected" | "ignored";
+  original_text: string;
+  replacement_text: string | null;
+  remember_correction: boolean;
+  language_code: string | null;
+}): Promise<TranscriptArtifact> {
+  return invoke<TranscriptArtifact>("apply_artifact_review", { payload });
 }
 
 export async function testPromptTemplate(payload: {

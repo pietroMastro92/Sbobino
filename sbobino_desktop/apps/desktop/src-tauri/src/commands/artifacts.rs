@@ -25,8 +25,8 @@ use sbobino_application::{
 use sbobino_domain::{
     constrain_transcript_edit, merge_optimized_transcript_sections,
     minimize_transcript_repetitions, AppLanguage, ArtifactChatMessage, ArtifactKind,
-    DetectedLanguageSummary, LanguageCode, PromptTask, TimedSegment, TimedWord, TranscriptArtifact,
-    TranscriptionOutput,
+    DetectedLanguageSummary, LanguageCode, PersonalizationEntry, PersonalizationEntryKind,
+    PromptTask, TimedSegment, TimedWord, TranscriptArtifact, TranscriptionOutput,
 };
 
 use crate::{
@@ -292,6 +292,170 @@ const OPTIMIZE_CONTEXT_OVERFLOW_MESSAGE: &str =
     "Exceeded model context window size while optimizing the transcript. The app retried with smaller chunks, but this transcript is still too large for the selected AI provider. Try a provider with a larger context window or optimize a shorter section.";
 const STUDY_PACK_METADATA_KEY: &str = "study_pack_v1";
 const MEETING_PACK_METADATA_KEY: &str = "meeting_intelligence_v1";
+const PERSONALIZATION_REVIEW_METADATA_KEY: &str = "personalization_review_v1";
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactReviewAction {
+    Confirmed,
+    Corrected,
+    Ignored,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplyArtifactReviewPayload {
+    pub artifact_id: String,
+    pub expected_revision: i64,
+    pub review_item_id: String,
+    pub action: ArtifactReviewAction,
+    pub original_text: String,
+    pub replacement_text: Option<String>,
+    #[serde(default)]
+    pub remember_correction: bool,
+    pub language_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedArtifactReviewDecision {
+    action: ArtifactReviewAction,
+    original_text: String,
+    replacement_text: Option<String>,
+    reviewed_at: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedArtifactReviewState {
+    #[serde(default = "persisted_review_version")]
+    version: u8,
+    #[serde(default)]
+    decisions: BTreeMap<String, PersistedArtifactReviewDecision>,
+}
+
+fn persisted_review_version() -> u8 {
+    1
+}
+
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn exact_whole_word_match_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    text.match_indices(needle)
+        .filter_map(|(start, matched)| {
+            let end = start + matched.len();
+            let left_is_word = text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_word_character);
+            let right_is_word = text[end..].chars().next().is_some_and(is_word_character);
+            (!left_is_word && !right_is_word).then_some((start, end))
+        })
+        .collect()
+}
+
+fn replace_unique_exact_whole_word(
+    text: &str,
+    source: &str,
+    replacement: &str,
+) -> Result<String, ApplicationError> {
+    let matches = exact_whole_word_match_ranges(text, source);
+    let [(start, end)] = matches.as_slice() else {
+        return Err(ApplicationError::Validation(if matches.is_empty() {
+            "the optimized transcript no longer contains the selected text; edit that passage in the transcript editor, then confirm this review item"
+                .to_string()
+        } else {
+            "the selected review text appears more than once; refine the transcript manually to avoid an ambiguous replacement"
+                .to_string()
+        }));
+    };
+    let mut updated = String::with_capacity(text.len() - source.len() + replacement.len());
+    updated.push_str(&text[..*start]);
+    updated.push_str(replacement);
+    updated.push_str(&text[*end..]);
+    Ok(updated)
+}
+
+fn joined_review_words(words: &[serde_json::Value]) -> String {
+    let mut result = String::new();
+    for word in words {
+        let text = word
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        if !result.is_empty()
+            && !matches!(text.chars().next(), Some(',' | '.' | ';' | ':' | '!' | '?'))
+        {
+            result.push(' ');
+        }
+        result.push_str(text);
+    }
+    result
+}
+
+fn review_item_original_text(timeline_json: &str, review_item_id: &str) -> Option<String> {
+    let timeline = serde_json::from_str::<serde_json::Value>(timeline_json).ok()?;
+    let segments = timeline.get("segments")?.as_array()?;
+    for (segment_index, segment) in segments.iter().enumerate() {
+        let words = segment
+            .get("words")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let has_word_confidence = words.iter().any(|word| {
+            word.get("confidence")
+                .and_then(serde_json::Value::as_f64)
+                .is_some()
+        });
+        if !has_word_confidence {
+            if review_item_id == format!("segment-{segment_index}-confidence-unavailable") {
+                return segment
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string);
+            }
+            continue;
+        }
+
+        let mut cursor = 0;
+        while cursor < words.len() {
+            let confidence = words[cursor]
+                .get("confidence")
+                .and_then(serde_json::Value::as_f64);
+            if confidence.is_none_or(|value| value > f64::from(LOW_CONFIDENCE_WORD_THRESHOLD)) {
+                cursor += 1;
+                continue;
+            }
+            let start = cursor;
+            let mut end = cursor + 1;
+            while end < words.len() {
+                let next = words[end]
+                    .get("confidence")
+                    .and_then(serde_json::Value::as_f64);
+                if next.is_none_or(|value| {
+                    value > f64::from(LOW_CONFIDENCE_SPAN_CONTINUATION_THRESHOLD)
+                }) {
+                    break;
+                }
+                end += 1;
+            }
+            if review_item_id == format!("segment-{segment_index}-words-{start}-{}", end - 1) {
+                let text = joined_review_words(&words[start..end]);
+                return (!text.is_empty()).then_some(text);
+            }
+            cursor = end;
+        }
+    }
+    None
+}
 
 #[derive(Debug, Clone)]
 struct LowConfidenceSpan {
@@ -575,6 +739,174 @@ pub async fn list_artifacts(
         })
         .await
         .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn list_personalization_entries(
+    state: State<'_, AppState>,
+) -> Result<Vec<PersonalizationEntry>, CommandError> {
+    state
+        .artifact_service
+        .list_personalization_entries()
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn upsert_personalization_entry(
+    state: State<'_, AppState>,
+    entry: PersonalizationEntry,
+) -> Result<(), CommandError> {
+    state
+        .artifact_service
+        .upsert_personalization_entry(&entry)
+        .await
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn delete_personalization_entry(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), CommandError> {
+    state
+        .artifact_service
+        .delete_personalization_entry(&id)
+        .await
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_personalization_entries(state: State<'_, AppState>) -> Result<(), CommandError> {
+    state
+        .artifact_service
+        .clear_personalization_entries()
+        .await
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn apply_artifact_review(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    payload: ApplyArtifactReviewPayload,
+) -> Result<TranscriptArtifact, CommandError> {
+    let artifact_id = payload.artifact_id.trim();
+    let review_item_id = payload.review_item_id.trim();
+    if artifact_id.is_empty() || review_item_id.is_empty() {
+        return Err(CommandError::new(
+            "artifact_review",
+            "artifact id and review item id are required",
+        ));
+    }
+
+    let mut artifact = state
+        .artifact_service
+        .get(artifact_id)
+        .await
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::new("artifact_review", "artifact not found"))?;
+    if artifact.revision != payload.expected_revision {
+        return Err(CommandError::new(
+            "artifact_review",
+            "artifact review rejected because a newer revision already exists",
+        ));
+    }
+    let timeline_json = artifact
+        .metadata
+        .get("timeline_v2")
+        .ok_or_else(|| CommandError::new("artifact_review", "artifact timeline is unavailable"))?;
+    let original_text =
+        review_item_original_text(timeline_json, review_item_id).ok_or_else(|| {
+            CommandError::new(
+                "artifact_review",
+                "review item is invalid or no longer belongs to this artifact timeline",
+            )
+        })?;
+    if payload.original_text.trim() != original_text {
+        return Err(CommandError::new(
+            "artifact_review",
+            "review item text does not match the artifact timeline",
+        ));
+    }
+
+    let replacement_text = payload
+        .replacement_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if payload.action == ArtifactReviewAction::Corrected {
+        let replacement = replacement_text.as_deref().ok_or_else(|| {
+            CommandError::new("artifact_review", "a non-empty correction is required")
+        })?;
+        let editable = if artifact.optimized_transcript.trim().is_empty() {
+            artifact.raw_transcript.as_str()
+        } else {
+            artifact.optimized_transcript.as_str()
+        };
+        artifact.optimized_transcript =
+            replace_unique_exact_whole_word(editable, &original_text, replacement)
+                .map_err(CommandError::from)?;
+    }
+
+    let mut review_state = artifact
+        .metadata
+        .get(PERSONALIZATION_REVIEW_METADATA_KEY)
+        .and_then(|value| serde_json::from_str::<PersistedArtifactReviewState>(value).ok())
+        .unwrap_or_else(|| PersistedArtifactReviewState {
+            version: persisted_review_version(),
+            decisions: BTreeMap::new(),
+        });
+    review_state.version = persisted_review_version();
+    review_state.decisions.insert(
+        review_item_id.to_string(),
+        PersistedArtifactReviewDecision {
+            action: payload.action,
+            original_text: original_text.clone(),
+            replacement_text: replacement_text.clone(),
+            reviewed_at: Utc::now().to_rfc3339(),
+        },
+    );
+    let review_json = serde_json::to_string(&review_state).map_err(|error| {
+        CommandError::new(
+            "artifact_review",
+            format!("failed to serialize review state: {error}"),
+        )
+    })?;
+
+    let remembered_correction =
+        if payload.action == ArtifactReviewAction::Corrected && payload.remember_correction {
+            Some(PersonalizationEntry::new(
+                PersonalizationEntryKind::Correction,
+                &original_text,
+                replacement_text.clone(),
+                payload
+                    .language_code
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            ))
+        } else {
+            None
+        };
+    let updated = state
+        .artifact_service
+        .apply_artifact_review_update(
+            artifact_id,
+            payload.expected_revision,
+            (payload.action == ArtifactReviewAction::Corrected)
+                .then_some(artifact.optimized_transcript.as_str()),
+            &review_json,
+            remembered_correction.as_ref(),
+        )
+        .await
+        .map_err(CommandError::from)?
+        .ok_or_else(|| CommandError::new("artifact_review", "artifact not found"))?;
+
+    emit_artifact_updated(&app, &updated);
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -4262,15 +4594,18 @@ mod tests {
         add_conversation_context, build_artifact_context_transcript, build_chat_context_candidates,
         build_chunk_note_prompt, build_confidence_aware_optimize_prompt,
         build_direct_summary_prompt, build_export_content, build_export_document,
-        build_export_segments, build_summary_instructions, build_summary_synthesis_prompt,
-        chunk_text_by_words, extract_low_confidence_spans, is_context_window_error,
-        manual_optimization_groups, optimize_source_language_groups, optimize_with_rag,
-        render_markdown_document, render_plain_text_document, resolve_ai_output_language,
-        run_cancellable, summarize_with_rag, timeline_segments_for_diarization,
-        trimmed_audio_output_metadata, validate_trimmed_audio_output, ApplicationError,
-        ArtifactAiContextOptions, ArtifactChatMessage, ArtifactKind, ExportStyle,
-        SourceLanguageOptimizationGroup, SummarizeArtifactPayload, TranscriptArtifact,
-        TranscriptEnhancer, MIN_TRIMMED_AUDIO_DURATION_SECONDS,
+        build_export_segments, build_generated_pack_instructions, build_generated_pack_sections,
+        build_summary_instructions, build_summary_synthesis_prompt, chunk_text_by_words,
+        extract_low_confidence_spans, is_context_window_error, manual_optimization_groups,
+        optimize_source_language_groups, optimize_with_rag, parse_generated_pack_from_metadata,
+        render_markdown_document, render_plain_text_document, replace_unique_exact_whole_word,
+        resolve_ai_output_language, review_item_original_text, run_cancellable, summarize_with_rag,
+        timeline_segments_for_diarization, trimmed_audio_output_metadata,
+        validate_trimmed_audio_output, ApplicationError, ArtifactAiContextOptions,
+        ArtifactChatMessage, ArtifactKind, ExportStyle, GeneratedArtifactPack,
+        GeneratedArtifactPackKind, SourceLanguageOptimizationGroup, SummarizeArtifactPayload,
+        TranscriptArtifact, TranscriptEnhancer, MEETING_PACK_METADATA_KEY,
+        MIN_TRIMMED_AUDIO_DURATION_SECONDS, STUDY_PACK_METADATA_KEY,
     };
 
     struct TrackingEnhancer {
@@ -6051,6 +6386,141 @@ mod tests {
             validate_trimmed_audio_output(MIN_TRIMMED_AUDIO_DURATION_SECONDS - 0.1, 128)
                 .expect_err("too-short trimmed file should be rejected");
         assert!(short_error.message.contains("trimmed audio is too short"));
+    }
+
+    #[test]
+    fn generated_pack_prompts_require_the_complete_study_and_meeting_structures() {
+        let study = build_generated_pack_instructions(
+            GeneratedArtifactPackKind::StudyPack,
+            "en",
+            true,
+            true,
+        );
+        for required in [
+            "Overview",
+            "Structured Notes",
+            "Glossary of Key Terms",
+            "Probable Exam Questions",
+            "Flashcards",
+        ] {
+            assert!(
+                study.contains(required),
+                "missing study section: {required}"
+            );
+        }
+
+        let meeting = build_generated_pack_instructions(
+            GeneratedArtifactPackKind::MeetingIntelligence,
+            "en",
+            true,
+            true,
+        );
+        for required in [
+            "Executive Summary",
+            "Decisions",
+            "Action Items",
+            "Open Questions",
+            "Risks and Blockers",
+        ] {
+            assert!(
+                meeting.contains(required),
+                "missing meeting section: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_packs_round_trip_from_metadata_into_export_sections() {
+        let study = GeneratedArtifactPack {
+            kind: GeneratedArtifactPackKind::StudyPack,
+            generated_at: "2026-08-25T00:00:00Z".to_string(),
+            body_markdown: "## Overview\nPersisted study content".to_string(),
+        };
+        let meeting = GeneratedArtifactPack {
+            kind: GeneratedArtifactPackKind::MeetingIntelligence,
+            generated_at: "2026-08-25T00:01:00Z".to_string(),
+            body_markdown: "## Decisions\nPersisted meeting content".to_string(),
+        };
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            STUDY_PACK_METADATA_KEY.to_string(),
+            serde_json::to_string(&study).expect("serialize study pack"),
+        );
+        metadata.insert(
+            MEETING_PACK_METADATA_KEY.to_string(),
+            serde_json::to_string(&meeting).expect("serialize meeting pack"),
+        );
+
+        let reopened = parse_generated_pack_from_metadata(&metadata, STUDY_PACK_METADATA_KEY)
+            .expect("study pack should reopen from artifact metadata");
+        assert_eq!(reopened.body_markdown, study.body_markdown);
+
+        let sections = build_generated_pack_sections("en", &metadata);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].title, "Study Pack");
+        assert!(sections[0].body.contains("Persisted study content"));
+        assert_eq!(sections[1].title, "Meeting Intelligence");
+        assert!(sections[1].body.contains("Persisted meeting content"));
+    }
+
+    #[test]
+    fn remembered_corrections_are_case_sensitive_unicode_whole_word_replacements() {
+        assert_eq!(
+            replace_unique_exact_whole_word("La citta e Roma.", "Roma", "Roma Capitale")
+                .expect("unique exact match"),
+            "La citta e Roma Capitale."
+        );
+        assert!(replace_unique_exact_whole_word("roma", "Roma", "Roma Capitale").is_err());
+        assert!(replace_unique_exact_whole_word("Romano", "Roma", "Roma Capitale").is_err());
+        assert_eq!(
+            replace_unique_exact_whole_word("parlo di citta.", "citta", "citta storica")
+                .expect("punctuation remains a Unicode-aware boundary"),
+            "parlo di citta storica."
+        );
+    }
+
+    #[test]
+    fn remembered_corrections_reject_ambiguous_replacements() {
+        let error = replace_unique_exact_whole_word("Sbobino e Sbobino", "Sbobino", "Sbobino App")
+            .expect_err("multiple matches must never be silently rewritten");
+        assert!(error.to_string().contains("more than once"));
+    }
+
+    #[test]
+    fn reviewed_correction_requires_explicit_edit_when_ai_rewrote_the_selected_span() {
+        let error =
+            replace_unique_exact_whole_word("The Sbobino app works.", "Sbobinoo", "Sbobino")
+                .expect_err("an unmapped AI rewrite must not be accepted as the reviewed span");
+        assert!(error.to_string().contains("transcript editor"));
+    }
+
+    #[test]
+    fn review_items_are_derived_from_the_persisted_timeline() {
+        let timeline = json!({
+            "segments": [
+                {
+                    "text": "hello uncertain phrase now",
+                    "words": [
+                        {"text": "hello", "confidence": 0.95},
+                        {"text": "uncertain", "confidence": 0.57},
+                        {"text": "phrase", "confidence": 0.70},
+                        {"text": "now", "confidence": 0.91}
+                    ]
+                },
+                {"text": "confidence unavailable", "words": []}
+            ]
+        })
+        .to_string();
+
+        assert_eq!(
+            review_item_original_text(&timeline, "segment-0-words-1-2").as_deref(),
+            Some("uncertain phrase")
+        );
+        assert_eq!(
+            review_item_original_text(&timeline, "segment-1-confidence-unavailable").as_deref(),
+            Some("confidence unavailable")
+        );
+        assert!(review_item_original_text(&timeline, "segment-0-words-0-2").is_none());
     }
 
     #[test]

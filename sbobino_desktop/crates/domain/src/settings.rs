@@ -867,6 +867,22 @@ impl Default for PromptSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersonalizationSettings {
+    pub enabled: bool,
+    pub auto_apply_safe_corrections: bool,
+}
+
+impl Default for PersonalizationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_apply_safe_corrections: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptTask {
@@ -902,6 +918,7 @@ pub struct AppSettings {
     pub organization: OrganizationSettings,
     pub ai: AiSettings,
     pub prompts: PromptSettings,
+    pub personalization: PersonalizationSettings,
 }
 
 impl Default for AppSettings {
@@ -912,6 +929,7 @@ impl Default for AppSettings {
         let organization = OrganizationSettings::default();
         let ai = AiSettings::default();
         let prompts = PromptSettings::default();
+        let personalization = PersonalizationSettings::default();
 
         Self {
             transcription_engine: transcription.engine.clone(),
@@ -933,6 +951,7 @@ impl Default for AppSettings {
             organization,
             ai,
             prompts,
+            personalization,
         }
     }
 }
@@ -1367,5 +1386,12 @@ mod language_tests {
             manifest.coreml_encoder.sha256,
             "c88cbd2648e1f5415092bcf5256add463a0f19943e6938f46e8d4ffdebd47739"
         );
+    }
+
+    #[test]
+    fn personalization_defaults_are_local_and_user_controlled() {
+        let settings = AppSettings::default().personalization;
+        assert!(settings.enabled);
+        assert!(!settings.auto_apply_safe_corrections);
     }
 }

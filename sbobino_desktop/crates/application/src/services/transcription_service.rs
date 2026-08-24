@@ -7,6 +7,7 @@ use std::{
 };
 
 use chrono::Utc;
+use serde::Serialize;
 use serde_json::json;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
@@ -14,8 +15,8 @@ use tracing::{instrument, warn};
 
 use sbobino_domain::{
     constrain_transcript_edit, minimize_transcript_repetitions, ArtifactKind, JobProgress,
-    JobStage, LanguageCode, SpeakerTurn, TimedSegment, TranscriptArtifact, TranscriptionEngine,
-    TranscriptionOutput,
+    JobStage, LanguageCode, PersonalizationEntry, PersonalizationEntryKind, SpeakerTurn,
+    TimedSegment, TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
 };
 
 use crate::{
@@ -34,6 +35,104 @@ const AUTO_IMPORT_GENERATE_PRESET_OUTPUT_METADATA_KEY: &str = "auto_import_gener
 const AUTO_POST_SUMMARY_STATUS_METADATA_KEY: &str = "auto_post_summary_status";
 const AUTO_POST_FAQS_STATUS_METADATA_KEY: &str = "auto_post_faqs_status";
 const AUTO_POST_PRESET_OUTPUT_STATUS_METADATA_KEY: &str = "auto_post_preset_output_status";
+const PERSONALIZATION_ENTRIES_REQUEST_METADATA_KEY: &str = "personalization_entries_request_v1";
+const PERSONALIZATION_AUTO_APPLY_METADATA_KEY: &str = "personalization_auto_apply_safe_corrections";
+const PERSONALIZATION_HITS_METADATA_KEY: &str = "personalization_hits_v1";
+const PERSONALIZATION_CORRECTIONS_APPLIED_METADATA_KEY: &str =
+    "personalization_corrections_applied_v1";
+const PERSONALIZATION_SUGGESTIONS_METADATA_KEY: &str = "personalization_suggestions_v1";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PersonalizationHit {
+    entry_id: String,
+    kind: String,
+    source_text: String,
+    replacement_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PersonalizationSuggestion {
+    entry_id: String,
+    kind: String,
+    source_text: String,
+    replacement_text: Option<String>,
+    reason: String,
+}
+
+fn personalization_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+fn personalization_match_ranges(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    text.match_indices(needle)
+        .filter_map(|(start, matched)| {
+            let end = start + matched.len();
+            let left_is_word = text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(personalization_word_character);
+            let right_is_word = text[end..]
+                .chars()
+                .next()
+                .is_some_and(personalization_word_character);
+            (!left_is_word && !right_is_word).then_some((start, end))
+        })
+        .collect()
+}
+
+fn apply_exact_personalization_corrections(
+    text: &str,
+    entries: &[PersonalizationEntry],
+    auto_apply: bool,
+) -> (
+    String,
+    Vec<PersonalizationHit>,
+    Vec<PersonalizationSuggestion>,
+) {
+    let mut updated = text.to_string();
+    let mut hits = Vec::new();
+    let mut suggestions = Vec::new();
+    for entry in entries.iter().filter(|entry| {
+        entry.enabled
+            && entry.kind == PersonalizationEntryKind::Correction
+            && entry
+                .replacement_text
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+    }) {
+        let ranges = personalization_match_ranges(&updated, entry.source_text.trim());
+        if ranges.is_empty() {
+            continue;
+        }
+        let replacement = entry.replacement_text.as_deref().unwrap_or_default().trim();
+        if !auto_apply || ranges.len() != 1 {
+            suggestions.push(PersonalizationSuggestion {
+                entry_id: entry.id.clone(),
+                kind: entry.kind.as_str().to_string(),
+                source_text: entry.source_text.clone(),
+                replacement_text: Some(replacement.to_string()),
+                reason: if auto_apply {
+                    "ambiguous_multiple_matches".to_string()
+                } else {
+                    "automatic_application_disabled".to_string()
+                },
+            });
+            continue;
+        }
+        let (start, end) = ranges[0];
+        updated.replace_range(start..end, replacement);
+        hits.push(PersonalizationHit {
+            entry_id: entry.id.clone(),
+            kind: entry.kind.as_str().to_string(),
+            source_text: entry.source_text.clone(),
+            replacement_text: Some(replacement.to_string()),
+        });
+    }
+    (updated, hits, suggestions)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceLanguageOptimizationGroup {
@@ -351,74 +450,143 @@ impl TranscriptionService {
                 );
             }
 
-            let (optimized, summary_faq, has_optimized_transcript, generated_outputs) = if request
-                .enable_ai
-            {
-                self.emit(
-                    &emit_progress,
-                    &progress_state,
-                    &request.job_id,
-                    JobStage::Optimizing,
-                    "Optimizing transcript with AI",
-                    93,
-                    None,
-                    None,
-                    Some(0),
-                );
-                self.emit(
-                    &emit_progress,
-                    &progress_state,
-                    &request.job_id,
-                    JobStage::Summarizing,
-                    "Generating summary and FAQs",
-                    96,
-                    None,
-                    None,
-                    Some(0),
-                );
+            let (mut optimized, summary_faq, mut has_optimized_transcript, generated_outputs) =
+                if request.enable_ai {
+                    self.emit(
+                        &emit_progress,
+                        &progress_state,
+                        &request.job_id,
+                        JobStage::Optimizing,
+                        "Optimizing transcript with AI",
+                        93,
+                        None,
+                        None,
+                        Some(0),
+                    );
+                    self.emit(
+                        &emit_progress,
+                        &progress_state,
+                        &request.job_id,
+                        JobStage::Summarizing,
+                        "Generating summary and FAQs",
+                        96,
+                        None,
+                        None,
+                        Some(0),
+                    );
 
-                let ai_language = if request.language.is_auto() {
-                    transcription_output
-                        .dominant_language_code()
-                        .unwrap_or_else(|| "en".to_string())
+                    let ai_language = if request.language.is_auto() {
+                        transcription_output
+                            .dominant_language_code()
+                            .unwrap_or_else(|| "en".to_string())
+                    } else {
+                        request.language.as_code().to_string()
+                    };
+                    let optimization_groups =
+                        Self::language_optimization_groups(&transcription_output, &raw_transcript);
+                    match self
+                        .run_cancellable(
+                            &cancellation_token,
+                            self.run_ai_post_processing(
+                                &optimization_groups,
+                                &ai_language,
+                                &request,
+                            ),
+                        )
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(ApplicationError::Cancelled) => {
+                            return Err(ApplicationError::Cancelled)
+                        }
+                        Err(error) => {
+                            warn!("ai optimization skipped; keeping raw transcript: {error}");
+                            (
+                                String::new(),
+                                SummaryFaq {
+                                    summary: String::new(),
+                                    faqs: String::new(),
+                                },
+                                false,
+                                BTreeMap::new(),
+                            )
+                        }
+                    }
                 } else {
-                    request.language.as_code().to_string()
-                };
-                let optimization_groups =
-                    Self::language_optimization_groups(&transcription_output, &raw_transcript);
-                match self
-                    .run_cancellable(
-                        &cancellation_token,
-                        self.run_ai_post_processing(&optimization_groups, &ai_language, &request),
+                    (
+                        String::new(),
+                        SummaryFaq {
+                            summary: String::new(),
+                            faqs: String::new(),
+                        },
+                        false,
+                        BTreeMap::new(),
                     )
+                };
+
+            let personalization_entries = request
+                .metadata
+                .get(PERSONALIZATION_ENTRIES_REQUEST_METADATA_KEY)
+                .and_then(|value| serde_json::from_str::<Vec<PersonalizationEntry>>(value).ok())
+                .unwrap_or_default();
+            let personalization_auto_apply = request
+                .metadata
+                .get(PERSONALIZATION_AUTO_APPLY_METADATA_KEY)
+                .is_some_and(|value| value == "true");
+            let personalization_source = if optimized.trim().is_empty() {
+                raw_transcript.as_str()
+            } else {
+                optimized.as_str()
+            };
+            let (personalized, mut personalization_hits, mut personalization_suggestions) =
+                apply_exact_personalization_corrections(
+                    personalization_source,
+                    &personalization_entries,
+                    personalization_auto_apply,
+                );
+            if personalized != personalization_source {
+                optimized = personalized;
+                has_optimized_transcript = true;
+            }
+            if request.engine != TranscriptionEngine::WhisperCpp {
+                personalization_suggestions.extend(
+                    personalization_entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.enabled && entry.kind == PersonalizationEntryKind::Vocabulary
+                        })
+                        .map(|entry| PersonalizationSuggestion {
+                            entry_id: entry.id.clone(),
+                            kind: entry.kind.as_str().to_string(),
+                            source_text: entry.source_text.clone(),
+                            replacement_text: None,
+                            reason: "prompt_bias_unavailable_for_engine".to_string(),
+                        }),
+                );
+            } else {
+                personalization_hits.extend(
+                    personalization_entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.enabled && entry.kind == PersonalizationEntryKind::Vocabulary
+                        })
+                        .map(|entry| PersonalizationHit {
+                            entry_id: entry.id.clone(),
+                            kind: entry.kind.as_str().to_string(),
+                            source_text: entry.source_text.clone(),
+                            replacement_text: None,
+                        }),
+                );
+            }
+            for hit in &personalization_hits {
+                if let Err(error) = self
+                    .artifacts
+                    .increment_personalization_hit_count(&hit.entry_id)
                     .await
                 {
-                    Ok(result) => result,
-                    Err(ApplicationError::Cancelled) => return Err(ApplicationError::Cancelled),
-                    Err(error) => {
-                        warn!("ai optimization skipped; keeping raw transcript: {error}");
-                        (
-                            String::new(),
-                            SummaryFaq {
-                                summary: String::new(),
-                                faqs: String::new(),
-                            },
-                            false,
-                            BTreeMap::new(),
-                        )
-                    }
+                    warn!("failed to update personalization hit count: {error}");
                 }
-            } else {
-                (
-                    String::new(),
-                    SummaryFaq {
-                        summary: String::new(),
-                        faqs: String::new(),
-                    },
-                    false,
-                    BTreeMap::new(),
-                )
-            };
+            }
 
             if request.enable_ai {
                 self.emit(
@@ -458,6 +626,31 @@ impl TranscriptionService {
             );
 
             let mut metadata = request.metadata.clone();
+            metadata.remove(PERSONALIZATION_ENTRIES_REQUEST_METADATA_KEY);
+            metadata.remove(PERSONALIZATION_AUTO_APPLY_METADATA_KEY);
+            if !personalization_hits.is_empty() {
+                if let Ok(value) = serde_json::to_string(&personalization_hits) {
+                    metadata.insert(PERSONALIZATION_HITS_METADATA_KEY.to_string(), value);
+                }
+                let correction_hits = personalization_hits
+                    .iter()
+                    .filter(|hit| hit.kind == PersonalizationEntryKind::Correction.as_str())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !correction_hits.is_empty() {
+                    if let Ok(value) = serde_json::to_string(&correction_hits) {
+                        metadata.insert(
+                            PERSONALIZATION_CORRECTIONS_APPLIED_METADATA_KEY.to_string(),
+                            value,
+                        );
+                    }
+                }
+            }
+            if !personalization_suggestions.is_empty() {
+                if let Ok(value) = serde_json::to_string(&personalization_suggestions) {
+                    metadata.insert(PERSONALIZATION_SUGGESTIONS_METADATA_KEY.to_string(), value);
+                }
+            }
             let processing_language = transcription_output.processing_language_code();
             metadata.insert(
                 "model".to_string(),
@@ -1220,5 +1413,52 @@ fn transcription_progress_message(engine: &TranscriptionEngine) -> &'static str 
     match engine {
         TranscriptionEngine::WhisperCpp => "Running Whisper transcription",
         TranscriptionEngine::ParakeetCpp => "Running Parakeet transcription",
+    }
+}
+
+#[cfg(test)]
+mod personalization_tests {
+    use sbobino_domain::{PersonalizationEntry, PersonalizationEntryKind};
+
+    use super::apply_exact_personalization_corrections;
+
+    fn correction(source: &str, replacement: &str) -> PersonalizationEntry {
+        PersonalizationEntry::new(
+            PersonalizationEntryKind::Correction,
+            source,
+            Some(replacement.to_string()),
+            None,
+        )
+    }
+
+    #[test]
+    fn applies_only_unique_case_sensitive_unicode_whole_word_corrections() {
+        let entries = vec![correction("citta", "citta storica")];
+        let (updated, hits, suggestions) =
+            apply_exact_personalization_corrections("una citta, non cittadino", &entries, true);
+        assert_eq!(updated, "una citta storica, non cittadino");
+        assert_eq!(hits.len(), 1);
+        assert!(suggestions.is_empty());
+
+        let (unchanged, hits, _) =
+            apply_exact_personalization_corrections("una Citta", &entries, true);
+        assert_eq!(unchanged, "una Citta");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn keeps_corrections_as_suggestions_without_opt_in_or_when_ambiguous() {
+        let entries = vec![correction("Sbobino", "Sbobino App")];
+        let (unchanged, hits, suggestions) =
+            apply_exact_personalization_corrections("Sbobino", &entries, false);
+        assert_eq!(unchanged, "Sbobino");
+        assert!(hits.is_empty());
+        assert_eq!(suggestions[0].reason, "automatic_application_disabled");
+
+        let (unchanged, hits, suggestions) =
+            apply_exact_personalization_corrections("Sbobino e Sbobino", &entries, true);
+        assert_eq!(unchanged, "Sbobino e Sbobino");
+        assert!(hits.is_empty());
+        assert_eq!(suggestions[0].reason, "ambiguous_multiple_matches");
     }
 }

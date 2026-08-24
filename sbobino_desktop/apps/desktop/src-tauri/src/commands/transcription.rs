@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RunTranscriptionRequest};
 use sbobino_domain::{
-    ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel, SpeechModel,
-    TranscriptionEngine, WhisperOptions,
+    ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel, PersonalizationEntry,
+    PersonalizationEntryKind, SpeechModel, TranscriptionEngine, WhisperOptions,
 };
 
 use crate::{
@@ -24,6 +24,47 @@ use crate::{
 };
 
 const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
+pub(crate) const PERSONALIZATION_ENTRIES_REQUEST_METADATA_KEY: &str =
+    "personalization_entries_request_v1";
+pub(crate) const PERSONALIZATION_AUTO_APPLY_METADATA_KEY: &str =
+    "personalization_auto_apply_safe_corrections";
+pub(crate) const PERSONALIZATION_PROMPT_BIAS_COUNT_METADATA_KEY: &str =
+    "personalization_prompt_bias_count";
+
+fn entry_matches_language(entry: &PersonalizationEntry, language: &LanguageCode) -> bool {
+    entry.language_code.as_deref().is_none_or(|code| {
+        code.trim().is_empty()
+            || (!language.is_auto() && code.eq_ignore_ascii_case(language.as_code()))
+    })
+}
+
+fn merge_vocabulary_prompt(
+    existing: Option<String>,
+    entries: &[PersonalizationEntry],
+) -> Option<String> {
+    let mut parts = existing
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default();
+    for term in entries
+        .iter()
+        .filter(|entry| entry.kind == PersonalizationEntryKind::Vocabulary)
+        .map(|entry| entry.source_text.trim())
+        .filter(|term| !term.is_empty())
+    {
+        if parts.iter().any(|part| part.eq_ignore_ascii_case(term)) {
+            continue;
+        }
+        let projected_len = parts.iter().map(String::len).sum::<usize>() + term.len() + parts.len();
+        if projected_len > 1_024 {
+            break;
+        }
+        parts.push(term.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartTranscriptionPayload {
@@ -103,6 +144,54 @@ pub(crate) async fn spawn_transcription_job(
 ) -> Result<StartTranscriptionResponse, CommandError> {
     let job_id = Uuid::new_v4().to_string();
 
+    let mut metadata = payload.metadata;
+    metadata.remove(PERSONALIZATION_ENTRIES_REQUEST_METADATA_KEY);
+    metadata.remove(PERSONALIZATION_AUTO_APPLY_METADATA_KEY);
+    metadata.remove(PERSONALIZATION_PROMPT_BIAS_COUNT_METADATA_KEY);
+    let mut whisper_options = payload.whisper_options;
+    let personalization_settings = state
+        .settings_service
+        .snapshot()
+        .await
+        .map_err(CommandError::from)?
+        .personalization;
+    if personalization_settings.enabled {
+        let entries = state
+            .artifact_service
+            .list_personalization_entries()
+            .await
+            .map_err(CommandError::from)?
+            .into_iter()
+            .filter(|entry| entry.enabled && entry_matches_language(entry, &payload.language))
+            .collect::<Vec<_>>();
+        if payload.engine == TranscriptionEngine::WhisperCpp {
+            let vocabulary_count = entries
+                .iter()
+                .filter(|entry| entry.kind == PersonalizationEntryKind::Vocabulary)
+                .count();
+            whisper_options.prompt = merge_vocabulary_prompt(whisper_options.prompt, &entries);
+            metadata.insert(
+                PERSONALIZATION_PROMPT_BIAS_COUNT_METADATA_KEY.to_string(),
+                vocabulary_count.to_string(),
+            );
+        }
+        metadata.insert(
+            PERSONALIZATION_AUTO_APPLY_METADATA_KEY.to_string(),
+            personalization_settings
+                .auto_apply_safe_corrections
+                .to_string(),
+        );
+        metadata.insert(
+            PERSONALIZATION_ENTRIES_REQUEST_METADATA_KEY.to_string(),
+            serde_json::to_string(&entries).map_err(|error| {
+                CommandError::new(
+                    "personalization",
+                    format!("failed to prepare personalization entries: {error}"),
+                )
+            })?,
+        );
+    }
+
     let request = RunTranscriptionRequest {
         job_id: job_id.clone(),
         input_path: payload.input_path,
@@ -111,13 +200,13 @@ pub(crate) async fn spawn_transcription_job(
         model: payload.model,
         parakeet_model: payload.parakeet_model,
         enable_ai: payload.enable_ai,
-        whisper_options: payload.whisper_options,
+        whisper_options,
         title: payload.title,
         parent_id: payload.parent_id,
         source_origin: payload
             .source_origin
             .unwrap_or(ArtifactSourceOrigin::Imported),
-        metadata: payload.metadata,
+        metadata,
         source_fingerprint_json: payload.source_fingerprint_json,
     };
 
@@ -321,4 +410,45 @@ pub async fn cancel_transcription(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use sbobino_domain::{LanguageCode, PersonalizationEntry, PersonalizationEntryKind};
+
+    use super::{entry_matches_language, merge_vocabulary_prompt};
+
+    #[test]
+    fn vocabulary_prompt_bias_preserves_existing_prompt_and_deduplicates_terms() {
+        let entries = vec![
+            PersonalizationEntry::new(
+                PersonalizationEntryKind::Vocabulary,
+                "Sbobino",
+                None,
+                Some("it".to_string()),
+            ),
+            PersonalizationEntry::new(PersonalizationEntryKind::Vocabulary, "sbobino", None, None),
+        ];
+        assert_eq!(
+            merge_vocabulary_prompt(Some("Pietro".to_string()), &entries).as_deref(),
+            Some("Pietro, Sbobino")
+        );
+    }
+
+    #[test]
+    fn automatic_language_only_uses_language_neutral_personalization() {
+        let italian = PersonalizationEntry::new(
+            PersonalizationEntryKind::Vocabulary,
+            "Sbobino",
+            None,
+            Some("it".to_string()),
+        );
+        let neutral =
+            PersonalizationEntry::new(PersonalizationEntryKind::Vocabulary, "Pietro", None, None);
+
+        assert!(!entry_matches_language(&italian, &LanguageCode::Auto));
+        assert!(entry_matches_language(&italian, &LanguageCode::It));
+        assert!(!entry_matches_language(&italian, &LanguageCode::En));
+        assert!(entry_matches_language(&neutral, &LanguageCode::Auto));
+    }
 }

@@ -6,7 +6,10 @@ use rusqlite::Connection;
 use tempfile::tempdir;
 
 use sbobino_application::ArtifactRepository;
-use sbobino_domain::{ArtifactChatMessage, ArtifactKind, ArtifactSourceOrigin, TranscriptArtifact};
+use sbobino_domain::{
+    ArtifactChatMessage, ArtifactKind, ArtifactSourceOrigin, PersonalizationEntry,
+    PersonalizationEntryKind, TranscriptArtifact,
+};
 use sbobino_infrastructure::repositories::sqlite_artifact_repository::SqliteArtifactRepository;
 
 fn enable_local_secure_storage_for_tests() {
@@ -54,6 +57,59 @@ async fn save_then_get_by_id_returns_persisted_artifact() {
     assert_eq!(loaded.job_id, "job-a");
     assert_eq!(loaded.raw_transcript, "hello transcript");
     assert_eq!(loaded.optimized_transcript, "hello transcript");
+}
+
+#[tokio::test]
+async fn optimized_review_and_encrypted_metadata_survive_reopen_without_mutating_original() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let db_path = temp.path().join("artifacts.db");
+    let repo = SqliteArtifactRepository::new(db_path.clone()).expect("repo should initialize");
+    let artifact = artifact_with_job("job-review", "/tmp/review.wav", "Welcome to Sbobbino");
+    let artifact_id = artifact.id.clone();
+    repo.save(&artifact).await.expect("artifact should persist");
+
+    repo.update_content(
+        &artifact_id,
+        "Welcome to Sbobino",
+        &artifact.summary,
+        &artifact.faqs,
+    )
+    .await
+    .expect("optimized correction should persist");
+    let review_json = r#"{"version":1,"decisions":{"segment-0-words-2-2":{"action":"corrected","original_text":"Sbobbino","replacement_text":"Sbobino","reviewed_at":"2026-08-25T00:00:00Z"}}}"#;
+    repo.update_metadata_entry(&artifact_id, "personalization_review_v1", Some(review_json))
+        .await
+        .expect("review metadata should persist");
+
+    let connection = Connection::open(&db_path).expect("db should open");
+    let metadata_ciphertext: Vec<u8> = connection
+        .query_row(
+            "SELECT metadata_json_enc FROM transcript_artifacts WHERE id = ?1",
+            [artifact_id.as_str()],
+            |row| row.get(0),
+        )
+        .expect("encrypted metadata should exist");
+    assert!(!metadata_ciphertext
+        .windows("Sbobbino".len())
+        .any(|window| window == b"Sbobbino"));
+    drop(connection);
+
+    let reopened = SqliteArtifactRepository::new(db_path).expect("repo should reopen");
+    let loaded = reopened
+        .get_by_id(&artifact_id)
+        .await
+        .expect("reviewed artifact should load")
+        .expect("reviewed artifact should exist");
+    assert_eq!(loaded.raw_transcript, "Welcome to Sbobbino");
+    assert_eq!(loaded.optimized_transcript, "Welcome to Sbobino");
+    assert_eq!(
+        loaded
+            .metadata
+            .get("personalization_review_v1")
+            .map(String::as_str),
+        Some(review_json)
+    );
 }
 
 #[tokio::test]
@@ -344,4 +400,154 @@ fn migrates_legacy_schema_before_creating_kind_index() {
     assert!(names.contains(&"deleted_at".to_string()));
     assert!(names.contains(&"source_label_enc".to_string()));
     assert!(names.contains(&"audio_backfill_status".to_string()));
+}
+
+#[tokio::test]
+async fn personalization_entries_round_trip_encrypted_and_support_lifecycle() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let db_path = temp.path().join("artifacts.db");
+    let repo = SqliteArtifactRepository::new(db_path.clone()).expect("repo should initialize");
+
+    let entry = PersonalizationEntry::new(
+        PersonalizationEntryKind::Correction,
+        "sbo bino",
+        Some("Sbobino".to_string()),
+        Some("it".to_string()),
+    );
+    let entry_id = entry.id.clone();
+    repo.upsert_personalization_entry(&entry)
+        .await
+        .expect("entry should persist");
+
+    let conn = Connection::open(&db_path).expect("db should open");
+    let (source_ciphertext, replacement_ciphertext): (Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT source_text_enc, replacement_text_enc FROM personalization_entries WHERE id = ?1",
+            [entry_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("entry ciphertext should be present");
+    assert!(!source_ciphertext
+        .windows("sbo bino".len())
+        .any(|window| window == b"sbo bino"));
+    assert!(!replacement_ciphertext
+        .windows("Sbobino".len())
+        .any(|window| window == b"Sbobino"));
+
+    let reopened = SqliteArtifactRepository::new(db_path).expect("repo should reopen");
+    let entries = reopened
+        .list_personalization_entries()
+        .await
+        .expect("entries should load");
+    assert_eq!(entries, vec![entry.clone()]);
+
+    let mut updated = entry.clone();
+    updated.enabled = false;
+    updated.hit_count = 3;
+    updated.source_text = "sbo-bino".to_string();
+    updated.updated_at = Utc::now();
+    reopened
+        .upsert_personalization_entry(&updated)
+        .await
+        .expect("entry update should persist");
+    let loaded = reopened
+        .list_personalization_entries()
+        .await
+        .expect("updated entries should load");
+    assert_eq!(loaded[0].source_text, "sbo-bino");
+    assert!(!loaded[0].enabled);
+    assert_eq!(loaded[0].hit_count, 3);
+    reopened
+        .increment_personalization_hit_count(&entry_id)
+        .await
+        .expect("hit count increment should be atomic");
+    let loaded = reopened
+        .list_personalization_entries()
+        .await
+        .expect("incremented entry should load");
+    assert_eq!(loaded[0].source_text, "sbo-bino");
+    assert!(!loaded[0].enabled);
+    assert_eq!(loaded[0].hit_count, 4);
+
+    assert_eq!(
+        reopened
+            .delete_personalization_entry(&entry_id)
+            .await
+            .expect("entry delete should succeed"),
+        1
+    );
+    assert!(reopened
+        .list_personalization_entries()
+        .await
+        .expect("entries should load after delete")
+        .is_empty());
+
+    reopened
+        .upsert_personalization_entry(&entry)
+        .await
+        .expect("entry should persist again");
+    assert_eq!(
+        reopened
+            .clear_personalization_entries()
+            .await
+            .expect("entry clear should succeed"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn artifact_review_update_is_atomic_preserves_raw_and_rejects_stale_revision() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let repo = SqliteArtifactRepository::new(temp.path().join("artifacts.db"))
+        .expect("repo should initialize");
+    let artifact = artifact_with_job("review-job", "/tmp/review.wav", "Sbobinoo works");
+    let artifact_id = artifact.id.clone();
+    repo.save(&artifact).await.expect("artifact should save");
+    let correction = PersonalizationEntry::new(
+        PersonalizationEntryKind::Correction,
+        "Sbobinoo",
+        Some("Sbobino".to_string()),
+        None,
+    );
+
+    let updated = repo
+        .apply_artifact_review_update(
+            &artifact_id,
+            artifact.revision,
+            Some("Sbobino works"),
+            r#"{"version":1,"decisions":{"segment-0":{"action":"corrected"}}}"#,
+            Some(&correction),
+        )
+        .await
+        .expect("atomic review should succeed")
+        .expect("artifact should exist");
+    assert_eq!(updated.raw_transcript, "Sbobinoo works");
+    assert_eq!(updated.optimized_transcript, "Sbobino works");
+    assert!(updated.metadata.contains_key("personalization_review_v1"));
+    assert_eq!(
+        repo.list_personalization_entries()
+            .await
+            .expect("remembered correction should load"),
+        vec![correction]
+    );
+
+    let stale = repo
+        .apply_artifact_review_update(
+            &artifact_id,
+            artifact.revision,
+            Some("stale overwrite"),
+            r#"{"version":1,"decisions":{}}"#,
+            None,
+        )
+        .await;
+    assert!(stale.is_err());
+    let reopened = repo
+        .get_by_id(&artifact_id)
+        .await
+        .expect("artifact query should succeed")
+        .expect("artifact should still exist");
+    assert_eq!(reopened.raw_transcript, "Sbobinoo works");
+    assert_eq!(reopened.optimized_transcript, "Sbobino works");
 }

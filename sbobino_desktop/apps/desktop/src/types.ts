@@ -281,6 +281,25 @@ export type PromptSettings = {
   bindings: PromptBindings;
 };
 
+export type PersonalizationSettings = {
+  enabled: boolean;
+  auto_apply_safe_corrections: boolean;
+};
+
+export type PersonalizationEntryKind = "vocabulary" | "correction";
+
+export type PersonalizationEntry = {
+  id: string;
+  kind: PersonalizationEntryKind;
+  source_text: string;
+  replacement_text: string | null;
+  language_code: string | null;
+  enabled: boolean;
+  hit_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
 export type AppSettings = {
   // Legacy fields kept for wire compatibility with existing commands.
   transcription_engine: TranscriptionEngine;
@@ -304,6 +323,7 @@ export type AppSettings = {
   organization: OrganizationSettings;
   ai: AiSettings;
   prompts: PromptSettings;
+  personalization: PersonalizationSettings;
 };
 
 export type JobStage =
@@ -755,6 +775,7 @@ export type UpdateSettingsPartialPayload = {
   organization?: OrganizationSettings;
   ai?: AiSettings;
   prompts?: PromptSettings;
+  personalization?: PersonalizationSettings;
 };
 
 export type AutomaticImportQueuedJob = {

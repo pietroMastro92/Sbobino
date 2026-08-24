@@ -7,8 +7,8 @@ use tauri::{Emitter, State};
 
 use sbobino_domain::{
     transcription_language_catalog, AiProvider, AiSettings, AppSettings, AutomaticImportSettings,
-    GeneralSettings, LanguageCode, OrganizationSettings, PromptSettings, PromptTask,
-    PromptTemplate, TranscriptionLanguageOption, TranscriptionSettings,
+    GeneralSettings, LanguageCode, OrganizationSettings, PersonalizationSettings, PromptSettings,
+    PromptTask, PromptTemplate, TranscriptionLanguageOption, TranscriptionSettings,
 };
 
 use crate::{
@@ -33,6 +33,7 @@ pub struct UpdateSettingsPartialPayload {
     pub organization: Option<OrganizationSettings>,
     pub ai: Option<AiSettings>,
     pub prompts: Option<PromptSettings>,
+    pub personalization: Option<PersonalizationSettings>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -245,13 +246,14 @@ pub async fn update_settings_partial(
 ) -> Result<AppSettings, CommandError> {
     let updated = state
         .settings_service
-        .update_partial(
+        .update_partial_with_personalization(
             payload.general,
             payload.transcription,
             payload.automation,
             payload.organization,
             payload.ai,
             payload.prompts,
+            payload.personalization,
         )
         .await
         .map_err(CommandError::from)?;
