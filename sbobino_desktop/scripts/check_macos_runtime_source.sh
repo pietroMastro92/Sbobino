@@ -55,6 +55,15 @@ if ! grep -Fq -- 'assert_binary_portable "$TARGET_BIN/parakeet-batch-json"' "$so
   exit 1
 fi
 
+for required in \
+  '-DGGML_METAL=ON' \
+  '-DGGML_ACCELERATE=ON'; do
+  if ! grep -Fq -- "$required" "$source_file"; then
+    printf 'packaged Whisper must enable the native macOS backend: %s\n' "$required" >&2
+    exit 1
+  fi
+done
+
 for patch_name in whisper-stream-audio-file.patch whisper-stream-fifo.patch whisper-stream-backlog.patch whisper-stream-finalization.patch whisper-stream-lossless-drain.patch; do
   patch_path="$script_dir/patches/$patch_name"
   if [[ ! -s "$patch_path" ]]; then

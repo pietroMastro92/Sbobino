@@ -275,7 +275,8 @@ build_whisper_binaries() {
     -DWHISPER_BUILD_SERVER=OFF \
     -DWHISPER_SDL2=ON \
     -DGGML_BLAS=OFF \
-    -DGGML_ACCELERATE=OFF \
+    -DGGML_METAL=ON \
+    -DGGML_ACCELERATE=ON \
     -DWHISPER_USE_SYSTEM_GGML=OFF
   cmake --build "$build_root" -j"$BUILD_JOBS" --target whisper-cli whisper-stream
 
