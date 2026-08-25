@@ -82,11 +82,11 @@ jobs:
           export SBOBINO_PARAKEET_EXPECTED_PROCESSING_LANGUAGE=en
           ./scripts/smoke_parakeet_real.sh
 
-      - name: Run real packaged Whisper live replay on Intel CPU
+      - name: Run real packaged Whisper live replay on Intel Auto
         working-directory: sbobino_desktop
         run: |
           SBOBINO_WHISPER_LIVE_ARCH=x86_64 \
-          SBOBINO_WHISPER_LIVE_DEVICE=cpu \
+          SBOBINO_WHISPER_LIVE_DEVICE=auto \
           SBOBINO_WHISPER_LIVE_RUNTIME_ZIP="$RUNNER_TEMP/speech-runtime-macos-x86_64.zip" \
           SBOBINO_LIVE_RUNNER="github-hosted macos-15-intel" \
           ./scripts/release_macos_whisper_live_smoke.sh \

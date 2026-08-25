@@ -177,7 +177,7 @@
      SDL_LogSetPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO);
  
      if (SDL_Init(SDL_INIT_AUDIO) < 0) {
-@@ -75,10 +182,46 @@
+@@ -75,10 +182,52 @@
  
      m_audio.resize((m_sample_rate*m_len_ms)/1000);
  
@@ -198,9 +198,11 @@
 +        m_running = true;
 +        m_replay_thread = std::thread([this]() {
 +            constexpr size_t replay_block = 160; // 10 ms at 16 kHz
++            const auto replay_started = std::chrono::steady_clock::now();
 +            while (m_running) {
 +                size_t count = 0;
 +                size_t start = 0;
++                size_t scheduled_samples = 0;
 +                {
 +                    std::lock_guard<std::mutex> lock(m_mutex);
 +                    if (m_replay_pos >= m_replay_samples.size()) {
@@ -210,11 +212,15 @@
 +                    count = std::min(replay_block, m_replay_samples.size() - m_replay_pos);
 +                    start = m_replay_pos;
 +                    m_replay_pos += count;
++                    scheduled_samples = m_replay_pos;
 +                }
 +                callback(reinterpret_cast<uint8_t *>(m_replay_samples.data() + start),
 +                         static_cast<int>(count * sizeof(float)));
-+                std::this_thread::sleep_for(std::chrono::milliseconds(
-+                    static_cast<int>(count * 1000 / m_sample_rate)));
++                const auto replay_deadline = replay_started +
++                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++                        std::chrono::duration<double>(
++                            static_cast<double>(scheduled_samples) / m_sample_rate));
++                std::this_thread::sleep_until(replay_deadline);
 +            }
 +            m_replay_eof = true;
 +        });
@@ -224,7 +230,7 @@
      if (!m_dev_id_in) {
          fprintf(stderr, "%s: no audio device to resume!\n", __func__);
          return false;
-@@ -97,6 +240,14 @@
+@@ -97,6 +246,14 @@
  }
  
  bool audio_async::pause() {
@@ -239,7 +245,7 @@
      if (!m_dev_id_in) {
          fprintf(stderr, "%s: no audio device to pause!\n", __func__);
          return false;
-@@ -115,6 +266,17 @@
+@@ -115,6 +272,17 @@
  }
  
  bool audio_async::clear() {
@@ -257,7 +263,7 @@
      if (!m_dev_id_in) {
          fprintf(stderr, "%s: no audio device to clear!\n", __func__);
          return false;
-@@ -154,6 +316,16 @@
+@@ -154,6 +322,16 @@
      {
          std::lock_guard<std::mutex> lock(m_mutex);
  
@@ -274,7 +280,7 @@
          if (m_audio_pos + n_samples > m_audio.size()) {
              const size_t n0 = m_audio.size() - m_audio_pos;
  
-@@ -164,11 +336,12 @@
+@@ -164,11 +342,12 @@
          }
          m_audio_pos = (m_audio_pos + n_samples) % m_audio.size();
          m_audio_len = std::min(m_audio_len + n_samples, m_audio.size());
@@ -288,7 +294,7 @@
          fprintf(stderr, "%s: no audio device to get audio from!\n", __func__);
          return;
      }
-@@ -194,11 +367,7 @@
+@@ -194,11 +373,7 @@
  
          result.resize(n_samples);
  
@@ -301,7 +307,7 @@
          if (s0 + n_samples > m_audio.size()) {
              const size_t n0 = m_audio.size() - s0;
  
-@@ -207,9 +376,40 @@
+@@ -207,9 +382,40 @@
          } else {
              memcpy(result.data(), &m_audio[s0], n_samples * sizeof(float));
          }

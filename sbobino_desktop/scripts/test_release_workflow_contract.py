@@ -160,6 +160,12 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("SBOBINO_PARAKEET_FORCE_CPU=1", workflow)
         self.assertIn("SBOBINO_PARAKEET_REQUIRE_WORKER_RSS_MONITOR=1", workflow)
         self.assertIn("SBOBINO_PARAKEET_SMOKE_MODE=service", workflow)
+        self.assertIn("SBOBINO_WHISPER_LIVE_DEVICE=auto", workflow)
+        self.assertNotIn("SBOBINO_WHISPER_LIVE_DEVICE=cpu", workflow)
+
+        release_workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("DEVICE=auto", release_workflow)
+        self.assertNotIn("DEVICE=cpu", release_workflow)
 
     def test_arm_validation_uses_standard_runner_and_shared_metal_buffers(self):
         workflow = ARM_VALIDATION.read_text(encoding="utf-8")

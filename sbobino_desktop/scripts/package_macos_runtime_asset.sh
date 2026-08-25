@@ -23,7 +23,9 @@ case "$PARAKEET_GGML_METAL" in
   *) echo "Unsupported SBOBINO_PARAKEET_METAL value: $PARAKEET_GGML_METAL" >&2; exit 1 ;;
 esac
 
-STAGE_DIR=$(mktemp -d)
+STAGE_PARENT=${SBOBINO_RUNTIME_STAGE_PARENT:-${TMPDIR:-/tmp}}
+mkdir -p "$STAGE_PARENT"
+STAGE_DIR=$(mktemp -d "$STAGE_PARENT/sbobino-runtime.XXXXXX")
 SOURCE_DIR="$STAGE_DIR/src"
 BUILD_DIR="$STAGE_DIR/build"
 INSTALL_PREFIX="$STAGE_DIR/install"

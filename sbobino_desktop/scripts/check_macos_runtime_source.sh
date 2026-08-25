@@ -64,6 +64,11 @@ for required in \
   fi
 done
 
+if ! grep -Fq -- 'SBOBINO_RUNTIME_STAGE_PARENT' "$source_file"; then
+  printf 'macOS runtime staging must support an explicit build volume\n' >&2
+  exit 1
+fi
+
 for patch_name in whisper-stream-audio-file.patch whisper-stream-fifo.patch whisper-stream-backlog.patch whisper-stream-finalization.patch whisper-stream-lossless-drain.patch; do
   patch_path="$script_dir/patches/$patch_name"
   if [[ ! -s "$patch_path" ]]; then
@@ -75,6 +80,11 @@ for patch_name in whisper-stream-audio-file.patch whisper-stream-fifo.patch whis
     exit 1
   fi
 done
+
+if ! grep -Fq -- 'std::this_thread::sleep_until(replay_deadline)' "$script_dir/patches/whisper-stream-audio-file.patch"; then
+  printf 'Whisper replay must use absolute deadlines without accumulating scheduler drift\n' >&2
+  exit 1
+fi
 
 if ! grep -Fq -- 'SBOBINO_WHISPER_LIVE_BACKLOG' "$script_dir/patches/whisper-stream-backlog.patch"; then
   printf 'Whisper live backlog patch must fail closed instead of dropping audio\n' >&2

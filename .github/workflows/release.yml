@@ -440,7 +440,6 @@ jobs:
           DEVICE=auto
           NATIVE_ARCH=arm64
           if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
-            DEVICE=cpu
             NATIVE_ARCH=x86_64
           fi
           SBOBINO_WHISPER_LIVE_ARCH="$NATIVE_ARCH" \
