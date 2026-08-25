@@ -48,6 +48,23 @@ class FinalizedTranscriptTests(unittest.TestCase):
             )
         )
 
+    def test_preflight_parser_preserves_retry_evidence(self):
+        stderr = (
+            "SBOBINO_WHISPER_LIVE_PREFLIGHT status=passed inference_ms=730.500 "
+            "budget_ms=1000.000 step_ms=1000 samples=6 max_ms=1226.297\n"
+        )
+        self.assertEqual(
+            final_preflight_result(stderr),
+            {
+                "status": "passed",
+                "inference_ms": 730.5,
+                "budget_ms": 1000.0,
+                "step_ms": 1000.0,
+                "samples": 6.0,
+                "max_ms": 1226.297,
+            },
+        )
+
     def test_captured_wav_discovery_excludes_input_and_fixture_in_the_run_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = pathlib.Path(temporary)

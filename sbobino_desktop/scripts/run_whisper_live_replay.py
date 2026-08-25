@@ -103,18 +103,23 @@ def final_runtime_summary(stderr: str, sample_rate: int) -> tuple[int, int] | No
 def final_preflight_result(stderr: str) -> dict[str, float | str] | None:
     matches = re.findall(
         r"SBOBINO_WHISPER_LIVE_PREFLIGHT\s+status=(passed|rejected)\s+"
-        r"inference_ms=([0-9.]+)\s+budget_ms=([0-9.]+)\s+step_ms=([0-9]+)",
+        r"inference_ms=([0-9.]+)\s+budget_ms=([0-9.]+)\s+step_ms=([0-9]+)"
+        r"(?:\s+samples=([0-9]+)\s+max_ms=([0-9.]+))?",
         stderr,
     )
     if not matches:
         return None
-    status, inference_ms, budget_ms, step_ms = matches[-1]
-    return {
+    status, inference_ms, budget_ms, step_ms, samples, max_ms = matches[-1]
+    result: dict[str, float | str] = {
         "status": status,
         "inference_ms": float(inference_ms),
         "budget_ms": float(budget_ms),
         "step_ms": float(step_ms),
     }
+    if samples and max_ms:
+        result["samples"] = float(samples)
+        result["max_ms"] = float(max_ms)
+    return result
 
 
 def backlog_threshold_overshoot(stderr: str, sample_rate: int) -> float | None:

@@ -96,6 +96,9 @@ for required in \
   'SBOBINO_WHISPER_LIVE_PREFLIGHT' \
   'SBOBINO_WHISPER_SKIP_LIVE_PREFLIGHT' \
   'SBOBINO_WHISPER_TEST_PREFLIGHT_DELAY_MS' \
+  'SBOBINO_WHISPER_TEST_PREFLIGHT_FIRST_ROUND_DELAY_MS' \
+  'probe_round < 2' \
+  'if (probe_round == 0) {' \
   'probe_index < 3' \
   'std::max(std::min(probe_a_ms, probe_b_ms)' \
   'params.max_tokens     = params.max_tokens > 0 ? std::min(params.max_tokens, 16) : 16;' \
