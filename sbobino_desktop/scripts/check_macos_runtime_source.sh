@@ -98,7 +98,7 @@ for required in \
   'SBOBINO_WHISPER_TEST_PREFLIGHT_DELAY_MS' \
   'probe_index < 3' \
   'std::max(std::min(probe_a_ms, probe_b_ms)' \
-  'std::min(params.max_tokens, 24)' \
+  'params.max_tokens     = params.max_tokens > 0 ? std::min(params.max_tokens, 16) : 16;' \
   'std::remove(capture_filename.c_str())'; do
   if ! grep -Fq -- "$required" "$script_dir/patches/whisper-stream-backlog.patch"; then
     printf 'Whisper live warmup contract is missing: %s\n' "$required" >&2
