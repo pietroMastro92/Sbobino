@@ -144,7 +144,14 @@ def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, 
     """Mirror the app's bounded thread count and CPU/GPU live window."""
     threads = max(1, min(8, available_cpus or 1))
     step_ms = 1280 if device == "cpu" else 1000
-    return threads, step_ms, 2000
+    length_ms = 2000
+    if value := os.environ.get("SBOBINO_WHISPER_TEST_STEP_MS"):
+        step_ms = int(value)
+    if value := os.environ.get("SBOBINO_WHISPER_TEST_LENGTH_MS"):
+        length_ms = int(value)
+    if step_ms <= 0 or length_ms < step_ms:
+        raise ValueError("diagnostic live profile requires 0 < step_ms <= length_ms")
+    return threads, step_ms, length_ms
 
 
 def preview_latency_seconds(step_ms: int, inference_ms: float) -> float:
@@ -264,6 +271,9 @@ def main() -> int:
         str(args.binary), "-m", str(args.model), "-t", str(threads), "--step", str(step_ms),
         "--length", str(length_ms), "--no-fallback", "--save-audio", "-l", "auto",
     ]
+    audio_ctx = int(os.environ.get("SBOBINO_WHISPER_TEST_AUDIO_CTX", "0"))
+    if audio_ctx > 0:
+        command.extend(["--audio-ctx", str(audio_ctx)])
     if args.device == "cpu":
         command.extend(["-ng", "-nfa"])
 
@@ -440,6 +450,12 @@ def main() -> int:
         "platform": args.platform,
         "duration_seconds": duration,
         "requested_duration_seconds": duration,
+        "profile": {
+            "threads": threads,
+            "step_ms": step_ms,
+            "length_ms": length_ms,
+            "audio_ctx": audio_ctx,
+        },
         "captured_duration_seconds": captured_frames / sample_rate,
         "live_mode": (
             "preflight-rejected-incompatible-cpu"
