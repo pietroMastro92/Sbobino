@@ -4,7 +4,7 @@
      params.no_timestamps  = !use_vad;
      params.no_context    |= use_vad;
 -    params.max_tokens     = 0;
-+    params.max_tokens     = params.max_tokens > 0 ? std::min(params.max_tokens, 64) : 64;
++    params.max_tokens     = params.max_tokens > 0 ? std::min(params.max_tokens, 32) : 32;
  
      // init audio
  
