@@ -30,7 +30,7 @@
  
      bool is_running = true;
  
-@@ -224,14 +224,93 @@
+@@ -224,14 +224,107 @@
      wav_writer wavWriter;
 +    std::string capture_filename;
      // save wav file
@@ -88,28 +88,42 @@
 +        const bool test_replay = std::getenv("SBOBINO_WHISPER_REPLAY_WAV") != nullptr;
 +        const bool skip_probe = test_replay &&
 +            std::getenv("SBOBINO_WHISPER_SKIP_LIVE_PREFLIGHT") != nullptr;
-+        const auto probe_started = std::chrono::steady_clock::now();
-+        if (whisper_full(ctx, warmup, probe_pcm.data(), probe_pcm.size()) != 0) {
-+            fprintf(stderr, "%s: failed to benchmark the live transcription backend\n", argv[0]);
-+            whisper_free(ctx);
-+            return 6;
-+        }
++        int forced_delay_ms = 0;
 +        if (test_replay) {
 +            const char * forced_delay = std::getenv("SBOBINO_WHISPER_TEST_PREFLIGHT_DELAY_MS");
 +            if (forced_delay != nullptr) {
-+                std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, std::atoi(forced_delay))));
++                forced_delay_ms = std::max(0, std::atoi(forced_delay));
 +            }
 +        }
-+        const double probe_ms = std::chrono::duration<double, std::milli>(
-+            std::chrono::steady_clock::now() - probe_started).count();
++        // Use the median of three probes so one scheduler spike cannot reject
++        // capable hardware, while sustained slower-than-realtime inference still fails closed.
++        std::vector<double> probe_samples_ms;
++        for (int probe_index = 0; probe_index < 3; ++probe_index) {
++            const auto probe_started = std::chrono::steady_clock::now();
++            if (whisper_full(ctx, warmup, probe_pcm.data(), probe_pcm.size()) != 0) {
++                fprintf(stderr, "%s: failed to benchmark the live transcription backend\n", argv[0]);
++                whisper_free(ctx);
++                return 6;
++            }
++            const double measured_ms = std::chrono::duration<double, std::milli>(
++                std::chrono::steady_clock::now() - probe_started).count();
++            probe_samples_ms.push_back(measured_ms + forced_delay_ms);
++        }
++        const double probe_a_ms = probe_samples_ms[0];
++        const double probe_b_ms = probe_samples_ms[1];
++        const double probe_c_ms = probe_samples_ms[2];
++        const double probe_ms = std::max(std::min(probe_a_ms, probe_b_ms),
++            std::min(std::max(probe_a_ms, probe_b_ms), probe_c_ms));
++        const double probe_max_ms = std::max(probe_a_ms, std::max(probe_b_ms, probe_c_ms));
 +        const double latency_budget_ms = params.step_ms < 2000
 +            ? 2000.0 - params.step_ms
 +            : 0.0;
 +        const double budget_ms = std::min<double>(params.step_ms, latency_budget_ms);
 +        const bool probe_passed = skip_probe || (budget_ms > 0.0 && probe_ms <= budget_ms);
 +        fprintf(stderr,
-+                "SBOBINO_WHISPER_LIVE_PREFLIGHT status=%s inference_ms=%.3f budget_ms=%.3f step_ms=%d\n",
-+                probe_passed ? "passed" : "rejected", probe_ms, budget_ms, params.step_ms);
++                "SBOBINO_WHISPER_LIVE_PREFLIGHT status=%s inference_ms=%.3f budget_ms=%.3f step_ms=%d samples=%zu max_ms=%.3f\n",
++                probe_passed ? "passed" : "rejected", probe_ms, budget_ms, params.step_ms,
++                probe_samples_ms.size(), probe_max_ms);
 +        fflush(stderr);
 +        if (!probe_passed) {
 +            if (params.save_audio) {

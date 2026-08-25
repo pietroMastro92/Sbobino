@@ -96,6 +96,8 @@ for required in \
   'SBOBINO_WHISPER_LIVE_PREFLIGHT' \
   'SBOBINO_WHISPER_SKIP_LIVE_PREFLIGHT' \
   'SBOBINO_WHISPER_TEST_PREFLIGHT_DELAY_MS' \
+  'probe_index < 3' \
+  'std::max(std::min(probe_a_ms, probe_b_ms)' \
   'std::min(params.max_tokens, 24)' \
   'std::remove(capture_filename.c_str())'; do
   if ! grep -Fq -- "$required" "$script_dir/patches/whisper-stream-backlog.patch"; then
