@@ -101,7 +101,7 @@ for required in \
   'if (probe_round == 0) {' \
   'probe_index < 3' \
   'std::max(std::min(probe_a_ms, probe_b_ms)' \
-  'params.max_tokens     = params.max_tokens > 0 ? std::min(params.max_tokens, 16) : 16;' \
+  'params.max_tokens     = params.max_tokens > 0 ? std::min(params.max_tokens, 32) : 32;' \
   'const uint64_t backlog = audio.buffered_samples();' \
   'std::remove(capture_filename.c_str())'; do
   if ! grep -Fq -- "$required" "$script_dir/patches/whisper-stream-backlog.patch"; then

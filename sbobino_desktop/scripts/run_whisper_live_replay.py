@@ -274,6 +274,9 @@ def main() -> int:
     audio_ctx = int(os.environ.get("SBOBINO_WHISPER_TEST_AUDIO_CTX", "0"))
     if audio_ctx > 0:
         command.extend(["--audio-ctx", str(audio_ctx)])
+    max_tokens = int(os.environ.get("SBOBINO_WHISPER_TEST_MAX_TOKENS", "32"))
+    if max_tokens > 0:
+        command.extend(["--max-tokens", str(max_tokens)])
     if args.device == "cpu":
         command.extend(["-ng", "-nfa"])
 
@@ -455,6 +458,7 @@ def main() -> int:
             "step_ms": step_ms,
             "length_ms": length_ms,
             "audio_ctx": audio_ctx,
+            "max_tokens": max_tokens,
         },
         "captured_duration_seconds": captured_frames / sample_rate,
         "live_mode": (

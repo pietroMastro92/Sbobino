@@ -59,7 +59,7 @@ jobs:
             -t 180 -ar 16000 -ac 1 -c:a pcm_s16le "$audio"
 
           run_profile() {
-            local name=$1 step=$2 length=$3 audio_ctx=$4
+            local name=$1 step=$2 length=$3 audio_ctx=$4 max_tokens=$5
             local run_dir="$RUNNER_TEMP/profile-$name"
             mkdir -p "$run_dir"
             set +e
@@ -69,6 +69,7 @@ jobs:
             SBOBINO_WHISPER_TEST_STEP_MS="$step" \
             SBOBINO_WHISPER_TEST_LENGTH_MS="$length" \
             SBOBINO_WHISPER_TEST_AUDIO_CTX="$audio_ctx" \
+            SBOBINO_WHISPER_TEST_MAX_TOKENS="$max_tokens" \
             python3 scripts/run_whisper_live_replay.py \
               --binary "$runtime/bin/whisper-stream" --model "$model" --audio "$audio" \
               --fixture "$fixture" --report "$RUNNER_TEMP/profile-proofs/$name.json" \
@@ -78,10 +79,10 @@ jobs:
             echo "$name exit=$result"
           }
 
-          run_profile context1024 1000 2000 1024
-          run_profile shorter-window 1000 1600 0
-          run_profile balanced 1100 1600 1024
-          run_profile context768 1000 2000 768
+          run_profile context768-tokens24 1000 2000 768 24
+          run_profile context768-tokens32 1000 2000 768 32
+          run_profile context768-window1800 1000 1800 768 24
+          run_profile context1024-window1800 1000 1800 1024 24
 
           python3 - "$RUNNER_TEMP/profile-proofs" <<'PY'
           import json, pathlib, sys
