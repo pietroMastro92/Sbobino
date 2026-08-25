@@ -140,16 +140,13 @@
      printf("[Start speaking]\n");
      fflush(stdout);
  
-@@ -258,8 +337,26 @@
+@@ -258,8 +337,23 @@
                      is_running = sdl_poll_events();
                  }
                  if (!is_running) {
 +                    break;
 +                }
-+                const uint64_t captured_before = audio.captured_samples();
-+                const uint64_t backlog_before = captured_before > n_samples_inferred
-+                    ? captured_before - n_samples_inferred
-+                    : 0;
++                const uint64_t backlog_before = audio.buffered_samples();
 +                if (audio.overrun() || backlog_before > 2U * WHISPER_SAMPLE_RATE) {
 +                    audio.get(0, pcmf32_new);
 +                    if (params.save_audio && !pcmf32_new.empty()) {
@@ -167,7 +164,7 @@
                  audio.get(params.step_ms, pcmf32_new);
  
                  if (audio.eof() && pcmf32_new.empty()) {
-@@ -269,15 +366,6 @@
+@@ -269,15 +363,6 @@
  
                  if (params.save_audio && !pcmf32_new.empty()) {
                      wavWriter.write(pcmf32_new.data(), pcmf32_new.size());
@@ -183,7 +180,7 @@
                  }
  
                  if ((int) pcmf32_new.size() >= n_samples_step || audio.eof()) {
-@@ -326,6 +414,8 @@
+@@ -326,6 +411,8 @@
              t_last = t_now;
          }
  
@@ -192,7 +189,7 @@
          // run the inference
          {
              whisper_full_params wparams = whisper_full_default_params(params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY);
-@@ -440,8 +530,33 @@
+@@ -440,8 +527,31 @@
              }
              fflush(stdout);
          }
@@ -202,9 +199,7 @@
 +        const double inference_ms = std::chrono::duration<double, std::milli>(
 +            inference_finished - inference_started).count();
 +        const uint64_t captured = audio.captured_samples();
-+        const uint64_t backlog = captured > n_samples_inferred
-+            ? captured - n_samples_inferred
-+            : 0;
++        const uint64_t backlog = audio.buffered_samples();
 +        fprintf(stderr,
 +                "SBOBINO_WHISPER_LIVE_METRIC captured_seconds=%.3f processed_seconds=%.3f backlog_seconds=%.3f inference_ms=%.3f dropped_samples=%zu\n",
 +                captured / float(WHISPER_SAMPLE_RATE),
@@ -226,7 +221,7 @@
      if (replay_mode) {
          fprintf(stderr,
                  "SBOBINO_WHISPER_LIVE_METRICS captured_seconds=%.3f processed_seconds=%.3f backlog_seconds=%.3f dropped_samples=%zu\n",
-@@ -456,5 +571,5 @@
+@@ -456,5 +566,5 @@
      whisper_print_timings(ctx);
      whisper_free(ctx);
  

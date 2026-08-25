@@ -120,13 +120,13 @@ def final_preflight_result(stderr: str) -> dict[str, float | str] | None:
 def backlog_threshold_overshoot(stderr: str, sample_rate: int) -> float | None:
     matches = re.findall(
         r"SBOBINO_WHISPER_LIVE_BACKLOG\s+exceeded\s+captured=([0-9]+)\s+"
-        r"inferred=([0-9]+)",
+        r"inferred=([0-9]+)\s+buffered=([0-9]+)",
         stderr,
     )
     if not matches:
         return None
-    captured, inferred = (int(value) for value in matches[-1])
-    queued_seconds = max(0, captured - inferred) / sample_rate
+    buffered = int(matches[-1][2])
+    queued_seconds = buffered / sample_rate
     return max(0.0, queued_seconds - 2.0)
 
 

@@ -156,8 +156,8 @@ class FinalizedTranscriptTests(unittest.TestCase):
 
     def test_backlog_reaction_is_measured_from_threshold_crossing(self):
         stderr = (
-            "SBOBINO_WHISPER_LIVE_BACKLOG exceeded captured=32240 "
-            "inferred=160 buffered=32080 dropped=0\n"
+            "SBOBINO_WHISPER_LIVE_BACKLOG exceeded captured=48240 "
+            "inferred=16000 buffered=32080 dropped=0\n"
         )
         self.assertAlmostEqual(backlog_threshold_overshoot(stderr, 16000), 0.005)
 

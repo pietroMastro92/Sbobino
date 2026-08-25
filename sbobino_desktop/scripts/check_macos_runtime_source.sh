@@ -99,6 +99,7 @@ for required in \
   'probe_index < 3' \
   'std::max(std::min(probe_a_ms, probe_b_ms)' \
   'params.max_tokens     = params.max_tokens > 0 ? std::min(params.max_tokens, 16) : 16;' \
+  'const uint64_t backlog = audio.buffered_samples();' \
   'std::remove(capture_filename.c_str())'; do
   if ! grep -Fq -- "$required" "$script_dir/patches/whisper-stream-backlog.patch"; then
     printf 'Whisper live warmup contract is missing: %s\n' "$required" >&2
@@ -124,6 +125,7 @@ for required in \
   'if (!m_running && ms > 0)' \
   'SBOBINO_WHISPER_TEST_INFERENCE_DELAY_MS' \
   'std::thread backlog_monitor' \
+  'const uint64_t backlog = audio.buffered_samples();' \
   'audio.pause();' \
   'inference_backlog_failed = true'; do
   if ! grep -Fq -- "$required" "$lossless_patch"; then
@@ -131,5 +133,12 @@ for required in \
     exit 1
   fi
 done
+
+if grep -Fq -- 'captured > n_samples_inferred' \
+    "$script_dir/patches/whisper-stream-backlog.patch" \
+    "$lossless_patch"; then
+  printf 'Whisper live backlog must exclude audio already dequeued for inference\n' >&2
+  exit 1
+fi
 
 printf 'macOS runtime source contract passed: %s\n' "$source_file"
