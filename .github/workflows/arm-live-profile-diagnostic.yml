@@ -88,9 +88,9 @@ jobs:
             echo "$name exit=$result"
           }
 
-          run_profile coreml-full-tokens16 1000 2000 0 16
-          run_profile coreml-full-tokens24 1000 2000 0 24
-          run_profile coreml-full-tokens32 1000 2000 0 32
+          run_profile coreml-full-tokens8 1000 2000 0 8
+          run_profile coreml-full-tokens10 1000 2000 0 10
+          run_profile coreml-full-tokens12 1000 2000 0 12
 
           python3 - "$RUNNER_TEMP/profile-proofs" <<'PY'
           import json, pathlib, sys
