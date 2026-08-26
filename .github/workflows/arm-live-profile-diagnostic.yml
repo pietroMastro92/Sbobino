@@ -24,7 +24,7 @@ jobs:
           path: |
             ${{ runner.temp }}/whisper-live-readiness-model
             ${{ runner.temp }}/whisper-live-readiness-fixture
-          key: whisper-live-q5-818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
+          key: whisper-live-q8-coreml-c88cbd2648e1f5415092bcf5256add463a0f19943e6938f46e8d4ffdebd47739-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
 
       - name: Build exact packaged Apple Silicon runtime once
         working-directory: sbobino_desktop
@@ -37,14 +37,22 @@ jobs:
           set -euo pipefail
           ditto -x -k "$RUNNER_TEMP/speech-runtime-macos-aarch64.zip" "$RUNNER_TEMP/speech"
           runtime="$RUNNER_TEMP/speech/runtime"
-          model="$RUNNER_TEMP/whisper-live-readiness-model/ggml-tiny-q5_1.bin"
+          model="$RUNNER_TEMP/whisper-live-readiness-model/ggml-tiny-q8_0.bin"
+          encoder_zip="$RUNNER_TEMP/whisper-live-readiness-model/ggml-tiny-encoder.mlmodelc.zip"
           fixture="$RUNNER_TEMP/whisper-live-readiness-fixture/speech.wav"
           mkdir -p "$(dirname "$model")" "$(dirname "$fixture")" "$RUNNER_TEMP/profile-proofs"
 
-          model_url='https://huggingface.co/ggerganov/whisper.cpp/resolve/98aa99a0a9db05ae2342309f5096248665f7cba3/ggml-tiny-q5_1.bin?download=true'
-          model_sha=818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7
+          model_url=$(python3 -c 'import json; print(json.load(open("crates/domain/src/whisper_live_model.json"))["url"])')
+          model_sha=$(python3 -c 'import json; print(json.load(open("crates/domain/src/whisper_live_model.json"))["sha256"])')
           if [[ ! -f "$model" ]]; then curl --fail --location --retry 5 --retry-all-errors "$model_url" --output "$model"; fi
           printf '%s  %s\n' "$model_sha" "$model" | shasum -a 256 -c -
+
+          encoder_url='https://huggingface.co/ggerganov/whisper.cpp/resolve/c521a4b02f422512d734391fdf08bb08c0862f68/ggml-tiny-encoder.mlmodelc.zip?download=true'
+          encoder_sha=c88cbd2648e1f5415092bcf5256add463a0f19943e6938f46e8d4ffdebd47739
+          if [[ ! -f "$encoder_zip" ]]; then curl --fail --location --retry 5 --retry-all-errors "$encoder_url" --output "$encoder_zip"; fi
+          printf '%s  %s\n' "$encoder_sha" "$encoder_zip" | shasum -a 256 -c -
+          ditto -x -k "$encoder_zip" "$(dirname "$model")"
+          test -f "$(dirname "$model")/ggml-tiny-encoder.mlmodelc/model.mil"
 
           fixture_sha=5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
           if [[ ! -f "$fixture" ]]; then
@@ -70,6 +78,7 @@ jobs:
             SBOBINO_WHISPER_TEST_LENGTH_MS="$length" \
             SBOBINO_WHISPER_TEST_AUDIO_CTX="$audio_ctx" \
             SBOBINO_WHISPER_TEST_MAX_TOKENS="$max_tokens" \
+            SBOBINO_WHISPER_EXPECT_COREML=1 \
             python3 scripts/run_whisper_live_replay.py \
               --binary "$runtime/bin/whisper-stream" --model "$model" --audio "$audio" \
               --fixture "$fixture" --report "$RUNNER_TEMP/profile-proofs/$name.json" \
@@ -79,9 +88,9 @@ jobs:
             echo "$name exit=$result"
           }
 
-          run_profile q5-full-window 1000 2000 0 16
-          run_profile q5-window1800 1000 1800 0 18
-          run_profile q5-window1600 1000 1600 0 20
+          run_profile coreml-full-tokens16 1000 2000 0 16
+          run_profile coreml-full-tokens24 1000 2000 0 24
+          run_profile coreml-full-tokens32 1000 2000 0 32
 
           python3 - "$RUNNER_TEMP/profile-proofs" <<'PY'
           import json, pathlib, sys

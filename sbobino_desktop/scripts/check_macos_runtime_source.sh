@@ -57,7 +57,9 @@ fi
 
 for required in \
   '-DGGML_METAL=ON' \
-  '-DGGML_ACCELERATE=ON'; do
+  '-DGGML_ACCELERATE=ON' \
+  '-DWHISPER_COREML="$WHISPER_COREML"' \
+  '-DWHISPER_COREML_ALLOW_FALLBACK=ON'; do
   if ! grep -Fq -- "$required" "$source_file"; then
     printf 'packaged Whisper must enable the native macOS backend: %s\n' "$required" >&2
     exit 1

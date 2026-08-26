@@ -346,6 +346,8 @@ def main() -> int:
     finished = time.monotonic()
     stderr = "".join(stderr_chunks)
     stdout = "".join(stdout_chunks)
+    coreml_expected = os.environ.get("SBOBINO_WHISPER_EXPECT_COREML") == "1"
+    coreml_loaded = "Core ML model loaded" in stderr
 
     metric_pattern = re.compile(
         r"SBOBINO_WHISPER_LIVE_METRIC\s+"
@@ -384,6 +386,8 @@ def main() -> int:
     final_dropped_samples = final_summary[1] if final_summary else None
     backlog_reaction_seconds = backlog_threshold_overshoot(stderr, sample_rate)
     failures: list[str] = []
+    if coreml_expected and not coreml_loaded:
+        failures.append("expected Core ML encoder was not loaded")
     if timed_out:
         failures.append("whisper-stream timed out")
     if final_summary is None and not args.expect_preflight_rejection:
@@ -459,6 +463,8 @@ def main() -> int:
             "length_ms": length_ms,
             "audio_ctx": audio_ctx,
             "max_tokens": max_tokens,
+            "coreml_expected": coreml_expected,
+            "coreml_loaded": coreml_loaded,
         },
         "captured_duration_seconds": captured_frames / sample_rate,
         "live_mode": (
