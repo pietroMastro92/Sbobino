@@ -24,7 +24,7 @@ jobs:
           path: |
             ${{ runner.temp }}/whisper-live-readiness-model
             ${{ runner.temp }}/whisper-live-readiness-fixture
-          key: whisper-live-model-${{ hashFiles('sbobino_desktop/crates/domain/src/whisper_live_model.json') }}-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
+          key: whisper-live-q5-818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
 
       - name: Build exact packaged Apple Silicon runtime once
         working-directory: sbobino_desktop
@@ -37,12 +37,12 @@ jobs:
           set -euo pipefail
           ditto -x -k "$RUNNER_TEMP/speech-runtime-macos-aarch64.zip" "$RUNNER_TEMP/speech"
           runtime="$RUNNER_TEMP/speech/runtime"
-          model="$RUNNER_TEMP/whisper-live-readiness-model/ggml-tiny-q8_0.bin"
+          model="$RUNNER_TEMP/whisper-live-readiness-model/ggml-tiny-q5_1.bin"
           fixture="$RUNNER_TEMP/whisper-live-readiness-fixture/speech.wav"
           mkdir -p "$(dirname "$model")" "$(dirname "$fixture")" "$RUNNER_TEMP/profile-proofs"
 
-          model_url=$(python3 -c 'import json; print(json.load(open("crates/domain/src/whisper_live_model.json"))["url"])')
-          model_sha=$(python3 -c 'import json; print(json.load(open("crates/domain/src/whisper_live_model.json"))["sha256"])')
+          model_url='https://huggingface.co/ggerganov/whisper.cpp/resolve/98aa99a0a9db05ae2342309f5096248665f7cba3/ggml-tiny-q5_1.bin?download=true'
+          model_sha=818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7
           if [[ ! -f "$model" ]]; then curl --fail --location --retry 5 --retry-all-errors "$model_url" --output "$model"; fi
           printf '%s  %s\n' "$model_sha" "$model" | shasum -a 256 -c -
 
@@ -79,10 +79,9 @@ jobs:
             echo "$name exit=$result"
           }
 
-          run_profile context768-tokens24 1000 2000 768 24
-          run_profile context768-tokens32 1000 2000 768 32
-          run_profile context768-window1800 1000 1800 768 24
-          run_profile context1024-window1800 1000 1800 1024 24
+          run_profile q5-full-window 1000 2000 0 16
+          run_profile q5-window1800 1000 1800 0 18
+          run_profile q5-window1600 1000 1600 0 20
 
           python3 - "$RUNNER_TEMP/profile-proofs" <<'PY'
           import json, pathlib, sys
