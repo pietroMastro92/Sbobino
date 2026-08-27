@@ -56,6 +56,10 @@ ditto -x -k "$ASSET_DIR/pyannote-model-community-1.zip" "$MODEL_DIR"
 SPEECH_ROOT="$SPEECH_DIR/runtime"
 FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"
 [[ -x "$FFMPEG_BIN" ]] || { echo "Packaged ffmpeg is missing or not executable." >&2; exit 1; }
+# The service smoke constructs its transcoder from this explicit path.  Put
+# the packaged bin directory first as well so every helper invoked by the
+# harness resolves the same self-contained FFmpeg runtime on a clean runner.
+export PATH="$SPEECH_ROOT/bin:$PATH"
 PYTHON_ROOT="$PYANNOTE_DIR/python"
 PYANNOTE_MODEL_ROOT="$MODEL_DIR/model"
 PARAKEET_MODEL="tdt-0.6b-v3-q4_k.gguf"

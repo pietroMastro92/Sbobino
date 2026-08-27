@@ -332,8 +332,13 @@ async fn parakeet_service_real_smoke_persists_metadata() {
 
     let repo = Arc::new(SmokeArtifactRepository::default());
     let emitted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // The hosted smoke downloads the self-contained FFmpeg binary together
+    // with the packaged speech runtime.  Honor that path explicitly instead
+    // of relying on a host-level `ffmpeg` executable being installed.
+    let ffmpeg_path =
+        optional_env("SBOBINO_WHISPER_FFMPEG").unwrap_or_else(|| "ffmpeg".to_string());
     let service = TranscriptionService::new(
-        Arc::new(FfmpegAdapter::new("ffmpeg".to_string())),
+        Arc::new(FfmpegAdapter::new(ffmpeg_path)),
         Arc::new(ParakeetCppEngine::new(cli_path, models_dir)),
         Arc::new(NoopEnhancer),
         repo.clone(),

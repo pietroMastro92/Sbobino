@@ -91,6 +91,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("poliglot", intel.lower() + live.lower())
         self.assertIn('FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"', intel)
         self.assertIn('SBOBINO_WHISPER_FFMPEG="$FFMPEG_BIN"', intel)
+        self.assertIn('export PATH="$SPEECH_ROOT/bin:$PATH"', intel)
+        self.assertIn('optional_env("SBOBINO_WHISPER_FFMPEG")', (ROOT / "crates" / "infrastructure" / "tests" / "parakeet_real_service_smoke_tests.rs").read_text(encoding="utf-8"))
         self.assertIn('FFMPEG_BIN="$SPEECH_ROOT/bin/ffmpeg"', live)
         self.assertNotIn("need_cmd ffmpeg", intel)
         self.assertNotIn("command in gh ditto ffmpeg", live)
