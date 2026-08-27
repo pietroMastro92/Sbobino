@@ -31,7 +31,7 @@ class ReleaseQualityGateTests(unittest.TestCase):
 
     def test_public_json_proof_asset_contract_is_exact_and_allows_non_json(self):
         names = set(MODULE.PUBLIC_JSON_PROOF_ASSETS)
-        names.update({"release-notes.md", "Sbobino_2.0.28_aarch64.dmg", "Sbobino_2.0.28_windows_x86_64-setup.exe"})
+        names.update({"release-notes.md", "Sbobino_2.0.29_aarch64.dmg", "Sbobino_2.0.29_windows_x86_64-setup.exe"})
         MODULE.validate_public_json_proof_assets(names)
 
         with self.assertRaisesRegex(ValueError, "unexpected=.*extra-proof.json"):

@@ -63,7 +63,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("Stage the candidate readiness proof", workflow)
         self.assertIn('--pattern "release-readiness-proof.json"', workflow)
         self.assertIn("release-quality-contract-tests.result", workflow)
-        self.assertIn("release-notes.md", (ROOT / "docs" / "release-notes" / "v2.0.28.md").read_text(encoding="utf-8"))
+        self.assertIn("release-notes.md", (ROOT / "docs" / "release-notes" / "v2.0.29.md").read_text(encoding="utf-8"))
 
     def test_real_quality_evidence_comes_from_distinct_packaged_engine_jobs(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
