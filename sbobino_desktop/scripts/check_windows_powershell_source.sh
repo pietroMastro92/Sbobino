@@ -109,7 +109,9 @@ if [[ -n "$package_script" ]]; then
   done
   for required in \
     'failed to warm up the live transcription backend' \
-    'whisper_reset_timings(ctx)'; do
+    'whisper_reset_timings(ctx)' \
+    'round_max_ms <= budget_ms' \
+    'const bool probe_passed = skip_probe || probe_round_passed;'; do
     if ! grep -Fq -- "$required" \
         "$repo_root/sbobino_desktop/scripts/patches/whisper-stream-backlog.patch"; then
       printf 'Windows Whisper live warmup contract is missing: %s\n' "$required" >&2

@@ -249,6 +249,7 @@ def main() -> int:
     expected_outcome = parser.add_mutually_exclusive_group()
     expected_outcome.add_argument("--expect-backlog-recovery", action="store_true")
     expected_outcome.add_argument("--expect-preflight-rejection", action="store_true")
+    expected_outcome.add_argument("--allow-preflight-rejection", action="store_true")
     args = parser.parse_args()
 
     with wave.open(str(args.audio), "rb") as handle:
@@ -333,6 +334,8 @@ def main() -> int:
     finished = time.monotonic()
     stderr = "".join(stderr_chunks)
     stdout = "".join(stdout_chunks)
+    coreml_expected = os.environ.get("SBOBINO_WHISPER_EXPECT_COREML") == "1"
+    coreml_loaded = "Core ML model loaded" in stderr
 
     metric_pattern = re.compile(
         r"SBOBINO_WHISPER_LIVE_METRIC\s+"
@@ -370,14 +373,24 @@ def main() -> int:
     captured_frames = final_summary[0] if final_summary else 0
     final_dropped_samples = final_summary[1] if final_summary else None
     backlog_reaction_seconds = backlog_threshold_overshoot(stderr, sample_rate)
+    preflight_rejection_observed = (
+        return_code == 8
+        and preflight is not None
+        and preflight.get("status") == "rejected"
+    )
+    preflight_rejection_mode = args.expect_preflight_rejection or (
+        args.allow_preflight_rejection and preflight_rejection_observed
+    )
     failures: list[str] = []
+    if coreml_expected and not coreml_loaded:
+        failures.append("expected Core ML encoder was not loaded")
     if timed_out:
         failures.append("whisper-stream timed out")
-    if final_summary is None and not args.expect_preflight_rejection:
+    if final_summary is None and not preflight_rejection_mode:
         failures.append("terminal runtime summary is missing")
     backlog_failure = "SBOBINO_WHISPER_LIVE_BACKLOG" in stderr
-    if args.expect_preflight_rejection:
-        if return_code != 8:
+    if preflight_rejection_mode:
+        if args.expect_preflight_rejection and return_code != 8:
             failures.append(f"expected preflight exit 8, got {return_code}")
         if preflight is None:
             failures.append("live preflight result is missing")
@@ -415,7 +428,7 @@ def main() -> int:
             failures.append("whisper-stream reported a real-time backlog")
         if not output_text:
             failures.append("whisper-stream produced no finalized transcript")
-    if not saved_audio and not args.expect_preflight_rejection:
+    if not saved_audio and not preflight_rejection_mode:
         failures.append("whisper-stream did not preserve captured WAV")
     if final_dropped_samples not in (None, 0):
         failures.append(
@@ -423,7 +436,7 @@ def main() -> int:
         )
     expected_saved_frames = (
         0
-        if args.expect_preflight_rejection
+        if preflight_rejection_mode
         else captured_frames
         if args.expect_backlog_recovery
         else input_frames
@@ -440,35 +453,44 @@ def main() -> int:
         "platform": args.platform,
         "duration_seconds": duration,
         "requested_duration_seconds": duration,
+        "profile": {
+            "threads": threads,
+            "step_ms": step_ms,
+            "length_ms": length_ms,
+            "max_tokens": 16,
+            "coreml_expected": coreml_expected,
+            "coreml_loaded": coreml_loaded,
+        },
         "captured_duration_seconds": captured_frames / sample_rate,
         "live_mode": (
             "preflight-rejected-incompatible-cpu"
-            if args.expect_preflight_rejection
+            if preflight_rejection_mode
             else "backlog-recovery"
             if args.expect_backlog_recovery
             else "realtime"
         ),
         "samples": samples,
-        "first_preview_seconds": 0.0 if args.expect_preflight_rejection else (
+        "first_preview_seconds": 0.0 if preflight_rejection_mode else (
             max(0.0, first_preview_wall - replay_started_wall - speech_onset)
             if first_preview_wall is not None and replay_started_wall is not None
             else 9999.0
         ),
-        "finalization_seconds": 0.0 if args.expect_preflight_rejection else (
+        "finalization_seconds": 0.0 if preflight_rejection_mode else (
             max(0.0, finished - last_metric_wall) if last_metric_wall is not None else 9999.0
         ),
         "rss_samples_mib": rss_samples,
         "dropped_samples": (
             0
-            if args.expect_preflight_rejection
+            if preflight_rejection_mode
             else final_dropped_samples
             if final_dropped_samples is not None
             else -1
         ),
-        "missing_segments": 0 if (args.expect_backlog_recovery or args.expect_preflight_rejection) else max(0, expected_segments - observed_segments),
-        "duplicate_segments": 0 if (args.expect_backlog_recovery or args.expect_preflight_rejection) else max(0, observed_segments - expected_segments),
+        "missing_segments": 0 if (args.expect_backlog_recovery or preflight_rejection_mode) else max(0, expected_segments - observed_segments),
+        "duplicate_segments": 0 if (args.expect_backlog_recovery or preflight_rejection_mode) else max(0, observed_segments - expected_segments),
         "backlog_recovery_expected": args.expect_backlog_recovery,
         "preflight_rejection_expected": args.expect_preflight_rejection,
+        "preflight_rejection_allowed": args.allow_preflight_rejection,
         "preflight_rejected": preflight is not None and preflight["status"] == "rejected",
         "preflight": preflight,
         "backlog_reaction_seconds": backlog_reaction_seconds,

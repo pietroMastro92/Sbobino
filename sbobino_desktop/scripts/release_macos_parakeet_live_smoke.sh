@@ -149,7 +149,7 @@ evaluated.update({
     "evidence_class": "hosted-packaged-engine",
     "real_engine": True,
     "real_harness": True,
-    "runner": "github-hosted macos-14",
+    "runner": "github-hosted macos-15",
     "harness": "release_macos_parakeet_live_smoke.sh@v1",
     "engine": "parakeet.cpp/nemotron-3.5-asr-streaming-0.6b-q4_k.gguf",
     "input_audio_sha256": sys.argv[4],

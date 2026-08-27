@@ -773,8 +773,7 @@ fn collect_missing_encoders(models_dir: &Path) -> Vec<String> {
     COREML_ENCODERS
         .iter()
         .filter_map(|(dir_name, _archive)| {
-            let path = models_dir.join(dir_name);
-            if path.is_dir() {
+            if coreml_encoder_is_installed(models_dir, dir_name) {
                 None
             } else {
                 Some((*dir_name).to_string())
@@ -783,8 +782,22 @@ fn collect_missing_encoders(models_dir: &Path) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
+fn coreml_encoder_is_installed(models_dir: &Path, dir_name: &str) -> bool {
+    let encoder_dir = models_dir.join(dir_name);
+    if !encoder_dir.is_dir() {
+        return false;
+    }
+
+    if dir_name == whisper_live_model_manifest().coreml_encoder.directory {
+        return encoder_dir.join("model.mil").is_file()
+            && encoder_dir.join("weights").join("weight.bin").is_file();
+    }
+
+    true
+}
+
 fn coreml_missing_for(models_dir: &Path, dir_name: &str) -> bool {
-    !models_dir.join(dir_name).is_dir()
+    !coreml_encoder_is_installed(models_dir, dir_name)
 }
 
 #[tauri::command]
@@ -849,7 +862,7 @@ pub async fn provisioning_models(
                 label: (*label).to_string(),
                 model_file: (*model_file).to_string(),
                 installed: whisper_model_is_installed(&models_dir, model_file),
-                coreml_installed: models_dir.join(encoder_dir).is_dir(),
+                coreml_installed: coreml_encoder_is_installed(&models_dir, encoder_dir),
                 engine: "whisper_cpp".to_string(),
                 experimental: false,
             }
@@ -1156,8 +1169,7 @@ pub async fn provisioning_start(
         COREML_ENCODERS
             .iter()
             .filter_map(|(dir_name, archive)| {
-                let path = models_dir.join(dir_name);
-                if path.is_dir() {
+                if coreml_encoder_is_installed(&models_dir, dir_name) {
                     None
                 } else {
                     Some(((*dir_name).to_string(), (*archive).to_string()))
@@ -1602,10 +1614,30 @@ fn spawn_provisioning_download(
                 return;
             }
 
-            let url = format!("{MODEL_BASE_URL}{archive}");
+            let pinned_encoder = verified_model
+                .as_ref()
+                .map(|manifest| &manifest.coreml_encoder)
+                .filter(|encoder| encoder.archive_filename == archive);
+            let (url, expected_sha256) = pinned_encoder.map_or_else(
+                || (format!("{MODEL_BASE_URL}{archive}"), None),
+                |encoder| (encoder.url.clone(), Some(encoder.sha256.as_str())),
+            );
             let archive_path = models_dir.join(&archive);
 
-            match download_to_path(&client, &url, &archive_path, &cancel_token).await {
+            let download_result = match expected_sha256 {
+                Some(expected_sha256) => {
+                    download_to_path_with_checksum(
+                        &client,
+                        &url,
+                        &archive_path,
+                        &cancel_token,
+                        expected_sha256,
+                    )
+                    .await
+                }
+                None => download_to_path(&client, &url, &archive_path, &cancel_token).await,
+            };
+            match download_result {
                 Ok(()) => {}
                 Err(error) => {
                     if error == "cancelled" {
@@ -4316,10 +4348,10 @@ mod tests {
     use super::probe_pyannote_import_and_load_receipt;
     use super::{
         commit_runtime_install_transaction, commit_runtime_install_transaction_with_cleanup,
-        estimate_pyannote_required_free_bytes, install_pyannote_archive, install_runtime_archive,
-        persist_pyannote_install_failure, plan_pyannote_background_action_inner,
-        prepare_pyannote_runtime_stage, prepare_pyannote_runtime_swap,
-        promote_staged_pyannote_runtime, pyannote_reconcile_action,
+        coreml_encoder_is_installed, estimate_pyannote_required_free_bytes,
+        install_pyannote_archive, install_runtime_archive, persist_pyannote_install_failure,
+        plan_pyannote_background_action_inner, prepare_pyannote_runtime_stage,
+        prepare_pyannote_runtime_swap, promote_staged_pyannote_runtime, pyannote_reconcile_action,
         recover_interrupted_runtime_install, remove_path_if_exists, rollback_pyannote_runtime_swap,
         rollback_runtime_install_transaction, runtime_install_journal_backup_path,
         runtime_install_journal_path, runtime_install_transaction_lock, sha256_bytes_hex,
@@ -4358,6 +4390,30 @@ mod tests {
                 .expect("runtime factory should initialize"),
         );
         (temp, factory)
+    }
+
+    #[test]
+    fn certified_live_coreml_encoder_requires_compiled_model_and_weights() {
+        let temp = tempdir().expect("encoder tempdir should create");
+        let encoder = temp.path().join("ggml-tiny-encoder.mlmodelc");
+        std::fs::create_dir_all(encoder.join("weights"))
+            .expect("encoder directories should create");
+
+        assert!(!coreml_encoder_is_installed(
+            temp.path(),
+            "ggml-tiny-encoder.mlmodelc"
+        ));
+        std::fs::write(encoder.join("model.mil"), b"model").expect("model metadata should write");
+        assert!(!coreml_encoder_is_installed(
+            temp.path(),
+            "ggml-tiny-encoder.mlmodelc"
+        ));
+        std::fs::write(encoder.join("weights").join("weight.bin"), b"weights")
+            .expect("encoder weights should write");
+        assert!(coreml_encoder_is_installed(
+            temp.path(),
+            "ggml-tiny-encoder.mlmodelc"
+        ));
     }
 
     fn spawn_download_server(responses: Vec<&'static str>) -> (String, thread::JoinHandle<()>) {

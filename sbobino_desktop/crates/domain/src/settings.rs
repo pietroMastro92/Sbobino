@@ -247,12 +247,21 @@ impl SpeechModel {
 /// Other Whisper models remain available for file transcription, but must not
 /// silently become an unvalidated live runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WhisperLiveCoreMlEncoderManifest {
+    pub directory: String,
+    pub archive_filename: String,
+    pub url: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WhisperLiveModelManifest {
     pub schema_version: u32,
     pub model: SpeechModel,
     pub filename: String,
     pub url: String,
     pub sha256: String,
+    pub coreml_encoder: WhisperLiveCoreMlEncoderManifest,
 }
 
 pub fn whisper_live_model_manifest() -> WhisperLiveModelManifest {
@@ -1342,5 +1351,21 @@ mod language_tests {
             .sha256
             .chars()
             .all(|character| character.is_ascii_hexdigit()));
+        assert_eq!(
+            manifest.coreml_encoder.directory,
+            "ggml-tiny-encoder.mlmodelc"
+        );
+        assert_eq!(
+            manifest.coreml_encoder.archive_filename,
+            "ggml-tiny-encoder.mlmodelc.zip"
+        );
+        assert!(manifest
+            .coreml_encoder
+            .url
+            .contains("/resolve/c521a4b02f422512d734391fdf08bb08c0862f68/"));
+        assert_eq!(
+            manifest.coreml_encoder.sha256,
+            "c88cbd2648e1f5415092bcf5256add463a0f19943e6938f46e8d4ffdebd47739"
+        );
     }
 }

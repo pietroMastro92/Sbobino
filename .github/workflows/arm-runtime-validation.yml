@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   whisper-live-replay:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     env:
       GH_TOKEN: ${{ github.token }}
@@ -36,8 +36,9 @@ jobs:
         working-directory: sbobino_desktop
         run: |
           SBOBINO_WHISPER_LIVE_ARCH=arm64 \
+          SBOBINO_WHISPER_ALLOW_PREFLIGHT_REJECTION=1 \
           SBOBINO_WHISPER_LIVE_RUNTIME_ZIP="$RUNNER_TEMP/speech-runtime-macos-aarch64.zip" \
-          SBOBINO_LIVE_RUNNER="github-hosted macos-14" \
+          SBOBINO_LIVE_RUNNER="github-hosted macos-15" \
           ./scripts/release_macos_whisper_live_smoke.sh \
             "source-validation" "${GITHUB_REPOSITORY}" \
             "$RUNNER_TEMP/arm-whisper-live-smoke-proof.json"

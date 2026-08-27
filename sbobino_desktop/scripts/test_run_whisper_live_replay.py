@@ -295,6 +295,57 @@ class FinalizedTranscriptTests(unittest.TestCase):
             self.assertEqual(payload["saved_audio_frames"], 0)
             self.assertEqual(payload["stdout_transcript"], "")
 
+    @unittest.skipIf(os.name == "nt", "POSIX fake executable is used for this contract test")
+    def test_allowed_preflight_rejection_accepts_measured_incompatible_device(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            audio = root / "audio.wav"
+            fixture = root / "fixture.wav"
+            for path in (audio, fixture):
+                with wave.open(str(path), "wb") as handle:
+                    handle.setnchannels(1)
+                    handle.setsampwidth(2)
+                    handle.setframerate(16000)
+                    handle.writeframes(b"\x00\x00" * 320)
+            model = root / "model.bin"
+            model.write_bytes(b"fake")
+            report = root / "report.json"
+            binary = root / "fake-whisper"
+            binary.write_text(
+                "#!/bin/sh\n"
+                "printf 'SBOBINO_WHISPER_LIVE_PREFLIGHT status=rejected inference_ms=1600.000 budget_ms=1000.000 step_ms=1000 samples=6 max_ms=1700.000\\n' 1>&2\n"
+                "exit 8\n",
+                encoding="utf-8",
+            )
+            binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(pathlib.Path(__file__).with_name("run_whisper_live_replay.py")),
+                    "--binary", str(binary),
+                    "--model", str(model),
+                    "--audio", str(audio),
+                    "--fixture", str(fixture),
+                    "--report", str(report),
+                    "--run-dir", str(run_dir),
+                    "--device", "auto",
+                    "--platform", "test",
+                    "--allow-preflight-rejection",
+                ],
+                check=False,
+            )
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(payload["status"], "passed")
+            self.assertTrue(payload["preflight_rejected"])
+            self.assertFalse(payload["preflight_rejection_expected"])
+            self.assertTrue(payload["preflight_rejection_allowed"])
+            self.assertEqual(payload["captured_audio_frames"], 0)
+            self.assertEqual(payload["saved_audio_frames"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

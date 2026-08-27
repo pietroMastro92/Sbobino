@@ -30,7 +30,7 @@
  
      bool is_running = true;
  
-@@ -224,14 +224,127 @@
+@@ -224,14 +224,131 @@
      wav_writer wavWriter;
 +    std::string capture_filename;
      // save wav file
@@ -110,6 +110,7 @@
 +        const double budget_ms = std::min<double>(params.step_ms, latency_budget_ms);
 +        double probe_ms = 1e30;
 +        double probe_max_ms = 0.0;
++        bool probe_round_passed = false;
 +        for (int probe_round = 0; probe_round < 2; ++probe_round) {
 +            const size_t round_start = probe_samples_ms.size();
 +            for (int probe_index = 0; probe_index < 3; ++probe_index) {
@@ -130,8 +131,11 @@
 +            const double probe_c_ms = probe_samples_ms[round_start + 2];
 +            const double round_median_ms = std::max(std::min(probe_a_ms, probe_b_ms),
 +                std::min(std::max(probe_a_ms, probe_b_ms), probe_c_ms));
++            const double round_max_ms = std::max(probe_a_ms, std::max(probe_b_ms, probe_c_ms));
 +            probe_ms = std::min(probe_ms, round_median_ms);
-+            if (skip_probe || (budget_ms > 0.0 && round_median_ms <= budget_ms)) {
++            if (skip_probe || (budget_ms > 0.0 && round_median_ms <= budget_ms &&
++                    round_max_ms <= budget_ms)) {
++                probe_round_passed = true;
 +                break;
 +            }
 +            if (probe_round == 0) {
@@ -139,7 +143,7 @@
 +                whisper_reset_timings(ctx);
 +            }
 +        }
-+        const bool probe_passed = skip_probe || (budget_ms > 0.0 && probe_ms <= budget_ms);
++        const bool probe_passed = skip_probe || probe_round_passed;
 +        fprintf(stderr,
 +                "SBOBINO_WHISPER_LIVE_PREFLIGHT status=%s inference_ms=%.3f budget_ms=%.3f step_ms=%d samples=%zu max_ms=%.3f\n",
 +                probe_passed ? "passed" : "rejected", probe_ms, budget_ms, params.step_ms,

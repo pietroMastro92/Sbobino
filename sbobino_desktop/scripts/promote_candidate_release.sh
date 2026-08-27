@@ -249,6 +249,43 @@ def validate_live_duration(source: dict, label: str) -> None:
     if not isinstance(duration, (int, float)) or not math.isfinite(float(duration)) or float(duration) < 900:
         raise SystemExit(f"Stable promotion blocked: {label} did not attest a 900-second live run.")
 
+def validate_preflight_rejection(source: dict, label: str) -> None:
+    preflight = source.get("preflight")
+    requested_duration = source.get("requested_duration_seconds")
+    captured_duration = source.get("captured_duration_seconds")
+    if source.get("realtime_capable") is not False:
+        raise SystemExit(f"Stable promotion blocked: {label} did not attest realtime incompatibility.")
+    if source.get("preflight_rejected") is not True or not isinstance(preflight, dict):
+        raise SystemExit(f"Stable promotion blocked: {label} preflight rejection evidence is missing.")
+    if str(preflight.get("status", "")).strip().lower() != "rejected":
+        raise SystemExit(f"Stable promotion blocked: {label} preflight status is not rejected.")
+    inference_ms = preflight.get("inference_ms")
+    max_ms = preflight.get("max_ms")
+    budget_ms = preflight.get("budget_ms")
+    samples = preflight.get("samples")
+    if (
+        not isinstance(inference_ms, (int, float))
+        or not isinstance(max_ms, (int, float))
+        or not isinstance(budget_ms, (int, float))
+        or not isinstance(samples, (int, float))
+        or not math.isfinite(float(inference_ms))
+        or not math.isfinite(float(max_ms))
+        or not math.isfinite(float(budget_ms))
+        or not math.isfinite(float(samples))
+        or float(budget_ms) <= 0
+        or float(samples) < 3
+        or max(float(inference_ms), float(max_ms)) <= float(budget_ms)
+    ):
+        raise SystemExit(f"Stable promotion blocked: {label} did not exceed its measured realtime budget.")
+    if (
+        not isinstance(requested_duration, (int, float))
+        or not math.isfinite(float(requested_duration))
+        or float(requested_duration) < 900
+    ):
+        raise SystemExit(f"Stable promotion blocked: {label} did not use the 900-second release profile.")
+    if not isinstance(captured_duration, (int, float)) or float(captured_duration) != 0.0:
+        raise SystemExit(f"Stable promotion blocked: {label} started capture before rejection.")
+
 asr_metrics = validate_quality_gate("asr_reference", "ASR reference")
 for metric, maximum in (
     ("wer", 0.35),
@@ -262,22 +299,41 @@ for metric, maximum in (
         )
 
 live_metrics = validate_quality_gate("live_latency", "live-latency")
-if distribution["live_latency"].get("live_mode") != "realtime" or distribution["live_latency"].get("realtime_capable") is not True:
-    raise SystemExit("Stable promotion blocked: ARM64 live proof must demonstrate realtime transcription.")
 validate_live_recovery(distribution["live_latency"], "live-latency")
 validate_live_duration(distribution["live_latency"], "live-latency")
-for metric, maximum in (
-    ("first_preview_seconds", 2.0),
-    ("preview_latency_p95_seconds", 2.0),
-    ("backlog_p95_seconds", 2.0),
-    ("finalization_seconds", 2.0),
-    ("rss_growth_mib", 256.0),
+arm_profile = distribution["live_latency"].get("profile")
+arm_runtime_hashes = distribution["live_latency"].get("runtime_artifact_sha256")
+if (
+    not isinstance(arm_profile, dict)
+    or arm_profile.get("coreml_expected") is not True
+    or arm_profile.get("coreml_loaded") is not True
+    or not isinstance(arm_runtime_hashes, dict)
+    or not re.fullmatch(
+        r"[0-9a-fA-F]{64}",
+        str(arm_runtime_hashes.get("whisper_coreml_encoder", "")).strip(),
+    )
 ):
-    value = live_metrics.get(metric)
-    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
-        raise SystemExit(
-            f"Stable promotion blocked: live-latency {metric} exceeds the release threshold."
-        )
+    raise SystemExit("Stable promotion blocked: ARM64 live proof did not load the pinned Core ML encoder.")
+arm_live_mode = distribution["live_latency"].get("live_mode")
+if arm_live_mode not in {"realtime", "preflight-rejected-incompatible-cpu"}:
+    raise SystemExit("Stable promotion blocked: ARM64 live proof has an unknown mode.")
+if arm_live_mode == "preflight-rejected-incompatible-cpu":
+    validate_preflight_rejection(distribution["live_latency"], "ARM64 live-latency")
+elif distribution["live_latency"].get("realtime_capable") is not True:
+    raise SystemExit("Stable promotion blocked: ARM64 realtime proof did not attest capability.")
+else:
+    for metric, maximum in (
+        ("first_preview_seconds", 2.0),
+        ("preview_latency_p95_seconds", 2.0),
+        ("backlog_p95_seconds", 2.0),
+        ("finalization_seconds", 2.0),
+        ("rss_growth_mib", 256.0),
+    ):
+        value = live_metrics.get(metric)
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
+            raise SystemExit(
+                f"Stable promotion blocked: live-latency {metric} exceeds the release threshold."
+            )
 for metric in ("dropped_samples", "missing_segments", "duplicate_segments"):
     if int(live_metrics.get(metric, -1)) != 0:
         raise SystemExit(f"Stable promotion blocked: live-latency {metric} is non-zero.")
@@ -290,22 +346,28 @@ intel_live_metrics = validate_quality_gate(
     "live_latency", "Intel live-latency", intel_distribution
 )
 validate_revision(intel_distribution, "intel-distribution-readiness-proof.json")
-if intel_distribution["live_latency"].get("live_mode") != "realtime" or intel_distribution["live_latency"].get("realtime_capable") is not True:
-    raise SystemExit("Stable promotion blocked: Intel live proof must demonstrate realtime transcription.")
 validate_live_recovery(intel_distribution["live_latency"], "Intel live-latency")
 validate_live_duration(intel_distribution["live_latency"], "Intel live-latency")
-for metric, maximum in (
-    ("first_preview_seconds", 2.0),
-    ("preview_latency_p95_seconds", 2.0),
-    ("backlog_p95_seconds", 2.0),
-    ("finalization_seconds", 2.0),
-    ("rss_growth_mib", 256.0),
-):
-    value = intel_live_metrics.get(metric)
-    if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
-        raise SystemExit(
-            f"Stable promotion blocked: Intel live-latency {metric} exceeds the release threshold."
-        )
+intel_live_mode = intel_distribution["live_latency"].get("live_mode")
+if intel_live_mode not in {"realtime", "preflight-rejected-incompatible-cpu"}:
+    raise SystemExit("Stable promotion blocked: Intel live proof has an unknown mode.")
+if intel_live_mode == "preflight-rejected-incompatible-cpu":
+    validate_preflight_rejection(intel_distribution["live_latency"], "Intel live-latency")
+elif intel_distribution["live_latency"].get("realtime_capable") is not True:
+    raise SystemExit("Stable promotion blocked: Intel realtime proof did not attest capability.")
+else:
+    for metric, maximum in (
+        ("first_preview_seconds", 2.0),
+        ("preview_latency_p95_seconds", 2.0),
+        ("backlog_p95_seconds", 2.0),
+        ("finalization_seconds", 2.0),
+        ("rss_growth_mib", 256.0),
+    ):
+        value = intel_live_metrics.get(metric)
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) > maximum:
+            raise SystemExit(
+                f"Stable promotion blocked: Intel live-latency {metric} exceeds the release threshold."
+            )
 for metric in ("dropped_samples", "missing_segments", "duplicate_segments"):
     if int(intel_live_metrics.get(metric, -1)) != 0:
         raise SystemExit(f"Stable promotion blocked: Intel live-latency {metric} is non-zero.")
@@ -345,34 +407,7 @@ windows_live_mode = windows_live.get("live_mode")
 if windows_live_mode not in {"realtime", "preflight-rejected-incompatible-cpu"}:
     raise SystemExit("Stable promotion blocked: Windows live proof has an unknown mode.")
 if windows_live_mode == "preflight-rejected-incompatible-cpu":
-    preflight = windows_live.get("preflight")
-    requested_duration = windows_live.get("requested_duration_seconds")
-    captured_duration = windows_live.get("captured_duration_seconds")
-    if windows_live.get("realtime_capable") is not False:
-        raise SystemExit("Stable promotion blocked: Windows CPU preflight did not attest realtime incompatibility.")
-    if windows_live.get("preflight_rejected") is not True or not isinstance(preflight, dict):
-        raise SystemExit("Stable promotion blocked: Windows CPU preflight rejection evidence is missing.")
-    if str(preflight.get("status", "")).strip().lower() != "rejected":
-        raise SystemExit("Stable promotion blocked: Windows CPU preflight status is not rejected.")
-    inference_ms = preflight.get("inference_ms")
-    budget_ms = preflight.get("budget_ms")
-    if (
-        not isinstance(inference_ms, (int, float))
-        or not isinstance(budget_ms, (int, float))
-        or not math.isfinite(float(inference_ms))
-        or not math.isfinite(float(budget_ms))
-        or float(budget_ms) <= 0
-        or float(inference_ms) <= float(budget_ms)
-    ):
-        raise SystemExit("Stable promotion blocked: Windows CPU preflight did not exceed its measured realtime budget.")
-    if (
-        not isinstance(requested_duration, (int, float))
-        or not math.isfinite(float(requested_duration))
-        or float(requested_duration) < 900
-    ):
-        raise SystemExit("Stable promotion blocked: Windows CPU preflight did not use the 900-second release profile.")
-    if not isinstance(captured_duration, (int, float)) or float(captured_duration) != 0.0:
-        raise SystemExit("Stable promotion blocked: Windows CPU preflight started capture before rejection.")
+    validate_preflight_rejection(windows_live, "Windows live-latency")
 else:
     if windows_live.get("realtime_capable") is not True:
         raise SystemExit("Stable promotion blocked: Windows realtime proof did not attest capability.")

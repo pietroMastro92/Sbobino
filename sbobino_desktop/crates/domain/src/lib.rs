@@ -25,8 +25,8 @@ pub use settings::{
     OrganizationSettings, ParakeetModel, PromptBindings, PromptCategory, PromptSettings,
     PromptTask, PromptTemplate, RemoteServiceConfig, RemoteServiceKind, SpeakerDiarizationSettings,
     SpeechModel, TranscriptionComputeDevice, TranscriptionEngine, TranscriptionLanguageOption,
-    TranscriptionLanguagePolicy, TranscriptionSettings, WhisperLiveModelManifest, WhisperOptions,
-    WorkspaceConfig,
+    TranscriptionLanguagePolicy, TranscriptionSettings, WhisperLiveCoreMlEncoderManifest,
+    WhisperLiveModelManifest, WhisperOptions, WorkspaceConfig,
 };
 pub use transcript_cleanup::{
     collapse_consecutive_repeated_segments, constrain_transcript_edit,

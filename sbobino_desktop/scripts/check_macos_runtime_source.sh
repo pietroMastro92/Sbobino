@@ -57,7 +57,9 @@ fi
 
 for required in \
   '-DGGML_METAL=ON' \
-  '-DGGML_ACCELERATE=ON'; do
+  '-DGGML_ACCELERATE=ON' \
+  '-DWHISPER_COREML="$WHISPER_COREML"' \
+  '-DWHISPER_COREML_ALLOW_FALLBACK=ON'; do
   if ! grep -Fq -- "$required" "$source_file"; then
     printf 'packaged Whisper must enable the native macOS backend: %s\n' "$required" >&2
     exit 1
@@ -101,6 +103,8 @@ for required in \
   'if (probe_round == 0) {' \
   'probe_index < 3' \
   'std::max(std::min(probe_a_ms, probe_b_ms)' \
+  'round_max_ms <= budget_ms' \
+  'const bool probe_passed = skip_probe || probe_round_passed;' \
   'params.max_tokens     = params.max_tokens > 0 ? std::min(params.max_tokens, 16) : 16;' \
   'const uint64_t backlog = audio.buffered_samples();' \
   'std::remove(capture_filename.c_str())'; do

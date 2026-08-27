@@ -87,6 +87,7 @@ jobs:
         run: |
           SBOBINO_WHISPER_LIVE_ARCH=x86_64 \
           SBOBINO_WHISPER_LIVE_DEVICE=auto \
+          SBOBINO_WHISPER_EXPECT_PREFLIGHT_REJECTION=1 \
           SBOBINO_WHISPER_LIVE_RUNTIME_ZIP="$RUNNER_TEMP/speech-runtime-macos-x86_64.zip" \
           SBOBINO_LIVE_RUNNER="github-hosted macos-15-intel" \
           ./scripts/release_macos_whisper_live_smoke.sh \

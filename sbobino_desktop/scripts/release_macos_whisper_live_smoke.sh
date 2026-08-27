@@ -46,6 +46,18 @@ case "$DEVICE" in
   *) echo "SBOBINO_WHISPER_LIVE_DEVICE must be auto or cpu." >&2; exit 1 ;;
 esac
 
+EXPECT_PREFLIGHT_REJECTION=${SBOBINO_WHISPER_EXPECT_PREFLIGHT_REJECTION:-0}
+ALLOW_PREFLIGHT_REJECTION=${SBOBINO_WHISPER_ALLOW_PREFLIGHT_REJECTION:-0}
+case "$EXPECT_PREFLIGHT_REJECTION:$ALLOW_PREFLIGHT_REJECTION" in
+  0:0|0:1|1:0) ;;
+  1:1) echo "Expected and allowed preflight rejection modes are mutually exclusive." >&2; exit 1 ;;
+  *) echo "Whisper preflight rejection controls must be 0 or 1." >&2; exit 1 ;;
+esac
+case "$EXPECT_PREFLIGHT_REJECTION" in
+  0|1) ;;
+  *) echo "SBOBINO_WHISPER_EXPECT_PREFLIGHT_REJECTION must be 0 or 1." >&2; exit 1 ;;
+esac
+
 ASSET_ARCH=$ARCH
 PLATFORM=macos-x86_64
 if [[ "$ARCH" == "arm64" ]]; then
@@ -86,7 +98,7 @@ MODEL_MANIFEST="$ROOT_DIR/crates/domain/src/whisper_live_model.json"
   echo "Whisper live model manifest is missing: $MODEL_MANIFEST" >&2
   exit 1
 }
-IFS=$'\t' read -r MODEL MODEL_URL MODEL_SHA256 < <(
+IFS=$'\t' read -r MODEL MODEL_URL MODEL_SHA256 ENCODER_DIR ENCODER_ARCHIVE ENCODER_URL ENCODER_SHA256 < <(
   python3 - "$MODEL_MANIFEST" <<'PY'
 import json
 import pathlib
@@ -102,7 +114,21 @@ url = str(manifest.get("url") or "")
 digest = str(manifest.get("sha256") or "").lower()
 if "/resolve/main/" in url or not re.fullmatch(r"[0-9a-f]{64}", digest):
     raise SystemExit("Whisper live model manifest must use an immutable URL and SHA-256")
-print(f"{manifest['filename']}\t{url}\t{digest}")
+encoder = manifest.get("coreml_encoder") or {}
+encoder_url = str(encoder.get("url") or "")
+encoder_digest = str(encoder.get("sha256") or "").lower()
+if (
+    encoder.get("directory") != "ggml-tiny-encoder.mlmodelc"
+    or encoder.get("archive_filename") != "ggml-tiny-encoder.mlmodelc.zip"
+    or "/resolve/main/" in encoder_url
+    or not re.fullmatch(r"[0-9a-f]{64}", encoder_digest)
+):
+    raise SystemExit("Whisper live Core ML encoder must use an immutable URL and SHA-256")
+print(
+    f"{manifest['filename']}\t{url}\t{digest}\t"
+    f"{encoder['directory']}\t{encoder['archive_filename']}\t"
+    f"{encoder_url}\t{encoder_digest}"
+)
 PY
 )
 MODEL_CACHE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/whisper-live-readiness-model/$MODEL"
@@ -115,6 +141,28 @@ if [[ ! -f "$MODEL_CACHE" ]] ||
 fi
 printf '%s  %s\n' "$MODEL_SHA256" "$MODEL_CACHE" | shasum -a 256 -c -
 cp "$MODEL_CACHE" "$MODEL_DIR/$MODEL"
+
+EXPECT_COREML=0
+if [[ "$ARCH" == "arm64" ]]; then
+  EXPECT_COREML=1
+  ENCODER_CACHE="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/whisper-live-readiness-model/$ENCODER_ARCHIVE"
+  if [[ ! -f "$ENCODER_CACHE" ]] ||
+     ! printf '%s  %s\n' "$ENCODER_SHA256" "$ENCODER_CACHE" | shasum -a 256 -c - >/dev/null 2>&1; then
+    curl --fail --location --retry 5 --retry-all-errors \
+      "$ENCODER_URL" \
+      --output "$ENCODER_CACHE"
+  fi
+  printf '%s  %s\n' "$ENCODER_SHA256" "$ENCODER_CACHE" | shasum -a 256 -c -
+  ditto -x -k "$ENCODER_CACHE" "$MODEL_DIR"
+  [[ -f "$MODEL_DIR/$ENCODER_DIR/model.mil" ]] || {
+    echo "Pinned Whisper live Core ML encoder is incomplete." >&2
+    exit 1
+  }
+  [[ -f "$MODEL_DIR/$ENCODER_DIR/weights/weight.bin" ]] || {
+    echo "Pinned Whisper live Core ML encoder weights are missing." >&2
+    exit 1
+  }
+fi
 
 FIXTURE_REF="9edf17c3ada66e0f881dcff155492867db7ac4cf"
 FIXTURE_SHA256="5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150"
@@ -142,11 +190,18 @@ LONG_AUDIO="$RUN_DIR/live-${LIVE_DURATION_SECONDS}s.wav"
 INPUT_SHA256=$(shasum -a 256 "$LONG_AUDIO" | awk '{print $1}')
 RAW_REPORT="$RUN_DIR/live-input.json"
 EVALUATED_REPORT="$RUN_DIR/live-evaluated.json"
+PREFLIGHT_ARG=""
+if [[ "$EXPECT_PREFLIGHT_REJECTION" == "1" ]]; then
+  PREFLIGHT_ARG=--expect-preflight-rejection
+elif [[ "$ALLOW_PREFLIGHT_REJECTION" == "1" ]]; then
+  PREFLIGHT_ARG=--allow-preflight-rejection
+fi
 
 set +e
 PATH="$SPEECH_ROOT/bin:$PATH" \
 DYLD_LIBRARY_PATH="$SPEECH_ROOT/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
 DYLD_FALLBACK_LIBRARY_PATH="$SPEECH_ROOT/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" \
+SBOBINO_WHISPER_EXPECT_COREML="$EXPECT_COREML" \
 python3 "$ROOT_DIR/scripts/run_whisper_live_replay.py" \
   --binary "$WHISPER_BIN" \
   --model "$MODEL_DIR/$MODEL" \
@@ -155,7 +210,8 @@ python3 "$ROOT_DIR/scripts/run_whisper_live_replay.py" \
   --report "$RAW_REPORT" \
   --run-dir "$RUN_DIR" \
   --device "$DEVICE" \
-  --platform "$PLATFORM"
+  --platform "$PLATFORM" \
+  ${PREFLIGHT_ARG:+"$PREFLIGHT_ARG"}
 RUN_STATUS=$?
 set -e
 
@@ -167,6 +223,7 @@ PATH="$SPEECH_ROOT/bin:$PATH" \
 DYLD_LIBRARY_PATH="$SPEECH_ROOT/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
 DYLD_FALLBACK_LIBRARY_PATH="$SPEECH_ROOT/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" \
 SBOBINO_WHISPER_TEST_INFERENCE_DELAY_MS=5000 \
+SBOBINO_WHISPER_EXPECT_COREML="$EXPECT_COREML" \
 python3 "$ROOT_DIR/scripts/run_whisper_live_replay.py" \
   --binary "$WHISPER_BIN" \
   --model "$MODEL_DIR/$MODEL" \
@@ -180,15 +237,40 @@ python3 "$ROOT_DIR/scripts/run_whisper_live_replay.py" \
 RECOVERY_STATUS=$?
 set -e
 
-set +e
-python3 "$ROOT_DIR/scripts/evaluate_live_latency.py" "$RAW_REPORT" \
-  --report "$EVALUATED_REPORT" --max-latency-seconds 2.0 --max-rss-growth-mib 256.0
-EVALUATE_STATUS=$?
-set -e
+RAW_LIVE_MODE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["live_mode"])' "$RAW_REPORT")
+if [[ "$RAW_LIVE_MODE" != "realtime" ]]; then
+  python3 - "$RAW_REPORT" "$EVALUATED_REPORT" <<'PY'
+import json
+import pathlib
+import sys
+
+raw = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+evaluated = {
+    "schema_version": 1,
+    "status": raw.get("status"),
+    "engine": raw.get("engine"),
+    "platform": raw.get("platform"),
+    "metrics": {
+        "dropped_samples": raw.get("dropped_samples", 0),
+        "missing_segments": raw.get("missing_segments", 0),
+        "duplicate_segments": raw.get("duplicate_segments", 0),
+    },
+    "failures": list(raw.get("failures") or []),
+}
+pathlib.Path(sys.argv[2]).write_text(json.dumps(evaluated, indent=2) + "\n", encoding="utf-8")
+PY
+  EVALUATE_STATUS=0
+else
+  set +e
+  python3 "$ROOT_DIR/scripts/evaluate_live_latency.py" "$RAW_REPORT" \
+    --report "$EVALUATED_REPORT" --max-latency-seconds 2.0 --max-rss-growth-mib 256.0
+  EVALUATE_STATUS=$?
+  set -e
+fi
 
 LIB_SHA256=$(shasum -a 256 "$WHISPER_BIN" | awk '{print $1}')
 COMMIT_SHA=$(git rev-parse HEAD)
-python3 - "$EVALUATED_REPORT" "$RAW_REPORT" "$REPORT_PATH" "$INPUT_SHA256" "$MODEL_SHA256" "$LIB_SHA256" "$DEVICE" "$VERSION" "$TAG" "$RECOVERY_REPORT" "$LIVE_DURATION_SECONDS" "$COMMIT_SHA" "$REPO_SLUG" <<'PY'
+python3 - "$EVALUATED_REPORT" "$RAW_REPORT" "$REPORT_PATH" "$INPUT_SHA256" "$MODEL_SHA256" "$LIB_SHA256" "$DEVICE" "$VERSION" "$TAG" "$RECOVERY_REPORT" "$LIVE_DURATION_SECONDS" "$COMMIT_SHA" "$REPO_SLUG" "$ENCODER_SHA256" "$EXPECT_COREML" <<'PY'
 import json
 import os
 import pathlib
@@ -197,6 +279,12 @@ import sys
 evaluated = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 raw = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 recovery = json.loads(pathlib.Path(sys.argv[10]).read_text(encoding="utf-8"))
+runtime_hashes = {
+    "whisper-stream": sys.argv[6],
+    "whisper_model": sys.argv[5],
+}
+if sys.argv[15] == "1":
+    runtime_hashes["whisper_coreml_encoder"] = sys.argv[14]
 evaluated["metrics"]["dropped_samples"] = raw.get("dropped_samples", 0)
 evaluated["metrics"]["missing_segments"] = raw.get("missing_segments", 0)
 evaluated["metrics"]["duplicate_segments"] = raw.get("duplicate_segments", 0)
@@ -214,24 +302,22 @@ evaluated.update({
     "evidence_class": "hosted-packaged-engine",
     "real_engine": True,
     "real_harness": True,
-    "runner": os.environ.get("SBOBINO_LIVE_RUNNER", "github-hosted macos-14"),
+    "runner": os.environ.get("SBOBINO_LIVE_RUNNER", "github-hosted macos-15"),
     "harness": "release_macos_whisper_live_smoke.sh@v1",
     "engine": "whisper.cpp/whisper-stream",
     "compute_device": sys.argv[7],
     "duration_seconds": float(sys.argv[11]),
     "requested_duration_seconds": raw.get("requested_duration_seconds"),
     "captured_duration_seconds": raw.get("captured_duration_seconds"),
-    "live_mode": "realtime",
-    "realtime_capable": True,
-    "preflight_rejected": False,
+    "live_mode": raw.get("live_mode"),
+    "realtime_capable": raw.get("live_mode") == "realtime",
+    "preflight_rejected": raw.get("preflight_rejected", False),
     "preflight": raw.get("preflight"),
+    "profile": raw.get("profile"),
     "commit_sha": sys.argv[12],
     "repo_slug": sys.argv[13],
     "input_audio_sha256": sys.argv[4],
-    "runtime_artifact_sha256": {
-        "whisper-stream": sys.argv[6],
-        "whisper_model": sys.argv[5],
-    },
+    "runtime_artifact_sha256": runtime_hashes,
     "backlog_recovery": {
         "status": recovery.get("status"),
         "live_mode": recovery.get("live_mode"),

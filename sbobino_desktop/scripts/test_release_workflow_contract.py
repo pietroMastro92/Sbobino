@@ -101,6 +101,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         for smoke in (live, windows):
             self.assertIn("whisper_live_model.json", smoke)
             self.assertIn("immutable URL", smoke)
+        self.assertIn("coreml_encoder", live)
+        self.assertIn("SBOBINO_WHISPER_EXPECT_COREML", live)
         self.assertNotIn("resolve/5359861c739e955e79d9a303bcbc70fb988958b1", live)
         self.assertNotIn("60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe", live)
         self.assertNotIn("resolve/5359861c739e955e79d9a303bcbc70fb988958b1", windows)
@@ -127,11 +129,15 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         ):
             self.assertIn(contract, windows)
         self.assertIn('-RuntimeZip (Join-Path $staging "speech-runtime-windows-x86_64.zip")', release_workflow)
-        self.assertIn('float(inference_ms) <= float(budget_ms)', promotion)
+        self.assertIn('max(float(inference_ms), float(max_ms)) <= float(budget_ms)', promotion)
+        self.assertIn('float(samples) < 3', promotion)
+        self.assertIn('validate_preflight_rejection(windows_live, "Windows live-latency")', promotion)
+        self.assertIn('arm_profile.get("coreml_loaded") is not True', promotion)
+        self.assertIn('arm_runtime_hashes.get("whisper_coreml_encoder", "")', promotion)
         self.assertIn('float(requested_duration) < 900', promotion)
         self.assertIn('float(captured_duration) != 0.0', promotion)
-        self.assertIn("ARM64 live proof must demonstrate realtime transcription", promotion)
-        self.assertIn("Intel live proof must demonstrate realtime transcription", promotion)
+        self.assertIn('arm_live_mode not in {"realtime", "preflight-rejected-incompatible-cpu"}', promotion)
+        self.assertIn('intel_live_mode not in {"realtime", "preflight-rejected-incompatible-cpu"}', promotion)
         self.assertIn('windows_live_mode not in {"realtime", "preflight-rejected-incompatible-cpu"}', promotion)
         self.assertIn('recovery.get("live_mode") != "backlog-recovery"', promotion)
         self.assertIn('recovery.get("backlog_recovery_expected") is not True', promotion)
@@ -139,8 +145,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("validate_revision", promotion)
 
         macos = ARM_LIVE_SMOKE.read_text(encoding="utf-8")
-        self.assertIn('"live_mode": "realtime"', macos)
-        self.assertIn('"realtime_capable": True', macos)
+        self.assertIn('"live_mode": raw.get("live_mode")', macos)
+        self.assertIn('"realtime_capable": raw.get("live_mode") == "realtime"', macos)
         self.assertIn('"commit_sha": sys.argv[12]', macos)
         self.assertIn('"repo_slug": sys.argv[13]', macos)
 
@@ -161,6 +167,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("SBOBINO_PARAKEET_REQUIRE_WORKER_RSS_MONITOR=1", workflow)
         self.assertIn("SBOBINO_PARAKEET_SMOKE_MODE=service", workflow)
         self.assertIn("SBOBINO_WHISPER_LIVE_DEVICE=auto", workflow)
+        self.assertIn("SBOBINO_WHISPER_EXPECT_PREFLIGHT_REJECTION=1", workflow)
         self.assertNotIn("SBOBINO_WHISPER_LIVE_DEVICE=cpu", workflow)
 
         release_workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -169,11 +176,12 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
     def test_arm_validation_uses_standard_runner_and_shared_metal_buffers(self):
         workflow = ARM_VALIDATION.read_text(encoding="utf-8")
-        self.assertIn("runs-on: macos-14", workflow)
+        self.assertIn("runs-on: macos-15", workflow)
         self.assertNotIn("-large", workflow)
         self.assertNotIn("larger", workflow.lower())
         self.assertIn("release_macos_whisper_live_smoke.sh", workflow)
         self.assertIn("SBOBINO_WHISPER_LIVE_ARCH=arm64", workflow)
+        self.assertIn("SBOBINO_WHISPER_ALLOW_PREFLIGHT_REJECTION=1", workflow)
         self.assertIn("arm-whisper-live-smoke-proof.json", workflow)
         self.assertNotIn("GGML_METAL_SHARED_BUFFERS_ENABLE", workflow)
 

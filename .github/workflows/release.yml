@@ -20,7 +20,7 @@ jobs:
         include:
           - arch: aarch64
             target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - arch: x86_64
             target: x86_64-apple-darwin
             runner: macos-15-intel
@@ -405,7 +405,7 @@ jobs:
       matrix:
         include:
           - arch: aarch64
-            runner: macos-14
+            runner: macos-15
             proof: distribution-readiness-proof.json
           - arch: x86_64
             runner: macos-15-intel
@@ -439,11 +439,17 @@ jobs:
         run: |
           DEVICE=auto
           NATIVE_ARCH=arm64
+          EXPECT_PREFLIGHT_REJECTION=0
+          ALLOW_PREFLIGHT_REJECTION=1
           if [[ "${{ matrix.arch }}" == "x86_64" ]]; then
             NATIVE_ARCH=x86_64
+            EXPECT_PREFLIGHT_REJECTION=1
+            ALLOW_PREFLIGHT_REJECTION=0
           fi
           SBOBINO_WHISPER_LIVE_ARCH="$NATIVE_ARCH" \
           SBOBINO_WHISPER_LIVE_DEVICE="$DEVICE" \
+          SBOBINO_WHISPER_EXPECT_PREFLIGHT_REJECTION="$EXPECT_PREFLIGHT_REJECTION" \
+          SBOBINO_WHISPER_ALLOW_PREFLIGHT_REJECTION="$ALLOW_PREFLIGHT_REJECTION" \
           SBOBINO_LIVE_RUNNER="github-hosted ${{ matrix.runner }}" \
           ./scripts/release_macos_whisper_live_smoke.sh \
             "${TAG_NAME#v}" "$GITHUB_REPOSITORY" "$PWD/${{ matrix.arch }}-whisper-live-smoke-proof.json"
@@ -590,7 +596,7 @@ jobs:
       matrix:
         include:
           - arch: aarch64
-            runner: macos-14
+            runner: macos-15
             report: portability-smoke-report.json
           - arch: x86_64
             runner: macos-15-intel
@@ -709,7 +715,7 @@ jobs:
         working-directory: sbobino_desktop
         run: |
           # Intel certifies the packaged long-file engine and Pyannote. The
-          # accelerated live replay is measured separately on macos-14 ARM64.
+          # accelerated live replay is measured separately on macos-15 ARM64.
           # Never substitute the synthetic Ubuntu fixture reports here.
           python3 - "$PWD/intel-pyannote-parakeet-smoke-proof.json" <<'PY'
           import json
