@@ -50,7 +50,8 @@ worker_process_group_snapshot_from_ps() {
       $1 = $2 = $3 = ""
       sub(/^[[:space:]]+/, "")
       command = $0
-      if (index(command, worker) == 1 &&
+      is_worker = index(command, worker) == 1
+      if (is_worker &&
           (pid !~ /^[1-9][0-9]*$/ ||
            process_group !~ /^[1-9][0-9]*$/ ||
            rss_kib !~ /^[0-9]+$/)) {
@@ -61,7 +62,7 @@ worker_process_group_snapshot_from_ps() {
           process_group ~ /^[1-9][0-9]*$/ &&
           rss_kib ~ /^[0-9]+$/) {
         group_rss_kib[process_group] += rss_kib
-        if (index(command, worker) == 1) {
+        if (is_worker) {
           worker_group[pid] = process_group
         }
       }
@@ -100,6 +101,20 @@ run_worker_rss_watchdog_self_check() {
   limit_mib=$(format_mib_from_bytes "$((6 * 1024 * 1024 * 1024))")
   [[ "$peak_mib" == "840.00" && "$limit_mib" == "6144.00" ]] ||
     fail "watchdog self-check reported incorrect MiB values: peak=$peak_mib limit=$limit_mib"
+
+  # Rust canonicalizes the worker path before spawning it. macOS resolves
+  # /var to /private/var, so the fixture intentionally contains the physical
+  # path that `ps` reports while the logical path is what a caller may provide.
+  local logical_worker_path physical_worker_path physical_snapshot
+  logical_worker_path="/var/folders/sbobino-self-check/parakeet-batch-json"
+  physical_worker_path="/private/var/folders/sbobino-self-check/parakeet-batch-json"
+  physical_snapshot=$'5252 5252 204800 /private/var/folders/sbobino-self-check/parakeet-batch-json --model model.gguf\n5253 5252 102400 /private/var/folders/sbobino-self-check/parakeet-helper'
+  IFS=$'\t' read -r worker_pid process_group rss_kib extra <<< \
+    "$(printf '%s\n' "$physical_snapshot" | worker_process_group_snapshot_from_ps "$physical_worker_path")"
+  [[ -z "$extra" && "$worker_pid" == "5252" && "$process_group" == "5252" && "$rss_kib" == "307200" ]] ||
+    fail "watchdog self-check did not match the canonical physical worker path: $worker_pid $process_group $rss_kib $extra"
+  [[ "$logical_worker_path" != "$physical_worker_path" ]] ||
+    fail "watchdog self-check fixture must cover logical /var and physical /private/var paths"
   echo "watchdog self-check passed: pid=$worker_pid process_group=$process_group peak=${peak_mib}MiB limit=${limit_mib}MiB"
 }
 
@@ -131,7 +146,7 @@ require_abs_path SBOBINO_PARAKEET_MODELS_DIR
 [[ -x "$SBOBINO_PARAKEET_CLI" ]] || fail "SBOBINO_PARAKEET_CLI is not executable: $SBOBINO_PARAKEET_CLI"
 [[ -d "$SBOBINO_PARAKEET_MODELS_DIR" ]] || fail "SBOBINO_PARAKEET_MODELS_DIR is not a directory: $SBOBINO_PARAKEET_MODELS_DIR"
 
-PARAKEET_WORKER="$(cd "$(dirname "$SBOBINO_PARAKEET_CLI")" && pwd)/parakeet-batch-json"
+PARAKEET_WORKER="$(cd "$(dirname "$SBOBINO_PARAKEET_CLI")" && pwd -P)/parakeet-batch-json"
 [[ -x "$PARAKEET_WORKER" ]] || fail "missing executable Parakeet batch worker next to CLI: $PARAKEET_WORKER"
 
 # The adapter owns the production ceiling too.  This harness independently
@@ -304,6 +319,10 @@ run_with_worker_rss_watchdog() {
       "$label" "$peak_mib" "$limit_mib"
   else
     echo "$label: no long-file Parakeet worker observed (short input or early failure)" >&2
+    # Preserve the raw process view in CI logs.  This makes a future packaging
+    # or process-name regression actionable without weakening the requirement
+    # that a long-file smoke must observe the real worker.
+    /bin/ps -axww -o pid=,pgid=,rss=,command= | /usr/bin/grep -F "${PARAKEET_WORKER##*/}" | tail -20 >&2 || true
   fi
   if [[ -f "$breach_file" ]]; then
     fail "$label exceeded the Parakeet worker RSS limit: $(<"$breach_file")"

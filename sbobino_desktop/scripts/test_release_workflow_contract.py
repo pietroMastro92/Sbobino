@@ -195,6 +195,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("SBOBINO_PARAKEET_SMOKE_MODE=service", intel)
         self.assertIn('SMOKE_MODE=${SBOBINO_PARAKEET_SMOKE_MODE:-both}', harness)
         self.assertIn('if [[ "$SMOKE_MODE" == "service" || "$SMOKE_MODE" == "both" ]]', harness)
+        self.assertIn('pwd -P)/parakeet-batch-json', harness)
         self.assertNotIn("need_cmd ffmpeg", harness)
         audio_helpers = (ROOT / "scripts" / "lib" / "asr_samples.sh").read_text(
             encoding="utf-8"

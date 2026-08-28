@@ -336,7 +336,37 @@ output.write_text(json.dumps(evaluated, indent=2) + "\n", encoding="utf-8")
 PY
 
 if [[ "$RUN_STATUS" -ne 0 || "$RECOVERY_STATUS" -ne 0 || "$EVALUATE_STATUS" -ne 0 ]]; then
-  echo "Packaged Whisper live smoke failed; report written to $REPORT_PATH" >&2
+  echo "Packaged Whisper live smoke failed (run=$RUN_STATUS recovery=$RECOVERY_STATUS evaluate=$EVALUATE_STATUS); report written to $REPORT_PATH" >&2
+  # The subprocesses intentionally capture their native output so the proof is
+  # deterministic.  On failure, emit a compact diagnostic summary as well so a
+  # hosted job remains debuggable even when its proof upload is the next step.
+  python3 - "$RAW_REPORT" "$RECOVERY_REPORT" "$EVALUATED_REPORT" <<'PY' >&2 || true
+import json
+import pathlib
+import sys
+
+for label, raw_path in (("run", sys.argv[1]), ("recovery", sys.argv[2]), ("evaluation", sys.argv[3])):
+    path = pathlib.Path(raw_path)
+    if not path.is_file():
+        print(f"{label}: report missing at {path}")
+        continue
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as error:
+        print(f"{label}: report unreadable: {error}")
+        continue
+    summary = {
+        "status": report.get("status"),
+        "live_mode": report.get("live_mode"),
+        "preflight_rejected": report.get("preflight_rejected"),
+        "preflight": report.get("preflight"),
+        "failures": report.get("failures", []),
+        "captured_audio_frames": report.get("captured_audio_frames"),
+        "saved_audio_frames": report.get("saved_audio_frames"),
+        "samples": len(report.get("samples") or []),
+    }
+    print(f"{label}: {json.dumps(summary, sort_keys=True)}")
+PY
   exit 1
 fi
 

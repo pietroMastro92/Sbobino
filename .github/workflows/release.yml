@@ -464,16 +464,18 @@ jobs:
             --commit-sha "$(git rev-parse HEAD)"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: distribution-readiness-${{ matrix.arch }}
           path: sbobino_desktop/${{ matrix.proof }}
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: whisper-live-${{ matrix.arch }}
           path: sbobino_desktop/${{ matrix.arch }}-whisper-live-smoke-proof.json
-          if-no-files-found: error
+          if-no-files-found: warn
 
   windows-distribution-readiness:
     needs: publish-candidate
