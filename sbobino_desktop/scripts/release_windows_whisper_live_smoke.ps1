@@ -167,6 +167,7 @@ try {
         saved_audio_frames = $recovery.saved_audio_frames
         dropped_samples = $recovery.dropped_samples
         backlog_reaction_seconds = $recovery.backlog_reaction_seconds
+        backlog_reaction_budget_seconds = $recovery.backlog_reaction_budget_seconds
     })
     $parent = Split-Path -Parent $ReportPath
     if ($parent) { New-Item -ItemType Directory -Force $parent | Out-Null }

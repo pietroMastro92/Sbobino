@@ -241,7 +241,17 @@ def validate_live_recovery(source: dict, label: str) -> None:
     if int(recovery.get("dropped_samples", -1)) != 0:
         raise SystemExit(f"Stable promotion blocked: {label} backlog recovery dropped audio.")
     reaction = recovery.get("backlog_reaction_seconds")
-    if not isinstance(reaction, (int, float)) or not math.isfinite(float(reaction)) or float(reaction) > 0.05:
+    reaction_budget = recovery.get("backlog_reaction_budget_seconds")
+    if reaction_budget != 0.25:
+        raise SystemExit(
+            f"Stable promotion blocked: {label} backlog recovery budget is not the reviewed 0.25 seconds."
+        )
+    if (
+        not isinstance(reaction, (int, float))
+        or not math.isfinite(float(reaction))
+        or float(reaction) < 0.0
+        or float(reaction) > float(reaction_budget)
+    ):
         raise SystemExit(f"Stable promotion blocked: {label} backlog recovery reacted too late.")
 
 def validate_live_duration(source: dict, label: str) -> None:

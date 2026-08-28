@@ -251,6 +251,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn('recovery.get("saved_audio_frames")', promotion)
         self.assertIn('recovery.get("dropped_samples", -1)', promotion)
         self.assertIn('recovery.get("backlog_reaction_seconds")', promotion)
+        self.assertIn('recovery.get("backlog_reaction_budget_seconds")', promotion)
+        self.assertIn("reaction_budget != 0.25", promotion)
         self.assertIn("validate_live_duration", promotion)
         for manifest in ("latest.json", "setup-manifest.json", "runtime-manifest.json", "pyannote-manifest.json"):
             self.assertIn(manifest, promotion)

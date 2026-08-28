@@ -328,6 +328,7 @@ evaluated.update({
         "saved_audio_frames": recovery.get("saved_audio_frames"),
         "dropped_samples": recovery.get("dropped_samples"),
         "backlog_reaction_seconds": recovery.get("backlog_reaction_seconds"),
+        "backlog_reaction_budget_seconds": recovery.get("backlog_reaction_budget_seconds"),
     },
 })
 output = pathlib.Path(sys.argv[3])

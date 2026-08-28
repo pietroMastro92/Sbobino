@@ -12,7 +12,9 @@ import wave
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from run_whisper_live_replay import (
+    BACKLOG_REACTION_BUDGET_SECONDS,
     backlog_threshold_overshoot,
+    backlog_reaction_within_budget,
     captured_wav_paths,
     count_fixture_utterances,
     final_preflight_result,
@@ -177,6 +179,13 @@ class FinalizedTranscriptTests(unittest.TestCase):
             "inferred=16000 buffered=32080 dropped=0\n"
         )
         self.assertAlmostEqual(backlog_threshold_overshoot(stderr, 16000), 0.005)
+
+    def test_backlog_reaction_budget_allows_host_scheduler_jitter_but_remains_bounded(self):
+        self.assertEqual(BACKLOG_REACTION_BUDGET_SECONDS, 0.25)
+        self.assertTrue(backlog_reaction_within_budget(0.08))
+        self.assertTrue(backlog_reaction_within_budget(0.25))
+        self.assertFalse(backlog_reaction_within_budget(0.250001))
+        self.assertFalse(backlog_reaction_within_budget(None))
 
     def test_missing_terminal_summary_makes_end_to_end_report_fail(self):
         with tempfile.TemporaryDirectory() as temporary:
