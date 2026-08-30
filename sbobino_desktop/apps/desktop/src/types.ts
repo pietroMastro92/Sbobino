@@ -146,6 +146,8 @@ export type AutomaticImportSource = {
   recursive: boolean;
   enable_ai_post_processing: boolean;
   post_processing: AutomaticImportPostProcessingSettings;
+  /** User-defined labels inherited by artifacts imported from this source. */
+  tags?: string[];
 };
 
 export type AutomaticImportPostProcessingSettings = {

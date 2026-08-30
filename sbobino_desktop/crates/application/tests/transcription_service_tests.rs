@@ -1076,6 +1076,30 @@ async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
             .map(String::as_str),
         Some("completed")
     );
+
+    let repair: serde_json::Value = serde_json::from_str(
+        artifact
+            .metadata
+            .get("segment_repair_v1")
+            .expect("segment repair report should be persisted"),
+    )
+    .expect("segment repair report should be valid JSON");
+    assert_eq!(repair["version"].as_str(), Some("segment_repair_v1"));
+    assert_eq!(repair["input_segment_count"].as_u64(), Some(2));
+    assert_eq!(repair["output_segment_count"].as_u64(), Some(2));
+
+    let speaker_quality: serde_json::Value = serde_json::from_str(
+        artifact
+            .metadata
+            .get("speaker_quality_v1")
+            .expect("speaker quality report should be persisted"),
+    )
+    .expect("speaker quality report should be valid JSON");
+    assert_eq!(
+        speaker_quality["version"].as_str(),
+        Some("speaker_quality_v1")
+    );
+    assert_eq!(speaker_quality["warning_count"].as_u64(), Some(0));
 }
 
 #[tokio::test]

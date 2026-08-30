@@ -24,9 +24,10 @@ use sbobino_application::{
 };
 use sbobino_domain::{
     constrain_transcript_edit, merge_optimized_transcript_sections,
-    minimize_transcript_repetitions, AppLanguage, ArtifactChatMessage, ArtifactKind,
-    DetectedLanguageSummary, LanguageCode, PromptTask, TimedSegment, TimedWord, TranscriptArtifact,
-    TranscriptionOutput,
+    minimize_transcript_repetitions, speaker_quality_report, AppLanguage, ArtifactChatMessage,
+    ArtifactKind, DetectedLanguageSummary, LanguageCode, PromptTask, TimedSegment, TimedWord,
+    TranscriptArtifact, TranscriptionOutput, SPEAKER_QUALITY_METADATA_KEY,
+    TIMELINE_MANUAL_EDITS_METADATA_KEY,
 };
 
 use crate::{
@@ -161,11 +162,22 @@ pub struct UpdateArtifactPayload {
 pub struct UpdateArtifactTimelinePayload {
     pub id: String,
     pub timeline_v2: String,
+    #[serde(default)]
+    pub manual_edit: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ArtifactSpeakerDiarizationPayload {
     pub artifact_id: String,
+    #[serde(default)]
+    pub allow_overwrite_manual_edits: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct TimelineManualEditMetadata {
+    version: String,
+    manual_edit_count: usize,
+    last_edited_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -641,11 +653,37 @@ pub async fn update_artifact_timeline(
     state: State<'_, AppState>,
     payload: UpdateArtifactTimelinePayload,
 ) -> Result<Option<TranscriptArtifact>, CommandError> {
-    state
+    let Some(mut updated) = state
         .artifact_service
         .update_timeline_v2(&payload.id, &payload.timeline_v2)
         .await
-        .map_err(CommandError::from)
+        .map_err(CommandError::from)?
+    else {
+        return Ok(None);
+    };
+
+    if payload.manual_edit {
+        let metadata = next_timeline_manual_edit_metadata(
+            updated
+                .metadata
+                .get(TIMELINE_MANUAL_EDITS_METADATA_KEY)
+                .map(String::as_str),
+        );
+        if let Some(metadata_updated) = state
+            .artifact_service
+            .update_metadata_entry(
+                &payload.id,
+                TIMELINE_MANUAL_EDITS_METADATA_KEY,
+                Some(&metadata),
+            )
+            .await
+            .map_err(CommandError::from)?
+        {
+            updated = metadata_updated;
+        }
+    }
+
+    Ok(Some(updated))
 }
 
 #[tauri::command]
@@ -660,6 +698,22 @@ pub async fn run_artifact_speaker_diarization(
             "speaker_diarization",
             "artifact id cannot be empty",
         ));
+    }
+
+    if !payload.allow_overwrite_manual_edits {
+        let has_manual_edits = state
+            .artifact_service
+            .get(&artifact_id)
+            .await
+            .map_err(CommandError::from)?
+            .as_ref()
+            .is_some_and(has_timeline_manual_edits);
+        if has_manual_edits {
+            return Err(CommandError::new(
+                "speaker_diarization",
+                "speaker diarization rerun is blocked because the timeline contains manual edits; explicitly allow overwriting manual edits to continue",
+            ));
+        }
     }
 
     let run_id = Uuid::new_v4().to_string();
@@ -704,6 +758,7 @@ pub async fn run_artifact_speaker_diarization(
             task_artifact_id,
             run_id,
             cancellation_token,
+            payload.allow_overwrite_manual_edits,
         )
         .await;
     });
@@ -762,6 +817,7 @@ async fn run_artifact_speaker_diarization_task(
     artifact_id: String,
     run_id: String,
     cancellation_token: CancellationToken,
+    allow_overwrite_manual_edits: bool,
 ) {
     let result = run_artifact_speaker_diarization_inner(
         &app,
@@ -769,6 +825,7 @@ async fn run_artifact_speaker_diarization_task(
         &artifact_id,
         &run_id,
         &cancellation_token,
+        allow_overwrite_manual_edits,
     )
     .await;
 
@@ -821,6 +878,7 @@ async fn run_artifact_speaker_diarization_inner(
     artifact_id: &str,
     run_id: &str,
     cancellation_token: &CancellationToken,
+    allow_overwrite_manual_edits: bool,
 ) -> Result<(), CommandError> {
     let artifact = state
         .artifact_service
@@ -869,6 +927,7 @@ async fn run_artifact_speaker_diarization_inner(
         &source_path,
         &segments,
         cancellation_token,
+        allow_overwrite_manual_edits,
     )
     .await;
 
@@ -891,6 +950,7 @@ async fn run_artifact_speaker_diarization_from_source(
     source_path: &Path,
     segments: &[TimedSegment],
     cancellation_token: &CancellationToken,
+    allow_overwrite_manual_edits: bool,
 ) -> Result<(), CommandError> {
     let Some((transcoder, speaker_diarizer)) = state
         .runtime_factory
@@ -931,6 +991,10 @@ async fn run_artifact_speaker_diarization_from_source(
         }
         emit_diarization_progress(app, artifact_id, "running", "Updating speaker timeline", 90);
         let assigned_segments = TranscriptionService::assign_speakers_to_segments(segments, &turns);
+        let speaker_quality_metadata = serde_json::to_string(&speaker_quality_report(
+            &assigned_segments,
+        ))
+        .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
         let timeline_v2 = TranscriptionOutput {
             text: String::new(),
             segments: assigned_segments,
@@ -939,10 +1003,41 @@ async fn run_artifact_speaker_diarization_from_source(
         if cancellation_token.is_cancelled() {
             return Err(ApplicationError::Cancelled);
         }
+        if !allow_overwrite_manual_edits {
+            let has_manual_edits = state
+                .artifact_service
+                .get(artifact_id)
+                .await
+                .map_err(|error| ApplicationError::Persistence(error.to_string()))?
+                .as_ref()
+                .is_some_and(has_timeline_manual_edits);
+            if has_manual_edits {
+                return Err(ApplicationError::Validation(
+                    "speaker diarization rerun is blocked because the timeline contains manual edits".to_string(),
+                ));
+            }
+        }
         state
             .artifact_service
             .update_timeline_v2(artifact_id, &timeline_v2)
             .await?;
+        state
+            .artifact_service
+            .update_metadata_entry(
+                artifact_id,
+                SPEAKER_QUALITY_METADATA_KEY,
+                Some(&speaker_quality_metadata),
+            )
+            .await?;
+        if allow_overwrite_manual_edits {
+            // The explicit override means the previous manual timeline is no
+            // longer the active source. Remove its guard so a later rerun is
+            // not blocked by stale provenance.
+            state
+                .artifact_service
+                .update_metadata_entry(artifact_id, TIMELINE_MANUAL_EDITS_METADATA_KEY, None)
+                .await?;
+        }
         if cancellation_token.is_cancelled() {
             return Err(ApplicationError::Cancelled);
         }
@@ -1027,6 +1122,31 @@ async fn set_diarization_metadata(
     }
 
     Ok(latest)
+}
+
+fn has_timeline_manual_edits(artifact: &TranscriptArtifact) -> bool {
+    artifact
+        .metadata
+        .contains_key(TIMELINE_MANUAL_EDITS_METADATA_KEY)
+}
+
+fn next_timeline_manual_edit_metadata(previous: Option<&str>) -> String {
+    let previous_count = previous
+        .and_then(|value| serde_json::from_str::<TimelineManualEditMetadata>(value).ok())
+        .filter(|metadata| metadata.version == TIMELINE_MANUAL_EDITS_METADATA_KEY)
+        .map(|metadata| metadata.manual_edit_count)
+        .unwrap_or(0);
+
+    serde_json::to_string(&TimelineManualEditMetadata {
+        version: TIMELINE_MANUAL_EDITS_METADATA_KEY.to_string(),
+        manual_edit_count: previous_count.saturating_add(1),
+        last_edited_at: Utc::now().to_rfc3339(),
+    })
+    .unwrap_or_else(|_| {
+        format!(
+            r#"{{"version":"{TIMELINE_MANUAL_EDITS_METADATA_KEY}","manual_edit_count":1,"last_edited_at":""}}"#
+        )
+    })
 }
 
 fn emit_artifact_updated(app: &tauri::AppHandle, artifact: &TranscriptArtifact) {
@@ -4263,14 +4383,15 @@ mod tests {
         build_chunk_note_prompt, build_confidence_aware_optimize_prompt,
         build_direct_summary_prompt, build_export_content, build_export_document,
         build_export_segments, build_summary_instructions, build_summary_synthesis_prompt,
-        chunk_text_by_words, extract_low_confidence_spans, is_context_window_error,
-        manual_optimization_groups, optimize_source_language_groups, optimize_with_rag,
-        render_markdown_document, render_plain_text_document, resolve_ai_output_language,
-        run_cancellable, summarize_with_rag, timeline_segments_for_diarization,
-        trimmed_audio_output_metadata, validate_trimmed_audio_output, ApplicationError,
-        ArtifactAiContextOptions, ArtifactChatMessage, ArtifactKind, ExportStyle,
-        SourceLanguageOptimizationGroup, SummarizeArtifactPayload, TranscriptArtifact,
-        TranscriptEnhancer, MIN_TRIMMED_AUDIO_DURATION_SECONDS,
+        chunk_text_by_words, extract_low_confidence_spans, has_timeline_manual_edits,
+        is_context_window_error, manual_optimization_groups, next_timeline_manual_edit_metadata,
+        optimize_source_language_groups, optimize_with_rag, render_markdown_document,
+        render_plain_text_document, resolve_ai_output_language, run_cancellable,
+        summarize_with_rag, timeline_segments_for_diarization, trimmed_audio_output_metadata,
+        validate_trimmed_audio_output, ApplicationError, ArtifactAiContextOptions,
+        ArtifactChatMessage, ArtifactKind, ExportStyle, SourceLanguageOptimizationGroup,
+        SummarizeArtifactPayload, TranscriptArtifact, TranscriptEnhancer,
+        MIN_TRIMMED_AUDIO_DURATION_SECONDS,
     };
 
     struct TrackingEnhancer {
@@ -6065,6 +6186,37 @@ mod tests {
         assert!(segments
             .iter()
             .all(|segment| segment.speaker_label.is_none()));
+    }
+
+    #[test]
+    fn manual_timeline_edit_metadata_is_versioned_and_counted() {
+        let first = next_timeline_manual_edit_metadata(None);
+        let second = next_timeline_manual_edit_metadata(Some(&first));
+        let first_value: serde_json::Value = serde_json::from_str(&first).expect("first metadata");
+        let second_value: serde_json::Value =
+            serde_json::from_str(&second).expect("second metadata");
+
+        assert_eq!(
+            first_value["version"].as_str(),
+            Some("timeline_manual_edits_v1")
+        );
+        assert_eq!(first_value["manual_edit_count"].as_u64(), Some(1));
+        assert_eq!(second_value["manual_edit_count"].as_u64(), Some(2));
+        assert!(second_value["last_edited_at"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
+    fn manual_timeline_edit_provenance_is_the_diarization_guard() {
+        let mut artifact = sample_artifact("transcript");
+        assert!(!has_timeline_manual_edits(&artifact));
+
+        artifact.metadata.insert(
+            "timeline_manual_edits_v1".to_string(),
+            next_timeline_manual_edit_metadata(None),
+        );
+        assert!(has_timeline_manual_edits(&artifact));
     }
 
     #[tokio::test]

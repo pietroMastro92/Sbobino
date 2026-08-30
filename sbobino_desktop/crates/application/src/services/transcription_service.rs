@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{instrument, warn};
 
 use sbobino_domain::{
-    constrain_transcript_edit, minimize_transcript_repetitions, ArtifactKind, JobProgress,
-    JobStage, LanguageCode, SpeakerTurn, TimedSegment, TranscriptArtifact, TranscriptionEngine,
-    TranscriptionOutput,
+    constrain_transcript_edit, minimize_transcript_repetitions, repair_segments,
+    speaker_quality_report, ArtifactKind, JobProgress, JobStage, LanguageCode, SpeakerTurn,
+    TimedSegment, TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
+    SEGMENT_REPAIR_METADATA_KEY, SPEAKER_QUALITY_METADATA_KEY,
 };
 
 use crate::{
@@ -445,6 +446,16 @@ impl TranscriptionService {
                 );
             }
 
+            // Structural cleanup is evidence-bound and runs only on the
+            // decoded timeline. It happens after AI grouping so duplicate
+            // segments cannot erase language evidence needed by post-processing.
+            // The raw transcript remains untouched, and speaker labels are
+            // never inferred or rewritten by this pass.
+            let (repaired_segments, segment_repair_report) =
+                repair_segments(&transcription_output.segments);
+            transcription_output.segments = repaired_segments;
+            let speaker_quality_report = speaker_quality_report(&transcription_output.segments);
+
             self.emit(
                 &emit_progress,
                 &progress_state,
@@ -476,6 +487,22 @@ impl TranscriptionService {
             metadata.insert(
                 "timeline_v2".to_string(),
                 transcription_output.timeline_v2_metadata_json(),
+            );
+            metadata.insert(
+                SEGMENT_REPAIR_METADATA_KEY.to_string(),
+                serde_json::to_string(&segment_repair_report).unwrap_or_else(|_| {
+                    format!(
+                        r#"{{"version":"{SEGMENT_REPAIR_METADATA_KEY}","status":"unavailable"}}"#
+                    )
+                }),
+            );
+            metadata.insert(
+                SPEAKER_QUALITY_METADATA_KEY.to_string(),
+                serde_json::to_string(&speaker_quality_report).unwrap_or_else(|_| {
+                    format!(
+                        r#"{{"version":"{SPEAKER_QUALITY_METADATA_KEY}","status":"unavailable","warning_count":0,"warnings":[]}}"#
+                    )
+                }),
             );
             if let Some(status) = diarization_status {
                 metadata.insert("speaker_diarization_status".to_string(), status);

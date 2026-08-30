@@ -607,6 +607,13 @@ pub struct AutomaticImportSource {
     pub recursive: bool,
     pub enable_ai_post_processing: bool,
     pub post_processing: AutomaticImportPostProcessingSettings,
+    /// Stable, user-defined labels applied to artifacts imported from this source.
+    ///
+    /// This field is intentionally additive and defaults to an empty list so old
+    /// settings files continue to deserialize unchanged. Incoming values are
+    /// trimmed and de-duplicated during deserialization.
+    #[serde(default, deserialize_with = "deserialize_automatic_import_tags")]
+    pub tags: Vec<String>,
 }
 
 impl Default for AutomaticImportSource {
@@ -623,8 +630,42 @@ impl Default for AutomaticImportSource {
             recursive: true,
             enable_ai_post_processing: false,
             post_processing: AutomaticImportPostProcessingSettings::default(),
+            tags: Vec::new(),
         }
     }
+}
+
+/// Normalize source tags without changing the spelling of the first occurrence.
+///
+/// Tags are labels rather than identifiers, so comparisons are case-insensitive
+/// while the first user's capitalization is retained for display. Empty labels
+/// are discarded and surrounding whitespace is never persisted.
+pub fn normalize_automatic_import_tags<I, S>(tags: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut normalized = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tag in tags {
+        let value = tag.as_ref().trim();
+        if value.is_empty() {
+            continue;
+        }
+        let key = value.to_lowercase();
+        if seen.insert(key) {
+            normalized.push(value.to_string());
+        }
+    }
+    normalized
+}
+
+fn deserialize_automatic_import_tags<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let tags = Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(normalize_automatic_import_tags(tags))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1284,6 +1325,36 @@ mod language_tests {
         let policy = TranscriptionLanguagePolicy::default();
         assert!(policy.adaptive_detection);
         assert_eq!(policy.preferred_language, LanguageCode::Auto);
+    }
+
+    #[test]
+    fn automatic_import_source_tags_are_additive_and_normalized() {
+        let source: AutomaticImportSource = serde_json::from_str(
+            r#"{
+                "id": "lectures",
+                "label": "Lectures",
+                "folder_path": "/tmp/lectures",
+                "tags": ["  University ", "university", "exam", "", " exam "]
+            }"#,
+        )
+        .expect("source should deserialize");
+
+        assert_eq!(source.tags, vec!["University", "exam"]);
+        assert_eq!(source.tags, normalize_automatic_import_tags(&source.tags));
+    }
+
+    #[test]
+    fn automatic_import_source_tags_default_when_absent() {
+        let source: AutomaticImportSource = serde_json::from_str(
+            r#"{
+                "id": "legacy",
+                "label": "Legacy",
+                "folder_path": "/tmp/legacy"
+            }"#,
+        )
+        .expect("legacy source should deserialize");
+
+        assert!(source.tags.is_empty());
     }
 
     #[test]

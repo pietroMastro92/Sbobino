@@ -39,6 +39,7 @@ pub(crate) const IMPORT_GENERATE_SUMMARY_METADATA_KEY: &str = "auto_import_gener
 pub(crate) const IMPORT_GENERATE_FAQS_METADATA_KEY: &str = "auto_import_generate_faqs";
 pub(crate) const IMPORT_GENERATE_PRESET_OUTPUT_METADATA_KEY: &str =
     "auto_import_generate_preset_output";
+pub(crate) const IMPORT_TAGS_METADATA_KEY: &str = "auto_import_tags_v1";
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ScanAutomaticImportPayload {
@@ -96,6 +97,7 @@ struct DiscoveredImportCandidate {
     generate_summary: bool,
     generate_faqs: bool,
     generate_preset_output: bool,
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -313,6 +315,10 @@ async fn scan_automatic_import_inner(
         metadata.insert(
             IMPORT_GENERATE_PRESET_OUTPUT_METADATA_KEY.to_string(),
             candidate.generate_preset_output.to_string(),
+        );
+        metadata.insert(
+            IMPORT_TAGS_METADATA_KEY.to_string(),
+            automatic_import_tags_metadata_value(&candidate.tags),
         );
         if let Some(workspace_id) = candidate.workspace_id.clone() {
             metadata.insert(IMPORT_WORKSPACE_METADATA_KEY.to_string(), workspace_id);
@@ -956,6 +962,7 @@ fn build_candidate(
         generate_summary: source.post_processing.generate_summary,
         generate_faqs: source.post_processing.generate_faqs,
         generate_preset_output: source.post_processing.generate_preset_output,
+        tags: sbobino_domain::normalize_automatic_import_tags(&source.tags),
     })
 }
 
@@ -1027,6 +1034,11 @@ fn automatic_import_preset_str(preset: &AutomaticImportPreset) -> &'static str {
     }
 }
 
+pub(crate) fn automatic_import_tags_metadata_value(tags: &[String]) -> String {
+    serde_json::to_string(&sbobino_domain::normalize_automatic_import_tags(tags))
+        .unwrap_or_else(|_| "[]".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -1060,6 +1072,7 @@ mod tests {
                     enable_ai_post_processing: false,
                     post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(
                     ),
+                    tags: vec!["course".to_string(), "study".to_string()],
                 }],
                 excluded_folders: Vec::new(),
                 source_statuses: Vec::new(),
@@ -1077,6 +1090,11 @@ mod tests {
         assert_eq!(scan.candidates[0].workspace_id.as_deref(), Some("uni"));
         assert_eq!(scan.candidates[0].model, SpeechModel::Small);
         assert_eq!(scan.candidates[0].language, LanguageCode::It);
+        assert_eq!(scan.candidates[0].tags, vec!["course", "study"]);
+        assert_eq!(
+            automatic_import_tags_metadata_value(&scan.candidates[0].tags),
+            r#"["course","study"]"#
+        );
         assert!(scan.candidates[0].fingerprint_json.contains("\"sha256\""));
         assert!(scan.candidates[0]
             .fingerprint_json
@@ -1108,6 +1126,7 @@ mod tests {
                     enable_ai_post_processing: false,
                     post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(
                     ),
+                    tags: Vec::new(),
                 }],
                 excluded_folders: Vec::new(),
                 source_statuses: Vec::new(),
@@ -1156,6 +1175,7 @@ mod tests {
             generate_summary: true,
             generate_faqs: true,
             generate_preset_output: true,
+            tags: Vec::new(),
         };
 
         let mut index = ExistingImportIndex::default();
