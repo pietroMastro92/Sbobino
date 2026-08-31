@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$OutputZip,
-    [string]$SidecarDir = ""
+    [string]$SidecarDir = "",
+    [string]$FfmpegArchivePath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,11 +18,19 @@ $ParakeetUrl = "https://github.com/mudler/parakeet.cpp/releases/download/v$Parak
 $ParakeetSha256 = "2880150a1bad2944baed46f2e6bb9f1bc55263a9f2bb85573785a7ec4fa35f27"
 $ParakeetSourceUrl = "https://github.com/mudler/parakeet.cpp.git"
 $ParakeetSourceRef = "fa5aeef1e3d353679cbd374a426fee28387deb6e"
-# BtbN prunes dated autobuild releases, so a URL pinned to one of those tags is
-# not durable. Reuse the immutable, already validated Windows runtime from the
-# immediately preceding stable release, which the promotion policy retains.
-$FfmpegUrl = "https://github.com/pietroMastro92/Sbobino/releases/download/v2.0.25/speech-runtime-windows-x86_64.zip"
-$FfmpegSha256 = "a0dadc1a7a58008a4c45b9c612a1c58ecc2a85baa6eefecad083f78c746a8c83"
+# The shared FFmpeg archive is pinned by SHA-256. The URL is intentionally
+# overridable so release jobs can stage an archive in the same workspace; a
+# moving URL can never silently change the bytes accepted by this packager.
+$FfmpegUrl = if ($env:SBOBINO_FFMPEG_RUNTIME_URL) {
+    $env:SBOBINO_FFMPEG_RUNTIME_URL
+} else {
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+}
+$FfmpegSha256 = if ($env:SBOBINO_FFMPEG_RUNTIME_SHA256) {
+    $env:SBOBINO_FFMPEG_RUNTIME_SHA256
+} else {
+    "ca56a31e81af11c8e4c77249039d3a61833ec37bfbc5308da91ba1b00b43a00f"
+}
 $TargetTriple = "x86_64-pc-windows-msvc"
 
 function Download-VerifiedArchive {
@@ -428,10 +437,24 @@ try {
 
     $sdlArchive = Join-Path $downloads "sdl2.zip"
     $parakeetArchive = Join-Path $downloads "parakeet.zip"
-    $ffmpegArchive = Join-Path $downloads "ffmpeg.zip"
+    $ffmpegArchive = if ($FfmpegArchivePath) {
+        if (-not (Test-Path -PathType Leaf $FfmpegArchivePath)) {
+            throw "FFmpeg archive was not found at '$FfmpegArchivePath'"
+        }
+        $FfmpegArchivePath
+    } else {
+        Join-Path $downloads "ffmpeg.zip"
+    }
     Download-VerifiedArchive $SdlUrl $sdlArchive $SdlSha256
     Download-VerifiedArchive $ParakeetUrl $parakeetArchive $ParakeetSha256
-    Download-VerifiedArchive $FfmpegUrl $ffmpegArchive $FfmpegSha256
+    if (-not $FfmpegArchivePath) {
+        Download-VerifiedArchive $FfmpegUrl $ffmpegArchive $FfmpegSha256
+    } else {
+        $actualFfmpegSha256 = (Get-FileHash -Algorithm SHA256 -Path $ffmpegArchive).Hash.ToLowerInvariant()
+        if ($actualFfmpegSha256 -ne $FfmpegSha256.ToLowerInvariant()) {
+            throw "checksum mismatch for staged FFmpeg archive (expected $FfmpegSha256, got $actualFfmpegSha256)"
+        }
+    }
 
     $sdlExtract = Join-Path $extract "sdl2"
     $parakeetExtract = Join-Path $extract "parakeet"

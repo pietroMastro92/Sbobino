@@ -20,6 +20,12 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",
     globals: false,
-    css: true
+    css: true,
+    // The Tauri/jsdom suites share a process-heavy mock environment. Running
+    // every file in parallel can starve a synchronous render test until
+    // Vitest's 5s per-test timeout expires, producing a false release-gate
+    // failure. Keep the gate deterministic; individual tests remain parallel
+    // inside their own file where that is safe.
+    fileParallelism: false,
   }
 });

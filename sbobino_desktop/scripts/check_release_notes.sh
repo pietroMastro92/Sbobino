@@ -20,9 +20,26 @@ if [[ ! -f "$NOTES_FILE" ]]; then
   exit 1
 fi
 
+for section in "Fixes" "New and improved" "Compatibility" "Known issues" "Refs"; do
+  if ! grep -Eq "^### ${section}$" "$NOTES_FILE"; then
+    echo "Release notes are missing mandatory section: $section" >&2
+    exit 1
+  fi
+done
+
 previous_ref=${3:-${SBOBINO_RELEASE_NOTES_PREVIOUS_REF:-}}
 if [[ -z "$previous_ref" ]]; then
-  previous_ref=$(git -C "$REPO_ROOT" describe --tags --abbrev=0 "HEAD^" 2>/dev/null || true)
+  # When the checkout is still sitting on the preceding release tag (the
+  # normal local-candidate starting point), HEAD^ skips over that tag and
+  # incorrectly selects the release before it. Prefer an exact current tag
+  # when it is different from the candidate being checked; once the candidate
+  # tag itself is checked out, HEAD^ correctly resolves the prior release.
+  current_tag=$(git -C "$REPO_ROOT" describe --tags --exact-match HEAD 2>/dev/null || true)
+  if [[ -n "$current_tag" && "${current_tag#v}" != "$VERSION" ]]; then
+    previous_ref=$current_tag
+  else
+    previous_ref=$(git -C "$REPO_ROOT" describe --tags --abbrev=0 "HEAD^" 2>/dev/null || true)
+  fi
 fi
 if [[ -z "$previous_ref" ]]; then
   # Keep the check usable from a clean source archive where tags are not

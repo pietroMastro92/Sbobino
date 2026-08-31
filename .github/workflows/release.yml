@@ -6,14 +6,29 @@ on:
       tag_name:
         description: Existing git tag to build and publish as a prerelease candidate
         required: true
+        default: v2.0.30
         type: string
 
 permissions:
   contents: write
 
 jobs:
+  validate-candidate:
+    name: Validate v2.0.30 candidate tag
+    runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
+    steps:
+      - name: Require the reviewed candidate tag
+        run: |
+          if [[ "$TAG_NAME" != "v2.0.30" ]]; then
+            echo "Release Candidate is locked to v2.0.30; got $TAG_NAME" >&2
+            exit 1
+          fi
+
   build-native:
     name: Build native macOS ${{ matrix.arch }}
+    needs: validate-candidate
     strategy:
       fail-fast: false
       matrix:
@@ -156,6 +171,7 @@ jobs:
 
   build-windows:
     name: Build native Windows x86_64
+    needs: validate-candidate
     runs-on: windows-2025
     env:
       TAG_NAME: ${{ inputs.tag_name }}
@@ -323,7 +339,7 @@ jobs:
           if-no-files-found: error
 
   publish-candidate:
-    needs: [build-native, build-windows]
+    needs: [validate-candidate, build-native, build-windows]
     runs-on: ubuntu-latest
     env:
       TAG_NAME: ${{ inputs.tag_name }}
@@ -361,6 +377,7 @@ jobs:
         run: |
           VERSION="${TAG_NAME#v}"
           OUTPUT_DIR="$PWD/dist/github-release/v$VERSION"
+          SBOBINO_RELEASE_REPOSITORY="$GITHUB_REPOSITORY" \
           ./scripts/assemble_local_release.sh \
             "$VERSION" \
             "$PWD/dist/staging/aarch64" \
@@ -468,14 +485,14 @@ jobs:
         with:
           name: distribution-readiness-${{ matrix.arch }}
           path: sbobino_desktop/${{ matrix.proof }}
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: whisper-live-${{ matrix.arch }}
           path: sbobino_desktop/${{ matrix.arch }}-whisper-live-smoke-proof.json
-          if-no-files-found: warn
+          if-no-files-found: error
 
   windows-distribution-readiness:
     needs: publish-candidate
@@ -585,11 +602,13 @@ jobs:
           } | ConvertTo-Json -Depth 10 | Set-Content windows-distribution-readiness-proof.json
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: distribution-readiness-windows-x86_64
           path: |
             sbobino_desktop/windows-distribution-readiness-proof.json
             sbobino_desktop/windows-gui-smoke-report.json
+          if-no-files-found: error
 
   portability-smoke:
     needs: publish-candidate
@@ -677,6 +696,7 @@ jobs:
         with:
           name: portability-smoke-${{ matrix.arch }}
           path: sbobino_desktop/${{ matrix.report }}
+          if-no-files-found: error
 
   intel-pyannote-parakeet-smoke:
     needs: publish-candidate
@@ -760,6 +780,7 @@ jobs:
           path: |
             sbobino_desktop/intel-pyannote-parakeet-smoke-proof.json
             sbobino_desktop/intel-pyannote-parakeet-smoke-logs/*.log
+          if-no-files-found: error
           retention-days: 3
 
   upload-validation-assets:
@@ -771,6 +792,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:

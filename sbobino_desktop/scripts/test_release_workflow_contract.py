@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 import wave
+import zipfile
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -17,17 +18,108 @@ ARM_VALIDATION = ROOT.parent / ".github" / "workflows" / "arm-runtime-validation
 INTEL_SMOKE = ROOT / "scripts" / "release_intel_pyannote_parakeet_smoke.sh"
 ARM_LIVE_SMOKE = ROOT / "scripts" / "release_macos_whisper_live_smoke.sh"
 WINDOWS_LIVE_SMOKE = ROOT / "scripts" / "release_windows_whisper_live_smoke.ps1"
+WINDOWS_RUNTIME_PACKAGER = ROOT / "scripts" / "package_windows_runtime_asset.ps1"
+WINDOWS_PYANNOTE_PACKAGER = ROOT / "scripts" / "package_windows_pyannote_runtime.ps1"
+PROVISIONING = ROOT / "apps" / "desktop" / "src-tauri" / "src" / "commands" / "provisioning.rs"
+DISPATCHER = ROOT / "scripts" / "dispatch_release_candidate.sh"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_candidate_validation_is_bound_to_the_requested_tag_revision(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        dispatcher = DISPATCHER.read_text(encoding="utf-8")
+        upload_job = workflow.split("  upload-validation-assets:", 1)[1]
+        self.assertIn("ref: ${{ inputs.tag_name }}", upload_job)
+        self.assertIn("fetch-depth: 0", upload_job)
+        self.assertIn('--ref "$TAG_NAME"', dispatcher)
+
     def test_release_readiness_metadata_binds_candidate_revision_and_repository(self):
         with tempfile.TemporaryDirectory() as temporary:
+            output_dir = pathlib.Path(temporary)
+            version = "9.8.7"
+            required_assets = [
+                f"Sbobino_{version}_aarch64.dmg",
+                f"Sbobino_{version}_x86_64.dmg",
+                f"Sbobino_{version}_aarch64.app.tar.gz",
+                f"Sbobino_{version}_aarch64.app.tar.gz.sig",
+                f"Sbobino_{version}_x86_64.app.tar.gz",
+                f"Sbobino_{version}_x86_64.app.tar.gz.sig",
+                f"Sbobino_{version}_windows_x86_64-setup.exe",
+                f"Sbobino_{version}_windows_x86_64.nsis.zip",
+                f"Sbobino_{version}_windows_x86_64.nsis.zip.sig",
+                "latest.json",
+                "setup-manifest.json",
+                "runtime-manifest.json",
+                "speech-runtime-macos-aarch64.zip",
+                "speech-runtime-macos-x86_64.zip",
+                "speech-runtime-windows-x86_64.zip",
+                "pyannote-manifest.json",
+                "pyannote-runtime-macos-aarch64.zip",
+                "pyannote-runtime-macos-x86_64.zip",
+                "pyannote-runtime-windows-x86_64.zip",
+                "pyannote-model-community-1.zip",
+                "release-notes.md",
+            ]
+            zip_members = {
+                "speech-runtime-macos-aarch64.zip": [
+                    "runtime/bin/ffmpeg",
+                    "runtime/bin/whisper-cli",
+                    "runtime/bin/whisper-stream",
+                    "runtime/bin/parakeet-cli",
+                    "runtime/bin/parakeet-batch-json",
+                ],
+                "speech-runtime-macos-x86_64.zip": [
+                    "runtime/bin/ffmpeg",
+                    "runtime/bin/whisper-cli",
+                    "runtime/bin/whisper-stream",
+                    "runtime/bin/parakeet-cli",
+                    "runtime/bin/parakeet-batch-json",
+                ],
+                "speech-runtime-windows-x86_64.zip": [
+                    "runtime/bin/ffmpeg.exe",
+                    "runtime/bin/whisper-cli.exe",
+                    "runtime/bin/whisper-stream.exe",
+                    "runtime/bin/parakeet-cli.exe",
+                    "runtime/bin/parakeet-batch-json.exe",
+                ],
+                "pyannote-runtime-macos-aarch64.zip": ["python/bin/python3"],
+                "pyannote-runtime-macos-x86_64.zip": ["python/bin/python3"],
+                "pyannote-runtime-windows-x86_64.zip": ["python/python.exe"],
+                "pyannote-model-community-1.zip": ["model/config.yaml"],
+            }
+            for name in required_assets:
+                path = output_dir / name
+                if name in zip_members:
+                    with zipfile.ZipFile(path, "w") as archive:
+                        for member in zip_members[name]:
+                            archive.writestr(member, b"fixture")
+                elif name == "latest.json":
+                    path.write_text(json.dumps({"version": version}), encoding="utf-8")
+                elif name == "setup-manifest.json":
+                    path.write_text(
+                        json.dumps({"app_version": version, "release_tag": f"v{version}"}),
+                        encoding="utf-8",
+                    )
+                elif name in {"runtime-manifest.json", "pyannote-manifest.json"}:
+                    path.write_text(json.dumps({"app_version": version}), encoding="utf-8")
+                elif name == "release-notes.md":
+                    path.write_text(
+                        "## Sbobino 9.8.7\n\n"
+                        "### Fixes\n\n- fixture fix\n\n"
+                        "### New and improved\n\n- fixture improvement\n\n"
+                        "### Compatibility\n\n- fixture compatibility\n\n"
+                        "### Known issues\n\n- fixture issue\n\n"
+                        "### Refs\n\n- v9.8.6..v9.8.7\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    path.write_bytes(b"fixture")
             subprocess.run(
                 [
                     "python3",
                     str(ROOT / "scripts" / "generate_release_candidate_metadata.py"),
                     temporary,
-                    "9.8.7",
+                    version,
                     "--commit-sha",
                     "a" * 40,
                     "--repo-slug",
@@ -157,6 +249,37 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('root / "lib" / "embedded-dylibs",\n            root / "lib",', readiness)
+
+    def test_windows_packagers_do_not_depend_on_deleted_release_assets(self):
+        for script in (WINDOWS_RUNTIME_PACKAGER, WINDOWS_PYANNOTE_PACKAGER):
+            contents = script.read_text(encoding="utf-8")
+            self.assertIn("SBOBINO_FFMPEG_RUNTIME_URL", contents)
+            self.assertIn("SBOBINO_FFMPEG_RUNTIME_SHA256", contents)
+            self.assertNotIn("pietroMastro92/Sbobino/releases/download", contents)
+            self.assertNotIn("v2.0.25", contents)
+            self.assertIn("BtbN/FFmpeg-Builds/releases/download/latest", contents)
+            self.assertIn("ca56a31e81af11c8e4c77249039d3a61833ec37bfbc5308da91ba1b00b43a00f", contents)
+            if script.name == "package_windows_pyannote_runtime.ps1":
+                self.assertIn('must contain exactly one ffmpeg.exe', contents)
+
+    def test_candidate_publish_binds_readiness_proof_to_tag_commit(self):
+        publish = (ROOT / "scripts" / "publish_candidate_release.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('git rev-parse "$TAG^{commit}"', publish)
+        self.assertIn('"$TAG_COMMIT_SHA"', publish)
+        self.assertIn('proof["commit_sha"].strip().lower() != tag_commit_sha', publish)
+
+    def test_windows_pyannote_receipt_scans_embedded_python_dll_directory(self):
+        contents = PROVISIONING.read_text(encoding="utf-8")
+        self.assertIn(
+            'roots.append(pathlib.Path(sys.executable).resolve().parent / "DLLs")',
+            contents,
+        )
+        self.assertIn(
+            '_dll_directory_handle = os.add_dll_directory(str(_dll_directory))',
+            contents,
+        )
 
     def test_intel_validation_uses_only_standard_free_runner_and_real_worker(self):
         workflow = INTEL_VALIDATION.read_text(encoding="utf-8")

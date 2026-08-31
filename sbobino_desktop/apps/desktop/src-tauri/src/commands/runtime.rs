@@ -596,15 +596,22 @@ async fn run_deep_runtime_probe(
 
 fn runtime_toolchain_ready(health: &sbobino_infrastructure::RuntimeHealth) -> bool {
     if health.managed_runtime_required {
-        // All release binaries (ffmpeg, whisper CLI, whisper stream,
-        // parakeet CLI) must be present regardless of which engine is
-        // selected, so the user can switch engines at runtime without
-        // re-running setup. v2.0.4 commit 4d0a61c made this a single
-        // check; the ff5c896 merge reverted to per-engine checks.
-        return health.managed_runtime.ffmpeg.available
-            && health.managed_runtime.whisper_cli.available
-            && health.managed_runtime.whisper_stream.available
-            && health.managed_runtime.parakeet_cli.available;
+        // Keep the start gate scoped to the selected engine. A partial
+        // Parakeet update must not make an otherwise healthy Whisper install
+        // unusable (and vice versa); the Local Models screen can repair the
+        // inactive engine in the background.
+        return match health.configured_engine {
+            TranscriptionEngine::WhisperCpp => {
+                health.managed_runtime.ffmpeg.available
+                    && health.managed_runtime.whisper_cli.available
+                    && health.managed_runtime.whisper_stream.available
+            }
+            TranscriptionEngine::ParakeetCpp => {
+                health.managed_runtime.ffmpeg.available
+                    && health.managed_runtime.parakeet_cli.available
+                    && health.managed_runtime.parakeet_worker.available
+            }
+        };
     }
 
     match health.configured_engine {
@@ -653,6 +660,13 @@ fn first_managed_runtime_failure(
                     "Parakeet CLI",
                     managed_runtime.parakeet_cli.resolved_path.as_str(),
                     managed_runtime.parakeet_cli.failure_message.as_str(),
+                ));
+            }
+            if !managed_runtime.parakeet_worker.available {
+                return Some((
+                    "Parakeet batch worker",
+                    managed_runtime.parakeet_worker.resolved_path.as_str(),
+                    managed_runtime.parakeet_worker.failure_message.as_str(),
                 ));
             }
         }
@@ -753,6 +767,13 @@ fn runtime_toolchain_message(
                 missing.push(format!(
                     "Parakeet CLI is not runnable at '{}'.",
                     health.parakeet_cli_resolved
+                ));
+            }
+            if health.managed_runtime_required && !health.managed_runtime.parakeet_worker.available
+            {
+                missing.push(format!(
+                    "Parakeet batch worker is not runnable at '{}'.",
+                    health.managed_runtime.parakeet_worker.resolved_path
                 ));
             }
         }
@@ -1467,6 +1488,11 @@ mod tests {
                 whisper_cli: available_binary("whisper-cli"),
                 whisper_stream: available_binary("whisper-stream"),
                 parakeet_cli,
+                parakeet_worker: if parakeet_available {
+                    available_binary("parakeet-batch-json")
+                } else {
+                    missing_binary("parakeet-batch-json")
+                },
             },
             ffmpeg_path: "ffmpeg".to_string(),
             ffmpeg_resolved: "/tmp/ffmpeg".to_string(),
@@ -1511,10 +1537,14 @@ mod tests {
     }
 
     #[test]
-    fn managed_runtime_requires_parakeet_even_when_whisper_is_selected() {
+    fn managed_runtime_scopes_readiness_to_selected_engine() {
         let health = runtime_health_for_managed_runtime(TranscriptionEngine::WhisperCpp, false);
 
-        assert!(!runtime_toolchain_ready(&health));
+        assert!(runtime_toolchain_ready(&health));
+
+        let parakeet_health =
+            runtime_health_for_managed_runtime(TranscriptionEngine::ParakeetCpp, false);
+        assert!(!runtime_toolchain_ready(&parakeet_health));
     }
 
     #[test]

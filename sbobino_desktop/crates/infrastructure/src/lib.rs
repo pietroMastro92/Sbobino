@@ -11,7 +11,7 @@ use std::{
     collections::HashSet,
     env,
     fs::File,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -103,6 +103,8 @@ pub const PYANNOTE_RECEIPT_FILENAME: &str = "receipt.json";
 const PYANNOTE_BUNDLED_OVERRIDE_SOURCE: &str = "bundled_override";
 const PYANNOTE_SWAP_BACKUP_PREFIX: &str = ".pyannote-backup-";
 const PYANNOTE_SWAP_STAGE_PREFIX: &str = ".pyannote-stage-";
+const PYANNOTE_SWAP_OWNER_FILENAME: &str = ".sbobino-owner";
+const PYANNOTE_SWAP_PENDING_FILENAME: &str = ".pyannote-pending-validation";
 pub const PYANNOTE_COMPAT_LEVEL: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -193,6 +195,12 @@ pub struct ManagedRuntimeHealth {
     pub whisper_cli: ManagedRuntimeBinaryHealth,
     pub whisper_stream: ManagedRuntimeBinaryHealth,
     pub parakeet_cli: ManagedRuntimeBinaryHealth,
+    /// The batch worker is required for Parakeet long-file transcription.
+    /// Keep it in the managed-runtime health contract so an upgrade cannot
+    /// report a healthy CLI while leaving the worker from an older install
+    /// behind or missing altogether.
+    #[serde(default)]
+    pub parakeet_worker: ManagedRuntimeBinaryHealth,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,7 +245,13 @@ pub struct RuntimeHealth {
 pub enum ReconcileManagedPyannoteReleaseOutcome {
     NoAction,
     ManifestUpdated,
-    NeedsMigration { message: String },
+    /// The release metadata is compatible, but the durable receipt is
+    /// missing or invalid. The caller should run the deep probe against the
+    /// existing runtime instead of downloading the large archives again.
+    ReceiptVerificationRequired,
+    NeedsMigration {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -518,6 +532,13 @@ impl RuntimeTranscriptionFactory {
                 return Err(format!(
                     "Parakeet.cpp CLI is not runnable at '{}'. Configure Parakeet CLI path in Settings > Local Models.",
                     parakeet_cli_path
+                ));
+            }
+            if self.managed_runtime_required() && !runtime_check.parakeet_worker.available {
+                return Err(format_managed_runtime_binary_error(
+                    "Parakeet batch worker",
+                    &runtime_check.parakeet_worker,
+                    "Install or repair the Parakeet runtime from Settings > Local Models.",
                 ));
             }
             let parakeet_model_path = PathBuf::from(&parakeet_models_dir)
@@ -1304,17 +1325,23 @@ impl RuntimeTranscriptionFactory {
             &self.managed_runtime_binary_path("parakeet-cli"),
             &lib_dir,
         );
+        let parakeet_worker = verify_managed_runtime_binary(
+            &self.managed_runtime_binary_path("parakeet-batch-json"),
+            &lib_dir,
+        );
 
         ManagedRuntimeHealth {
             source: "managed_release_asset".to_string(),
             ready: ffmpeg.available
                 && whisper_cli.available
                 && whisper_stream.available
-                && parakeet_cli.available,
+                && parakeet_cli.available
+                && parakeet_worker.available,
             ffmpeg,
             whisper_cli,
             whisper_stream,
             parakeet_cli,
+            parakeet_worker,
         }
     }
 
@@ -1433,7 +1460,9 @@ impl RuntimeTranscriptionFactory {
                         && managed_runtime.whisper_stream.available
                 }
                 TranscriptionEngine::ParakeetCpp => {
-                    managed_runtime.ffmpeg.available && managed_runtime.parakeet_cli.available
+                    managed_runtime.ffmpeg.available
+                        && managed_runtime.parakeet_cli.available
+                        && managed_runtime.parakeet_worker.available
                 }
             }
         } else {
@@ -1441,7 +1470,12 @@ impl RuntimeTranscriptionFactory {
                 TranscriptionEngine::WhisperCpp => {
                     ffmpeg_available && whisper_cli_available && whisper_stream_available
                 }
-                TranscriptionEngine::ParakeetCpp => ffmpeg_available && parakeet_cli_available,
+                TranscriptionEngine::ParakeetCpp => {
+                    ffmpeg_available
+                        && parakeet_cli_available
+                        && (!self.managed_runtime_required()
+                            || managed_runtime.parakeet_worker.available)
+                }
             }
         };
         let runtime_source = if self.managed_runtime_required() {
@@ -1605,6 +1639,19 @@ impl RuntimeTranscriptionFactory {
             })?;
         }
 
+        // Keep a durable pending-validation marker in the newly created tree
+        // before copying the bundled assets. If the process is interrupted
+        // while the copy is in progress, startup recovery can restore the
+        // previous backup instead of treating a partially copied tree as a
+        // completed installation.
+        std::fs::create_dir_all(&runtime_dir)
+            .map_err(|e| format!("failed to create pending pyannote runtime: {e}"))?;
+        std::fs::write(
+            runtime_dir.join(PYANNOTE_SWAP_PENDING_FILENAME),
+            "pending-validation",
+        )
+        .map_err(|e| format!("failed to mark bundled pyannote install as pending: {e}"))?;
+
         self.install_bundled_pyannote_override_if_available()?;
         Ok(true)
     }
@@ -1670,8 +1717,7 @@ impl RuntimeTranscriptionFactory {
             .map_err(|e| format!("failed to create pyannote runtime directory: {e}"))?;
         let body = serde_json::to_string_pretty(manifest)
             .map_err(|e| format!("failed to serialize pyannote manifest: {e}"))?;
-        std::fs::write(self.managed_pyannote_manifest_path(), body)
-            .map_err(|e| format!("failed to write pyannote manifest: {e}"))
+        self.write_managed_pyannote_json(&self.managed_pyannote_manifest_path(), &body, "manifest")
     }
 
     pub fn read_managed_pyannote_status(&self) -> Option<ManagedPyannoteStatus> {
@@ -1695,15 +1741,7 @@ impl RuntimeTranscriptionFactory {
             .map_err(|e| format!("failed to create pyannote runtime directory: {e}"))?;
         let body = serde_json::to_string_pretty(receipt)
             .map_err(|e| format!("failed to serialize pyannote receipt: {e}"))?;
-        let path = self.managed_pyannote_receipt_path();
-        let temporary = runtime_dir.join(format!(".{PYANNOTE_RECEIPT_FILENAME}.tmp"));
-        std::fs::write(&temporary, body)
-            .map_err(|e| format!("failed to write temporary pyannote receipt: {e}"))?;
-        if let Err(error) = std::fs::rename(&temporary, &path) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(format!("failed to publish pyannote receipt: {error}"));
-        }
-        Ok(())
+        self.write_managed_pyannote_json(&self.managed_pyannote_receipt_path(), &body, "receipt")
     }
 
     /// Validate the cheap, durable portion of the pyannote installation
@@ -1809,8 +1847,35 @@ impl RuntimeTranscriptionFactory {
         };
         let body = serde_json::to_string_pretty(&status)
             .map_err(|e| format!("failed to serialize pyannote status: {e}"))?;
-        std::fs::write(self.managed_pyannote_status_path(), body)
-            .map_err(|e| format!("failed to write pyannote status: {e}"))
+        self.write_managed_pyannote_json(&self.managed_pyannote_status_path(), &body, "status")
+    }
+
+    /// Publish small Pyannote metadata files through a same-directory
+    /// temporary file. `NamedTempFile::persist` atomically replaces an
+    /// existing destination on all supported platforms, so concurrent
+    /// startup/repair tasks cannot expose truncated JSON to the next reader.
+    fn write_managed_pyannote_json(
+        &self,
+        path: &Path,
+        body: &str,
+        label: &str,
+    ) -> Result<(), String> {
+        let runtime_dir = self.managed_pyannote_runtime_dir();
+        let mut temporary = tempfile::Builder::new()
+            .prefix(&format!(".{label}-"))
+            .tempfile_in(&runtime_dir)
+            .map_err(|e| format!("failed to create temporary pyannote {label}: {e}"))?;
+        temporary
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("failed to write temporary pyannote {label}: {e}"))?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|e| format!("failed to flush temporary pyannote {label}: {e}"))?;
+        temporary
+            .persist(path)
+            .map(|_| ())
+            .map_err(|error| format!("failed to publish pyannote {label}: {error}"))
     }
 
     pub fn reconcile_managed_pyannote_release_assets(
@@ -1859,7 +1924,20 @@ impl RuntimeTranscriptionFactory {
             && sha256_matches(manifest.model_sha256.trim(), expected_model_sha256.trim());
 
         if compat_matches && runtime_matches && model_matches {
-            let mut receipt_migration = self.read_managed_pyannote_receipt().and_then(|receipt| {
+            let existing_receipt = self.read_managed_pyannote_receipt();
+            let receipt_requires_probe = existing_receipt.as_ref().is_none_or(|receipt| {
+                let receipt_matches_expected = receipt.runtime_asset.trim()
+                    == expected_runtime_asset.trim()
+                    && sha256_matches(
+                        receipt.runtime_sha256.trim(),
+                        expected_runtime_sha256.trim(),
+                    )
+                    && receipt.model_asset.trim() == expected_model_asset.trim()
+                    && sha256_matches(receipt.model_sha256.trim(), expected_model_sha256.trim());
+                !receipt_matches_expected
+                    || self.validate_managed_pyannote_receipt(receipt).is_err()
+            });
+            let mut receipt_migration = existing_receipt.and_then(|receipt| {
                 let receipt_matches_expected = receipt.runtime_asset.trim()
                     == expected_runtime_asset.trim()
                     && sha256_matches(
@@ -1901,7 +1979,9 @@ impl RuntimeTranscriptionFactory {
                     self.write_managed_pyannote_receipt(&receipt)?;
                 }
             }
-            return Ok(if changed {
+            return Ok(if receipt_requires_probe {
+                ReconcileManagedPyannoteReleaseOutcome::ReceiptVerificationRequired
+            } else if changed {
                 ReconcileManagedPyannoteReleaseOutcome::ManifestUpdated
             } else {
                 ReconcileManagedPyannoteReleaseOutcome::NoAction
@@ -2782,9 +2862,9 @@ fn binary_probe_accepts_nonzero_exit(candidate: &Path, output: &std::process::Ou
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
-    if !file_name
-        .trim_end_matches(".exe")
-        .eq_ignore_ascii_case("parakeet-cli")
+    let normalized_name = file_name.trim_end_matches(".exe");
+    if !normalized_name.eq_ignore_ascii_case("parakeet-cli")
+        && !normalized_name.eq_ignore_ascii_case("parakeet-batch-json")
     {
         return false;
     }
@@ -2792,6 +2872,7 @@ fn binary_probe_accepts_nonzero_exit(candidate: &Path, output: &std::process::Ou
     let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     combined.contains("parakeet-cli transcribe")
+        || combined.contains("parakeet-batch-json")
         || combined.contains("Usage:")
         || combined.contains("Available commands")
 }
@@ -2904,37 +2985,109 @@ fn managed_runnable_binary_probe(candidate: &Path) -> RunnableBinaryProbe {
 impl RuntimeTranscriptionFactory {
     fn recover_interrupted_pyannote_swap_if_needed(&self) -> Result<(), String> {
         let current_runtime_dir = self.managed_pyannote_runtime_dir();
-        if pyannote_runtime_layout_is_usable(&current_runtime_dir) {
-            return Ok(());
-        }
-
         let Some(parent) = current_runtime_dir.parent() else {
             return Ok(());
         };
 
-        for prefix in [PYANNOTE_SWAP_BACKUP_PREFIX, PYANNOTE_SWAP_STAGE_PREFIX] {
-            let Some(candidate) = newest_swap_candidate_dir(parent, prefix) else {
-                continue;
-            };
-            if !pyannote_runtime_layout_is_usable(&candidate) {
-                continue;
-            }
+        let current_process_id = std::process::id().to_string();
+        let pending_validation = current_runtime_dir.join(PYANNOTE_SWAP_PENDING_FILENAME);
 
-            remove_file_or_directory_if_exists(&current_runtime_dir)?;
-            std::fs::rename(&candidate, &current_runtime_dir).map_err(|e| {
-                format!(
-                    "failed to recover pyannote runtime from '{}' to '{}': {e}",
+        // A published runtime is not committed until its deep smoke, receipt,
+        // and `ok` status are all durable. Keep the old backup around across
+        // that window. If the process died before the commit, restore the
+        // last known-good runtime even when the interrupted tree happens to
+        // have a superficially usable layout.
+        if pending_validation.is_file() {
+            let committed = self
+                .read_managed_pyannote_status()
+                .is_some_and(|status| status.reason_code.trim() == "ok")
+                && self.read_managed_pyannote_receipt().is_some_and(|receipt| {
+                    self.validate_managed_pyannote_receipt(&receipt).is_ok()
+                });
+
+            if committed {
+                remove_file_or_directory_if_exists(&pending_validation)?;
+                info!(
+                    "finalized interrupted pyannote validation after durable receipt: '{}'",
+                    current_runtime_dir.display()
+                );
+            } else if let Some(candidate) =
+                newest_swap_candidate_dir(parent, PYANNOTE_SWAP_BACKUP_PREFIX, |path| {
+                    !pyannote_swap_is_owned_by_current_process(path, &current_process_id)
+                })
+            {
+                if pyannote_runtime_layout_is_usable(&candidate) {
+                    remove_file_or_directory_if_exists(&current_runtime_dir)?;
+                    std::fs::rename(&candidate, &current_runtime_dir).map_err(|e| {
+                        format!(
+                            "failed to restore pyannote runtime backup '{}' into '{}': {e}",
+                            candidate.display(),
+                            current_runtime_dir.display()
+                        )
+                    })?;
+                    let _ = std::fs::remove_file(
+                        current_runtime_dir.join(PYANNOTE_SWAP_OWNER_FILENAME),
+                    );
+                    let _ = std::fs::remove_file(
+                        current_runtime_dir.join(PYANNOTE_SWAP_PENDING_FILENAME),
+                    );
+                    info!(
+                        "rolled back interrupted pyannote validation: '{}' -> '{}'",
+                        candidate.display(),
+                        current_runtime_dir.display()
+                    );
+                } else {
+                    // There is no trustworthy previous runtime. Leave the
+                    // current tree for the normal explicit verification/
+                    // repair path, but clear the marker so startup does not
+                    // repeatedly treat it as an active transaction.
+                    remove_file_or_directory_if_exists(&pending_validation)?;
+                }
+            } else {
+                // First install, or a backup that was already unusable: keep
+                // the data for the explicit deep probe and clear only the
+                // transaction marker.
+                remove_file_or_directory_if_exists(&pending_validation)?;
+            }
+        }
+
+        if !pyannote_runtime_layout_is_usable(&current_runtime_dir) {
+            for prefix in [PYANNOTE_SWAP_BACKUP_PREFIX, PYANNOTE_SWAP_STAGE_PREFIX] {
+                let Some(candidate) = newest_swap_candidate_dir(parent, prefix, |path| {
+                    !pyannote_swap_is_owned_by_current_process(path, &current_process_id)
+                }) else {
+                    continue;
+                };
+                if !pyannote_runtime_layout_is_usable(&candidate) {
+                    continue;
+                }
+
+                remove_file_or_directory_if_exists(&current_runtime_dir)?;
+                std::fs::rename(&candidate, &current_runtime_dir).map_err(|e| {
+                    format!(
+                        "failed to recover pyannote runtime from '{}' to '{}': {e}",
+                        candidate.display(),
+                        current_runtime_dir.display()
+                    )
+                })?;
+                let _ =
+                    std::fs::remove_file(current_runtime_dir.join(PYANNOTE_SWAP_OWNER_FILENAME));
+                info!(
+                    "recovered pyannote runtime from interrupted swap: '{}' -> '{}'",
                     candidate.display(),
                     current_runtime_dir.display()
-                )
-            })?;
-            info!(
-                "recovered pyannote runtime from interrupted swap: '{}' -> '{}'",
-                candidate.display(),
-                current_runtime_dir.display()
-            );
-            return Ok(());
+                );
+                break;
+            }
         }
+
+        // Staging/backup directories are created next to the published
+        // runtime. A killed installer used to leave these directories behind
+        // forever (often consuming more than a gigabyte), causing every
+        // subsequent Repair attempt to fail for lack of disk space. Keep a
+        // stage owned by this process, but remove candidates from previous
+        // processes after the recovery attempt above.
+        cleanup_orphaned_pyannote_swap_candidates(parent, &current_process_id)?;
 
         Ok(())
     }
@@ -3425,7 +3578,10 @@ fn pyannote_runtime_layout_is_usable(runtime_dir: &Path) -> bool {
     python_ready && model_ready
 }
 
-fn newest_swap_candidate_dir(parent: &Path, prefix: &str) -> Option<PathBuf> {
+fn newest_swap_candidate_dir<F>(parent: &Path, prefix: &str, predicate: F) -> Option<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
     let mut candidates = std::fs::read_dir(parent)
         .ok()?
         .filter_map(|entry| entry.ok())
@@ -3433,7 +3589,7 @@ fn newest_swap_candidate_dir(parent: &Path, prefix: &str) -> Option<PathBuf> {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if path.is_dir() && name.starts_with(prefix) {
+            if path.is_dir() && name.starts_with(prefix) && predicate(&path) {
                 Some(path)
             } else {
                 None
@@ -3443,6 +3599,47 @@ fn newest_swap_candidate_dir(parent: &Path, prefix: &str) -> Option<PathBuf> {
 
     candidates.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
     candidates.into_iter().next()
+}
+
+fn pyannote_swap_is_owned_by_current_process(path: &Path, current_process_id: &str) -> bool {
+    std::fs::read_to_string(path.join(PYANNOTE_SWAP_OWNER_FILENAME))
+        .map(|owner| owner.trim() == current_process_id)
+        .unwrap_or(false)
+}
+
+fn cleanup_orphaned_pyannote_swap_candidates(
+    parent: &Path,
+    current_process_id: &str,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect Pyannote staging directory: {error}"
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("failed to inspect Pyannote staging entry: {e}"))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !path.is_dir()
+            || (!name.starts_with(PYANNOTE_SWAP_BACKUP_PREFIX)
+                && !name.starts_with(PYANNOTE_SWAP_STAGE_PREFIX))
+            || pyannote_swap_is_owned_by_current_process(&path, current_process_id)
+        {
+            continue;
+        }
+
+        remove_file_or_directory_if_exists(&path)?;
+        info!(
+            "removed orphaned Pyannote staging directory '{}'.",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn remove_file_or_directory_if_exists(path: &Path) -> Result<(), String> {
@@ -3807,7 +4004,7 @@ fn validate_embedded_torchcodec_ffmpeg(runtime_root: &Path) -> Result<(), String
         .collect::<HashSet<_>>();
 
     let torchcodec_binaries = pyannote_torchcodec_binary_paths(runtime_root);
-    let mut required_ffmpeg_libraries = HashSet::new();
+    let mut dependency_variants = Vec::<(PathBuf, HashSet<String>)>::new();
     for binary in torchcodec_binaries {
         let deps_output = std::process::Command::new("/usr/bin/otool")
             .arg("-L")
@@ -3828,12 +4025,18 @@ fn validate_embedded_torchcodec_ffmpeg(runtime_root: &Path) -> Result<(), String
         }
         let deps =
             parse_otool_linked_library_entries(&String::from_utf8_lossy(&deps_output.stdout));
-        required_ffmpeg_libraries.extend(deps.iter().filter_map(|dependency| {
-            dependency
-                .strip_prefix("@rpath/")
-                .filter(|name| name.starts_with("libav") && name.ends_with(".dylib"))
-                .map(ToString::to_string)
-        }));
+        let required = deps
+            .iter()
+            .filter_map(|dependency| {
+                dependency
+                    .strip_prefix("@rpath/")
+                    .filter(|name| name.starts_with("libav") && name.ends_with(".dylib"))
+                    .map(ToString::to_string)
+            })
+            .collect::<HashSet<_>>();
+        if !required.is_empty() {
+            dependency_variants.push((binary.clone(), required));
+        }
         let deps_body = String::from_utf8_lossy(&deps_output.stdout);
         if let Some(dep) = deps_body
             .lines()
@@ -3878,23 +4081,47 @@ fn validate_embedded_torchcodec_ffmpeg(runtime_root: &Path) -> Result<(), String
         }
     }
 
-    if required_ffmpeg_libraries.is_empty() {
+    validate_torchcodec_ffmpeg_dependency_variants(&dependency_variants, &bundled_libraries)
+}
+
+/// TorchCodec ships several optional native cores.  Newer releases can
+/// include binaries linked against multiple FFmpeg ABI generations even
+/// though only one generation is selected by the current Python build.  A
+/// runtime is portable when at least one FFmpeg-dependent core has its full
+/// dependency set bundled; requiring every optional core made valid ARM
+/// installs fail with false `libav*.dylib` missing errors.
+fn validate_torchcodec_ffmpeg_dependency_variants(
+    variants: &[(PathBuf, HashSet<String>)],
+    bundled_libraries: &HashSet<String>,
+) -> Result<(), String> {
+    if variants.is_empty() {
         return Err(
             "Pyannote runtime has TorchCodec binaries but none link to a bundled FFmpeg library. Repair or reinstall it from Settings > Local Models."
                 .to_string(),
         );
     }
-    if let Some(missing) = required_ffmpeg_libraries
+
+    if variants
         .iter()
-        .find(|name| !bundled_libraries.contains(*name))
+        .any(|(_, required)| required.iter().all(|name| bundled_libraries.contains(name)))
     {
-        return Err(format!(
-            "Pyannote runtime is missing bundled TorchCodec FFmpeg library '{}'. Repair or reinstall it from Settings > Local Models.",
-            missing
-        ));
+        return Ok(());
     }
 
-    Ok(())
+    let (binary, required) = variants
+        .first()
+        .expect("non-empty TorchCodec dependency variants");
+    let missing = required
+        .iter()
+        .filter(|name| !bundled_libraries.contains(*name))
+        .min()
+        .map(String::as_str)
+        .unwrap_or("unknown");
+    Err(format!(
+        "Pyannote runtime is missing bundled TorchCodec FFmpeg library '{}' required by '{}'. Repair or reinstall it from Settings > Local Models.",
+        missing,
+        binary.display()
+    ))
 }
 
 fn parse_external_python_framework_reference(otool_output: &str) -> Option<String> {
@@ -4281,14 +4508,17 @@ mod tests {
         parse_otool_linked_library_entries, parse_otool_rpath_entries,
         parse_pyannote_python_framework_version, pyannote_native_binary_paths,
         pyannote_runtime_arch_matches_host, pyannote_runtime_validation_script,
-        target_triple_suffix, ManagedPyannoteManifest, ManagedPyannoteReceipt,
-        ReconcileManagedPyannoteReleaseOutcome, RuntimeSourcePolicy, RuntimeTranscriptionFactory,
-        PYANNOTE_COMPAT_LEVEL, PYANNOTE_RECEIPT_FILENAME, PYANNOTE_STATUS_FILENAME,
+        target_triple_suffix, validate_torchcodec_ffmpeg_dependency_variants,
+        ManagedPyannoteManifest, ManagedPyannoteReceipt, ReconcileManagedPyannoteReleaseOutcome,
+        RuntimeSourcePolicy, RuntimeTranscriptionFactory, PYANNOTE_COMPAT_LEVEL,
+        PYANNOTE_RECEIPT_FILENAME, PYANNOTE_STATUS_FILENAME, PYANNOTE_SWAP_OWNER_FILENAME,
+        PYANNOTE_SWAP_PENDING_FILENAME,
     };
     use sbobino_domain::{
         AiProvider, AppSettings, RemoteServiceConfig, RemoteServiceKind, SpeechModel,
         TranscriptionEngine,
     };
+    use std::{collections::HashSet, path::PathBuf};
     use tempfile::tempdir;
 
     #[test]
@@ -4359,6 +4589,92 @@ mod tests {
         )
         .expect("factory should build");
         (temp, factory, resources_dir)
+    }
+
+    #[test]
+    fn load_settings_removes_orphaned_pyannote_stage_from_previous_process() {
+        let (_temp, factory) = build_factory();
+        let runtime_dir = factory.managed_pyannote_runtime_dir();
+        let runtime_parent = runtime_dir
+            .parent()
+            .expect("pyannote runtime should have a parent");
+        let orphan = runtime_parent.join(".pyannote-stage-previous");
+        std::fs::create_dir_all(&orphan).expect("orphan stage should create");
+        std::fs::write(orphan.join("partial.bin"), b"partial").expect("partial should write");
+        std::fs::write(
+            orphan.join(PYANNOTE_SWAP_OWNER_FILENAME),
+            std::process::id().saturating_add(1).to_string(),
+        )
+        .expect("orphan owner marker should write");
+
+        factory
+            .load_settings()
+            .expect("settings load should clean orphaned stage");
+
+        assert!(!orphan.exists(), "stale stage should not survive startup");
+    }
+
+    #[test]
+    fn load_settings_preserves_pyannote_stage_owned_by_current_process() {
+        let (_temp, factory) = build_factory();
+        let runtime_dir = factory.managed_pyannote_runtime_dir();
+        let runtime_parent = runtime_dir
+            .parent()
+            .expect("pyannote runtime should have a parent");
+        let active_stage = runtime_parent.join(".pyannote-stage-active");
+        std::fs::create_dir_all(&active_stage).expect("active stage should create");
+        std::fs::write(
+            active_stage.join(PYANNOTE_SWAP_OWNER_FILENAME),
+            std::process::id().to_string(),
+        )
+        .expect("active owner marker should write");
+
+        factory
+            .load_settings()
+            .expect("settings load should preserve active stage");
+
+        assert!(active_stage.exists(), "active stage must not be deleted");
+    }
+
+    #[test]
+    fn load_settings_recovers_complete_pyannote_backup_and_cleans_marker() {
+        let (_temp, factory) = build_factory();
+        let runtime_dir = factory.managed_pyannote_runtime_dir();
+        let runtime_parent = runtime_dir
+            .parent()
+            .expect("pyannote runtime should have a parent");
+        let backup = runtime_parent.join(".pyannote-backup-previous");
+        let python_root = backup.join("python");
+        write_executable_file(
+            &python_root.join("bin").join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&python_root, "python3.11");
+        let model_dir = backup.join("model");
+        std::fs::create_dir_all(&model_dir).expect("backup model should create");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n")
+            .expect("backup model should write");
+        std::fs::write(
+            backup.join(PYANNOTE_SWAP_OWNER_FILENAME),
+            "previous-process",
+        )
+        .expect("backup owner marker should write");
+
+        factory
+            .load_settings()
+            .expect("settings load should recover complete backup");
+
+        assert!(factory
+            .managed_pyannote_runtime_dir()
+            .join("python")
+            .join("bin")
+            .join("python3")
+            .is_file());
+        assert!(!backup.exists(), "recovered backup should be moved away");
+        assert!(!factory
+            .managed_pyannote_runtime_dir()
+            .join(PYANNOTE_SWAP_OWNER_FILENAME)
+            .exists());
     }
 
     fn persist_enabled_diarization(factory: &RuntimeTranscriptionFactory) {
@@ -4582,6 +4898,13 @@ mod tests {
         );
         if let Some(script) = parakeet_cli_script {
             write_executable_file(&factory.managed_runtime_binary_path("parakeet-cli"), script);
+            // The batch worker is a separate executable in every release
+            // archive.  Keep the fixture representative so aggregate health
+            // tests do not accidentally pass without it.
+            write_executable_file(
+                &factory.managed_runtime_binary_path("parakeet-batch-json"),
+                "#!/bin/sh\nexit 0\n",
+            );
         }
     }
 
@@ -5180,6 +5503,69 @@ mod tests {
     }
 
     #[test]
+    fn load_settings_rolls_back_usable_pending_pyannote_publish_before_receipt() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        let runtime_dir = factory.managed_pyannote_runtime_dir();
+        write_executable_file(
+            &runtime_dir.join("python").join("bin").join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&runtime_dir.join("python"), "python3.11");
+        std::fs::create_dir_all(runtime_dir.join("model")).expect("new model dir should exist");
+        std::fs::write(
+            runtime_dir.join("model").join("config.yaml"),
+            "name: interrupted-new\n",
+        )
+        .expect("new model marker should write");
+        std::fs::write(
+            runtime_dir.join(PYANNOTE_SWAP_PENDING_FILENAME),
+            "pending-validation",
+        )
+        .expect("pending marker should write");
+
+        let backup_dir = runtime_dir
+            .parent()
+            .expect("runtime dir should have parent")
+            .join(".pyannote-backup-pending");
+        write_executable_file(
+            &backup_dir.join("python").join("bin").join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&backup_dir.join("python"), "python3.11");
+        std::fs::create_dir_all(backup_dir.join("model")).expect("old model dir should exist");
+        std::fs::write(
+            backup_dir.join("model").join("config.yaml"),
+            "name: previous-known-good\n",
+        )
+        .expect("old model marker should write");
+        std::fs::write(
+            backup_dir.join(PYANNOTE_SWAP_OWNER_FILENAME),
+            "previous-process",
+        )
+        .expect("backup owner marker should write");
+
+        factory
+            .load_settings()
+            .expect("settings should recover a pending publish");
+
+        assert_eq!(
+            std::fs::read_to_string(factory.managed_pyannote_model_dir().join("config.yaml"))
+                .expect("restored model marker should be readable"),
+            "name: previous-known-good\n"
+        );
+        assert!(!backup_dir.exists(), "pending backup should be consumed");
+        assert!(
+            !factory
+                .managed_pyannote_runtime_dir()
+                .join(PYANNOTE_SWAP_PENDING_FILENAME)
+                .exists(),
+            "rollback must clear the pending marker"
+        );
+    }
+
+    #[test]
     fn public_runtime_ignores_bundled_pyannote_override_assets() {
         let (_temp, factory, resources_dir) = build_factory_with_bundle_resources();
         persist_enabled_diarization(&factory);
@@ -5554,6 +5940,57 @@ mod tests {
                 .app_version,
             "2.0.27"
         );
+    }
+
+    #[test]
+    fn reconcile_managed_pyannote_release_assets_requests_probe_when_receipt_is_missing() {
+        let (_temp, factory) = build_factory();
+        persist_enabled_diarization(&factory);
+
+        write_executable_file(
+            &factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        write_fake_pyannote_stdlib(&factory.managed_pyannote_python_dir(), "python3.11");
+        let model_dir = factory.managed_pyannote_model_dir();
+        std::fs::create_dir_all(&model_dir).expect("model dir should exist");
+        std::fs::write(model_dir.join("config.yaml"), "name: test\n").expect("config should write");
+        factory
+            .write_managed_pyannote_manifest(&ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: "2.0.27".to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL,
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "abc123".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "def456".to_string(),
+                runtime_arch: target_triple_suffix().to_string(),
+                installed_at: "2026-03-13T00:00:00Z".to_string(),
+            })
+            .expect("manifest should write");
+        factory
+            .write_managed_pyannote_status("ok", "ready")
+            .expect("status should write");
+
+        let reconciled = factory
+            .reconcile_managed_pyannote_release_assets(
+                env!("CARGO_PKG_VERSION"),
+                PYANNOTE_COMPAT_LEVEL,
+                "pyannote-runtime-macos-aarch64.zip",
+                "abc123",
+                "pyannote-model-community-1.zip",
+                "def456",
+            )
+            .expect("reconcile should succeed");
+
+        assert!(matches!(
+            reconciled,
+            ReconcileManagedPyannoteReleaseOutcome::ReceiptVerificationRequired
+        ));
+        assert!(factory.read_managed_pyannote_receipt().is_none());
     }
 
     #[test]
@@ -6029,6 +6466,50 @@ Load command 14
     }
 
     #[test]
+    fn torchcodec_ffmpeg_validation_accepts_one_complete_optional_core() {
+        let variants = vec![
+            (
+                PathBuf::from("libtorchcodec_core4.dylib"),
+                HashSet::from([
+                    "libavcodec.60.dylib".to_string(),
+                    "libavformat.60.dylib".to_string(),
+                ]),
+            ),
+            (
+                PathBuf::from("libtorchcodec_core9.dylib"),
+                HashSet::from([
+                    "libavcodec.62.dylib".to_string(),
+                    "libavformat.62.dylib".to_string(),
+                ]),
+            ),
+        ];
+        let bundled = HashSet::from([
+            "libavcodec.62.dylib".to_string(),
+            "libavformat.62.dylib".to_string(),
+        ]);
+
+        validate_torchcodec_ffmpeg_dependency_variants(&variants, &bundled)
+            .expect("a complete optional core should make the runtime portable");
+    }
+
+    #[test]
+    fn torchcodec_ffmpeg_validation_reports_missing_dependency_when_no_core_is_complete() {
+        let variants = vec![(
+            PathBuf::from("libtorchcodec_core4.dylib"),
+            HashSet::from([
+                "libavcodec.60.dylib".to_string(),
+                "libavformat.60.dylib".to_string(),
+            ]),
+        )];
+        let bundled = HashSet::from(["libavcodec.60.dylib".to_string()]);
+
+        let error = validate_torchcodec_ffmpeg_dependency_variants(&variants, &bundled)
+            .expect_err("an incomplete core should fail validation");
+        assert!(error.contains("libavformat.60.dylib"));
+        assert!(error.contains("libtorchcodec_core4.dylib"));
+    }
+
+    #[test]
     fn pyannote_runtime_arch_matches_host_accepts_current_and_legacy_labels() {
         assert!(pyannote_runtime_arch_matches_host(target_triple_suffix()));
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -6097,6 +6578,24 @@ Load command 14
         let health = factory.managed_runtime_health();
         assert!(health.whisper_stream.available);
         assert!(health.ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_runtime_is_not_ready_when_parakeet_batch_worker_is_missing() {
+        let (_temp, factory) = build_factory();
+        prepare_managed_runtime(
+            &factory,
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+            "#!/bin/sh\nexit 0\n",
+        );
+        std::fs::remove_file(factory.managed_runtime_binary_path("parakeet-batch-json"))
+            .expect("worker fixture should exist");
+
+        let health = factory.managed_runtime_health();
+        assert!(!health.parakeet_worker.available);
+        assert!(!health.ready);
     }
 
     #[test]

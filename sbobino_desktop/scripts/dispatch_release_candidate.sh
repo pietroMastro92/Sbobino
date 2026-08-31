@@ -26,6 +26,7 @@ fi
 
 gh workflow run "Release Candidate" \
   --repo "$REPO_SLUG" \
+  --ref "$TAG_NAME" \
   -f "tag_name=$TAG_NAME"
 
 cat <<EOF

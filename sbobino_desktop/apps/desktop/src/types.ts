@@ -664,6 +664,8 @@ export type ManagedRuntimeHealth = {
   whisper_cli: ManagedRuntimeBinaryHealth;
   whisper_stream: ManagedRuntimeBinaryHealth;
   parakeet_cli: ManagedRuntimeBinaryHealth;
+  /** Added in v2.0.29; absent in older setup reports. */
+  parakeet_worker?: ManagedRuntimeBinaryHealth;
 };
 
 export type TranscriptionStartPreflight = {
@@ -734,6 +736,7 @@ export type PyannoteBackgroundActionResponse = {
     | "none"
     | "install_missing"
     | "repair_existing"
+    | "verify_existing"
     | "migrate_manifest"
     | "migrate_assets";
   should_start: boolean;

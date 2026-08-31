@@ -59,6 +59,9 @@ const PYANNOTE_REPAIR_REASON_CODES = new Set([
   "pyannote_validation_required",
   "pyannote_install_incomplete",
   "pyannote_checksum_invalid",
+  "pyannote_receipt_required",
+  "pyannote_receipt_invalid",
+  "pyannote_import_load_failed",
 ]);
 
 export function isProvisionedModelReady(
@@ -275,6 +278,15 @@ function engineBinaryRequirements(
       available: managedRuntime.parakeet_cli.available,
       failure_message: managedRuntime.parakeet_cli.failure_message,
     });
+    // Setup reports written before the worker health field was introduced
+    // remain readable, but they cannot claim Parakeet readiness until the
+    // worker has been observed. New backend responses always include it.
+    binaries.push({
+      available: managedRuntime.parakeet_worker?.available ?? false,
+      failure_message:
+        managedRuntime.parakeet_worker?.failure_message ||
+        "Parakeet batch worker health is unavailable; repair the local runtime.",
+    });
   } else {
     binaries.push(
       {
@@ -346,6 +358,7 @@ function getManagedRuntime(
         failure_reason: "",
         failure_message: "",
       },
+      parakeet_worker: undefined,
     }
   );
 }

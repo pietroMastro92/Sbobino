@@ -725,6 +725,9 @@ const PYANNOTE_AUTO_ACTION_FAILURE_REASON_CODES = new Set([
   "pyannote_validation_required",
   "pyannote_version_mismatch",
   "pyannote_arch_mismatch",
+  "pyannote_receipt_required",
+  "pyannote_receipt_invalid",
+  "pyannote_import_load_failed",
 ]);
 type TranscriptionStartBadgeState = "warning" | "ready" | "error";
 
@@ -748,6 +751,7 @@ function getPyannoteBackgroundActionStatusMessage(
       );
     case "repair_existing":
     case "migrate_assets":
+    case "verify_existing":
       return t(
         "provisioning.repairingPyannote",
         "Repairing pyannote diarization runtime...",
@@ -2179,6 +2183,14 @@ function formatTranscriptionPreflightMessage(
         "Transcription cannot start on this machine.",
       )
     );
+  }
+
+  // Preserve actionable backend diagnostics for new compatibility checks
+  // (for example a missing Parakeet batch worker or a failed deep smoke).
+  // Older versions collapsed every unknown reason into an opaque generic
+  // message, which made update failures impossible to repair from the UI.
+  if (preflight.message.trim()) {
+    return preflight.message.trim();
   }
 
   return t(
@@ -4317,15 +4329,27 @@ export function App({
           initialRuntimeHealthResult.value
             ? initialRuntimeHealthResult.value.app_version
             : currentBuildVersion;
-        if (
+        const setupReportVersion = initialBootstrap?.setupReport?.build_version;
+        const isPostUpdate = Boolean(
           resolvedBuildVersion &&
-          previousSeenVersion &&
-          previousSeenVersion !== resolvedBuildVersion
-        ) {
-          void maybeStartPyannoteBackgroundAction(
-            "post_update",
-            resolvedBuildVersion,
-          );
+            ((previousSeenVersion && previousSeenVersion !== resolvedBuildVersion) ||
+              (setupReportVersion && setupReportVersion !== resolvedBuildVersion)),
+        );
+        if (isPostUpdate && resolvedBuildVersion) {
+          const healthForRepair =
+            initialRuntimeHealthResult.status === "fulfilled"
+              ? initialRuntimeHealthResult.value
+              : null;
+          void (async () => {
+            // Repair the speech runtime first.  Pyannote provisioning uses the
+            // same transaction slot and must not race an update that is still
+            // replacing the managed binaries.
+            await maybeStartRuntimeBackgroundAction(healthForRepair);
+            await maybeStartPyannoteBackgroundAction(
+              "post_update",
+              resolvedBuildVersion,
+            );
+          })();
         }
 
         void (async () => {
@@ -5483,7 +5507,10 @@ export function App({
             : event.state === "cancelled"
               ? t("provisioning.cancelled", "Provisioning cancelled")
               : event.reason_code === "pyannote_install_incomplete" ||
-                  event.reason_code === "pyannote_checksum_invalid"
+                  event.reason_code === "pyannote_checksum_invalid" ||
+                  event.reason_code === "pyannote_receipt_required" ||
+                  event.reason_code === "pyannote_receipt_invalid" ||
+                  event.reason_code === "pyannote_import_load_failed"
                 ? event.message || t("settings.pyannote.desc")
                 : event.reason_code === "pyannote_runtime_missing" ||
                     event.reason_code === "pyannote_model_missing" ||
@@ -7598,6 +7625,54 @@ export function App({
     }
   }
 
+  async function maybeStartRuntimeBackgroundAction(
+    health: RuntimeHealth | null,
+  ): Promise<void> {
+    if (!health?.managed_runtime_required) {
+      return;
+    }
+
+    // `ready` is aggregate health for all managed binaries.  The explicit
+    // worker check keeps upgrades from appearing healthy when only the
+    // Parakeet CLI survived a partial extraction.
+    const worker = health.managed_runtime?.parakeet_worker;
+    const needsRepair =
+      !health.managed_runtime.ready || worker?.available === false;
+    if (!needsRepair) {
+      return;
+    }
+
+    try {
+      setProvisioning((previous) => ({
+        ...previous,
+        running: true,
+        progress: null,
+        statusMessage: t(
+          "provisioning.repairingRuntime",
+          "Repairing local transcription runtime after update...",
+        ),
+      }));
+      await waitForProvisioningRun(() => provisioningInstallRuntime(false));
+    } catch (error) {
+      // Keep the app interactive.  The subsequent preflight can still show
+      // the precise missing binary and the Local Models screen exposes the
+      // explicit Repair action.
+      setProvisioning((previous) => ({
+        ...previous,
+        running: false,
+        progress: null,
+        statusMessage:
+          error instanceof Error
+            ? error.message
+            : t(
+                "error.runtimeInstallFailed",
+                "Local runtime install failed",
+              ),
+      }));
+      console.warn("Automatic runtime repair after update failed:", error);
+    }
+  }
+
   async function waitForProvisioningRun(
     starter: () => Promise<{ started: boolean }>,
     options?: { waitForExistingRun?: boolean },
@@ -7605,40 +7680,48 @@ export function App({
     let unlisten: (() => void) | undefined;
 
     try {
+      // Register the listener before starting the native job.  The old
+      // nested async Promise raced a fast local install: a completion event
+      // could be emitted between `starter()` and the resolution of
+      // `listen()`, leaving the UI waiting forever and making Pyannote look
+      // as if it needed another Repair click.
+      let resolveCompletion!: () => void;
+      let rejectCompletion!: (error: Error) => void;
       const completion = new Promise<void>((resolve, reject) => {
-        void (async () => {
-          unlisten = await subscribeProvisioningStatus((event) => {
-            if (event.state === "completed") {
-              resolve();
-              return;
-            }
-
-            if (event.state === "cancelled") {
-              reject(
-                new Error(
-                  event.message ||
-                    t("provisioning.cancelled", "Provisioning cancelled"),
-                ),
-              );
-              return;
-            }
-
-            if (event.state === "error") {
-              reject(
-                new Error(
-                  event.message ||
-                    t("error.provisioningFailed", "Provisioning failed"),
-                ),
-              );
-            }
-          });
-
-          const result = await starter();
-          if (!result.started && !options?.waitForExistingRun) {
-            resolve();
-          }
-        })().catch(reject);
+        resolveCompletion = resolve;
+        rejectCompletion = reject;
       });
+
+      unlisten = await subscribeProvisioningStatus((event) => {
+        if (event.state === "completed") {
+          resolveCompletion();
+          return;
+        }
+
+        if (event.state === "cancelled") {
+          rejectCompletion(
+            new Error(
+              event.message ||
+                t("provisioning.cancelled", "Provisioning cancelled"),
+            ),
+          );
+          return;
+        }
+
+        if (event.state === "error") {
+          rejectCompletion(
+            new Error(
+              event.message ||
+                t("error.provisioningFailed", "Provisioning failed"),
+            ),
+          );
+        }
+      });
+
+      const result = await starter();
+      if (!result.started && !options?.waitForExistingRun) {
+        resolveCompletion();
+      }
 
       await completion;
     } finally {
@@ -10809,7 +10892,13 @@ export function App({
               "Installing pyannote diarization runtime...",
             ),
       }));
-      await provisioningInstallPyannote(force);
+      // provisioningInstallPyannote starts the native job asynchronously. Do
+      // not enable diarization (or report success to the caller) until the
+      // status event confirms that the runtime was validated and its receipt
+      // was written. Previously this awaited only the start command, so a
+      // failed download/deep smoke was followed immediately by enabling an
+      // unusable Pyannote runtime, forcing users into repeated Repair clicks.
+      await waitForProvisioningRun(() => provisioningInstallPyannote(force));
       await enablePyannoteForTranscriptions();
     } catch (installError) {
       pyannoteProvisioningActiveRef.current = false;
@@ -15718,7 +15807,16 @@ export function App({
                   "settings.transcription.speakerDiarization",
                   "Enable speaker diarization",
                 )}
+                disabled={provisioning.running}
                 onClick={() => {
+                  if (!speakerDiarization.enabled && !pyannoteHealth?.ready) {
+                    // Enabling the switch must be a plug-and-play action. If
+                    // the optional runtime is missing or stale, provision it
+                    // first and enable diarization only after the native
+                    // install/deep-smoke completion event succeeds.
+                    void onInstallPyannote(false);
+                    return;
+                  }
                   void onPatchSpeakerDiarizationSettings((current) => ({
                     ...current,
                     enabled: !current.enabled,
@@ -16262,6 +16360,21 @@ export function App({
       provisioning.running &&
       (provisioning.progress?.asset_kind === "pyannote_runtime" ||
         provisioning.progress?.asset_kind === "pyannote_model");
+    const pyannoteAction =
+      !pyannoteHealth?.runtime_installed || !pyannoteHealth?.model_installed
+        ? {
+            force: false,
+            label: t("settings.pyannote.install", "Install Pyannote"),
+          }
+        : pyannoteHealth.ready
+          ? {
+              force: true,
+              label: t("settings.pyannote.repair", "Repair"),
+            }
+          : {
+              force: false,
+              label: t("settings.pyannote.retry", "Retry Pyannote setup"),
+            };
 
     return (
       <div className="settings-stack">
@@ -16751,10 +16864,10 @@ export function App({
           <div className="notice-actions">
             <button
               className="primary-button"
-              onClick={() => void onInstallPyannote(false)}
-              disabled={provisioning.running || Boolean(pyannoteHealth?.ready)}
+              onClick={() => void onInstallPyannote(pyannoteAction.force)}
+              disabled={provisioning.running}
             >
-              {t("settings.pyannote.install", "Install Pyannote")}
+              {pyannoteAction.label}
             </button>
             {pyannoteHealth?.ready && !speakerDiarization.enabled ? (
               <button
@@ -16768,13 +16881,6 @@ export function App({
                 )}
               </button>
             ) : null}
-            <button
-              className="secondary-button"
-              onClick={() => void onInstallPyannote(true)}
-              disabled={provisioning.running}
-            >
-              {t("settings.pyannote.repair", "Repair")}
-            </button>
             <button
               className="secondary-button"
               onClick={() => void onCancelProvisioning()}

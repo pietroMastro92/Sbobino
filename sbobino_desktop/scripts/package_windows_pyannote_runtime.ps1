@@ -10,11 +10,19 @@ $ProgressPreference = "SilentlyContinue"
 
 $PythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
 $PythonBase = (& $PythonCommand -c "import sys; print(sys.base_prefix)").Trim()
-# TorchCodec requires a shared FFmpeg build on Windows. Hosted packaging passes
-# the speech runtime produced and verified earlier in the same job. Keep the
-# retained previous stable asset as a verified standalone-script fallback.
-$FfmpegUrl = "https://github.com/pietroMastro92/Sbobino/releases/download/v2.0.25/speech-runtime-windows-x86_64.zip"
-$FfmpegSha256 = "a0dadc1a7a58008a4c45b9c612a1c58ecc2a85baa6eefecad083f78c746a8c83"
+# TorchCodec requires a shared FFmpeg build on Windows. The archive is pinned
+# by SHA-256; callers may provide a staged speech runtime or override the URL,
+# but no unverified bytes are accepted.
+$FfmpegUrl = if ($env:SBOBINO_FFMPEG_RUNTIME_URL) {
+    $env:SBOBINO_FFMPEG_RUNTIME_URL
+} else {
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+}
+$FfmpegSha256 = if ($env:SBOBINO_FFMPEG_RUNTIME_SHA256) {
+    $env:SBOBINO_FFMPEG_RUNTIME_SHA256
+} else {
+    "ca56a31e81af11c8e4c77249039d3a61833ec37bfbc5308da91ba1b00b43a00f"
+}
 $TargetTriple = "x86_64-pc-windows-msvc"
 
 function Download-VerifiedArchive {
@@ -86,6 +94,10 @@ try {
     }
     $ffmpegExtract = Join-Path $stage "ffmpeg"
     Expand-Archive -Path $ffmpegArchive -DestinationPath $ffmpegExtract
+    $ffmpegExecutables = @(Get-ChildItem -Path $ffmpegExtract -Recurse -File -Filter "ffmpeg.exe")
+    if ($ffmpegExecutables.Count -ne 1) {
+        throw "Windows speech runtime archive must contain exactly one ffmpeg.exe"
+    }
     $ffmpegDlls = @(Get-ChildItem -Path $ffmpegExtract -Recurse -File -Filter "*.dll")
     if ($ffmpegDlls.Count -eq 0) {
         throw "Windows speech runtime archive contains no FFmpeg DLLs"

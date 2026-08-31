@@ -6,8 +6,13 @@ if [[ $# -ne 2 ]]; then
   exit 1
 fi
 
-VERSION=$1
+VERSION=${1#v}
 ASSET_DIR=$2
+
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Release version must be semantic MAJOR.MINOR.PATCH (got '$VERSION')." >&2
+  exit 1
+fi
 
 RUNTIME_ZIP="$ASSET_DIR/speech-runtime-macos-aarch64.zip"
 RUNTIME_X86_64_ZIP="$ASSET_DIR/speech-runtime-macos-x86_64.zip"
@@ -30,11 +35,60 @@ for path in \
   "$PYANNOTE_RUNTIME_WINDOWS_ZIP" \
   "$PYANNOTE_MODEL_ZIP"
 do
-  if [[ ! -f "$path" ]]; then
+  if [[ ! -s "$path" ]]; then
     echo "Missing required release asset: $path" >&2
     exit 1
   fi
 done
+
+python3 - "$RUNTIME_ZIP" "$RUNTIME_X86_64_ZIP" "$RUNTIME_WINDOWS_ZIP" \
+  "$PYANNOTE_RUNTIME_ZIP" "$PYANNOTE_RUNTIME_X86_64_ZIP" \
+  "$PYANNOTE_RUNTIME_WINDOWS_ZIP" "$PYANNOTE_MODEL_ZIP" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+
+def members(path: pathlib.Path) -> set[str]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = {
+                name.replace("\\", "/").lstrip("./")
+                for name in archive.namelist()
+                if name and not name.endswith("/")
+            }
+    except (OSError, zipfile.BadZipFile) as error:
+        raise SystemExit(f"release asset is not a readable ZIP archive: {path}: {error}") from error
+    if not names:
+        raise SystemExit(f"release asset ZIP is empty: {path}")
+    return names
+
+
+def require(path: pathlib.Path, alternatives: tuple[str, ...], label: str) -> None:
+    names = members(path)
+    if not any(candidate in names for candidate in alternatives):
+        joined = ", ".join(alternatives)
+        raise SystemExit(f"{label} is missing from {path}; expected one of: {joined}")
+
+
+mac_runtime, intel_runtime, windows_runtime, mac_pyannote, intel_pyannote, windows_pyannote, model = map(
+    pathlib.Path, sys.argv[1:]
+)
+for path, label in (
+    (mac_runtime, "Apple Silicon speech runtime"),
+    (intel_runtime, "Intel speech runtime"),
+):
+    for binary in ("ffmpeg", "whisper-cli", "whisper-stream", "parakeet-cli", "parakeet-batch-json"):
+        require(path, (f"runtime/bin/{binary}",), label)
+
+for binary in ("ffmpeg.exe", "whisper-cli.exe", "whisper-stream.exe", "parakeet-cli.exe", "parakeet-batch-json.exe"):
+    require(windows_runtime, (f"runtime/bin/{binary}",), "Windows speech runtime")
+
+for path, label in ((mac_pyannote, "Apple Silicon Pyannote runtime"), (intel_pyannote, "Intel Pyannote runtime")):
+    require(path, ("python/bin/python3",), label)
+require(windows_pyannote, ("python/python.exe",), "Windows Pyannote runtime")
+require(model, ("model/config.yaml",), "Pyannote model asset")
+PY
 
 mkdir -p "$ASSET_DIR"
 

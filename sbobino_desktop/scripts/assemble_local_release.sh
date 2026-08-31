@@ -6,7 +6,7 @@ if [[ $# -ne 5 ]]; then
   exit 1
 fi
 
-VERSION=$1
+VERSION=${1#v}
 ARM_DIR=$2
 INTEL_DIR=$3
 WINDOWS_DIR=$4
@@ -24,7 +24,12 @@ if [[ ! -f "$NOTES_SOURCE" ]]; then
 fi
 
 if [[ -z "$PREVIOUS_REF" ]]; then
-  PREVIOUS_REF=$(git -C "$ROOT_DIR/.." describe --tags --abbrev=0 "$CURRENT_REF^" 2>/dev/null || true)
+  current_tag=$(git -C "$ROOT_DIR/.." describe --tags --exact-match "$CURRENT_REF" 2>/dev/null || true)
+  if [[ -n "$current_tag" && "${current_tag#v}" != "$VERSION" ]]; then
+    PREVIOUS_REF=$current_tag
+  else
+    PREVIOUS_REF=$(git -C "$ROOT_DIR/.." describe --tags --abbrev=0 "$CURRENT_REF^" 2>/dev/null || true)
+  fi
 fi
 if [[ -z "$PREVIOUS_REF" ]]; then
   echo "Unable to determine previous release ref for $VERSION; set SBOBINO_RELEASE_NOTES_PREVIOUS_REF." >&2
@@ -49,7 +54,7 @@ for path in \
   "$WINDOWS_DIR/speech-runtime-windows-x86_64.zip" \
   "$WINDOWS_DIR/pyannote-runtime-windows-x86_64.zip"
 do
-  if [[ ! -f "$path" ]]; then
+  if [[ ! -s "$path" ]]; then
     echo "Missing native staging artifact: $path" >&2
     exit 1
   fi
@@ -111,13 +116,8 @@ with open(path, "w", encoding="utf-8") as handle:
     handle.write("\n")
 PY
 
-python3 "$ROOT_DIR/scripts/generate_release_candidate_metadata.py" \
-  "$OUTPUT_DIR" \
-  "$VERSION" \
-  --release-profile public \
-  --commit-sha "$(git -C "$ROOT_DIR/.." rev-parse HEAD)" \
-  --repo-slug "$REPO_SLUG"
-
+# Generate and validate the reviewed notes before creating the readiness proof;
+# the proof checksum set must cover the exact notes that will be uploaded.
 python3 "$ROOT_DIR/scripts/generate_codex_style_release_notes.py" \
   "$VERSION" \
   "$PREVIOUS_REF" \
@@ -129,6 +129,13 @@ python3 "$ROOT_DIR/scripts/generate_codex_style_release_notes.py" \
   "$VERSION" \
   "$OUTPUT_DIR/release-notes.md" \
   "$PREVIOUS_REF"
+
+python3 "$ROOT_DIR/scripts/generate_release_candidate_metadata.py" \
+  "$OUTPUT_DIR" \
+  "$VERSION" \
+  --release-profile public \
+  --commit-sha "$(git -C "$ROOT_DIR/.." rev-parse HEAD)" \
+  --repo-slug "$REPO_SLUG"
 
 cat <<EOF
 Multi-platform local candidate prepared in:

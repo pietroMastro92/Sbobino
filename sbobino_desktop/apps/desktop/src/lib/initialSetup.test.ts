@@ -48,6 +48,12 @@ function createRuntimeHealthFixture(): RuntimeHealth {
         failure_reason: "",
         failure_message: "",
       },
+      parakeet_worker: {
+        resolved_path: "/tmp/parakeet-batch-json",
+        available: true,
+        failure_reason: "",
+        failure_message: "",
+      },
     },
     ffmpeg_path: "ffmpeg",
     ffmpeg_resolved: "/tmp/ffmpeg",
@@ -146,6 +152,27 @@ describe("initialSetup helpers", () => {
         message: "stale runtime",
       }),
     ).toBe(true);
+
+    for (const reasonCode of [
+      "pyannote_receipt_required",
+      "pyannote_receipt_invalid",
+      "pyannote_import_load_failed",
+    ]) {
+      expect(
+        shouldRepairPyannoteRuntime({
+          enabled: true,
+          ready: false,
+          runtime_installed: true,
+          model_installed: true,
+          runtime_dir: "/tmp/runtime/pyannote",
+          arch: "aarch64-apple-darwin",
+          device: "cpu",
+          source: "release_asset",
+          reason_code: reasonCode,
+          message: "verification required",
+        }),
+      ).toBe(true);
+    }
 
     expect(
       shouldRepairPyannoteRuntime({
@@ -251,6 +278,27 @@ describe("initialSetup helpers", () => {
     expect(isRuntimeToolchainReady(parakeetRuntime)).toBe(false);
     expect(getRuntimeToolchainFailureMessage(parakeetRuntime)).toBe(
       "Parakeet CLI missing.",
+    );
+
+    parakeetRuntime.managed_runtime.parakeet_cli.available = true;
+    parakeetRuntime.parakeet_cli_available = true;
+    parakeetRuntime.managed_runtime.parakeet_worker = {
+      resolved_path: "/tmp/parakeet-batch-json",
+      available: false,
+      failure_reason: "missing_file",
+      failure_message: "Parakeet batch worker missing.",
+    };
+    expect(isRuntimeToolchainReady(parakeetRuntime)).toBe(false);
+    expect(getRuntimeToolchainFailureMessage(parakeetRuntime)).toBe(
+      "Parakeet batch worker missing.",
+    );
+
+    // Legacy setup reports do not have the worker field. They remain
+    // deserializable, but must not be treated as a ready Parakeet runtime.
+    delete parakeetRuntime.managed_runtime.parakeet_worker;
+    expect(isRuntimeToolchainReady(parakeetRuntime)).toBe(false);
+    expect(getRuntimeToolchainFailureMessage(parakeetRuntime)).toBe(
+      "Parakeet batch worker health is unavailable; repair the local runtime.",
     );
   });
 

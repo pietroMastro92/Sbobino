@@ -126,6 +126,10 @@ const MODEL_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(500);
 const RELEASE_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RELEASE_HTTP_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const PYANNOTE_IMPORT_LOAD_TIMEOUT: Duration = Duration::from_secs(90);
+const PYANNOTE_SWAP_OWNER_FILENAME: &str = ".sbobino-owner";
+const PYANNOTE_SWAP_PENDING_FILENAME: &str = ".pyannote-pending-validation";
+const PYANNOTE_SWAP_BACKUP_PREFIX: &str = ".pyannote-backup-";
+const PYANNOTE_SWAP_STAGE_PREFIX: &str = ".pyannote-stage-";
 static DOWNLOAD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PROVISIONING_SWAP_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Runtime publication moves the `bin` and `lib` directories independently.
@@ -446,6 +450,7 @@ fn cleanup_pyannote_workdir(runtime_factory: &RuntimeTranscriptionFactory) -> Re
     remove_path_if_exists(&model_dir)?;
     remove_path_if_exists(&manifest_path)?;
     remove_path_if_exists(&receipt_path)?;
+    remove_path_if_exists(&runtime_dir.join(PYANNOTE_SWAP_PENDING_FILENAME))?;
 
     if runtime_dir.is_dir() {
         for entry in std::fs::read_dir(&runtime_dir)
@@ -461,6 +466,29 @@ fn cleanup_pyannote_workdir(runtime_factory: &RuntimeTranscriptionFactory) -> Re
                 || name.starts_with(".receipt.json.tmp")
             {
                 remove_path_if_exists(&path)?;
+            }
+        }
+    }
+
+    // Pyannote archive extraction stages live next to the published runtime,
+    // not inside it. Remove any abandoned sibling stages/backups as part of a
+    // failed install so a retry starts with the same disk budget as a clean
+    // install. The provisioning slot guarantees that no active installer can
+    // be using these paths while this failure cleanup runs.
+    if let Some(parent) = runtime_dir.parent() {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries {
+                let entry =
+                    entry.map_err(|e| format!("failed to inspect Pyannote staging entry: {e}"))?;
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if path.is_dir()
+                    && (name.starts_with(PYANNOTE_SWAP_STAGE_PREFIX)
+                        || name.starts_with(PYANNOTE_SWAP_BACKUP_PREFIX))
+                {
+                    remove_path_if_exists(&path)?;
+                }
             }
         }
     }
@@ -548,6 +576,16 @@ fn prepare_pyannote_runtime_swap(
             backup_dir.display()
         )
     })?;
+    if let Err(error) = std::fs::write(
+        backup_dir.join(PYANNOTE_SWAP_OWNER_FILENAME),
+        std::process::id().to_string(),
+    ) {
+        let _ = std::fs::rename(&backup_dir, runtime_dir);
+        return Err(format!(
+            "failed to mark pyannote runtime backup '{}': {error}",
+            backup_dir.display()
+        ));
+    }
     Ok(Some(backup_dir))
 }
 
@@ -568,7 +606,10 @@ fn rollback_pyannote_runtime_swap(
             backup_dir.display(),
             runtime_dir.display()
         )
-    })
+    })?;
+    let _ = remove_path_if_exists(&runtime_dir.join(PYANNOTE_SWAP_OWNER_FILENAME));
+    let _ = remove_path_if_exists(&runtime_dir.join(PYANNOTE_SWAP_PENDING_FILENAME));
+    Ok(())
 }
 
 fn cleanup_pyannote_runtime_backup(backup_dir: Option<PathBuf>) -> Result<(), String> {
@@ -577,6 +618,17 @@ fn cleanup_pyannote_runtime_backup(backup_dir: Option<PathBuf>) -> Result<(), St
     };
 
     remove_path_if_exists(&backup_dir)
+}
+
+fn finalize_pyannote_runtime_swap(
+    runtime_dir: &Path,
+    backup_dir: Option<PathBuf>,
+) -> Result<(), String> {
+    // Only remove the pending marker after deep smoke, receipt, and status
+    // have all succeeded. If this process is interrupted earlier, startup
+    // recovery can still restore the backup instead of deleting it as stale.
+    remove_path_if_exists(&runtime_dir.join(PYANNOTE_SWAP_PENDING_FILENAME))?;
+    cleanup_pyannote_runtime_backup(backup_dir)
 }
 
 fn prepare_pyannote_runtime_stage(runtime_dir: &Path) -> Result<PathBuf, String> {
@@ -593,6 +645,26 @@ fn prepare_pyannote_runtime_stage(runtime_dir: &Path) -> Result<PathBuf, String>
             stage_dir.display()
         )
     })?;
+    if let Err(error) = std::fs::write(
+        stage_dir.join(PYANNOTE_SWAP_OWNER_FILENAME),
+        std::process::id().to_string(),
+    ) {
+        let _ = remove_path_if_exists(&stage_dir);
+        return Err(format!(
+            "failed to mark pyannote staging directory '{}': {error}",
+            stage_dir.display()
+        ));
+    }
+    if let Err(error) = std::fs::write(
+        stage_dir.join(PYANNOTE_SWAP_PENDING_FILENAME),
+        "pending-validation",
+    ) {
+        let _ = remove_path_if_exists(&stage_dir);
+        return Err(format!(
+            "failed to mark pyannote staging directory '{}' as pending validation: {error}",
+            stage_dir.display()
+        ));
+    }
     Ok(stage_dir)
 }
 
@@ -626,6 +698,12 @@ fn promote_staged_pyannote_runtime(
     if runtime_dir.exists() {
         remove_path_if_exists(runtime_dir)?;
     }
+
+    // The owner marker protects an active staging directory from startup
+    // cleanup. Remove it before publication; the pending-validation marker
+    // intentionally remains in the published tree until deep smoke, receipt,
+    // and status have all committed successfully.
+    remove_path_if_exists(&stage_dir.join(PYANNOTE_SWAP_OWNER_FILENAME))?;
 
     if let Err(error) = std::fs::rename(stage_dir, runtime_dir) {
         let rollback_error =
@@ -698,6 +776,8 @@ fn format_managed_runtime_install_error(health: &ManagedRuntimeHealth) -> String
         Some(("Whisper Stream", &health.whisper_stream))
     } else if !health.parakeet_cli.available {
         Some(("Parakeet CLI", &health.parakeet_cli))
+    } else if !health.parakeet_worker.available {
+        Some(("Parakeet batch worker", &health.parakeet_worker))
     } else {
         None
     };
@@ -727,7 +807,8 @@ fn transcription_runtime_install_complete(health: &sbobino_infrastructure::Runti
         return health.managed_runtime.ffmpeg.available
             && health.managed_runtime.whisper_cli.available
             && health.managed_runtime.whisper_stream.available
-            && health.managed_runtime.parakeet_cli.available;
+            && health.managed_runtime.parakeet_cli.available
+            && health.managed_runtime.parakeet_worker.available;
     }
 
     match health.configured_engine {
@@ -941,6 +1022,15 @@ fn pyannote_reconcile_action(
                 "Pyannote metadata was updated for this app version.",
             ))
         }
+        ReconcileManagedPyannoteReleaseOutcome::ReceiptVerificationRequired => Some(
+            pyannote_background_action_response(
+                "verify_existing",
+                true,
+                false,
+                "pyannote_receipt_required",
+                "Pyannote metadata is compatible; verifying the existing runtime without downloading it again.",
+            ),
+        ),
         ReconcileManagedPyannoteReleaseOutcome::NeedsMigration { message } => {
             let reason_code = infer_pyannote_reconcile_reason_code(&message);
             Some(pyannote_background_action_response(
@@ -1024,6 +1114,25 @@ async fn plan_pyannote_background_action_inner(
                 true,
                 reason_code,
                 message,
+            ));
+        }
+
+        // A missing receipt does not mean that the (large) runtime and model
+        // assets are broken. Verify the existing installation in place and
+        // create the durable receipt instead of downloading hundreds of MB on
+        // every upgrade or Repair click.
+        if matches!(
+            reason_code,
+            "pyannote_receipt_required"
+                | "pyannote_receipt_invalid"
+                | "pyannote_import_load_failed"
+        ) {
+            return Ok(pyannote_background_action_response(
+                "verify_existing",
+                true,
+                false,
+                reason_code,
+                message.clone(),
             ));
         }
 
@@ -1122,11 +1231,13 @@ pub async fn reconcile_post_update_runtime(
             migration_started: false,
             message: Some(action.message),
         },
-        "install_missing" | "repair_existing" | "migrate_assets" => PostUpdateReconcileResponse {
-            status: "needs_auto_migration".to_string(),
-            migration_started: false,
-            message: Some(action.message),
-        },
+        "install_missing" | "repair_existing" | "migrate_assets" | "verify_existing" => {
+            PostUpdateReconcileResponse {
+                status: "needs_auto_migration".to_string(),
+                migration_started: false,
+                message: Some(action.message),
+            }
+        }
         _ => PostUpdateReconcileResponse {
             status: "ok_no_action".to_string(),
             migration_started: false,
@@ -1349,6 +1460,22 @@ pub async fn provisioning_install_pyannote(
     // the one-time receipt migration runs so an interrupted repair cannot
     // delete the last known installation.
     let has_existing_install = health.pyannote.runtime_installed && health.pyannote.model_installed;
+    let can_verify_existing_receipt = !force
+        && matches!(
+            health.pyannote.reason_code.trim(),
+            "pyannote_receipt_required"
+                | "pyannote_receipt_invalid"
+                | "pyannote_import_load_failed"
+        )
+        && has_existing_install
+        && state
+            .runtime_factory
+            .read_managed_pyannote_manifest()
+            .is_some_and(|manifest| {
+                manifest.app_version.trim() == env!("CARGO_PKG_VERSION")
+                    && normalize_pyannote_compat_level(manifest.compat_level)
+                        == PYANNOTE_COMPAT_LEVEL
+            });
 
     if health.pyannote.ready && !repair_required {
         emit_provisioning_status(
@@ -1363,7 +1490,14 @@ pub async fn provisioning_install_pyannote(
     let (cancel_token, slot_guard) =
         acquire_provisioning_slot(state.provisioning.cancel_token.clone()).await?;
 
-    if state.runtime_factory.has_bundled_pyannote_override_assets() {
+    if can_verify_existing_receipt {
+        spawn_pyannote_existing_install_verification(
+            app,
+            state.runtime_factory.clone(),
+            cancel_token,
+            slot_guard,
+        );
+    } else if state.runtime_factory.has_bundled_pyannote_override_assets() {
         spawn_pyannote_bundled_install(
             app,
             state.runtime_factory.clone(),
@@ -1813,10 +1947,23 @@ pub(crate) async fn probe_pyannote_import_and_load_receipt(
 
     let probe_script = r#"
 import importlib.metadata
+import os
 import json
 import pathlib
 import re
 import sys
+
+if sys.platform == "win32":
+    # Python 3.11 on Windows does not search an embedded runtime's DLLs
+    # directory automatically.  The packaged app must register it before
+    # importing Torch/TorchCodec, just like the release smoke does.
+    _dll_directory = pathlib.Path(sys.executable).resolve().parent / "DLLs"
+    if _dll_directory.is_dir():
+        # Keep the handle alive for the whole probe. Dropping the return value
+        # immediately removes the directory from the DLL search path on
+        # Python 3.8+, which reintroduces intermittent TorchCodec import
+        # failures on clean Windows installs.
+        _dll_directory_handle = os.add_dll_directory(str(_dll_directory))
 
 from pyannote.audio import Pipeline
 import torch
@@ -1828,6 +1975,12 @@ def ffmpeg_abi():
     roots = []
     package_root = pathlib.Path(torchcodec.__file__).resolve().parent
     roots.extend((package_root / ".dylibs", package_root, package_root.parent.parent / "embedded-dylibs"))
+    if sys.platform == "win32":
+        # The Windows packager keeps the FFmpeg DLLs next to the embedded
+        # interpreter (python/DLLs).  TorchCodec may load them through the
+        # registered DLL directory without exposing that directory from its
+        # package, so include it when collecting the durable ABI receipt.
+        roots.append(pathlib.Path(sys.executable).resolve().parent / "DLLs")
     names = set()
     for root in roots:
         if not root.is_dir():
@@ -1870,6 +2023,8 @@ print("sbobino-pyannote-receipt=" + json.dumps(payload, sort_keys=True))
             .unwrap_or_else(|| python_root.join("bin")),
         runtime_factory.data_dir().join("bin"),
     ];
+    #[cfg(target_os = "windows")]
+    path_entries.push(python_root.join("DLLs"));
     if let Some(existing) = std::env::var_os("PATH") {
         path_entries.extend(std::env::split_paths(&existing));
     }
@@ -2151,7 +2306,9 @@ fn spawn_pyannote_bundled_install(
                     "Pyannote diarization runtime installed successfully.",
                     None,
                 );
-                if let Err(cleanup_error) = cleanup_pyannote_runtime_backup(backup_runtime_dir) {
+                if let Err(cleanup_error) =
+                    finalize_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir)
+                {
                     tracing::warn!(
                         "failed to clean up bundled pyannote runtime backup: {cleanup_error}"
                     );
@@ -2579,7 +2736,9 @@ fn spawn_pyannote_provisioning_download(
                     "Pyannote diarization runtime installed successfully.",
                     None,
                 );
-                if let Err(cleanup_error) = cleanup_pyannote_runtime_backup(backup_runtime_dir) {
+                if let Err(cleanup_error) =
+                    finalize_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir)
+                {
                     tracing::warn!("failed to clean up pyannote runtime backup: {cleanup_error}");
                 }
             }
@@ -3367,6 +3526,106 @@ fn install_pyannote_archive(
 
     remove_path_if_exists(&stage_dir)?;
     Ok(())
+}
+
+/// Validate an already-installed Pyannote runtime and create its receipt
+/// without downloading or replacing the large runtime/model archives. This
+/// is used for legacy installs that are structurally intact but predate the
+/// durable receipt contract introduced by the release updater.
+fn spawn_pyannote_existing_install_verification(
+    app: tauri::AppHandle,
+    runtime_factory: std::sync::Arc<RuntimeTranscriptionFactory>,
+    cancel_token: CancellationToken,
+    slot_guard: ProvisioningSlotGuard,
+) {
+    tauri::async_runtime::spawn(async move {
+        let _slot_guard = slot_guard;
+        let _ = app.emit(
+            "provisioning://progress",
+            ProvisioningProgressEvent {
+                current: 0,
+                total: 1,
+                asset: "existing-pyannote-runtime".to_string(),
+                asset_kind: "pyannote_runtime".to_string(),
+                stage: "verifying".to_string(),
+                percentage: 10,
+            },
+        );
+
+        if cancel_token.is_cancelled() {
+            emit_provisioning_status(
+                &app,
+                "cancelled",
+                "Pyannote verification cancelled.",
+                Some("cancelled"),
+            );
+            return;
+        }
+
+        if let Err(error) = runtime_factory.validate_managed_pyannote_runtime() {
+            let _ =
+                runtime_factory.write_managed_pyannote_status("pyannote_repair_required", &error);
+            emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"));
+            return;
+        }
+
+        let receipt =
+            match probe_pyannote_import_and_load_receipt(&runtime_factory, &cancel_token).await {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    if error == "cancelled" {
+                        emit_provisioning_status(
+                            &app,
+                            "cancelled",
+                            "Pyannote verification cancelled.",
+                            Some("cancelled"),
+                        );
+                        return;
+                    }
+                    let _ = runtime_factory
+                        .write_managed_pyannote_status("pyannote_import_load_failed", &error);
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_import_load_failed"),
+                    );
+                    return;
+                }
+            };
+
+        if let Err(error) = runtime_factory.write_managed_pyannote_receipt(&receipt) {
+            let _ = runtime_factory
+                .write_managed_pyannote_status("pyannote_install_incomplete", &error);
+            emit_provisioning_status(&app, "error", &error, Some("pyannote_install_incomplete"));
+            return;
+        }
+
+        if let Err(error) = runtime_factory
+            .write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")
+        {
+            emit_provisioning_status(&app, "error", &error, Some("pyannote_install_incomplete"));
+            return;
+        }
+
+        let _ = app.emit(
+            "provisioning://progress",
+            ProvisioningProgressEvent {
+                current: 1,
+                total: 1,
+                asset: "existing-pyannote-runtime".to_string(),
+                asset_kind: "pyannote_runtime".to_string(),
+                stage: "verified".to_string(),
+                percentage: 100,
+            },
+        );
+        emit_provisioning_status(
+            &app,
+            "completed",
+            "Pyannote diarization runtime verified successfully.",
+            None,
+        );
+    });
 }
 
 /// Extract a Core ML encoder into a sibling staging directory and publish it
@@ -4349,9 +4608,10 @@ mod tests {
     use super::{
         commit_runtime_install_transaction, commit_runtime_install_transaction_with_cleanup,
         coreml_encoder_is_installed, estimate_pyannote_required_free_bytes,
-        install_pyannote_archive, install_runtime_archive, persist_pyannote_install_failure,
-        plan_pyannote_background_action_inner, prepare_pyannote_runtime_stage,
-        prepare_pyannote_runtime_swap, promote_staged_pyannote_runtime, pyannote_reconcile_action,
+        finalize_pyannote_runtime_swap, install_pyannote_archive, install_runtime_archive,
+        persist_pyannote_install_failure, plan_pyannote_background_action_inner,
+        prepare_pyannote_runtime_stage, prepare_pyannote_runtime_swap,
+        promote_staged_pyannote_runtime, pyannote_reconcile_action,
         recover_interrupted_runtime_install, remove_path_if_exists, rollback_pyannote_runtime_swap,
         rollback_runtime_install_transaction, runtime_install_journal_backup_path,
         runtime_install_journal_path, runtime_install_transaction_lock, sha256_bytes_hex,
@@ -4359,6 +4619,7 @@ mod tests {
         validate_manifest_asset_descriptor, validate_setup_manifest, verify_file_sha256,
         write_runtime_install_journal, PyannoteAssetSelection, PyannoteBackgroundActionTrigger,
         RuntimeInstallCommitError, RuntimeInstallJournal, RuntimeInstallTransaction,
+        PYANNOTE_SWAP_PENDING_FILENAME,
     };
     use crate::release_assets::{
         PyannoteReleaseAsset, PyannoteReleaseManifest, ReleaseAssetDescriptor, RuntimeReleaseAsset,
@@ -4930,6 +5191,7 @@ mod tests {
             whisper_cli: managed_binary_health(true),
             whisper_stream: managed_binary_health(true),
             parakeet_cli: managed_binary_health(false),
+            parakeet_worker: managed_binary_health(false),
         });
 
         assert!(
@@ -5038,6 +5300,75 @@ mod tests {
         assert_eq!(action.reason_code, "pyannote_auto_check_disabled");
     }
 
+    #[tokio::test]
+    async fn plan_pyannote_background_action_verifies_existing_install_when_receipt_is_missing() {
+        let (_temp, factory) = build_runtime_factory();
+        persist_settings(&factory, true);
+        prepare_ready_pyannote_install(
+            &factory,
+            ManagedPyannoteManifest {
+                source: "release_asset".to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                compat_level: PYANNOTE_COMPAT_LEVEL,
+                runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                runtime_sha256: "runtime-sha".to_string(),
+                model_asset: "pyannote-model-community-1.zip".to_string(),
+                model_sha256: "model-sha".to_string(),
+                runtime_arch: super::host_pyannote_arch_label().to_string(),
+                installed_at: "2026-04-21T00:00:00Z".to_string(),
+            },
+            "ok",
+        );
+
+        let action = plan_pyannote_background_action_inner(
+            &factory,
+            PyannoteBackgroundActionTrigger::PostUpdate,
+        )
+        .await
+        .expect("planner should succeed");
+
+        assert_eq!(action.status, "verify_existing");
+        assert!(action.should_start);
+        assert!(!action.force_reinstall);
+        assert_eq!(action.reason_code, "pyannote_receipt_required");
+    }
+
+    #[tokio::test]
+    async fn plan_pyannote_background_action_rechecks_existing_install_after_receipt_or_probe_failure(
+    ) {
+        for reason_code in ["pyannote_receipt_invalid", "pyannote_import_load_failed"] {
+            let (_temp, factory) = build_runtime_factory();
+            persist_settings(&factory, true);
+            prepare_ready_pyannote_install(
+                &factory,
+                ManagedPyannoteManifest {
+                    source: "release_asset".to_string(),
+                    app_version: env!("CARGO_PKG_VERSION").to_string(),
+                    compat_level: PYANNOTE_COMPAT_LEVEL,
+                    runtime_asset: "pyannote-runtime-macos-aarch64.zip".to_string(),
+                    runtime_sha256: "runtime-sha".to_string(),
+                    model_asset: "pyannote-model-community-1.zip".to_string(),
+                    model_sha256: "model-sha".to_string(),
+                    runtime_arch: super::host_pyannote_arch_label().to_string(),
+                    installed_at: "2026-04-21T00:00:00Z".to_string(),
+                },
+                reason_code,
+            );
+
+            let action = plan_pyannote_background_action_inner(
+                &factory,
+                PyannoteBackgroundActionTrigger::PostUpdate,
+            )
+            .await
+            .expect("planner should succeed");
+
+            assert_eq!(action.status, "verify_existing");
+            assert!(action.should_start);
+            assert!(!action.force_reinstall);
+            assert_eq!(action.reason_code, reason_code);
+        }
+    }
+
     #[test]
     fn pyannote_reconcile_action_requests_manifest_only_migration_on_patch_update() {
         let action =
@@ -5062,6 +5393,18 @@ mod tests {
         assert!(action.should_start);
         assert!(action.force_reinstall);
         assert_eq!(action.reason_code, "pyannote_checksum_invalid");
+    }
+
+    #[test]
+    fn pyannote_reconcile_action_verifies_existing_runtime_when_receipt_is_missing() {
+        let action = pyannote_reconcile_action(
+            ReconcileManagedPyannoteReleaseOutcome::ReceiptVerificationRequired,
+        )
+        .expect("receipt verification should produce an action");
+        assert_eq!(action.status, "verify_existing");
+        assert!(action.should_start);
+        assert!(!action.force_reinstall);
+        assert_eq!(action.reason_code, "pyannote_receipt_required");
     }
 
     #[test]
@@ -5763,6 +6106,17 @@ mod tests {
             .expect("promoted runtime should exist");
         assert_eq!(promoted, b"new-runtime");
         assert!(backup.join("python/bin/python3").is_file());
+        assert!(
+            runtime_dir.join(PYANNOTE_SWAP_PENDING_FILENAME).is_file(),
+            "promoted runtime must remain pending until deep smoke commits"
+        );
+
+        finalize_pyannote_runtime_swap(&runtime_dir, Some(backup))
+            .expect("successful validation should finalize the swap");
+        assert!(
+            !runtime_dir.join(PYANNOTE_SWAP_PENDING_FILENAME).exists(),
+            "finalized runtime must clear the pending marker"
+        );
     }
 
     #[test]
