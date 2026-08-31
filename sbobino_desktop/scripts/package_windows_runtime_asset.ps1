@@ -24,12 +24,12 @@ $ParakeetSourceRef = "fa5aeef1e3d353679cbd374a426fee28387deb6e"
 $FfmpegUrl = if ($env:SBOBINO_FFMPEG_RUNTIME_URL) {
     $env:SBOBINO_FFMPEG_RUNTIME_URL
 } else {
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-30-13-12/ffmpeg-n8.1.2-50-g1a748fe2cd-win64-gpl-shared-8.1.zip"
 }
 $FfmpegSha256 = if ($env:SBOBINO_FFMPEG_RUNTIME_SHA256) {
     $env:SBOBINO_FFMPEG_RUNTIME_SHA256
 } else {
-    "ca56a31e81af11c8e4c77249039d3a61833ec37bfbc5308da91ba1b00b43a00f"
+    "d0db0a48da22815a04b5ec9e757640dc8069f9f8c37fd4e1b8753a4c0326502c"
 }
 $TargetTriple = "x86_64-pc-windows-msvc"
 

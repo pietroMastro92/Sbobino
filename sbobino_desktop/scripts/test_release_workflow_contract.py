@@ -257,8 +257,19 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.assertIn("SBOBINO_FFMPEG_RUNTIME_SHA256", contents)
             self.assertNotIn("pietroMastro92/Sbobino/releases/download", contents)
             self.assertNotIn("v2.0.25", contents)
-            self.assertIn("BtbN/FFmpeg-Builds/releases/download/latest", contents)
-            self.assertIn("ca56a31e81af11c8e4c77249039d3a61833ec37bfbc5308da91ba1b00b43a00f", contents)
+            self.assertNotIn("/releases/download/latest/", contents)
+            self.assertIn(
+                "BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-30-13-12",
+                contents,
+            )
+            self.assertIn(
+                "ffmpeg-n8.1.2-50-g1a748fe2cd-win64-gpl-shared-8.1.zip",
+                contents,
+            )
+            self.assertIn(
+                "d0db0a48da22815a04b5ec9e757640dc8069f9f8c37fd4e1b8753a4c0326502c",
+                contents,
+            )
             if script.name == "package_windows_pyannote_runtime.ps1":
                 self.assertIn('must contain exactly one ffmpeg.exe', contents)
 

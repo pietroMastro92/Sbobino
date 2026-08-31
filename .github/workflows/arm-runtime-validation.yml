@@ -6,7 +6,7 @@ on:
       tag_name:
         description: Candidate tag whose packaged runtime should be validated
         required: true
-        default: v2.0.30
+        default: v2.0.31
         type: string
 
 permissions:
@@ -25,11 +25,11 @@ jobs:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
-      - name: Validate v2.0.30 candidate tag and versioned notes
+      - name: Validate v2.0.31 candidate tag and versioned notes
         working-directory: sbobino_desktop
         run: |
-          if [[ "$TAG_NAME" != "v2.0.30" ]]; then
-            echo "ARM validation is locked to the v2.0.30 candidate; got $TAG_NAME" >&2
+          if [[ "$TAG_NAME" != "v2.0.31" ]]; then
+            echo "ARM validation is locked to the v2.0.31 candidate; got $TAG_NAME" >&2
             exit 1
           fi
           VERSION="${TAG_NAME#v}"

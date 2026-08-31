@@ -6,7 +6,7 @@ on:
       tag_name:
         description: Existing prerelease tag to promote
         required: true
-        default: v2.0.30
+        default: v2.0.31
         type: string
 
 permissions:
@@ -28,8 +28,8 @@ jobs:
       - name: Validate versioned release notes
         working-directory: sbobino_desktop
         run: |
-          if [[ "$TAG_NAME" != "v2.0.30" ]]; then
-            echo "Promotion is locked to the v2.0.30 candidate; got $TAG_NAME" >&2
+          if [[ "$TAG_NAME" != "v2.0.31" ]]; then
+            echo "Promotion is locked to the v2.0.31 candidate; got $TAG_NAME" >&2
             exit 1
           fi
           VERSION="${TAG_NAME#v}"
