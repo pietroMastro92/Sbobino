@@ -166,6 +166,12 @@ import {
   normalizeJobFailureMessage,
 } from "./lib/diarizationUi";
 import {
+  parseSegmentRepairReport,
+  parseSpeakerQualityReport,
+  parseTimelineManualEditsReport,
+  suspiciousSpeakerSegmentIndexes,
+} from "./lib/qualityReports";
+import {
   consumeRealtimeSavedSpeakerDetection,
   finalizeQueuedRealtimeSpeakerDetectionStop,
   registerRealtimeSpeakerDetectionBeforeStop,
@@ -173,6 +179,17 @@ import {
   type RealtimeSpeakerDetectionTracking,
 } from "./lib/realtimeSpeakerDetection";
 import { loadInitialAppBootstrapData } from "./lib/appBootstrap";
+import {
+  filterHistoryArtifacts,
+  getHistoryGeneratedOutputs,
+  getHistorySourceKind,
+  getHistoryStatus,
+  getHistoryTags,
+  normalizeHistoryTags,
+  type HistoryGeneratedOutputFilter,
+  type HistorySourceFilter,
+  type HistoryStatusFilter,
+} from "./lib/historyFilters";
 import {
   deriveUpdateUiState,
   matchesPyannoteAutoActionMarker,
@@ -1148,6 +1165,7 @@ function createDefaultAutomaticImportSource(
     model: "base",
     language: "auto",
     workspace_id: null,
+    tags: [],
     recursive: true,
     enable_ai_post_processing: false,
     post_processing: defaultAutomaticImportPostProcessing("general"),
@@ -1164,6 +1182,7 @@ function createPresetAutomaticImportSource(
       | "model"
       | "language"
       | "workspace_id"
+      | "tags"
       | "recursive"
       | "enable_ai_post_processing"
       | "post_processing"
@@ -1182,6 +1201,7 @@ function createPresetAutomaticImportSource(
     model: overrides?.model ?? base.model,
     language: overrides?.language ?? base.language,
     workspace_id: overrides?.workspace_id ?? base.workspace_id,
+    tags: overrides?.tags ?? base.tags,
     recursive: overrides?.recursive ?? base.recursive,
     enable_ai_post_processing:
       overrides?.enable_ai_post_processing ?? base.enable_ai_post_processing,
@@ -2345,6 +2365,7 @@ function normalizeSettings(settings: AppSettings): AppSettings {
         model: source.model ?? settings.transcription.model ?? "base",
         language: source.language ?? settings.transcription.language ?? "auto",
         workspace_id: source.workspace_id ?? null,
+        tags: normalizeHistoryTags(source.tags ?? []),
         recursive: source.recursive ?? true,
         enable_ai_post_processing:
           source.enable_ai_post_processing ?? false,
@@ -3229,6 +3250,13 @@ export function App({
   const [deletedSearch, setDeletedSearch] = useState("");
   const [historyKind, setHistoryKind] = useState<"all" | ArtifactKind>("all");
   const [historyWorkspaceFilter, setHistoryWorkspaceFilter] = useState("all");
+  const [historySourceFilter, setHistorySourceFilter] =
+    useState<HistorySourceFilter>("all");
+  const [historyStatusFilter, setHistoryStatusFilter] =
+    useState<HistoryStatusFilter>("all");
+  const [historyOutputFilter, setHistoryOutputFilter] =
+    useState<HistoryGeneratedOutputFilter>("all");
+  const [historyTagFilter, setHistoryTagFilter] = useState("all");
   const [automaticImportScanResult, setAutomaticImportScanResult] =
     useState<AutomaticImportScanResponse | null>(null);
   const [automaticImportScanError, setAutomaticImportScanError] = useState<
@@ -5603,7 +5631,12 @@ export function App({
   const filteredArtifacts = useMemo(() => {
     const needle = search.trim().toLowerCase();
 
-    return artifacts.filter((artifact) => {
+    return filterHistoryArtifacts(artifacts, {
+      source: historySourceFilter,
+      status: historyStatusFilter,
+      output: historyOutputFilter,
+      tag: historyTagFilter === "all" ? null : historyTagFilter,
+    }).filter((artifact) => {
       if (historyKind !== "all" && artifact.kind !== historyKind) {
         return false;
       }
@@ -5625,7 +5658,16 @@ export function App({
         artifact.raw_transcript?.toLowerCase().includes(needle)
       );
     });
-  }, [artifacts, historyKind, historyWorkspaceFilter, search]);
+  }, [
+    artifacts,
+    historyKind,
+    historyOutputFilter,
+    historySourceFilter,
+    historyStatusFilter,
+    historyTagFilter,
+    historyWorkspaceFilter,
+    search,
+  ]);
 
   const filteredDeletedArtifacts = useMemo(() => {
     const needle = deletedSearch.trim().toLowerCase();
@@ -5853,6 +5895,31 @@ export function App({
         activeArtifact?.metadata?.timeline_v2 ?? realtimeTimelineV2Json,
       ),
     [activeArtifact?.metadata?.timeline_v2, realtimeTimelineV2Json],
+  );
+  const segmentRepairReport = useMemo(
+    () =>
+      parseSegmentRepairReport(
+        activeArtifact?.metadata?.segment_repair_v1,
+      ),
+    [activeArtifact?.metadata?.segment_repair_v1],
+  );
+  const speakerQualityReport = useMemo(
+    () =>
+      parseSpeakerQualityReport(
+        activeArtifact?.metadata?.speaker_quality_v1,
+      ),
+    [activeArtifact?.metadata?.speaker_quality_v1],
+  );
+  const timelineManualEditsReport = useMemo(
+    () =>
+      parseTimelineManualEditsReport(
+        activeArtifact?.metadata?.timeline_manual_edits_v1,
+      ),
+    [activeArtifact?.metadata?.timeline_manual_edits_v1],
+  );
+  const suspiciousSpeakerSegments = useMemo(
+    () => suspiciousSpeakerSegmentIndexes(speakerQualityReport),
+    [speakerQualityReport],
   );
   const speakerColorMap = useMemo(
     () =>
@@ -6500,6 +6567,17 @@ export function App({
         workspaceOptions.map((workspace) => [workspace.id, workspace.label]),
       ),
     [workspaceOptions],
+  );
+  const historyWatchedSourceOptions = useMemo(
+    () => settings?.automation.watched_sources ?? [],
+    [settings?.automation.watched_sources],
+  );
+  const historyTagOptions = useMemo(
+    () =>
+      normalizeHistoryTags(
+        artifacts.flatMap((artifact) => getHistoryTags(artifact)),
+      ).sort((left, right) => left.localeCompare(right)),
+    [artifacts],
   );
   const automaticImportSourceStatusMap = useMemo(
     () =>
@@ -8911,6 +8989,22 @@ export function App({
     }
 
     const artifactId = activeArtifact.id;
+    let allowOverwriteManualEdits = false;
+    if (timelineManualEditsReport && timelineManualEditsReport.manual_edit_count > 0) {
+      allowOverwriteManualEdits = await confirmDialog(
+        t(
+          "detail.overwriteManualSpeakerEdits",
+          "This timeline contains manual speaker edits. Running speaker detection again can replace them. Continue?",
+        ),
+        {
+          title: t("detail.manualSpeakerEdits", "Manual speaker edits"),
+          kind: "warning",
+          okLabel: t("detail.overwriteAndRun", "Overwrite and run"),
+          cancelLabel: t("selection.cancel", "Cancel"),
+        },
+      );
+      if (!allowOverwriteManualEdits) return;
+    }
     setArtifactDiarizationProgress((previous) => ({
       ...previous,
       [artifactId]: {
@@ -8925,7 +9019,11 @@ export function App({
     }));
 
     try {
-      await runArtifactSpeakerDiarization(artifactId);
+      if (allowOverwriteManualEdits) {
+        await runArtifactSpeakerDiarization(artifactId, true);
+      } else {
+        await runArtifactSpeakerDiarization(artifactId);
+      }
       setError(null);
     } catch (diarizationError) {
       setArtifactDiarizationProgress((previous) => {
@@ -8941,6 +9039,16 @@ export function App({
         ),
       );
     }
+  }
+
+  function onJumpToSpeakerQualityWarning(segmentIndex: number): void {
+    setDetailMode("segments");
+    setSelectedSegmentSourceIndex(segmentIndex);
+    window.requestAnimationFrame(() => {
+      segmentElementMapRef.current
+        .get(segmentIndex)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
   }
 
   async function onRequestCancelSpeakerDiarization(): Promise<void> {
@@ -9210,6 +9318,7 @@ export function App({
       const updated = await updateArtifactTimeline({
         id: activeArtifact.id,
         timeline_v2: JSON.stringify(nextTimeline),
+        manual_edit: true,
       });
       if (!updated) {
         setError(
@@ -9307,6 +9416,7 @@ export function App({
       const updated = await updateArtifactTimeline({
         id: activeArtifact.id,
         timeline_v2: JSON.stringify(renameResult.timeline),
+        manual_edit: true,
       });
       if (!updated) {
         setError(
@@ -9425,6 +9535,7 @@ export function App({
       const updated = await updateArtifactTimeline({
         id: activeArtifact.id,
         timeline_v2: JSON.stringify(mergeResult.timeline),
+        manual_edit: true,
       });
       if (!updated) {
         setError(
@@ -9526,6 +9637,7 @@ export function App({
       const updated = await updateArtifactTimeline({
         id: activeArtifact.id,
         timeline_v2: JSON.stringify(removeResult.timeline),
+        manual_edit: true,
       });
       if (!updated) {
         setError(
@@ -11735,6 +11847,13 @@ export function App({
       artifact: GroupedArtifact,
       depth = 0,
     ): React.ReactNode => {
+      const artifactTags = getHistoryTags(artifact);
+      const artifactOutputs = getHistoryGeneratedOutputs(artifact);
+      const artifactStatus = getHistoryStatus(artifact);
+      const artifactSourceKind = getHistorySourceKind(artifact);
+      const artifactSourceLabel =
+        artifact.metadata?.auto_import_source_label?.trim() ||
+        t(`history.source.${artifactSourceKind}`, artifactSourceKind);
       return (
         <React.Fragment key={artifact.id}>
           <article
@@ -11787,6 +11906,22 @@ export function App({
                   >
                     {formatHomeTime(artifact.updated_at)}
                   </span>
+                </div>
+                <div className="history-smart-chips">
+                  <span className="kind-chip">{artifactSourceLabel}</span>
+                  <span className="kind-chip">
+                    {t(`history.status.${artifactStatus}`, artifactStatus)}
+                  </span>
+                  {artifactOutputs.map((output) => (
+                    <span key={output} className="kind-chip">
+                      {t(`history.output.${output}`, output)}
+                    </span>
+                  ))}
+                  {artifactTags.map((tag) => (
+                    <span key={tag} className="kind-chip history-tag-chip">
+                      {tag}
+                    </span>
+                  ))}
                 </div>
                 <p
                   className="history-preview"
@@ -11912,6 +12047,78 @@ export function App({
               ))}
             </select>
           </label>
+          <label className="toggle-row compact">
+            <span>{t("history.sourceFilter", "Source")}</span>
+            <select
+              className="inspector-select"
+              value={historySourceFilter}
+              onChange={(event) =>
+                setHistorySourceFilter(event.target.value as HistorySourceFilter)
+              }
+            >
+              <option value="all">{t("history.sourceAll", "All sources")}</option>
+              <option value="automatic">{t("history.sourceAutomatic", "All watched folders")}</option>
+              {historyWatchedSourceOptions.map((source) => (
+                <option key={source.id} value={`source:${source.id}`}>
+                  {source.label || fileLabel(source.folder_path)}
+                </option>
+              ))}
+              <option value="manual">{t("history.sourceManual", "Manual imports")}</option>
+              <option value="realtime">{t("history.sourceRealtime", "Live recordings")}</option>
+              <option value="unassigned">{t("history.sourceUnassigned", "Unassigned")}</option>
+            </select>
+          </label>
+          <label className="toggle-row compact">
+            <span>{t("history.statusFilter", "Status")}</span>
+            <select
+              className="inspector-select"
+              value={historyStatusFilter}
+              onChange={(event) =>
+                setHistoryStatusFilter(event.target.value as HistoryStatusFilter)
+              }
+            >
+              <option value="all">{t("history.statusAll", "All statuses")}</option>
+              <option value="completed">{t("history.statusCompleted", "Completed")}</option>
+              <option value="processing">{t("history.statusProcessing", "Processing")}</option>
+              <option value="failed">{t("history.statusFailed", "Failed")}</option>
+              <option value="cancelled">{t("history.statusCancelled", "Cancelled")}</option>
+              <option value="unknown">{t("history.statusUnknown", "Unknown")}</option>
+            </select>
+          </label>
+          <label className="toggle-row compact">
+            <span>{t("history.outputFilter", "Output")}</span>
+            <select
+              className="inspector-select"
+              value={historyOutputFilter}
+              onChange={(event) =>
+                setHistoryOutputFilter(
+                  event.target.value as HistoryGeneratedOutputFilter,
+                )
+              }
+            >
+              <option value="all">{t("history.outputAll", "All outputs")}</option>
+              <option value="study">{t("history.outputStudy", "Study Pack")}</option>
+              <option value="meeting">{t("history.outputMeeting", "Meeting Pack")}</option>
+              <option value="summary">{t("history.outputSummary", "Summary")}</option>
+              <option value="faqs">{t("history.outputFaqs", "FAQs")}</option>
+              <option value="none">{t("history.outputNone", "No generated output")}</option>
+            </select>
+          </label>
+          {historyTagOptions.length > 0 ? (
+            <label className="toggle-row compact">
+              <span>{t("history.tagFilter", "Tag")}</span>
+              <select
+                className="inspector-select"
+                value={historyTagFilter}
+                onChange={(event) => setHistoryTagFilter(event.target.value)}
+              >
+                <option value="all">{t("history.tagAll", "All tags")}</option>
+                {historyTagOptions.map((tag) => (
+                  <option key={tag} value={tag}>{tag}</option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           <small>
             {automaticImportScanResult
               ? t(
@@ -12560,6 +12767,13 @@ export function App({
                   </span>
                 </div>
               ) : null}
+              {suspiciousSpeakerSegments.has(segment.sourceIndex) ? (
+                <div className="segment-quality-warning">
+                  <span className="missing-chip">
+                    {t("quality.suspiciousSpeakerChange", "Check speaker change")}
+                  </span>
+                </div>
+              ) : null}
               {(activeArtifact?.metadata?.language_detection_version === "1" ||
                 Boolean(realtimeTimelineV2Json)) ? (
                 <div style={{ marginBottom: "8px", display: "flex", gap: "6px", flexWrap: "wrap" }}>
@@ -12793,6 +13007,72 @@ export function App({
                 </span>
               </span>
             </label>
+          </div>
+        ) : null}
+
+        {segmentRepairReport || speakerQualityReport || timelineManualEditsReport ? (
+          <div className="inspector-block quality-report-block">
+            <h4>{t("quality.title", "Transcript quality")}</h4>
+            {segmentRepairReport ? (
+              <small>
+                {segmentRepairReport.changed
+                  ? t(
+                      "quality.repairsApplied",
+                      "Repaired {timestamps} timestamps and collapsed {duplicates} repeated segments.",
+                      {
+                        timestamps: segmentRepairReport.timestamp_repair_count,
+                        duplicates:
+                          segmentRepairReport.collapsed_repeated_segment_count,
+                      },
+                    )
+                  : t(
+                      "quality.structureClean",
+                      "No structural repairs were needed.",
+                    )}
+              </small>
+            ) : null}
+            {timelineManualEditsReport ? (
+              <small>
+                {t(
+                  "quality.manualEditsProtected",
+                  "{count} manual timeline edits are protected before speaker detection reruns.",
+                  { count: timelineManualEditsReport.manual_edit_count },
+                )}
+              </small>
+            ) : null}
+            {speakerQualityReport && speakerQualityReport.warning_count > 0 ? (
+              <div className="quality-warning-list">
+                <small>
+                  {t(
+                    "quality.speakerWarnings",
+                    "{count} speaker changes need review.",
+                    { count: speakerQualityReport.warning_count },
+                  )}
+                </small>
+                {speakerQualityReport.warnings.map((warning, index) => {
+                  const target = warning.segment_indexes[0];
+                  return (
+                    <button
+                      key={`${warning.kind}-${index}`}
+                      type="button"
+                      className="secondary-button quality-warning-button"
+                      disabled={target === undefined}
+                      onClick={() => {
+                        if (target !== undefined) {
+                          onJumpToSpeakerQualityWarning(target);
+                        }
+                      }}
+                    >
+                      {warning.kind === "short_flip"
+                        ? t("quality.shortFlip", "Suspicious short speaker flip")
+                        : t("quality.rapidTurn", "Rapid speaker alternation")}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : speakerQualityReport ? (
+              <small>{t("quality.noSpeakerWarnings", "No suspicious speaker changes detected.")}</small>
+            ) : null}
           </div>
         ) : null}
 
@@ -15036,6 +15316,44 @@ export function App({
                       </option>
                     ))}
                   </select>
+                </div>
+
+                <div className="settings-row settings-row-block">
+                  <div>
+                    <strong>
+                      {t("settings.automaticImport.tags", "Automatic tags")}
+                    </strong>
+                    <small>
+                      {t(
+                        "settings.automaticImport.tagsDesc",
+                        "Comma-separated tags added to every new artifact from this source.",
+                      )}
+                    </small>
+                  </div>
+                  <input
+                    type="text"
+                    value={(source.tags ?? []).join(", ")}
+                    placeholder={t(
+                      "settings.automaticImport.tagsPlaceholder",
+                      "course, client, project",
+                    )}
+                    onChange={(event) => {
+                      const tags = Array.from(
+                        new Set(
+                          event.target.value
+                            .split(",")
+                            .map((value) => value.trim())
+                            .filter(Boolean),
+                        ),
+                      );
+                      void patchAutomaticImportSettings((current) => ({
+                        ...current,
+                        watched_sources: current.watched_sources.map((entry) =>
+                          entry.id === source.id ? { ...entry, tags } : entry,
+                        ),
+                      }));
+                    }}
+                  />
                 </div>
 
                 <div className="settings-row">

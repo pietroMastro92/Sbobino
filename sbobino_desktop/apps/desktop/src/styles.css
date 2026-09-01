@@ -1702,6 +1702,24 @@ summary,
   min-width: 0;
 }
 
+.history-smart-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.history-smart-chips .kind-chip {
+  padding: 2px 7px;
+  font-size: 0.72rem;
+}
+
+.history-tag-chip {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--line));
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--text);
+}
+
 .history-main strong {
   font-size: 1.03rem;
   font-weight: 650;
@@ -2734,6 +2752,23 @@ summary,
 
 .transcript-speaker-banner.is-warning {
   background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+}
+
+.segment-quality-warning {
+  display: flex;
+  margin-bottom: 8px;
+}
+
+.quality-report-block,
+.quality-warning-list {
+  display: grid;
+  gap: 8px;
+}
+
+.quality-warning-button {
+  justify-content: flex-start;
+  width: 100%;
+  text-align: left;
 }
 
 .transcript-speaker-banner.is-running {

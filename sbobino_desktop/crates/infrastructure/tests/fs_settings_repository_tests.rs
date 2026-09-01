@@ -248,6 +248,7 @@ async fn save_then_load_preserves_automatic_import_and_workspace_settings() {
         recursive: false,
         enable_ai_post_processing: true,
         post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(),
+        tags: vec!["work".to_string(), "voice memo".to_string()],
     }];
     settings.organization.workspaces = vec![sbobino_domain::WorkspaceConfig {
         id: "work".to_string(),
@@ -280,6 +281,10 @@ async fn save_then_load_preserves_automatic_import_and_workspace_settings() {
         sbobino_domain::LanguageCode::It
     );
     assert!(loaded.automation.watched_sources[0].enable_ai_post_processing);
+    assert_eq!(
+        loaded.automation.watched_sources[0].tags,
+        vec!["work".to_string(), "voice memo".to_string()]
+    );
     assert!(
         loaded.automation.watched_sources[0]
             .post_processing
@@ -312,6 +317,7 @@ async fn load_backfills_legacy_automatic_import_source_model_and_language() {
         recursive: true,
         enable_ai_post_processing: false,
         post_processing: sbobino_domain::AutomaticImportPostProcessingSettings::default(),
+        tags: Vec::new(),
     }];
 
     let mut raw = serde_json::to_value(&settings).expect("settings should serialize");

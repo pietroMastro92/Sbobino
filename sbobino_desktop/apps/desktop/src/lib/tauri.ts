@@ -181,7 +181,7 @@ export async function cancelTranscription(job_id: string): Promise<void> {
   return invoke<void>("cancel_transcription", { payload: { job_id } });
 }
 
-export async function listRecentArtifacts(limit = 40): Promise<TranscriptArtifact[]> {
+export async function listRecentArtifacts(limit = 500): Promise<TranscriptArtifact[]> {
   return invoke<TranscriptArtifact[]>("list_recent_artifacts", { limit });
 }
 
@@ -219,16 +219,18 @@ export async function updateArtifact(payload: {
 export async function updateArtifactTimeline(payload: {
   id: string;
   timeline_v2: string;
+  manual_edit?: boolean;
 }): Promise<TranscriptArtifact | null> {
   return invoke<TranscriptArtifact | null>("update_artifact_timeline", { payload });
 }
 
 export async function runArtifactSpeakerDiarization(
   artifact_id: string,
+  allow_overwrite_manual_edits = false,
 ): Promise<{ artifact_id: string; state: string }> {
   return invoke<{ artifact_id: string; state: string }>(
     "run_artifact_speaker_diarization",
-    { payload: { artifact_id } },
+    { payload: { artifact_id, allow_overwrite_manual_edits } },
   );
 }
 
