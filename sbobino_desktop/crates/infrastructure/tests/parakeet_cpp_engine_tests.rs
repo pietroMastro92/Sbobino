@@ -18,9 +18,10 @@ use sbobino_infrastructure::adapters::parakeet_cpp::ParakeetCppEngine;
 const DEFAULT_REAL_SMOKE_MODEL: &str = "tdt-0.6b-v3-q4_k.gguf";
 
 fn transcription_policy(code: &str) -> TranscriptionLanguagePolicy {
+    let preferred_language = LanguageCode::from_code(code);
     TranscriptionLanguagePolicy {
-        preferred_language: LanguageCode::from_code(code),
-        adaptive_detection: true,
+        adaptive_detection: preferred_language.is_auto(),
+        preferred_language,
     }
 }
 
@@ -1861,7 +1862,7 @@ done
 }
 
 #[tokio::test]
-async fn long_file_worker_uses_auto_language_and_preserves_nemotron_markers() {
+async fn long_file_worker_passes_explicit_language_and_preserves_nemotron_markers() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");
     let worker_path = temp.path().join("parakeet-batch-json");
@@ -1891,7 +1892,7 @@ while [ "$#" -gt 0 ]; do
     *) shift ;;
   esac
 done
-[ "$lang" = "auto" ] || { echo "worker language must be auto, got $lang" >&2; exit 46; }
+[ "$lang" = "it" ] || { echo "worker language must be it, got $lang" >&2; exit 46; }
 while IFS="$(printf '\t')" read -r idx decode_start decode_end commit_start commit_end path; do
   echo "{\"index\":$idx,\"decode_start\":$decode_start,\"decode_end\":$decode_end,\"commit_start\":$commit_start,\"commit_end\":$commit_end,\"result\":{\"text\":\"<it-IT>Ciao <en-US>Hello\"}}"
 done < "$manifest"

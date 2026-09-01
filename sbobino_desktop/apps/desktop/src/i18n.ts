@@ -43,7 +43,7 @@ const translations: AllTranslations = {
     "settings.transcription.language": "Preferred language",
     "settings.transcription.languageAuto": "Auto — detected per utterance",
     "settings.transcription.languageSearch": "Search languages...",
-    "settings.transcription.languageCompatibility": "Detection stays automatic; this preference is used for AI output. Compatibility follows the installed model.",
+    "settings.transcription.languageCompatibility": "Select Auto for adaptive detection; a concrete language is passed to the engine. Compatibility follows the installed model.",
     "settings.transcription.enableAi": "Enable AI post-processing",
     "settings.transcription.enableAiDesc": "Run optimize/summary prompts after transcription.",
 
@@ -586,7 +586,7 @@ const translations: AllTranslations = {
     "settings.transcription.language": "Lingua preferita",
     "settings.transcription.languageAuto": "Automatico — rilevata per enunciato",
     "settings.transcription.languageSearch": "Cerca lingue...",
-    "settings.transcription.languageCompatibility": "Il rilevamento resta automatico; questa preferenza viene usata per l'output AI. La compatibilità dipende dal modello installato.",
+    "settings.transcription.languageCompatibility": "Seleziona Auto per il rilevamento adattivo; una lingua concreta viene passata al motore. La compatibilità dipende dal modello installato.",
     "settings.transcription.enableAi": "Abilita post-elaborazione AI",
     "settings.transcription.enableAiDesc": "Esegui prompt di ottimizzazione/riepilogo dopo la trascrizione.",
     "settings.whisper.title": "Whisper C++",
@@ -1076,7 +1076,7 @@ const translations: AllTranslations = {
     "settings.transcription.language": "Idioma preferido",
     "settings.transcription.languageAuto": "Automático — detectado por enunciado",
     "settings.transcription.languageSearch": "Buscar idiomas...",
-    "settings.transcription.languageCompatibility": "La detección sigue siendo automática; esta preferencia se usa para la salida de IA. La compatibilidad depende del modelo instalado.",
+    "settings.transcription.languageCompatibility": "Selecciona Auto para la detección adaptativa; el motor recibe el idioma concreto. La compatibilidad depende del modelo instalado.",
     "settings.transcription.enableAi": "Habilitar posprocesamiento con IA",
     "settings.transcription.enableAiDesc": "Ejecutar prompts de optimización/resumen después de la transcripción.",
 
@@ -1622,7 +1622,7 @@ const translations: AllTranslations = {
     "settings.transcription.language": "Bevorzugte Sprache",
     "settings.transcription.languageAuto": "Automatisch — pro Äußerung erkannt",
     "settings.transcription.languageSearch": "Sprachen suchen...",
-    "settings.transcription.languageCompatibility": "Die Erkennung bleibt automatisch; diese Präferenz wird für die KI-Ausgabe verwendet. Die Kompatibilität hängt vom installierten Modell ab.",
+    "settings.transcription.languageCompatibility": "Wähle Auto für die adaptive Erkennung; eine konkrete Sprache wird an die Engine übergeben. Die Kompatibilität hängt vom installierten Modell ab.",
     "settings.transcription.enableAi": "KI-Nachbearbeitung aktivieren",
     "settings.transcription.enableAiDesc": "Optimierungs-/Zusammenfassungs-Prompts nach der Transkription ausführen.",
 

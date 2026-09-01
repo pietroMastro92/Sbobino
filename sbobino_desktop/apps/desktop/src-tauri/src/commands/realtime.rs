@@ -275,9 +275,14 @@ fn resolve_parakeet_live_library_path_for_platform(
         .unwrap_or_else(|| bin_dir.join(platform.library_filename()))
 }
 
-pub(crate) fn parakeet_live_target_lang(language: LanguageCode) -> &'static str {
-    let _preferred_language = language;
-    "auto"
+pub(crate) fn parakeet_live_target_lang(language: LanguageCode) -> String {
+    match language {
+        LanguageCode::Auto => "auto".to_string(),
+        // Nemotron's locale dictionary uses ja-JP rather than bare ja.
+        LanguageCode::Ja => "ja-JP".to_string(),
+        LanguageCode::Custom(value) => value,
+        language => language.as_code().to_string(),
+    }
 }
 
 pub(crate) fn select_parakeet_live_model(
@@ -763,7 +768,6 @@ pub async fn start_realtime(
     *state.realtime.active_job_id.lock().await = Some(job_id.clone());
     *state.realtime.session_name.lock().await = Some(session_title.clone());
     // Persist the user's preference separately from the engine's runtime flag.
-    // Both live engines are started in automatic detection mode.
     *state.realtime.language_code.lock().await = language.as_code().to_string();
     *state.realtime.active_engine.lock().await = engine_kind.clone();
     *state.realtime.model.lock().await = Some(model.clone());
@@ -896,10 +900,11 @@ pub async fn start_realtime(
             }
 
             eprintln!("[realtime-start] starting parakeet engine");
+            let target_language = parakeet_live_target_lang(language.clone());
             if let Err(error) = parakeet_engine
                 .start(
                     live_model.gguf_filename(),
-                    parakeet_live_target_lang(language.clone()),
+                    &target_language,
                     emit_delta,
                     emit_input_level.clone(),
                 )
@@ -1413,6 +1418,17 @@ mod tests {
                 .expect("selected");
 
         assert_eq!(selected, ParakeetModel::Nemotron35AsrStreaming06bQ4);
+    }
+
+    #[test]
+    fn parakeet_live_passes_selected_language_or_auto_to_runtime() {
+        assert_eq!(parakeet_live_target_lang(LanguageCode::Auto), "auto");
+        assert_eq!(parakeet_live_target_lang(LanguageCode::It), "it");
+        assert_eq!(parakeet_live_target_lang(LanguageCode::Ja), "ja-JP");
+        assert_eq!(
+            parakeet_live_target_lang(LanguageCode::Custom("nl".to_string())),
+            "nl"
+        );
     }
 
     #[test]

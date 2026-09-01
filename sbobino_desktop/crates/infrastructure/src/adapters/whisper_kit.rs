@@ -1086,7 +1086,7 @@ impl SpeechToTextEngine for WhisperKitEngine {
         &self,
         input_wav: &Path,
         model_filename: &str,
-        _language_policy: &TranscriptionLanguagePolicy,
+        language_policy: &TranscriptionLanguagePolicy,
         options: &WhisperOptions,
         _total_audio_seconds: Option<f32>,
         emit_partial: Arc<dyn Fn(String) + Send + Sync>,
@@ -1096,10 +1096,7 @@ impl SpeechToTextEngine for WhisperKitEngine {
             .transcribe_with_server(
                 input_wav,
                 model_filename,
-                // Keep the legacy WhisperKit adapter adaptive as well.  The
-                // selected language is persisted as an AI preference, never
-                // sent as a transcription constraint.
-                "auto",
+                language_policy.runtime_language_code(),
                 options,
                 emit_partial.clone(),
                 emit_progress_seconds.clone(),
@@ -1112,7 +1109,7 @@ impl SpeechToTextEngine for WhisperKitEngine {
                 self.transcribe_with_cli(
                     input_wav,
                     model_filename,
-                    "auto",
+                    language_policy.runtime_language_code(),
                     options,
                     emit_partial,
                     emit_progress_seconds,
