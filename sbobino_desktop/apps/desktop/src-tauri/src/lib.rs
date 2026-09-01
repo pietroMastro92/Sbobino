@@ -20,13 +20,14 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::commands::artifacts::{
-    analyze_artifact_emotions, cancel_artifact_speaker_diarization, chat_artifact,
-    delete_artifacts, empty_deleted_artifacts, export_artifact, generate_artifact_pack,
-    get_artifact, hard_delete_artifacts, list_artifact_chat, list_artifacts,
-    list_deleted_artifacts, list_recent_artifacts, optimize_artifact, preview_artifact_export,
-    read_artifact_audio, read_audio_file, rename_artifact, restore_artifacts,
-    run_artifact_speaker_diarization, summarize_artifact, update_artifact,
-    update_artifact_timeline, write_trimmed_audio,
+    analyze_artifact_emotions, apply_artifact_review, cancel_artifact_speaker_diarization,
+    chat_artifact, clear_personalization_entries, delete_artifacts, delete_personalization_entry,
+    empty_deleted_artifacts, export_artifact, generate_artifact_pack, get_artifact,
+    hard_delete_artifacts, list_artifact_chat, list_artifacts, list_deleted_artifacts,
+    list_personalization_entries, list_recent_artifacts, optimize_artifact,
+    preview_artifact_export, read_artifact_audio, read_audio_file, rename_artifact,
+    restore_artifacts, run_artifact_speaker_diarization, summarize_artifact, update_artifact,
+    update_artifact_timeline, upsert_personalization_entry, write_trimmed_audio,
 };
 use crate::commands::automatic_import::{
     clear_automatic_import_quarantine_item, retry_automatic_import_quarantine_item,
@@ -231,6 +232,11 @@ pub fn run() {
             list_artifacts,
             list_deleted_artifacts,
             list_recent_artifacts,
+            list_personalization_entries,
+            upsert_personalization_entry,
+            delete_personalization_entry,
+            clear_personalization_entries,
+            apply_artifact_review,
             get_artifact,
             list_artifact_chat,
             update_artifact,

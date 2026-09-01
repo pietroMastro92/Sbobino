@@ -93,6 +93,10 @@ function createSettingsFixture(): AppSettings {
     organization: {
       workspaces: [],
     },
+    personalization: {
+      enabled: true,
+      auto_apply_safe_corrections: false,
+    },
     ai: {
       active_provider: "none",
       active_remote_service_id: null,

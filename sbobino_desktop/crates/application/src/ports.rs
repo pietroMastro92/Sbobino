@@ -3,8 +3,8 @@ use std::path::Path;
 use async_trait::async_trait;
 
 use sbobino_domain::{
-    AppSettings, ArtifactChatMessage, ArtifactKind, SpeakerTurn, TranscriptArtifact,
-    TranscriptionLanguagePolicy, TranscriptionOutput, WhisperOptions,
+    AppSettings, ArtifactChatMessage, ArtifactKind, PersonalizationEntry, SpeakerTurn,
+    TranscriptArtifact, TranscriptionLanguagePolicy, TranscriptionOutput, WhisperOptions,
 };
 
 use crate::{dto::SummaryFaq, ApplicationError};
@@ -111,6 +111,18 @@ pub trait ArtifactRepository: Send + Sync {
         key: &str,
         value: Option<&str>,
     ) -> Result<Option<TranscriptArtifact>, ApplicationError>;
+    async fn apply_artifact_review_update(
+        &self,
+        _id: &str,
+        _expected_revision: i64,
+        _optimized_transcript: Option<&str>,
+        _review_metadata_json: &str,
+        _remembered_correction: Option<&PersonalizationEntry>,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        Err(ApplicationError::Persistence(
+            "atomic artifact review updates are not supported".to_string(),
+        ))
+    }
     async fn update_timeline_v2(
         &self,
         id: &str,
@@ -169,6 +181,36 @@ pub trait ArtifactRepository: Send + Sync {
         _artifact_id: &str,
     ) -> Result<Option<String>, ApplicationError> {
         Ok(None)
+    }
+
+    /// List local vocabulary and correction-memory entries.  The default keeps
+    /// lightweight repository test doubles source-compatible while the
+    /// SQLite adapter provides the durable implementation.
+    async fn list_personalization_entries(
+        &self,
+    ) -> Result<Vec<PersonalizationEntry>, ApplicationError> {
+        Ok(Vec::new())
+    }
+
+    async fn upsert_personalization_entry(
+        &self,
+        _entry: &PersonalizationEntry,
+    ) -> Result<(), ApplicationError> {
+        Err(ApplicationError::Persistence(
+            "personalization persistence is not supported".to_string(),
+        ))
+    }
+
+    async fn delete_personalization_entry(&self, _id: &str) -> Result<usize, ApplicationError> {
+        Ok(0)
+    }
+
+    async fn clear_personalization_entries(&self) -> Result<usize, ApplicationError> {
+        Ok(0)
+    }
+
+    async fn increment_personalization_hit_count(&self, _id: &str) -> Result<(), ApplicationError> {
+        Ok(())
     }
 }
 

@@ -8084,3 +8084,111 @@ body.sidebar-resizing {
   background: rgba(92, 35, 25, 0.44);
   border-color: rgba(255, 154, 118, 0.22);
 }
+
+.transcript-review-card,
+.personalization-entry {
+  display: grid;
+  gap: 10px;
+}
+
+.transcript-review-head,
+.personalization-entry,
+.personalization-entry-actions,
+.transcript-review-actions,
+.transcript-review-nav {
+  display: flex;
+  align-items: center;
+}
+
+.transcript-review-head,
+.personalization-entry {
+  justify-content: space-between;
+}
+
+.transcript-review-head > div,
+.personalization-entry > div:first-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.transcript-review-context {
+  margin: 0;
+  padding: 10px 12px;
+  border-left: 3px solid var(--accent, #6575d8);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent, #6575d8) 7%, transparent);
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.transcript-review-target {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+  border-radius: 7px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.transcript-review-editor,
+.transcript-review-editor label,
+.personalization-entry-form,
+.personalization-entry-list {
+  display: grid;
+  gap: 8px;
+}
+
+.transcript-review-remember {
+  display: flex !important;
+  grid-template-columns: none !important;
+  align-items: center;
+  gap: 7px !important;
+}
+
+.transcript-review-actions,
+.transcript-review-nav,
+.personalization-entry-actions {
+  gap: 7px;
+}
+
+.transcript-review-actions,
+.transcript-review-nav {
+  justify-content: flex-end;
+}
+
+.transcript-review-card.is-complete {
+  border-color: color-mix(in srgb, #2f9d62 36%, transparent);
+}
+
+.personalization-entry-form {
+  grid-template-columns: minmax(120px, 0.75fr) minmax(160px, 1.4fr) minmax(110px, 0.75fr) auto;
+  align-items: end;
+}
+
+.personalization-entry-form input,
+.personalization-entry-form select,
+.transcript-review-editor input {
+  min-width: 0;
+  width: 100%;
+}
+
+.personalization-entry-list {
+  margin: 12px 0;
+}
+
+.personalization-entry {
+  padding: 11px 12px;
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  border-radius: 9px;
+}
+
+.personalization-entry small {
+  display: block;
+  opacity: 0.72;
+}
+
+@media (max-width: 900px) {
+  .personalization-entry-form {
+    grid-template-columns: 1fr;
+  }
+}

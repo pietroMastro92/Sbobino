@@ -354,6 +354,7 @@ fn should_treat_legacy_fields_as_source(settings: &AppSettings) -> bool {
         "organization": &settings.organization,
         "ai": &settings.ai,
         "prompts": &settings.prompts,
+        "personalization": &settings.personalization,
     }) == json!({
         "general": {
             "auto_update_enabled": defaults.general.auto_update_enabled,
@@ -364,6 +365,7 @@ fn should_treat_legacy_fields_as_source(settings: &AppSettings) -> bool {
         "organization": &defaults.organization,
         "ai": &defaults.ai,
         "prompts": &defaults.prompts,
+        "personalization": &defaults.personalization,
     });
 
     legacy_differs && sections_match_defaults

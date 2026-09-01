@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use sbobino_application::{ApplicationError, ArtifactRepository};
 use sbobino_domain::{
     ArtifactAudioBackfillStatus, ArtifactChatMessage, ArtifactKind, ArtifactSourceOrigin,
-    TranscriptArtifact,
+    PersonalizationEntry, PersonalizationEntryKind, TranscriptArtifact,
 };
 
 use crate::secure_storage::{decrypt_from_file, encrypt_to_file, SecureStorage};
@@ -162,6 +162,88 @@ impl SqliteArtifactRepository {
         Ok(())
     }
 
+    pub fn import_backup_personalization_entry(
+        &self,
+        entry: &PersonalizationEntry,
+    ) -> Result<(), ApplicationError> {
+        self.upsert_personalization_entry_sync(entry)
+    }
+
+    fn upsert_personalization_entry_sync(
+        &self,
+        entry: &PersonalizationEntry,
+    ) -> Result<(), ApplicationError> {
+        if entry.id.trim().is_empty() {
+            return Err(ApplicationError::Validation(
+                "personalization entry id cannot be empty".to_string(),
+            ));
+        }
+        if entry.source_text.trim().is_empty() {
+            return Err(ApplicationError::Validation(
+                "personalization source text cannot be empty".to_string(),
+            ));
+        }
+        if entry.kind == PersonalizationEntryKind::Correction
+            && entry
+                .replacement_text
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(ApplicationError::Validation(
+                "personalization correction replacement text cannot be empty".to_string(),
+            ));
+        }
+        let hit_count = i64::try_from(entry.hit_count).map_err(|_| {
+            ApplicationError::Validation(
+                "personalization entry hit count exceeds SQLite integer range".to_string(),
+            )
+        })?;
+        let source_text_enc =
+            self.encrypt_personalization_text(&entry.id, "source_text", &entry.source_text)?;
+        let replacement_text_enc = entry
+            .replacement_text
+            .as_deref()
+            .map(|value| self.encrypt_personalization_text(&entry.id, "replacement_text", value))
+            .transpose()?;
+        let language_code_enc = entry
+            .language_code
+            .as_deref()
+            .map(|value| self.encrypt_personalization_text(&entry.id, "language_code", value))
+            .transpose()?;
+        let conn = self.open_connection()?;
+        conn.execute(
+            r#"
+            INSERT INTO personalization_entries (
+                id, kind, source_text_enc, replacement_text_enc, language_code_enc,
+                enabled, hit_count, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                source_text_enc = excluded.source_text_enc,
+                replacement_text_enc = excluded.replacement_text_enc,
+                language_code_enc = excluded.language_code_enc,
+                enabled = excluded.enabled,
+                hit_count = excluded.hit_count,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                entry.id,
+                entry.kind.as_str(),
+                source_text_enc,
+                replacement_text_enc,
+                language_code_enc,
+                if entry.enabled { 1_i64 } else { 0_i64 },
+                hit_count,
+                entry.created_at.to_rfc3339(),
+                entry.updated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| {
+            ApplicationError::Persistence(format!("failed to upsert personalization entry: {e}"))
+        })?;
+        Ok(())
+    }
+
     fn init_schema(&self) -> Result<(), ApplicationError> {
         if let Some(parent) = self.db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -261,8 +343,26 @@ impl SqliteArtifactRepository {
                 FOREIGN KEY(artifact_id) REFERENCES transcript_artifacts(id) ON DELETE CASCADE
             );
 
+            -- Personalization is additive to the artifact schema.  User text
+            -- stays encrypted with the same per-installation SecureStorage
+            -- key; only query-neutral metadata is kept in plaintext.
+            CREATE TABLE IF NOT EXISTS personalization_entries (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                source_text_enc BLOB NOT NULL,
+                replacement_text_enc BLOB,
+                language_code_enc BLOB,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                hit_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_artifact_chat_messages_artifact
             ON artifact_chat_messages(artifact_id, created_at, id);
+
+            CREATE INDEX IF NOT EXISTS idx_personalization_entries_updated_at
+            ON personalization_entries(updated_at DESC, id ASC);
 
             CREATE INDEX IF NOT EXISTS idx_transcript_artifacts_created_at
             ON transcript_artifacts(created_at DESC);
@@ -602,6 +702,94 @@ impl SqliteArtifactRepository {
             .decrypt_bytes(&Self::encrypted_label(artifact_id, field), value)?;
         String::from_utf8(bytes).map_err(|e| {
             ApplicationError::Persistence(format!("failed to decode decrypted UTF-8 text: {e}"))
+        })
+    }
+
+    fn personalization_encrypted_label(entry_id: &str, field: &str) -> String {
+        format!("personalization:{entry_id}:{field}")
+    }
+
+    fn encrypt_personalization_text(
+        &self,
+        entry_id: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<Vec<u8>, ApplicationError> {
+        self.secure_storage.encrypt_bytes(
+            &Self::personalization_encrypted_label(entry_id, field),
+            value.as_bytes(),
+        )
+    }
+
+    fn decrypt_personalization_text(
+        &self,
+        entry_id: &str,
+        field: &str,
+        value: &[u8],
+    ) -> Result<String, ApplicationError> {
+        let bytes = self.secure_storage.decrypt_bytes(
+            &Self::personalization_encrypted_label(entry_id, field),
+            value,
+        )?;
+        String::from_utf8(bytes).map_err(|e| {
+            ApplicationError::Persistence(format!(
+                "failed to decode decrypted personalization UTF-8 text: {e}"
+            ))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_personalization_entry(
+        &self,
+        id: String,
+        kind: String,
+        source_text_enc: Vec<u8>,
+        replacement_text_enc: Option<Vec<u8>>,
+        language_code_enc: Option<Vec<u8>>,
+        enabled: i64,
+        hit_count: i64,
+        created_at: String,
+        updated_at: String,
+    ) -> Result<PersonalizationEntry, ApplicationError> {
+        let kind = PersonalizationEntryKind::parse_storage_value(&kind).ok_or_else(|| {
+            ApplicationError::Persistence(format!("unknown personalization entry kind `{kind}`"))
+        })?;
+        let hit_count = u64::try_from(hit_count).map_err(|_| {
+            ApplicationError::Persistence(
+                "personalization entry hit count cannot be negative".to_string(),
+            )
+        })?;
+        let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|e| {
+                ApplicationError::Persistence(format!(
+                    "invalid personalization created_at timestamp: {e}"
+                ))
+            })?;
+        let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|e| {
+                ApplicationError::Persistence(format!(
+                    "invalid personalization updated_at timestamp: {e}"
+                ))
+            })?;
+
+        Ok(PersonalizationEntry {
+            source_text: self.decrypt_personalization_text(&id, "source_text", &source_text_enc)?,
+            replacement_text: replacement_text_enc
+                .as_deref()
+                .map(|value| self.decrypt_personalization_text(&id, "replacement_text", value))
+                .transpose()?,
+            language_code: language_code_enc
+                .as_deref()
+                .map(|value| self.decrypt_personalization_text(&id, "language_code", value))
+                .transpose()?,
+            id,
+            kind,
+            enabled: enabled != 0,
+            hit_count,
+            created_at,
+            updated_at,
         })
     }
 
@@ -1355,6 +1543,145 @@ impl ArtifactRepository for SqliteArtifactRepository {
         .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
     }
 
+    async fn apply_artifact_review_update(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        optimized_transcript: Option<&str>,
+        review_metadata_json: &str,
+        remembered_correction: Option<&PersonalizationEntry>,
+    ) -> Result<Option<TranscriptArtifact>, ApplicationError> {
+        let repo = self.clone();
+        let id = id.to_string();
+        let optimized_transcript = optimized_transcript.map(str::to_string);
+        let review_metadata_json = review_metadata_json.to_string();
+        let remembered_correction = remembered_correction.cloned();
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = repo.open_connection()?;
+            let Some(current) = repo.load_one(&conn, &id, false)? else {
+                return Ok(None);
+            };
+            if current.revision != expected_revision {
+                return Err(ApplicationError::Persistence(
+                    "artifact review rejected because a newer revision already exists".to_string(),
+                ));
+            }
+            let mut metadata = current.metadata.clone();
+            metadata.insert(
+                "personalization_review_v1".to_string(),
+                review_metadata_json,
+            );
+            let next_optimized = optimized_transcript
+                .as_deref()
+                .unwrap_or(&current.optimized_transcript);
+            if next_optimized.trim().is_empty() {
+                metadata.remove(HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY);
+            } else {
+                metadata.insert(
+                    HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY.to_string(),
+                    "true".to_string(),
+                );
+            }
+            let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
+                ApplicationError::Persistence(format!(
+                    "failed to serialize artifact review metadata: {error}"
+                ))
+            })?;
+            let tx = conn.transaction().map_err(|error| {
+                ApplicationError::Persistence(format!(
+                    "failed to start artifact review transaction: {error}"
+                ))
+            })?;
+            let changed = tx
+                .execute(
+                    r#"
+                    UPDATE transcript_artifacts
+                    SET optimized_transcript_enc = ?2,
+                        metadata_json_enc = ?3,
+                        updated_at = ?4,
+                        revision = revision + 1
+                    WHERE id = ?1 AND is_deleted = 0 AND revision = ?5
+                    "#,
+                    params![
+                        id,
+                        repo.encrypt_text(&current.id, "optimized_transcript", next_optimized)?,
+                        repo.encrypt_text(&current.id, "metadata_json", &metadata_json)?,
+                        Utc::now().to_rfc3339(),
+                        expected_revision,
+                    ],
+                )
+                .map_err(|error| {
+                    ApplicationError::Persistence(format!(
+                        "failed to apply artifact review: {error}"
+                    ))
+                })?;
+            if changed == 0 {
+                return Err(ApplicationError::Persistence(
+                    "artifact review rejected because a newer revision already exists".to_string(),
+                ));
+            }
+            if let Some(correction) = remembered_correction {
+                let source_text_enc = repo.encrypt_personalization_text(
+                    &correction.id,
+                    "source_text",
+                    &correction.source_text,
+                )?;
+                let replacement_text_enc = correction
+                    .replacement_text
+                    .as_deref()
+                    .map(|value| {
+                        repo.encrypt_personalization_text(&correction.id, "replacement_text", value)
+                    })
+                    .transpose()?;
+                let language_code_enc = correction
+                    .language_code
+                    .as_deref()
+                    .map(|value| {
+                        repo.encrypt_personalization_text(&correction.id, "language_code", value)
+                    })
+                    .transpose()?;
+                let hit_count = i64::try_from(correction.hit_count).map_err(|_| {
+                    ApplicationError::Validation(
+                        "personalization entry hit count exceeds SQLite integer range".to_string(),
+                    )
+                })?;
+                tx.execute(
+                    r#"
+                    INSERT INTO personalization_entries (
+                        id, kind, source_text_enc, replacement_text_enc, language_code_enc,
+                        enabled, hit_count, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    "#,
+                    params![
+                        correction.id,
+                        correction.kind.as_str(),
+                        source_text_enc,
+                        replacement_text_enc,
+                        language_code_enc,
+                        if correction.enabled { 1_i64 } else { 0_i64 },
+                        hit_count,
+                        correction.created_at.to_rfc3339(),
+                        correction.updated_at.to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| {
+                    ApplicationError::Persistence(format!(
+                        "failed to remember reviewed correction: {error}"
+                    ))
+                })?;
+            }
+            tx.commit().map_err(|error| {
+                ApplicationError::Persistence(format!("failed to commit artifact review: {error}"))
+            })?;
+            repo.load_one(&repo.open_connection()?, &id, false)
+        })
+        .await
+        .map_err(|error| {
+            ApplicationError::Persistence(format!("storage task join error: {error}"))
+        })?
+    }
+
     async fn update_timeline_v2(
         &self,
         id: &str,
@@ -1736,6 +2063,157 @@ impl ArtifactRepository for SqliteArtifactRepository {
         })
         .await
         .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn list_personalization_entries(
+        &self,
+    ) -> Result<Vec<PersonalizationEntry>, ApplicationError> {
+        let repo = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = repo.open_connection()?;
+            let mut stmt = conn
+                .prepare(
+                    r#"
+                    SELECT id, kind, source_text_enc, replacement_text_enc,
+                           language_code_enc, enabled, hit_count, created_at, updated_at
+                    FROM personalization_entries
+                    ORDER BY updated_at DESC, id ASC
+                    "#,
+                )
+                .map_err(|e| {
+                    ApplicationError::Persistence(format!(
+                        "failed to prepare personalization query: {e}"
+                    ))
+                })?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                })
+                .map_err(|e| {
+                    ApplicationError::Persistence(format!(
+                        "failed to query personalization entries: {e}"
+                    ))
+                })?;
+
+            rows.map(|row| {
+                let (
+                    id,
+                    kind,
+                    source_text_enc,
+                    replacement_text_enc,
+                    language_code_enc,
+                    enabled,
+                    hit_count,
+                    created_at,
+                    updated_at,
+                ) = row.map_err(|e| {
+                    ApplicationError::Persistence(format!(
+                        "failed to read personalization entry: {e}"
+                    ))
+                })?;
+                repo.decode_personalization_entry(
+                    id,
+                    kind,
+                    source_text_enc,
+                    replacement_text_enc,
+                    language_code_enc,
+                    enabled,
+                    hit_count,
+                    created_at,
+                    updated_at,
+                )
+            })
+            .collect()
+        })
+        .await
+        .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn upsert_personalization_entry(
+        &self,
+        entry: &PersonalizationEntry,
+    ) -> Result<(), ApplicationError> {
+        let repo = self.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || repo.upsert_personalization_entry_sync(&entry))
+            .await
+            .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn delete_personalization_entry(&self, id: &str) -> Result<usize, ApplicationError> {
+        let id = id.trim().to_string();
+        if id.is_empty() {
+            return Ok(0);
+        }
+        let repo = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = repo.open_connection()?;
+            conn.execute(
+                "DELETE FROM personalization_entries WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| {
+                ApplicationError::Persistence(format!(
+                    "failed to delete personalization entry: {e}"
+                ))
+            })
+        })
+        .await
+        .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn clear_personalization_entries(&self) -> Result<usize, ApplicationError> {
+        let repo = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = repo.open_connection()?;
+            conn.execute("DELETE FROM personalization_entries", [])
+                .map_err(|e| {
+                    ApplicationError::Persistence(format!(
+                        "failed to clear personalization entries: {e}"
+                    ))
+                })
+        })
+        .await
+        .map_err(|e| ApplicationError::Persistence(format!("storage task join error: {e}")))?
+    }
+
+    async fn increment_personalization_hit_count(&self, id: &str) -> Result<(), ApplicationError> {
+        let repo = self.clone();
+        let id = id.trim().to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = repo.open_connection()?;
+            let changed = conn
+                .execute(
+                    "UPDATE personalization_entries SET hit_count = hit_count + 1, updated_at = ?2 WHERE id = ?1",
+                    params![id, Utc::now().to_rfc3339()],
+                )
+                .map_err(|error| {
+                    ApplicationError::Persistence(format!(
+                        "failed to increment personalization hit count: {error}"
+                    ))
+                })?;
+            if changed == 0 {
+                return Err(ApplicationError::Persistence(
+                    "personalization entry disappeared before its hit count could be updated"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            ApplicationError::Persistence(format!("storage task join error: {error}"))
+        })?
     }
 }
 

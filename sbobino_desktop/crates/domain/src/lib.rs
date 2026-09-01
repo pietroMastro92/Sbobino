@@ -2,6 +2,7 @@ pub mod artifact;
 pub mod emotion_analysis;
 pub mod error;
 pub mod job;
+pub mod personalization;
 pub mod settings;
 pub mod transcript_cleanup;
 
@@ -16,17 +17,18 @@ pub use emotion_analysis::{
 };
 pub use error::DomainError;
 pub use job::{JobProgress, JobStage, JobStatus, TranscriptionJob};
+pub use personalization::{PersonalizationEntry, PersonalizationEntryKind};
 pub use settings::{
     default_prompt_templates, transcription_language_catalog, whisper_live_model_manifest,
     AiProvider, AiSettings, AppLanguage, AppSettings, AppearanceMode, AutomaticImportActivityEntry,
     AutomaticImportActivityLevel, AutomaticImportPostProcessingSettings, AutomaticImportPreset,
     AutomaticImportQuarantineItem, AutomaticImportSettings, AutomaticImportSource,
     AutomaticImportSourceHealth, AutomaticImportSourceStatus, GeneralSettings, LanguageCode,
-    OrganizationSettings, ParakeetModel, PromptBindings, PromptCategory, PromptSettings,
-    PromptTask, PromptTemplate, RemoteServiceConfig, RemoteServiceKind, SpeakerDiarizationSettings,
-    SpeechModel, TranscriptionComputeDevice, TranscriptionEngine, TranscriptionLanguageOption,
-    TranscriptionLanguagePolicy, TranscriptionSettings, WhisperLiveCoreMlEncoderManifest,
-    WhisperLiveModelManifest, WhisperOptions, WorkspaceConfig,
+    OrganizationSettings, ParakeetModel, PersonalizationSettings, PromptBindings, PromptCategory,
+    PromptSettings, PromptTask, PromptTemplate, RemoteServiceConfig, RemoteServiceKind,
+    SpeakerDiarizationSettings, SpeechModel, TranscriptionComputeDevice, TranscriptionEngine,
+    TranscriptionLanguageOption, TranscriptionLanguagePolicy, TranscriptionSettings,
+    WhisperLiveCoreMlEncoderManifest, WhisperLiveModelManifest, WhisperOptions, WorkspaceConfig,
 };
 pub use transcript_cleanup::{
     collapse_consecutive_repeated_segments, constrain_transcript_edit,

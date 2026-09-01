@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sbobino_domain::{
     AiProvider, AiSettings, AppSettings, AutomaticImportSettings, GeneralSettings,
-    OrganizationSettings, PromptSettings, PromptTask, PromptTemplate, TranscriptionSettings,
+    OrganizationSettings, PersonalizationSettings, PromptSettings, PromptTask, PromptTemplate,
+    TranscriptionSettings,
 };
 
 use crate::{ApplicationError, SettingsRepository};
@@ -50,6 +51,29 @@ impl SettingsService {
         ai: Option<AiSettings>,
         prompts: Option<PromptSettings>,
     ) -> Result<AppSettings, ApplicationError> {
+        self.update_partial_with_personalization(
+            general,
+            transcription,
+            automation,
+            organization,
+            ai,
+            prompts,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_partial_with_personalization(
+        &self,
+        general: Option<GeneralSettings>,
+        transcription: Option<TranscriptionSettings>,
+        automation: Option<AutomaticImportSettings>,
+        organization: Option<OrganizationSettings>,
+        ai: Option<AiSettings>,
+        prompts: Option<PromptSettings>,
+        personalization: Option<PersonalizationSettings>,
+    ) -> Result<AppSettings, ApplicationError> {
         let _write_guard = self.write_lock.lock().await;
         let mut settings = self.load_synced().await?;
         if let Some(value) = general {
@@ -69,6 +93,9 @@ impl SettingsService {
         }
         if let Some(value) = prompts {
             settings.prompts = value;
+        }
+        if let Some(value) = personalization {
+            settings.personalization = value;
         }
 
         self.persist_with_source(settings, SettingsSyncSource::Sections)
