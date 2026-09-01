@@ -102,6 +102,19 @@ impl Default for TranscriptionLanguagePolicy {
     }
 }
 
+impl TranscriptionLanguagePolicy {
+    /// Resolve the language flag sent to an engine. Automatic detection is
+    /// explicit in the policy; a concrete preference is passed through only
+    /// when adaptive detection is disabled.
+    pub fn runtime_language_code(&self) -> &str {
+        if self.adaptive_detection {
+            "auto"
+        } else {
+            self.preferred_language.as_code()
+        }
+    }
+}
+
 impl Serialize for LanguageCode {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1284,6 +1297,23 @@ mod language_tests {
         let policy = TranscriptionLanguagePolicy::default();
         assert!(policy.adaptive_detection);
         assert_eq!(policy.preferred_language, LanguageCode::Auto);
+    }
+
+    #[test]
+    fn explicit_policy_uses_selected_runtime_language() {
+        let policy = TranscriptionLanguagePolicy {
+            preferred_language: LanguageCode::It,
+            adaptive_detection: false,
+        };
+        assert_eq!(policy.runtime_language_code(), "it");
+        assert_eq!(
+            TranscriptionLanguagePolicy {
+                preferred_language: LanguageCode::It,
+                adaptive_detection: true,
+            }
+            .runtime_language_code(),
+            "auto"
+        );
     }
 
     #[test]

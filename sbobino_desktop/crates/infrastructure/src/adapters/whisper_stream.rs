@@ -127,6 +127,15 @@ impl WhisperStreamEngine {
         }
     }
 
+    fn runtime_language_code(language_code: &str) -> &str {
+        let language_code = language_code.trim();
+        if language_code.is_empty() {
+            "auto"
+        } else {
+            language_code
+        }
+    }
+
     fn bounded_thread_count(available: usize) -> usize {
         available.clamp(1, 8)
     }
@@ -784,8 +793,9 @@ impl WhisperStreamEngine {
             .stderr(std::process::Stdio::piped())
             .current_dir(&session_dir);
 
-        let _preferred_language = language_code;
-        command.arg("-l").arg("auto");
+        command
+            .arg("-l")
+            .arg(Self::runtime_language_code(language_code));
         for argument in Self::compute_device_args(self.compute_device) {
             command.arg(argument);
         }
@@ -1149,6 +1159,12 @@ mod tests {
             "whisper_full_with_state: auto-detected language: en (p = 0.83)",
         );
         assert_eq!(parsed, Some(("en".to_string(), 0.83)));
+    }
+
+    #[test]
+    fn empty_live_language_falls_back_to_auto() {
+        assert_eq!(WhisperStreamEngine::runtime_language_code(""), "auto");
+        assert_eq!(WhisperStreamEngine::runtime_language_code("it"), "it");
     }
 
     #[test]

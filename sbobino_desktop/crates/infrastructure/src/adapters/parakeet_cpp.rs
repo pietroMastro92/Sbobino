@@ -422,11 +422,13 @@ impl ParakeetCppEngine {
         model_filename.starts_with(NEMOTRON_STREAMING_PREFIX)
     }
 
-    fn parakeet_target_lang(_language_code: &str) -> &str {
-        // The persisted language is a preference for AI output.  Nemotron's
-        // language marker stream must remain in automatic mode so it can
-        // switch languages between utterances.
-        "auto"
+    fn parakeet_target_lang(language_code: &str) -> &str {
+        match language_code.trim() {
+            "" => "auto",
+            // Nemotron's locale dictionary uses ja-JP rather than bare ja.
+            "ja" => "ja-JP",
+            value => value,
+        }
     }
 
     fn validate_preview_model_exists(
@@ -1533,37 +1535,88 @@ impl ParakeetCppEngine {
         } else {
             marked_text
         };
-        let words = segment
-            .words
-            .into_iter()
-            .filter_map(Self::word_from_json)
-            .collect::<Vec<_>>();
+        let parent_start = segment.start.filter(|value| value.is_finite());
+        let parent_end = segment.end.filter(|value| value.is_finite());
+        let segment_language = segment
+            .language
+            .as_deref()
+            .and_then(Self::normalize_detected_language);
+        let language_confidence = segment
+            .language_confidence
+            .filter(|value| value.is_finite());
 
-        let text_count = text.len().max(1);
-        text.into_iter()
-            .enumerate()
-            .map(|(index, (text, marker_language))| TimedSegment {
-                text,
-                start_seconds: segment.start.filter(|value| value.is_finite()),
-                end_seconds: segment.end.filter(|value| value.is_finite()),
-                speaker_id: None,
-                speaker_label: None,
-                language_code: marker_language.or_else(|| {
-                    segment
-                        .language
-                        .as_deref()
-                        .and_then(Self::normalize_detected_language)
-                }),
-                language_confidence: segment
-                    .language_confidence
-                    .filter(|value| value.is_finite()),
-                words: if index + 1 == text_count {
-                    words.clone()
-                } else {
-                    Vec::new()
-                },
-            })
-            .collect()
+        let mut segments = if text.len() > 1 {
+            let mut segments = Self::segments_from_marked_text_and_words(text, segment.words);
+            Self::fill_missing_parent_bounds(&mut segments, parent_start, parent_end);
+            segments
+        } else {
+            text.into_iter()
+                .map(|(text, marker_language)| TimedSegment {
+                    text,
+                    start_seconds: parent_start,
+                    end_seconds: parent_end,
+                    speaker_id: None,
+                    speaker_label: None,
+                    language_code: marker_language.or_else(|| segment_language.clone()),
+                    language_confidence,
+                    words: segment
+                        .words
+                        .iter()
+                        .cloned()
+                        .filter_map(Self::word_from_json)
+                        .collect(),
+                })
+                .collect()
+        };
+
+        for segment in &mut segments {
+            if segment.language_code.is_none() {
+                segment.language_code = segment_language.clone();
+            }
+            if segment.language_confidence.is_none() {
+                segment.language_confidence = language_confidence;
+            }
+        }
+        segments
+    }
+
+    fn fill_missing_parent_bounds(
+        segments: &mut [TimedSegment],
+        parent_start: Option<f32>,
+        parent_end: Option<f32>,
+    ) {
+        let (Some(start), Some(end)) = (parent_start, parent_end) else {
+            return;
+        };
+        if segments.len() < 2 || end <= start {
+            return;
+        }
+
+        let weights = segments
+            .iter()
+            .map(|segment| segment.text.split_whitespace().count().max(1) as f32)
+            .collect::<Vec<_>>();
+        let total_weight = weights.iter().sum::<f32>().max(1.0);
+        let duration = end - start;
+        let mut cursor = start;
+        for (index, segment) in segments.iter_mut().enumerate() {
+            let fallback_end = if index + 1 == weights.len() {
+                end
+            } else {
+                (cursor + duration * (weights[index] / total_weight)).min(end)
+            };
+            if segment.start_seconds.is_none() {
+                segment.start_seconds = Some(cursor);
+            }
+            if segment.end_seconds.is_none() {
+                segment.end_seconds =
+                    Some(fallback_end.max(segment.start_seconds.unwrap_or(cursor)));
+            }
+            cursor = segment
+                .end_seconds
+                .unwrap_or(fallback_end)
+                .clamp(cursor, end);
+        }
     }
 
     fn word_from_json(word: ParakeetJsonWord) -> Option<TimedWord> {
@@ -3836,7 +3889,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
                     input_wav,
                     &model_path,
                     model_filename,
-                    language_policy.preferred_language.as_code(),
+                    language_policy.runtime_language_code(),
                     options.threads.clamp(1, 8),
                     total_audio_seconds,
                     LongFileCallbacks {
@@ -3854,7 +3907,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
         }
         let preview_model_path = self.validate_preview_model_exists(
             model_filename,
-            language_policy.preferred_language.as_code(),
+            language_policy.runtime_language_code(),
         )?;
         let preview_state = Arc::new(Mutex::new(PreviewStreamState::default()));
         match tokio::time::timeout(
@@ -3865,7 +3918,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
                 preview_state.clone(),
                 emit_partial.clone(),
                 emit_progress_seconds.clone(),
-                language_policy.preferred_language.as_code(),
+                language_policy.runtime_language_code(),
             ),
         )
         .await
@@ -3890,7 +3943,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
             .arg("--json");
         if Self::is_nemotron_streaming_model(model_filename) {
             command.arg("--lang").arg(Self::parakeet_target_lang(
-                language_policy.preferred_language.as_code(),
+                language_policy.runtime_language_code(),
             ));
         }
         command
@@ -4022,6 +4075,14 @@ mod tests {
         assert_eq!(cpu_device.as_deref(), Some("cpu"));
     }
 
+    #[test]
+    fn parakeet_target_language_preserves_explicit_codes() {
+        assert_eq!(ParakeetCppEngine::parakeet_target_lang("auto"), "auto");
+        assert_eq!(ParakeetCppEngine::parakeet_target_lang("it"), "it");
+        assert_eq!(ParakeetCppEngine::parakeet_target_lang("ja"), "ja-JP");
+        assert_eq!(ParakeetCppEngine::parakeet_target_lang(""), "auto");
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_worker_job_guard_is_send_for_guarded_async_worker() {
@@ -4100,6 +4161,57 @@ mod tests {
             .segments
             .iter()
             .all(|segment| segment.language_code.as_deref() != Some("unk")));
+    }
+
+    #[test]
+    fn nested_language_markers_split_parent_timeline_and_word_ownership() {
+        let output = ParakeetCppEngine::parse_json_output(
+            r#"{"text":"<it-IT>Ciao mondo <en-US>Hello world","segments":[{"text":"<it-IT>Ciao mondo <en-US>Hello world","start":0.0,"end":4.0,"words":[{"w":"Ciao","start":0.1,"end":0.6},{"w":"mondo","start":0.6,"end":1.2},{"w":"Hello","start":2.0,"end":2.5},{"w":"world","start":2.5,"end":3.1}]}]}"#,
+            Some(4.0),
+        )
+        .expect("nested marker output should parse");
+
+        assert_eq!(output.segments.len(), 2);
+        assert_eq!(output.segments[0].language_code.as_deref(), Some("it"));
+        assert_eq!(output.segments[1].language_code.as_deref(), Some("en"));
+        assert_eq!(
+            output.segments[0]
+                .words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Ciao", "mondo"]
+        );
+        assert_eq!(
+            output.segments[1]
+                .words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Hello", "world"]
+        );
+        assert_eq!(output.segments[0].start_seconds, Some(0.1));
+        assert_eq!(output.segments[0].end_seconds, Some(1.2));
+        assert_eq!(output.segments[1].start_seconds, Some(2.0));
+        assert_eq!(output.segments[1].end_seconds, Some(3.1));
+        assert!(output.segments.windows(2).all(|pair| {
+            pair[0].end_seconds.unwrap_or_default() <= pair[1].start_seconds.unwrap_or_default()
+        }));
+    }
+
+    #[test]
+    fn nested_language_markers_without_words_receive_distinct_parent_intervals() {
+        let output = ParakeetCppEngine::parse_json_output(
+            r#"{"text":"<it-IT>Ciao <en-US>Hello","segments":[{"text":"<it-IT>Ciao <en-US>Hello","start":10.0,"end":14.0}]}"#,
+            Some(20.0),
+        )
+        .expect("nested marker output should parse");
+
+        assert_eq!(output.segments.len(), 2);
+        assert_eq!(output.segments[0].start_seconds, Some(10.0));
+        assert_eq!(output.segments[0].end_seconds, Some(12.0));
+        assert_eq!(output.segments[1].start_seconds, Some(12.0));
+        assert_eq!(output.segments[1].end_seconds, Some(14.0));
     }
 
     #[test]

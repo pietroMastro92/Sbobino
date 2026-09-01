@@ -1296,8 +1296,12 @@ impl WhisperCppEngine {
             .arg(options.word_threshold.to_string())
             .arg("-sns");
 
-        let _preferred_language = language_code;
-        command.arg("-l").arg("auto");
+        let language_code = if language_code.trim().is_empty() {
+            "auto"
+        } else {
+            language_code
+        };
+        command.arg("-l").arg(language_code);
 
         if options.translate_to_english {
             command.arg("-tr");
@@ -2400,7 +2404,7 @@ mod tests {
     }
 
     #[test]
-    fn append_cli_flags_ignores_preference_and_always_uses_auto() {
+    fn append_cli_flags_passes_explicit_language() {
         let mut command = Command::new("whisper-cli");
         WhisperCppEngine::append_cli_flags(
             &mut command,
@@ -2419,10 +2423,10 @@ mod tests {
             .collect::<Vec<_>>();
         let language_flag = args
             .windows(2)
-            .any(|pair| pair[0] == "-l" && pair[1] == "auto");
+            .any(|pair| pair[0] == "-l" && pair[1] == "it");
         assert!(
             language_flag,
-            "expected whisper-cli args to contain -l auto: {args:?}"
+            "expected whisper-cli args to contain -l it: {args:?}"
         );
     }
 
@@ -2615,7 +2619,7 @@ impl SpeechToTextEngine for WhisperCppEngine {
         self.transcribe_with_cli(
             input_wav,
             &model_path,
-            language_policy.preferred_language.as_code(),
+            language_policy.runtime_language_code(),
             options,
             total_audio_seconds,
             emit_partial,

@@ -12,9 +12,10 @@ use sbobino_infrastructure::adapters::whisper_cpp::WhisperCppEngine;
 const DELTA_REPLACE_PREFIX: &str = "\u{001F}REPLACE:";
 
 fn transcription_policy(code: &str) -> TranscriptionLanguagePolicy {
+    let preferred_language = LanguageCode::from_code(code);
     TranscriptionLanguagePolicy {
-        preferred_language: LanguageCode::from_code(code),
-        adaptive_detection: true,
+        adaptive_detection: preferred_language.is_auto(),
+        preferred_language,
     }
 }
 
@@ -61,6 +62,10 @@ async fn transcribe_collects_lines_from_stdout_and_stderr() {
     write_executable_script(
         &script_path,
         r#"#!/bin/sh
+case "$*" in
+  *"-l en"*) ;;
+  *) echo "expected explicit -l en, got: $*" 1>&2; exit 41 ;;
+esac
 echo "init: loading model"
 echo "[00:00:00.000 --> 00:00:01.000] first line"
 echo "[00:00:01.000 --> 00:00:02.000] second line" 1>&2

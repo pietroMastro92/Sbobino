@@ -218,6 +218,10 @@ async fn realtime_emits_diagnostic_telemetry_with_first_preview_and_finalization
     write_executable_script(
         &script_path,
         r#"#!/bin/sh
+case "$*" in
+  *"-l en"*) ;;
+  *) echo "expected explicit -l en, got: $*" 1>&2; exit 41 ;;
+esac
 printf '\033[2Kpreview telemetry\n' 1>&2
 sleep 0.08
 printf 'final telemetry\n' 1>&2
@@ -826,7 +830,7 @@ exit 0
 }
 
 #[tokio::test]
-async fn realtime_start_uses_auto_detection_when_preference_is_selected() {
+async fn realtime_start_passes_explicit_language_when_preference_is_selected() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("whisper-stream");
     let models_dir = temp.path().join("models");
@@ -872,7 +876,7 @@ exit 0
     let args = std::fs::read_to_string(&args_path).expect("expected captured args");
     let args = args.lines().collect::<Vec<_>>();
     assert!(
-        args.windows(2).any(|pair| matches!(pair, ["-l", "auto"])),
-        "expected whisper-stream to receive '-l auto', got: {args:?}"
+        args.windows(2).any(|pair| matches!(pair, ["-l", "it"])),
+        "expected whisper-stream to receive '-l it', got: {args:?}"
     );
 }

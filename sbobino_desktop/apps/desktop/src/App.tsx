@@ -15721,7 +15721,7 @@ export function App({
               <small>
                 {t(
                   "settings.transcription.languageCompatibility",
-                  "Detection stays automatic; this preference is used for AI output. Compatibility follows the installed model.",
+                  "Select Auto for adaptive detection; a concrete language is passed to the engine. Compatibility follows the installed model.",
                 )}
               </small>
             </div>
