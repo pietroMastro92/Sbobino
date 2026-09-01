@@ -145,6 +145,8 @@ checkout_parakeet_source() {
     cd "$source_root"
     git checkout "$ref"
     retry_command git submodule update --init --recursive --depth 1
+    git apply --check "$SCRIPT_DIR/patches/parakeet-thread-cap.patch"
+    git apply "$SCRIPT_DIR/patches/parakeet-thread-cap.patch"
   )
 }
 

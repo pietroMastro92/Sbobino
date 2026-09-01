@@ -5,7 +5,9 @@ use tempfile::tempdir;
 use tokio::sync::{Mutex, MutexGuard};
 
 use sbobino_application::SettingsRepository;
-use sbobino_domain::{LanguageCode, RemoteServiceConfig, RemoteServiceKind, SpeechModel};
+use sbobino_domain::{
+    LanguageCode, ParakeetModel, RemoteServiceConfig, RemoteServiceKind, SpeechModel,
+};
 use sbobino_infrastructure::repositories::fs_settings_repository::FsSettingsRepository;
 use sbobino_infrastructure::secure_storage::SecureStorage;
 
@@ -35,6 +37,31 @@ async fn load_creates_default_settings_when_file_is_missing() {
     assert_eq!(settings.general.auto_update_repo, "pietroMastro92/Sbobino");
     assert!(settings.general.privacy_policy_version_accepted.is_none());
     assert!(settings.general.privacy_policy_accepted_at.is_none());
+}
+
+#[tokio::test]
+async fn load_migrates_streaming_parakeet_model_to_file_tdt_and_persists_it() {
+    let _guard = secure_storage_test_guard().await;
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let settings_path = temp.path().join("settings.json");
+    let mut settings = sbobino_domain::AppSettings::default();
+    settings.transcription.parakeet_model = ParakeetModel::Nemotron35AsrStreaming06bQ4;
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).expect("settings should serialize"),
+    )
+    .expect("legacy settings should write");
+
+    let repo = FsSettingsRepository::new(settings_path.clone());
+    let loaded = repo.load().await.expect("settings migration should load");
+    assert_eq!(
+        loaded.transcription.parakeet_model,
+        ParakeetModel::Tdt06bV3Q4
+    );
+    let persisted = fs::read_to_string(settings_path).expect("migrated settings should persist");
+    assert!(persisted.contains("\"parakeet_model\": \"tdt06b_v3_q4\""));
+    assert!(!persisted.contains("nemotron35_asr_streaming_06b_q4"));
 }
 
 #[tokio::test]

@@ -83,10 +83,13 @@ checkout_parakeet_source() {
       cd "$SOURCE_ROOT"
       git checkout "$ref"
       git submodule update --init --recursive --depth 1
+      git apply --check "$SCRIPT_DIR/patches/parakeet-thread-cap.patch"
+      git apply "$SCRIPT_DIR/patches/parakeet-thread-cap.patch"
     )
   else
     echo "+ cd '$SOURCE_ROOT' && git checkout '$ref'"
     echo "+ cd '$SOURCE_ROOT' && git submodule update --init --recursive --depth 1"
+    echo "+ git -C '$SOURCE_ROOT' apply '$SCRIPT_DIR/patches/parakeet-thread-cap.patch'"
   fi
 }
 

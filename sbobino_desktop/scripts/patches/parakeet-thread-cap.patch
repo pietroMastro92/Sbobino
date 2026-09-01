@@ -1,0 +1,38 @@
+diff --git a/include/parakeet_capi.h b/include/parakeet_capi.h
+index c199a70..160c0b8 100644
+--- a/include/parakeet_capi.h
++++ b/include/parakeet_capi.h
+@@ -41,6 +41,10 @@ typedef struct parakeet_ctx parakeet_ctx;
+ //     is_eob + timestamps, freed with parakeet_capi_free_events) and an
+ //     "events" array in the stream_feed_json / stream_finalize_json documents.
+ int parakeet_capi_abi_version(void);
+ 
++// Set the process-wide graph thread cap used by every model computation.
++// Values below one clear the override and restore the library default.
++void parakeet_capi_set_num_threads(int n_threads);
++
+ // Load a GGUF model. Returns an owning context, or NULL on failure.
+ // The returned context must be released with parakeet_capi_free.
+ parakeet_ctx* parakeet_capi_load(const char* gguf_path);
+diff --git a/src/parakeet_capi.cpp b/src/parakeet_capi.cpp
+index 77e163a..315d44a 100644
+--- a/src/parakeet_capi.cpp
++++ b/src/parakeet_capi.cpp
+@@ -1,5 +1,6 @@
+ #include "parakeet_capi.h"
+ #include "parakeet.h"     // pk::Decoder
++#include "ggml_graph.hpp" // pk::set_num_threads
+ #include "model.hpp"      // pk::Model
+ #include "streaming.hpp"  // pk::StreamingSession
+ #include "mel.hpp"        // pk::MelFrontend
+@@ -210,6 +211,10 @@ extern "C" int parakeet_capi_abi_version(void) {
+     return PARAKEET_CAPI_ABI_VERSION;
+ }
+ 
++extern "C" void parakeet_capi_set_num_threads(int n_threads) {
++    pk::set_num_threads(n_threads);
++}
++
+ extern "C" parakeet_ctx* parakeet_capi_load(const char* gguf_path) {
+     if (!gguf_path) return nullptr;
+     try {

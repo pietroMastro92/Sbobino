@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use sbobino_application::{ApplicationError, SettingsRepository};
-use sbobino_domain::AppSettings;
+use sbobino_domain::{AppSettings, ParakeetModel};
 
 use crate::secure_storage::SecureStorage;
 
@@ -95,8 +95,16 @@ impl FsSettingsRepository {
         }
         backfill_automatic_import_source_transcription_defaults(&mut settings, &raw_json);
 
+        let migrated_file_model = !matches!(
+            settings.transcription.parakeet_model,
+            ParakeetModel::Tdt06bV3F16 | ParakeetModel::Tdt06bV3Q8 | ParakeetModel::Tdt06bV3Q4
+        );
+        if migrated_file_model {
+            settings.transcription.parakeet_model = ParakeetModel::Tdt06bV3Q4;
+        }
+
         let plaintext_secrets_found = self.populate_secrets(&mut settings)?;
-        if plaintext_secrets_found {
+        if plaintext_secrets_found || migrated_file_model {
             // Legacy releases stored API keys in settings.json.  Move them to
             // secure storage and immediately rewrite the file redacted so a
             // successful migration does not leave plaintext behind. Redact
@@ -110,6 +118,12 @@ impl FsSettingsRepository {
     pub fn save_sync(&self, settings: &AppSettings) -> Result<(), ApplicationError> {
         let previous_remote_service_ids = self.stored_remote_service_ids().unwrap_or_default();
         let mut normalized = settings.clone();
+        if !matches!(
+            normalized.transcription.parakeet_model,
+            ParakeetModel::Tdt06bV3F16 | ParakeetModel::Tdt06bV3Q8 | ParakeetModel::Tdt06bV3Q4
+        ) {
+            normalized.transcription.parakeet_model = ParakeetModel::Tdt06bV3Q4;
+        }
         self.merge_stored_secrets_for_save(&mut normalized)?;
         if should_treat_legacy_fields_as_source(&normalized) {
             normalized.sync_sections_from_legacy();

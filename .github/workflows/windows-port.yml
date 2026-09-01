@@ -6,7 +6,7 @@ on:
       tag_name:
         description: Candidate tag whose Windows package should be validated
         required: true
-        default: v2.0.31
+        default: v2.0.32
         type: string
   push:
     branches:
@@ -30,13 +30,13 @@ jobs:
           ref: ${{ inputs.tag_name || github.ref }}
           fetch-depth: 0
 
-      - name: Validate v2.0.31 candidate tag and versioned notes
+      - name: Validate v2.0.32 candidate tag and versioned notes
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         working-directory: sbobino_desktop
         run: |
-          if [[ "$TAG_NAME" != "v2.0.31" ]]; then
-            echo "Windows validation is locked to the v2.0.31 candidate; got $TAG_NAME" >&2
+          if [[ "$TAG_NAME" != "v2.0.32" ]]; then
+            echo "Windows validation is locked to the v2.0.32 candidate; got $TAG_NAME" >&2
             exit 1
           fi
           VERSION="${TAG_NAME#v}"

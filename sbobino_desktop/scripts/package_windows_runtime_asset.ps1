@@ -190,6 +190,11 @@ function Checkout-ParakeetSource {
     if ($LASTEXITCODE -ne 0 -or $resolved -ne $ParakeetSourceRef) {
         throw "pinned Parakeet source resolved to '$resolved', expected '$ParakeetSourceRef'"
     }
+    $patchPath = Join-Path $PSScriptRoot "patches\parakeet-thread-cap.patch"
+    & git -C $Destination apply --check $patchPath
+    if ($LASTEXITCODE -ne 0) { throw "Parakeet thread-cap patch check failed" }
+    & git -C $Destination apply $patchPath
+    if ($LASTEXITCODE -ne 0) { throw "Parakeet thread-cap patch apply failed" }
 }
 
 function Checkout-WhisperSource {
@@ -392,6 +397,7 @@ function Build-ParakeetBatchWorker {
     $requiredExports = @(
         "parakeet_capi_load",
         "parakeet_capi_free",
+        "parakeet_capi_set_num_threads",
         "parakeet_capi_transcribe_path_json",
         "parakeet_capi_transcribe_pcm_batch_json_lang",
         "parakeet_capi_free_string",

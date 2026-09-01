@@ -30,9 +30,13 @@ const WORD_SEGMENT_MAX_DURATION_SECONDS: f32 = 12.0;
 const WORD_SEGMENT_MIN_TERMINAL_WORDS: usize = 3;
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(12);
 const PREVIEW_CHUNK_SECONDS: f32 = 8.0;
-const PREVIEW_MAX_CHUNKS: usize = 2;
+// File transcription must not run extra model loads just to synthesize a
+// preview. The final decoder already emits the complete result, while the old
+// two-chunk preview could perform three inferences for one short file and make
+// the whole machine unresponsive.
+const PREVIEW_MAX_CHUNKS: usize = 0;
 const PREVIEW_CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
-const LONG_FILE_THRESHOLD_SECONDS: f32 = 45.0;
+const LONG_FILE_THRESHOLD_SECONDS: f32 = 15.0;
 // Parakeet TDT allocates its graph from the decoded clip rather than from the
 // worker batch size. Keep every serialized clip safely below the graph size
 // that caused the real 16 GiB Apple Silicon watchdog panic.
@@ -971,24 +975,22 @@ impl ParakeetCppEngine {
                 Language::French,
                 Language::German,
                 Language::Greek,
-                Language::Hindi,
                 Language::Hungarian,
                 Language::Italian,
                 Language::Latvian,
                 Language::Lithuanian,
-                Language::Malay,
-                Language::Persian,
                 Language::Polish,
                 Language::Portuguese,
                 Language::Romanian,
                 Language::Slovak,
                 Language::Slovene,
                 Language::Spanish,
-                Language::Swahili,
                 Language::Swedish,
                 Language::Russian,
                 Language::Ukrainian,
             ];
+            // Lingua 1.8 has no Maltese model. TDT can still transcribe it,
+            // but metadata stays undetermined unless the ASR emits a label.
             LanguageDetectorBuilder::from_languages(&languages)
                 .with_minimum_relative_distance(0.25)
                 .build()
@@ -2185,6 +2187,7 @@ impl ParakeetCppEngine {
         command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.kill_on_drop(true);
 
         let output = tokio::time::timeout(PREVIEW_CHUNK_TIMEOUT, command.output())
             .await
@@ -2225,6 +2228,9 @@ impl ParakeetCppEngine {
         emit_progress_seconds: Arc<dyn Fn(f32) + Send + Sync>,
         language_code: &str,
     ) -> Result<(), ApplicationError> {
+        if PREVIEW_MAX_CHUNKS == 0 {
+            return Ok(());
+        }
         let (_temp_dir, chunks) = match Self::prepare_preview_chunks(input_wav) {
             Ok(chunks) => chunks,
             Err(error) => {
@@ -2269,7 +2275,7 @@ impl ParakeetCppEngine {
     }
 
     fn should_use_long_file_chunking(input_wav: &Path, total_audio_seconds: Option<f32>) -> bool {
-        if total_audio_seconds.is_some_and(|seconds| seconds >= LONG_FILE_THRESHOLD_SECONDS) {
+        if total_audio_seconds.is_some_and(|seconds| seconds > LONG_FILE_THRESHOLD_SECONDS) {
             return true;
         }
         let Ok(reader) = hound::WavReader::open(input_wav) else {
@@ -2277,7 +2283,7 @@ impl ParakeetCppEngine {
         };
         let spec = reader.spec();
         let frames = reader.duration() as f32 / f32::from(spec.channels.max(1));
-        (frames / spec.sample_rate.max(1) as f32) >= LONG_FILE_THRESHOLD_SECONDS
+        (frames / spec.sample_rate.max(1) as f32) > LONG_FILE_THRESHOLD_SECONDS
     }
 
     fn prepare_long_file_chunks(
@@ -2871,6 +2877,7 @@ impl ParakeetCppEngine {
         worker_path: &Path,
         model_path: &Path,
         language_code: &str,
+        threads: u8,
         chunks: &[AudioChunk],
         existing: &[(AudioChunk, TranscriptionOutput)],
         total_audio_seconds: Option<f32>,
@@ -2892,6 +2899,8 @@ impl ParakeetCppEngine {
             .arg(manifest.path())
             .arg("--lang")
             .arg(Self::parakeet_target_lang(language_code))
+            .arg("--threads")
+            .arg(threads.clamp(1, 8).to_string())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         command.kill_on_drop(true);
@@ -3199,24 +3208,35 @@ impl ParakeetCppEngine {
         Ok(results)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_long_file_transcription(
         &self,
         input_wav: &Path,
         model_path: &Path,
         _model_filename: &str,
         language_code: &str,
+        threads: u8,
         total_audio_seconds: Option<f32>,
         callbacks: LongFileCallbacks,
     ) -> Result<TranscriptionOutput, ApplicationError> {
         let worker_path = self.parakeet_worker_path().ok_or_else(|| {
             ApplicationError::SpeechToText(
-                "Parakeet batch worker is required for audio longer than 45 seconds; install parakeet-batch-json next to parakeet-cli"
+                "Parakeet batch worker is required for audio longer than 15 seconds; install parakeet-batch-json next to parakeet-cli"
                     .to_string(),
             )
         })?;
-        let target_sizes = std::iter::once(LONG_FILE_TARGET_COMMIT_WINDOW_SECONDS)
+        let initial_window = if total_audio_seconds
+            .is_some_and(|seconds| seconds <= LONG_FILE_MAX_SERIALIZED_DECODE_SECONDS)
+        {
+            LONG_FILE_MIN_COMMIT_WINDOW_SECONDS
+        } else {
+            LONG_FILE_TARGET_COMMIT_WINDOW_SECONDS
+        };
+        let mut target_sizes = std::iter::once(initial_window)
             .chain(LONG_FILE_RETRY_COMMIT_WINDOW_SECONDS)
+            .filter(|seconds| *seconds <= initial_window)
             .collect::<Vec<_>>();
+        target_sizes.dedup();
         let mut completed = Vec::<(AudioChunk, TranscriptionOutput)>::new();
         let mut resume_from_seconds = 0.0_f32;
         let mut isolated_empty_retries = HashSet::<(i64, i64)>::new();
@@ -3260,6 +3280,7 @@ impl ParakeetCppEngine {
                     &worker_path,
                     model_path,
                     language_code,
+                    threads,
                     &chunks,
                     &completed,
                     total_audio_seconds,
@@ -3328,6 +3349,7 @@ impl ParakeetCppEngine {
                                             &worker_path,
                                             model_path,
                                             language_code,
+                                            threads,
                                             std::slice::from_ref(&isolated_chunk),
                                             &completed,
                                             total_audio_seconds,
@@ -3409,6 +3431,7 @@ impl ParakeetCppEngine {
                         &worker_path,
                         model_path,
                         language_code,
+                        threads,
                         &cpu_chunks,
                         &completed,
                         total_audio_seconds,
@@ -3814,6 +3837,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
                     &model_path,
                     model_filename,
                     language_policy.preferred_language.as_code(),
+                    options.threads.clamp(1, 8),
                     total_audio_seconds,
                     LongFileCallbacks {
                         emit_partial: emit_partial.clone(),
@@ -3869,6 +3893,9 @@ impl SpeechToTextEngine for ParakeetCppEngine {
                 language_policy.preferred_language.as_code(),
             ));
         }
+        command
+            .arg("--threads")
+            .arg(options.threads.clamp(1, 8).to_string());
         command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());

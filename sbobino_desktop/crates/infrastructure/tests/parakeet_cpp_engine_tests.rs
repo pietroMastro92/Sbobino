@@ -160,6 +160,7 @@ struct parakeet_ctx {};
 extern "C" {
 parakeet_ctx* parakeet_capi_load(const char*);
 void parakeet_capi_free(parakeet_ctx*);
+void parakeet_capi_set_num_threads(int);
 char* parakeet_capi_transcribe_path_json(parakeet_ctx*, const char*, int);
 char* parakeet_capi_transcribe_pcm_batch_json_lang(
     parakeet_ctx*, float*, int*, int, int, int, const char*);
@@ -178,6 +179,7 @@ extern "C" parakeet_ctx* parakeet_capi_load(const char*) {
     return nullptr;
 }
 extern "C" void parakeet_capi_free(parakeet_ctx*) {}
+extern "C" void parakeet_capi_set_num_threads(int) {}
 extern "C" char* parakeet_capi_transcribe_path_json(parakeet_ctx*, const char*, int) {
     return nullptr;
 }
@@ -296,6 +298,7 @@ struct parakeet_ctx {};
 extern "C" {
 parakeet_ctx* parakeet_capi_load(const char*);
 void parakeet_capi_free(parakeet_ctx*);
+void parakeet_capi_set_num_threads(int);
 char* parakeet_capi_transcribe_path_json(parakeet_ctx*, const char*, int);
 char* parakeet_capi_transcribe_pcm_batch_json_lang(
     parakeet_ctx*, float*, int*, int, int, int, const char*);
@@ -326,14 +329,17 @@ extern "C" parakeet_ctx* parakeet_capi_load(const char*) {
     return &context;
 }
 extern "C" void parakeet_capi_free(parakeet_ctx*) {}
+extern "C" void parakeet_capi_set_num_threads(int threads) {
+    std::fprintf(stderr, "THREAD_CAP=%d\n", threads);
+}
 extern "C" char* parakeet_capi_transcribe_path_json(
-    parakeet_ctx*, const char*, int) {
-    std::fputs("PATH_JSON\n", stderr);
+    parakeet_ctx*, const char*, int decoder) {
+    std::fprintf(stderr, "PATH_JSON_DECODER=%d\n", decoder);
     return copy_json("{\"text\":\"path\",\"words\":[],\"tokens\":[]}");
 }
 extern "C" char* parakeet_capi_transcribe_pcm_batch_json_lang(
-    parakeet_ctx*, float*, int*, int, int, int, const char*) {
-    std::fputs("LANG_BATCH\n", stderr);
+    parakeet_ctx*, float*, int*, int, int, int decoder, const char*) {
+    std::fprintf(stderr, "LANG_BATCH_DECODER=%d\n", decoder);
     return copy_json("[{\"text\":\"lang\",\"words\":[],\"tokens\":[]}]");
 }
 extern "C" const char* parakeet_capi_last_error(parakeet_ctx*) { return "fake"; }
@@ -366,6 +372,7 @@ extern "C" void parakeet_capi_free_string(char* value) { std::free(value); }
     let auto = Command::new(&worker_binary)
         .args(["--model", "fake-model.gguf", "--manifest"])
         .arg(&manifest_path)
+        .args(["--threads", "3"])
         .output()
         .expect("failed to launch auto worker");
     let auto_stdout = String::from_utf8_lossy(&auto.stdout);
@@ -375,13 +382,14 @@ extern "C" void parakeet_capi_free_string(char* value) { std::free(value); }
         auto_stdout.contains("\"result\":{\"text\":\"path\""),
         "auto worker must preserve path JSON result, got stdout: {auto_stdout}"
     );
-    assert!(auto_stderr.contains("PATH_JSON"));
+    assert!(auto_stderr.contains("THREAD_CAP=3"));
+    assert!(auto_stderr.contains("PATH_JSON_DECODER=0"));
     assert!(!auto_stderr.contains("LANG_BATCH"));
 
     let explicit = Command::new(&worker_binary)
         .args(["--model", "fake-model.gguf", "--manifest"])
         .arg(&manifest_path)
-        .args(["--lang", "it"])
+        .args(["--lang", "it", "--threads", "2"])
         .output()
         .expect("failed to launch explicit-language worker");
     let explicit_stdout = String::from_utf8_lossy(&explicit.stdout);
@@ -394,7 +402,8 @@ extern "C" void parakeet_capi_free_string(char* value) { std::free(value); }
         explicit_stdout.contains("\"result\":{\"text\":\"lang\""),
         "explicit-language worker must preserve batch result, got stdout: {explicit_stdout}"
     );
-    assert!(explicit_stderr.contains("LANG_BATCH"));
+    assert!(explicit_stderr.contains("THREAD_CAP=2"));
+    assert!(explicit_stderr.contains("LANG_BATCH_DECODER=0"));
     assert!(!explicit_stderr.contains("PATH_JSON"));
 }
 
@@ -543,7 +552,7 @@ exit 0
 }
 
 #[tokio::test]
-async fn transcribe_uses_realtime_json_chunks_for_progressive_preview() {
+async fn short_file_transcription_does_not_run_duplicate_preview_inference() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");
     let models_dir = temp.path().join("parakeet-models");
@@ -552,23 +561,23 @@ async fn transcribe_uses_realtime_json_chunks_for_progressive_preview() {
     std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
     std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
         .expect("failed to create final model");
-    write_test_wav(&input_wav, 18);
+    write_test_wav(&input_wav, 12);
 
     write_executable_script(
         &script_path,
         r#"#!/bin/sh
 case "$*" in
   *tdt-0.6b-v3-q4_k.gguf*chunk-0000.wav*)
-    echo '{"text":"first chunk<EOU>","words":[{"w":"first","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
-    exit 0
+    echo 'duplicate preview inference must not run' 1>&2
+    exit 91
     ;;
   *tdt-0.6b-v3-q4_k.gguf*chunk-0001.wav*)
-    echo '{"text":"second chunk<EOU>","words":[{"w":"second","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
-    exit 0
+    echo 'duplicate preview inference must not run' 1>&2
+    exit 91
     ;;
   *tdt-0.6b-v3-q4_k.gguf*chunk-0002.wav*)
-    echo '{"text":"third chunk<EOU>","words":[{"w":"third","start":0.1,"end":0.3},{"w":"chunk","start":0.3,"end":0.6}]}'
-    exit 0
+    echo 'duplicate preview inference must not run' 1>&2
+    exit 91
     ;;
 esac
 echo '{"text":"first chunk second chunk third chunk","words":[{"w":"first","start":0.0,"end":0.2},{"w":"chunk","start":0.2,"end":0.4},{"w":"second","start":8.0,"end":8.2},{"w":"chunk","start":8.2,"end":8.4},{"w":"third","start":16.0,"end":16.2},{"w":"chunk","start":16.2,"end":16.4}]}'
@@ -589,7 +598,7 @@ exit 0
             "tdt-0.6b-v3-q4_k.gguf",
             &transcription_policy("en"),
             &WhisperOptions::default(),
-            Some(18.0),
+            Some(12.0),
             Arc::new(move |line: String| {
                 emitted_ref.lock().expect("emit lock poisoned").push(line);
             }),
@@ -636,7 +645,7 @@ async fn non_english_progressive_preview_uses_final_tdt_model_not_english_eou() 
         b"fake english realtime model",
     )
     .expect("failed to create realtime model");
-    write_test_wav(&input_wav, 18);
+    write_test_wav(&input_wav, 12);
 
     write_executable_script(
         &script_path,
@@ -673,7 +682,7 @@ exit 0
             "tdt-0.6b-v3-q4_k.gguf",
             &transcription_policy("it"),
             &WhisperOptions::default(),
-            Some(18.0),
+            Some(12.0),
             Arc::new(move |line: String| {
                 emitted_ref.lock().expect("emit lock poisoned").push(line);
             }),
@@ -1159,7 +1168,7 @@ exit 0
 }
 
 #[tokio::test]
-async fn long_file_worker_streams_first_chunk_before_process_exit() {
+async fn medium_file_worker_streams_progress_before_process_exit() {
     let temp = tempdir().expect("failed to create temp dir");
     let script_path = temp.path().join("parakeet-cli");
     let worker_path = temp.path().join("parakeet-batch-json");
@@ -1170,7 +1179,7 @@ async fn long_file_worker_streams_first_chunk_before_process_exit() {
     std::fs::create_dir_all(&models_dir).expect("failed to create models dir");
     std::fs::write(models_dir.join("tdt-0.6b-v3-q4_k.gguf"), b"fake model")
         .expect("failed to create model");
-    write_test_wav(&input_wav, 700);
+    write_test_wav(&input_wav, 18);
 
     write_executable_script(
         &script_path,
@@ -1213,7 +1222,10 @@ exit 0
     );
     let saw_first_chunk_before_worker_finished = Arc::new(AtomicBool::new(false));
     let saw_first_chunk_before_worker_finished_ref = saw_first_chunk_before_worker_finished.clone();
+    let saw_progress_before_worker_finished = Arc::new(AtomicBool::new(false));
+    let saw_progress_before_worker_finished_ref = saw_progress_before_worker_finished.clone();
     let marker_ref = first_chunk_sleep_marker.clone();
+    let progress_marker_ref = first_chunk_sleep_marker.clone();
 
     let transcript = engine
         .transcribe(
@@ -1221,13 +1233,17 @@ exit 0
             "tdt-0.6b-v3-q4_k.gguf",
             &transcription_policy("it"),
             &WhisperOptions::default(),
-            Some(700.0),
+            Some(18.0),
             Arc::new(move |line: String| {
                 if line.contains("stream0") && !marker_ref.exists() {
                     saw_first_chunk_before_worker_finished_ref.store(true, Ordering::SeqCst);
                 }
             }),
-            Arc::new(|_seconds: f32| {}),
+            Arc::new(move |seconds: f32| {
+                if seconds > 0.0 && !progress_marker_ref.exists() {
+                    saw_progress_before_worker_finished_ref.store(true, Ordering::SeqCst);
+                }
+            }),
         )
         .await
         .expect("long Parakeet transcription should stream worker chunks");
@@ -1237,6 +1253,10 @@ exit 0
     assert!(
         saw_first_chunk_before_worker_finished.load(Ordering::SeqCst),
         "first worker chunk should be emitted while the worker is still running"
+    );
+    assert!(
+        saw_progress_before_worker_finished.load(Ordering::SeqCst),
+        "a 15-45 second file must report committed progress before the worker exits"
     );
 }
 

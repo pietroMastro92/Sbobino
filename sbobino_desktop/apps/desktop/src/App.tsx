@@ -663,10 +663,6 @@ const modelOptions: Array<{ value: SpeechModel; label: string }> = [
 
 const parakeetModelOptions: Array<{ value: ParakeetModel; label: string }> = [
   { value: "tdt06b_v3_q4", label: "Parakeet TDT 0.6B Q4 — file only" },
-  {
-    value: "nemotron35_asr_streaming_06b_q4",
-    label: "NVIDIA Nemotron 3.5 ASR 0.6B Q4 — live + multilingual",
-  },
 ];
 
 type PrimaryTranscriptionModelOption =
@@ -2429,7 +2425,9 @@ function normalizeSettings(settings: AppSettings): AppSettings {
       // chooses a dedicated live preference.
       live_compute_device: settings.transcription.live_compute_device ?? "auto",
       parakeet_model:
-        settings.transcription.parakeet_model ?? "tdt06b_v3_q4",
+        settings.transcription.parakeet_model?.startsWith("tdt06b_v3_")
+          ? settings.transcription.parakeet_model
+          : "tdt06b_v3_q4",
       parakeet_cli_path:
         settings.transcription.parakeet_cli_path?.trim() || "parakeet-cli",
       parakeet_models_dir:

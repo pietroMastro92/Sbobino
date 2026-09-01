@@ -29,7 +29,7 @@ struct Chunk {
 
 static void usage() {
     std::fprintf(stderr,
-                 "usage: parakeet-batch-json --model <model.gguf> --manifest <chunks.tsv> [--lang <locale>]\n");
+                 "usage: parakeet-batch-json --model <model.gguf> --manifest <chunks.tsv> [--lang <locale>] [--threads N]\n");
 }
 
 static std::uint16_t read_u16(std::istream& in) {
@@ -255,6 +255,7 @@ int main(int argc, char** argv) {
     std::string model;
     std::string manifest;
     std::string target_lang = "auto";
+    int threads = 4;
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
@@ -263,6 +264,11 @@ int main(int argc, char** argv) {
             manifest = argv[++i];
         } else if (std::strcmp(argv[i], "--lang") == 0 && i + 1 < argc) {
             target_lang = argv[++i];
+        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            if (!parse_strict_index(argv[++i], threads) || threads < 1 || threads > 8) {
+                usage();
+                return 2;
+            }
         } else {
             usage();
             return 2;
@@ -283,6 +289,7 @@ int main(int argc, char** argv) {
 
     emit_event("loading_model", -1, "Loading Parakeet model");
     std::fprintf(stderr, "parakeet-batch-json: loading model %s\n", model.c_str());
+    parakeet_capi_set_num_threads(threads);
     parakeet_ctx* ctx = parakeet_capi_load(model.c_str());
     if (!ctx) {
         emit_event("failed", -1, "Failed to load Parakeet model");
