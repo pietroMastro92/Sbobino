@@ -12,6 +12,7 @@ import zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT.parent / ".github" / "workflows" / "release.yml"
+STABILITY_VALIDATION = ROOT.parent / ".github" / "workflows" / "stability-validation.yml"
 PROMOTION = ROOT / "scripts" / "promote_candidate_release.sh"
 INTEL_VALIDATION = ROOT.parent / ".github" / "workflows" / "intel-runtime-validation.yml"
 ARM_VALIDATION = ROOT.parent / ".github" / "workflows" / "arm-runtime-validation.yml"
@@ -25,6 +26,25 @@ DISPATCHER = ROOT / "scripts" / "dispatch_release_candidate.sh"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_stability_validation_cannot_publish_a_release(self):
+        workflow = STABILITY_VALIDATION.read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertIn("macos-15-intel", workflow)
+        self.assertIn("windows-2025", workflow)
+        self.assertIn("source-manifest.json", workflow)
+        self.assertNotIn("contents: write", workflow)
+        self.assertNotIn("gh release", workflow)
+        self.assertNotIn("publish_candidate", workflow)
+
+    def test_pull_request_windows_job_compiles_the_workspace_and_is_blocking(self):
+        workflow = (ROOT.parent / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        windows_job = workflow.split("  windows-bootstrap:", 1)[1]
+        self.assertNotIn("continue-on-error: true", windows_job)
+        self.assertIn("cargo check --workspace --all-targets", windows_job)
+
     def test_candidate_validation_is_bound_to_the_requested_tag_revision(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         dispatcher = DISPATCHER.read_text(encoding="utf-8")

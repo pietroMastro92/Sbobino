@@ -1,0 +1,99 @@
+name: Stability validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-validation:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-latest
+            rust_mode: full
+          - label: macos-arm64
+            runner: macos-15
+            rust_mode: full
+          - label: macos-x86_64
+            runner: macos-15-intel
+            rust_mode: full
+          - label: windows-x86_64
+            runner: windows-2025
+            rust_mode: windows
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: sbobino_desktop
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sbobino_desktop/apps/desktop/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libglib2.0-dev libgirepository1.0-dev libgtk-3-dev libsoup-3.0-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Record source manifest and runner identity
+        run: python scripts/validation_evidence.py manifest validation-evidence/source-manifest.json
+
+      - name: Install frontend dependencies
+        working-directory: sbobino_desktop/apps/desktop
+        run: npm ci
+
+      - name: Frontend tests
+        run: python scripts/validation_evidence.py run validation-evidence/frontend-tests.json -- npm --prefix apps/desktop test
+
+      - name: Frontend build
+        run: python scripts/validation_evidence.py run validation-evidence/frontend-build.json -- npm --prefix apps/desktop run build
+
+      - name: Rust format
+        run: python scripts/validation_evidence.py run validation-evidence/rust-format.json -- cargo fmt --all -- --check
+
+      - name: Rust tests
+        if: matrix.rust_mode == 'full'
+        run: python scripts/validation_evidence.py run validation-evidence/rust-tests.json -- cargo test --workspace --all-targets -- --test-threads=1
+
+      - name: Compile all Windows Rust targets
+        if: matrix.rust_mode == 'windows'
+        run: python scripts/validation_evidence.py run validation-evidence/rust-tests.json -- cargo test --workspace --all-targets --no-run
+
+      - name: Run portable Windows Rust tests
+        if: matrix.rust_mode == 'windows'
+        run: python scripts/validation_evidence.py run validation-evidence/windows-portable-tests.json -- cargo test -p sbobino-domain -p sbobino-application -p sbobino-desktop -- --test-threads=1
+
+      - name: Clippy
+        run: python scripts/validation_evidence.py run validation-evidence/clippy.json -- cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Runtime and workflow contracts
+        run: python scripts/validation_evidence.py run validation-evidence/contracts.json -- python -m unittest scripts/test_release_workflow_contract.py scripts/test_evaluate_live_latency.py scripts/test_run_whisper_live_replay.py
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stability-validation-${{ matrix.label }}
+          path: sbobino_desktop/validation-evidence/*.json
+          if-no-files-found: error
+          retention-days: 7

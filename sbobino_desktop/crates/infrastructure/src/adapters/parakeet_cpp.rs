@@ -54,6 +54,7 @@ const OVERLAP_DEDUPE_TOLERANCE_SECONDS: f32 = 0.05;
 const WORD_DUPLICATE_TOLERANCE_SECONDS: f32 = 0.12;
 const NEMOTRON_UTTERANCE_GAP_SECONDS: f32 = 1.25;
 const WORKER_RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const WORKER_CAPABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_WORKER_RSS_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 const WORKER_RSS_LIMIT_ENV: &str = "SBOBINO_PARAKEET_WORKER_RSS_LIMIT_BYTES";
 const EMPTY_VOICED_CHUNK_MARKER: &str = "SBOBINO_PARAKEET_EMPTY_VOICED_CHUNK";
@@ -2766,6 +2767,31 @@ impl ParakeetCppEngine {
         candidate.exists().then_some(candidate)
     }
 
+    async fn worker_supports_threads(&self, worker_path: &Path) -> bool {
+        let mut command = tokio_background_command(worker_path);
+        self.configure_command_environment(&mut command, worker_path.to_string_lossy().as_ref());
+        command
+            .arg("--help")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command.kill_on_drop(true);
+
+        let output = match tokio::time::timeout(WORKER_CAPABILITY_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(_)) | Err(_) => return false,
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        stdout
+            .split_ascii_whitespace()
+            .chain(stderr.split_ascii_whitespace())
+            .any(|token| {
+                token.trim_matches(|character: char| {
+                    !character.is_ascii_alphanumeric() && character != '-'
+                }) == "--threads"
+            })
+    }
+
     fn write_worker_manifest(
         chunks: &[AudioChunk],
     ) -> Result<tempfile::NamedTempFile, ApplicationError> {
@@ -2878,6 +2904,7 @@ impl ParakeetCppEngine {
         model_path: &Path,
         language_code: &str,
         threads: u8,
+        worker_supports_threads: bool,
         chunks: &[AudioChunk],
         existing: &[(AudioChunk, TranscriptionOutput)],
         total_audio_seconds: Option<f32>,
@@ -2898,9 +2925,13 @@ impl ParakeetCppEngine {
             .arg("--manifest")
             .arg(manifest.path())
             .arg("--lang")
-            .arg(Self::parakeet_target_lang(language_code))
-            .arg("--threads")
-            .arg(threads.clamp(1, 8).to_string())
+            .arg(Self::parakeet_target_lang(language_code));
+        if worker_supports_threads {
+            command
+                .arg("--threads")
+                .arg(threads.clamp(1, 8).to_string());
+        }
+        command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         command.kill_on_drop(true);
@@ -3225,6 +3256,7 @@ impl ParakeetCppEngine {
                     .to_string(),
             )
         })?;
+        let worker_supports_threads = self.worker_supports_threads(&worker_path).await;
         let initial_window = if total_audio_seconds
             .is_some_and(|seconds| seconds <= LONG_FILE_MAX_SERIALIZED_DECODE_SECONDS)
         {
@@ -3281,6 +3313,7 @@ impl ParakeetCppEngine {
                     model_path,
                     language_code,
                     threads,
+                    worker_supports_threads,
                     &chunks,
                     &completed,
                     total_audio_seconds,
@@ -3350,6 +3383,7 @@ impl ParakeetCppEngine {
                                             model_path,
                                             language_code,
                                             threads,
+                                            worker_supports_threads,
                                             std::slice::from_ref(&isolated_chunk),
                                             &completed,
                                             total_audio_seconds,
@@ -3432,6 +3466,7 @@ impl ParakeetCppEngine {
                         model_path,
                         language_code,
                         threads,
+                        worker_supports_threads,
                         &cpu_chunks,
                         &completed,
                         total_audio_seconds,
@@ -3949,6 +3984,7 @@ impl SpeechToTextEngine for ParakeetCppEngine {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use hound::{SampleFormat, WavSpec, WavWriter};
     use tempfile::tempdir;
@@ -3988,6 +4024,80 @@ mod tests {
         let path = temp.path().join("silent.wav");
         write_energy_fixture(&path, 0);
         assert!(!ParakeetCppEngine::chunk_has_audio_energy(&path, 0.0, 1.0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_threads_flag_is_detected_from_runtime_usage() {
+        let temp = tempdir().expect("tempdir");
+        let worker = temp.path().join("current-worker");
+        std::fs::write(
+            &worker,
+            b"#!/bin/sh
+if [ \"$1\" = \"--help\" ]; then
+  printf '%s%s\\n' 'usage: --model --manifest --lang --thr' 'eads N' >&2
+fi
+exit 2
+",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&worker).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&worker, permissions).unwrap();
+        }
+
+        let engine = ParakeetCppEngine::new(worker.to_string_lossy().to_string(), ".".to_string());
+        assert!(engine.worker_supports_threads(&worker).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_threads_probe_rejects_longer_option_names() {
+        let temp = tempdir().expect("tempdir");
+        let worker = temp.path().join("different-worker-option");
+        std::fs::write(
+            &worker,
+            b"#!/bin/sh\nprintf '%s\\n' 'usage: --model --manifest --threads-per-worker N' >&2\n",
+        )
+        .expect("write worker");
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&worker).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&worker, permissions).unwrap();
+        }
+
+        let engine = ParakeetCppEngine::new(worker.to_string_lossy().to_string(), ".".to_string());
+        assert!(!engine.worker_supports_threads(&worker).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_threads_probe_times_out_closed() {
+        let temp = tempdir().expect("tempdir");
+        let worker = temp.path().join("slow-worker");
+        std::fs::write(&worker, "#!/bin/sh\nsleep 5\n").expect("write worker");
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&worker).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&worker, permissions).unwrap();
+        }
+
+        let engine = ParakeetCppEngine::new(worker.to_string_lossy().to_string(), ".".to_string());
+        let probe = tokio::time::timeout(
+            Duration::from_secs(4),
+            engine.worker_supports_threads(&worker),
+        )
+        .await
+        .expect("capability probe should have its own timeout");
+        assert!(!probe);
     }
 
     #[cfg(windows)]

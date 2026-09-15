@@ -2,6 +2,7 @@ import { Braces, Captions, Check, Copy, Download, FileCode2, FileSpreadsheet, Fi
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "../i18n";
 import { copyTextToClipboard } from "../lib/clipboard";
+import { useModalDialog } from "../lib/useModalDialog";
 
 export type ExportFormat = "txt" | "docx" | "html" | "pdf" | "json" | "srt" | "vtt" | "csv" | "md";
 export type ExportStyle = "transcript" | "subtitles" | "segments";
@@ -146,6 +147,7 @@ export function ExportSheet({
   onPreview,
   onExport,
 }: ExportSheetProps): JSX.Element | null {
+  const dialogRef = useModalDialog(open);
   const [format, setFormat] = useState<ExportFormat>("txt");
   const [style, setStyle] = useState<ExportStyle>("transcript");
   const [includeTimestamps, setIncludeTimestamps] = useState(false);
@@ -273,21 +275,6 @@ export function ExportSheet({
   })();
 
   useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === "Escape" && !isExporting) {
-        event.preventDefault();
-        onClose();
-      }
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [isExporting, onClose, open]);
-
-  useEffect(() => {
     if (copyState === "idle") return;
     const timeoutId = window.setTimeout(() => {
       setCopyState("idle");
@@ -338,15 +325,23 @@ export function ExportSheet({
   const previewReady = previewState.status === "ready";
 
   return (
-    <div className="sheet-overlay" onClick={isExporting ? undefined : onClose}>
+    <dialog
+      ref={dialogRef}
+      className="sheet-overlay"
+      aria-labelledby="export-sheet-title"
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!isExporting) onClose();
+      }}
+      onClick={(event) => {
+        if (!isExporting && event.target === event.currentTarget) onClose();
+      }}
+    >
       <section
         className="export-sheet"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="export-sheet-title"
-        onClick={(event) => event.stopPropagation()}
       >
         <button
+          autoFocus
           className="export-close-button"
           aria-label={t("export.closePreview", "Close export preview")}
           onClick={onClose}
@@ -522,6 +517,6 @@ export function ExportSheet({
           </div>
         </aside>
       </section>
-    </div>
+    </dialog>
   );
 }

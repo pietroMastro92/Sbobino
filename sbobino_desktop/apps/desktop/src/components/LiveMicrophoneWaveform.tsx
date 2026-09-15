@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { subscribeRealtimeInputLevel } from "../lib/tauri";
 
 type PreviewState =
   | "idle"
@@ -13,7 +14,6 @@ type LiveMicrophoneWaveformProps = {
   ariaLabel: string;
   mode: "idle" | "running" | "paused";
   previewState: PreviewState;
-  levels: number[];
   elapsedSeconds: number;
   runningLabel: string;
   pausedLabel: string;
@@ -168,7 +168,6 @@ export function LiveMicrophoneWaveform({
   ariaLabel,
   mode,
   previewState,
-  levels,
   elapsedSeconds,
   runningLabel,
   pausedLabel,
@@ -180,41 +179,45 @@ export function LiveMicrophoneWaveform({
   degradedLabel = "Live preview paused; saved audio is available for file transcription.",
 }: LiveMicrophoneWaveformProps): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  // Keep the hot audio path outside React's render loop. Input events update a
-  // bounded ring buffer and one RAF paints the latest snapshot at display
-  // cadence, avoiding per-sample canvas/state churn.
   const levelsRef = useRef<number[]>([]);
-  const previewStateRef = useRef(previewState);
-  const modeRef = useRef(mode);
-
-  useEffect(() => {
-    const next = levels.slice(-160);
-    levelsRef.current = next;
-  }, [levels]);
-
-  useEffect(() => {
-    previewStateRef.current = previewState;
-    modeRef.current = mode;
-  }, [mode, previewState]);
-
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) {
-      return;
-    }
-    let frame = 0;
-    const paint = () => {
-      drawWaveform(
-        canvas,
-        levelsRef.current,
-        previewStateRef.current,
-        modeRef.current,
-      );
-      frame = window.requestAnimationFrame(paint);
+    if (!canvas) return;
+    if (!["running", "paused", "degraded"].includes(previewState)) levelsRef.current = [];
+    let disposed = false;
+    let frame: number | null = null;
+    let unlisten: (() => void) | undefined;
+    const redraw = () => {
+      if (disposed || frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        drawWaveform(canvas, levelsRef.current, previewState, mode);
+      });
     };
-    frame = window.requestAnimationFrame(paint);
-    return () => window.cancelAnimationFrame(frame);
-  }, []);
+    redraw();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(redraw);
+    observer?.observe(canvas);
+
+    void subscribeRealtimeInputLevel((event) => {
+      if (disposed || event.state !== "running") return;
+      const level = Number.isFinite(event.level) ? clamp(event.level, 0, 1) : 0;
+      levelsRef.current.push(level);
+      if (levelsRef.current.length > 160) levelsRef.current.shift();
+      redraw();
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    }).catch(() => {
+      // The parent displays microphone availability; a missing preview is non-fatal.
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+      observer?.disconnect();
+      if (frame !== null) window.cancelAnimationFrame(frame);
+    };
+  }, [previewState, mode]);
 
   const overlayLabel = (() => {
     if (mode === "paused") return pausedLabel;

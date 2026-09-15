@@ -5333,12 +5333,28 @@ body.sidebar-resizing {
 .sheet-overlay {
   position: fixed;
   inset: 0;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: inherit;
   background: var(--glass-overlay);
   display: grid;
   place-items: center;
   z-index: 70;
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
+}
+
+.sheet-overlay::backdrop {
+  background: transparent;
+}
+
+dialog.sheet-overlay:not([open]) {
+  display: none;
 }
 
 .rename-sheet {
@@ -8083,4 +8099,15 @@ body.sidebar-resizing {
 [data-theme="dark"] .startup-error-card {
   background: rgba(92, 35, 25, 0.44);
   border-color: rgba(255, 154, 118, 0.22);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

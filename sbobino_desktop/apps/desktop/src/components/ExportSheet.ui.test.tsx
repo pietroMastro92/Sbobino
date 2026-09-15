@@ -22,6 +22,7 @@ afterEach(() => {
 function renderExportSheet(options?: {
   onPreview?: (payload: ExportRequest) => Promise<ExportPreview>;
   onExport?: (payload: ExportRequest) => Promise<boolean>;
+  onClose?: () => void;
 }): void {
   render(
     <ExportSheet
@@ -36,7 +37,7 @@ function renderExportSheet(options?: {
           speakerLabel: "Alice",
         },
       ]}
-      onClose={vi.fn()}
+      onClose={options?.onClose ?? vi.fn()}
       onPreview={
         options?.onPreview ??
         vi.fn().mockResolvedValue({ content: "Backend preview", mode: "exact" })
@@ -47,6 +48,20 @@ function renderExportSheet(options?: {
 }
 
 describe("ExportSheet", () => {
+  it("contains focus and closes from the native dialog cancel event", async () => {
+    const onClose = vi.fn();
+    renderExportSheet({ onClose });
+
+    const closeButton = screen.getByRole("button", { name: "Close export preview" });
+    await waitFor(() => expect(closeButton).toHaveFocus());
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(screen.getByRole("button", { name: /^Export$/i })).toHaveFocus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(closeButton).toHaveFocus();
+    fireEvent(screen.getByRole("dialog"), new Event("cancel", { cancelable: true }));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
   it("does not render orphan transcript options", () => {
     renderExportSheet();
 

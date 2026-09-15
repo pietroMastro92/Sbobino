@@ -50,3 +50,20 @@ if (!("scrollIntoView" in Element.prototype)) {
     writable: true,
   });
 }
+
+if (typeof HTMLDialogElement.prototype.showModal !== "function") {
+  Object.defineProperties(HTMLDialogElement.prototype, {
+    showModal: {
+      configurable: true,
+      value(this: HTMLDialogElement) {
+        this.setAttribute("open", "");
+      },
+    },
+    close: {
+      configurable: true,
+      value(this: HTMLDialogElement) {
+        this.removeAttribute("open");
+      },
+    },
+  });
+}

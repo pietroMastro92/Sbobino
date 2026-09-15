@@ -30,6 +30,11 @@ function extractBlock(source: string, selector: string): string {
 }
 
 describe("theme consistency", () => {
+  it("hides only closed native dialogs, not div-based sheets such as Rename", () => {
+    expect(cssSource).toContain("dialog.sheet-overlay:not([open])");
+    expect(cssSource).not.toContain("\n.sheet-overlay:not([open])");
+  });
+
   it("keeps settings/main topbar styling split correctly for light and dark modes", () => {
     expect(cssSource).toContain('[data-theme="light"] .main-topbar');
     expect(cssSource).toContain('[data-theme="light"] .detail-toolbar');

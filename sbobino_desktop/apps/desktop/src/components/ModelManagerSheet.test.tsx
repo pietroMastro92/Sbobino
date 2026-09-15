@@ -41,6 +41,7 @@ describe("ModelManagerSheet", () => {
     );
 
     expect(screen.getByText("1 model(s) missing")).toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toHaveAccessibleName("Model Manager");
     fireEvent.click(screen.getByRole("button", { name: /download missing/i }));
     expect(onDownloadAll).toHaveBeenCalledTimes(1);
 

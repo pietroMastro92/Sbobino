@@ -784,8 +784,11 @@ impl WhisperStreamEngine {
             .stderr(std::process::Stdio::piped())
             .current_dir(&session_dir);
 
-        let _preferred_language = language_code;
-        command.arg("-l").arg("auto");
+        command.arg("-l").arg(if language_code.trim().is_empty() {
+            "auto"
+        } else {
+            language_code
+        });
         for argument in Self::compute_device_args(self.compute_device) {
             command.arg(argument);
         }

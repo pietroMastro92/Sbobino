@@ -1296,6 +1296,10 @@ exit 45
         &worker_path,
         &format!(
             r#"#!/bin/sh
+if [ "${{1:-}}" = "--help" ]; then
+  printf '%s\n' 'usage: parakeet-batch-json --model <model.gguf> --manifest <chunks.tsv> [--lang <locale>] [--threads N]' 1>&2
+  exit 2
+fi
 manifest=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -1545,6 +1549,10 @@ exit 45
         &worker_path,
         r#"#!/bin/sh
 set -eu
+if [ "${1:-}" = "--help" ]; then
+  printf '%s\n' 'usage: parakeet-batch-json --model <model.gguf> --manifest <chunks.tsv> [--lang <locale>] [--threads N]' 1>&2
+  exit 2
+fi
 base=$(dirname "$0")
 attempt_file="$base/auto-attempt-count"
 device_file="$base/auto-devices"
@@ -1636,6 +1644,10 @@ async fn long_file_explicit_cpu_rejects_terminal_partial_oom_prefix() {
         &format!(
             r#"#!/bin/sh
 set -eu
+if [ "${{1:-}}" = "--help" ]; then
+  printf '%s\n' 'usage: parakeet-batch-json --model <model.gguf> --manifest <chunks.tsv> [--lang <locale>] [--threads N]' 1>&2
+  exit 2
+fi
 attempt=0
 if [ -f "{attempt_file}" ]; then attempt=$(cat "{attempt_file}"); fi
 attempt=$((attempt + 1))
@@ -1795,6 +1807,10 @@ async fn long_file_rss_limit_terminates_worker_group_and_reports_peak() {
         &worker_path,
         &format!(
             r#"#!/bin/sh
+if [ "${{1:-}}" = "--help" ]; then
+  printf '%s\n' 'usage: parakeet-batch-json --model <model.gguf> --manifest <chunks.tsv> [--lang <locale>] [--threads N]' 1>&2
+  exit 2
+fi
 # Do not trip on the shell's startup RSS: first make the helper observable,
 # then let it allocate enough memory to cross the explicit test cap.
 python3 -c 'import time; reserve = bytearray(32 * 1024 * 1024); time.sleep(30)' &

@@ -1,5 +1,6 @@
 import { Download, RefreshCw } from "lucide-react";
 import { t } from "../i18n";
+import { useModalDialog } from "../lib/useModalDialog";
 import type {
   ProvisioningModelCatalogEntry,
   ProvisioningProgressEvent,
@@ -32,6 +33,7 @@ export function ModelManagerSheet({
   onCancel,
   onClose,
 }: ModelManagerSheetProps): JSX.Element | null {
+  const dialogRef = useModalDialog(open);
   if (!open) {
     return null;
   }
@@ -39,19 +41,30 @@ export function ModelManagerSheet({
   const missingCount = models.filter((model) => !model.installed).length;
 
   return (
-    <div className="sheet-overlay" onClick={onClose}>
-      <section className="model-sheet" onClick={(event) => event.stopPropagation()}>
+    <dialog
+      ref={dialogRef}
+      className="sheet-overlay"
+      aria-labelledby="model-manager-title"
+      onCancel={(event) => {
+        event.preventDefault();
+        if (!running) onClose();
+      }}
+      onClick={(event) => {
+        if (!running && event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section className="model-sheet">
         <header className="model-sheet-head">
           <div>
-            <h3>{t("modelManager.title", "Model Manager")}</h3>
+            <h3 id="model-manager-title">{t("modelManager.title", "Model Manager")}</h3>
             <small>
               {missingCount === 0
                 ? t("modelManager.allAvailable", "All models are available")
                 : `${missingCount} ${t("modelManager.modelsMissing", "model(s) missing")}`}
             </small>
           </div>
-          <button className="icon-button" onClick={() => void onRefresh()} disabled={running} title={t("modelManager.refresh", "Refresh")}>
-            <RefreshCw size={14} />
+          <button autoFocus className="icon-button" onClick={() => void onRefresh()} disabled={running} title={t("modelManager.refresh", "Refresh")} aria-label={t("modelManager.refresh", "Refresh")}>
+            <RefreshCw size={14} aria-hidden="true" />
           </button>
         </header>
 
@@ -93,7 +106,7 @@ export function ModelManagerSheet({
                   }
                   onClick={() => void onDownloadModel(model.key)}
                 >
-                  <Download size={14} />
+                  <Download size={14} aria-hidden="true" />
                   {model.installed &&
                   (model.engine !== "whisper_cpp" || model.coreml_installed)
                     ? t("modelManager.installed", "Installed")
@@ -125,6 +138,6 @@ export function ModelManagerSheet({
           <button className="secondary-button" onClick={onClose}>{t("modelManager.close", "Close")}</button>
         </footer>
       </section>
-    </div>
+    </dialog>
   );
 }

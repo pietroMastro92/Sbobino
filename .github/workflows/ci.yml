@@ -68,7 +68,6 @@ jobs:
 
   windows-bootstrap:
     runs-on: windows-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: sbobino_desktop
@@ -83,5 +82,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Check release version wiring
         run: ./scripts/check_release_versions.sh
-      - name: Bootstrap metadata smoke
-        run: cargo metadata --manifest-path Cargo.toml --format-version 1 >/dev/null
+      - name: Compile Windows workspace
+        run: cargo check --workspace --all-targets

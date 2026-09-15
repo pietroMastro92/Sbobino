@@ -1085,10 +1085,26 @@ impl WhisperCppEngine {
     {
         use tokio::io::AsyncBufReadExt;
 
-        let mut lines = tokio::io::BufReader::new(reader).lines();
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut bytes = Vec::new();
         let mut raw_lines = Vec::<String>::new();
 
-        while let Ok(Some(raw)) = lines.next_line().await {
+        loop {
+            bytes.clear();
+            let read = reader
+                .read_until(b'\n', &mut bytes)
+                .await
+                .map_err(|error| {
+                    ApplicationError::SpeechToText(format!(
+                        "failed to read whisper-cli output: {error}"
+                    ))
+                })?;
+            if read == 0 {
+                break;
+            }
+            let raw = String::from_utf8_lossy(&bytes)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
             Self::mark_activity(last_activity_at_ms.as_ref());
             raw_lines.push(raw.clone());
             if let Some(parsed_line) = Self::parse_cli_line(&raw) {
@@ -2289,14 +2305,44 @@ fn status_signal_is_crash(_status: Option<ExitStatus>) -> bool {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use std::path::{Path, PathBuf};
-    use tokio::process::Command;
+    use std::{
+        path::{Path, PathBuf},
+        sync::{atomic::AtomicU64, Arc, Mutex},
+    };
+    use tokio::{io::AsyncWriteExt, process::Command};
 
     use super::{
-        WhisperAudioChunk, WhisperCppEngine, PROCESS_IDLE_TIMEOUT_MAX, PROCESS_IDLE_TIMEOUT_MIN,
-        WHISPER_AGGREGATE_TARGET_SECONDS, WHISPER_MAX_UTTERANCE_SECONDS, WHISPER_SAMPLE_RATE,
+        TranscriptCollector, WhisperAudioChunk, WhisperCppEngine, PROCESS_IDLE_TIMEOUT_MAX,
+        PROCESS_IDLE_TIMEOUT_MIN, WHISPER_AGGREGATE_TARGET_SECONDS, WHISPER_MAX_UTTERANCE_SECONDS,
+        WHISPER_SAMPLE_RATE,
     };
     use sbobino_domain::{TranscriptionComputeDevice, WhisperOptions};
+
+    #[tokio::test]
+    async fn consume_stream_keeps_reading_after_invalid_utf8() {
+        let (mut writer, reader) = tokio::io::duplex(256);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"\xff\n[00:00:00.000 --> 00:00:01.000] recovered\n")
+                .await
+                .expect("test stream should write");
+        });
+        let collector = Arc::new(Mutex::new(TranscriptCollector::default()));
+        let lines = WhisperCppEngine::consume_stream(
+            reader,
+            collector.clone(),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            Some(1.0),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("invalid UTF-8 should be decoded lossily");
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(collector.lock().unwrap().segments[0].text, "recovered");
+    }
 
     #[test]
     fn transcription_idle_timeout_defaults_to_minimum_without_duration() {

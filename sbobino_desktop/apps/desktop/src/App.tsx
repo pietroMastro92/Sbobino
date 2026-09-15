@@ -143,7 +143,12 @@ import {
 } from "./lib/tauri";
 import {
   formatProvisioningAssetLabel,
+  formatProvisioningFailureMessage,
+  provisioningScopeForAssetKind,
+  runProvisioningAndRefresh,
+  shouldShowProvisioningStatus,
   shouldOfferLocalModelsCta,
+  type ProvisioningScope,
 } from "./lib/provisioningUi";
 import {
   canWarmStartFromSetupReport,
@@ -3099,6 +3104,8 @@ function createProvisioningUiState(
   running: boolean;
   progress: ProvisioningProgressEvent | null;
   statusMessage: string;
+  operationScope: ProvisioningScope | null;
+  previousInstallationAvailable: boolean;
 } {
   if (!status) {
     return {
@@ -3109,6 +3116,8 @@ function createProvisioningUiState(
       running: false,
       progress: null,
       statusMessage: "",
+      operationScope: null,
+      previousInstallationAvailable: false,
     };
   }
 
@@ -3120,6 +3129,8 @@ function createProvisioningUiState(
     running: false,
     progress: null,
     statusMessage: "",
+    operationScope: null,
+    previousInstallationAvailable: false,
   };
 }
 
@@ -3435,10 +3446,6 @@ export function App({
   const [realtimeSegments, setRealtimeSegments] = useState<TimelineV2Segment[]>([]);
   const [realtimePreviewSegment, setRealtimePreviewSegment] =
     useState<TimelineV2Segment | null>(null);
-  const [realtimeInputLevels, setRealtimeInputLevels] = useState<number[]>([]);
-  const [realtimeTelemetry, setRealtimeTelemetry] = useState<
-    RealtimeInputLevelEvent["telemetry"]
-  >(null);
   const [realtimePreviewState, setRealtimePreviewState] = useState<
     | "idle"
     | "connecting"
@@ -3468,6 +3475,8 @@ export function App({
     running: boolean;
     progress: ProvisioningProgressEvent | null;
     statusMessage: string;
+    operationScope: ProvisioningScope | null;
+    previousInstallationAvailable: boolean;
   }>(() => createProvisioningUiState(initialBootstrap?.provisioning));
   const [startupRequirementsLoaded, setStartupRequirementsLoaded] = useState(
     standaloneSettingsWindow ||
@@ -5310,7 +5319,6 @@ export function App({
       const uRealtimeInput = await subscribeRealtimeInputLevel(
         (event: RealtimeInputLevelEvent) => {
           if (event.telemetry) {
-            setRealtimeTelemetry(event.telemetry);
             if (event.telemetry.backlog_seconds > 2) {
               setRealtimeMessage(
                 event.message ||
@@ -5342,10 +5350,6 @@ export function App({
             setRealtimePreviewState((previous) =>
               previous === "degraded" ? previous : "running",
             );
-            setRealtimeInputLevels((previous) => {
-              const next = [...previous, Math.max(0, Math.min(1, event.level ?? 0))];
-              return next.length > 160 ? next.slice(next.length - 160) : next;
-            });
             return;
           }
 
@@ -5361,12 +5365,10 @@ export function App({
 
           if (event.state === "blocked" || event.state === "unavailable") {
             setRealtimePreviewState(event.state);
-            setRealtimeInputLevels([]);
             return;
           }
 
           setRealtimePreviewState("idle");
-          setRealtimeInputLevels([]);
         },
       );
       if (unmounted) {
@@ -5455,6 +5457,7 @@ export function App({
             ...previous,
             running: true,
             progress: event,
+            operationScope: provisioningScopeForAssetKind(event.asset_kind),
             statusMessage: `${formatProvisioningAssetLabel(event)} (${event.current}/${event.total})`,
           }));
         },
@@ -5494,36 +5497,32 @@ export function App({
           pyannoteProvisioningActiveRef.current = false;
         }
 
-        const localizedStatusMessage =
-          event.state === "completed"
-            ? provisioningProgressKindRef.current === "speech_runtime"
-              ? t(
-                  "provisioning.runtimeReady",
-                  "Local transcription runtime is ready",
-                )
-              : t("settings.localModels.readyMessage", "Local models are ready")
-            : event.state === "cancelled"
-              ? t("provisioning.cancelled", "Provisioning cancelled")
-              : event.reason_code === "pyannote_install_incomplete" ||
-                  event.reason_code === "pyannote_checksum_invalid" ||
-                  event.reason_code === "pyannote_receipt_required" ||
-                  event.reason_code === "pyannote_receipt_invalid" ||
-                  event.reason_code === "pyannote_import_load_failed"
-                ? event.message || t("settings.pyannote.desc")
-                : event.reason_code === "pyannote_runtime_missing" ||
-                    event.reason_code === "pyannote_model_missing" ||
-                    event.reason_code === "pyannote_repair_required" ||
-                    event.reason_code === "pyannote_validation_required" ||
-                    event.reason_code === "pyannote_version_mismatch" ||
-                    event.reason_code === "pyannote_arch_mismatch"
-                  ? t("settings.pyannote.desc")
-                  : t("error.provisioningFailed", "Provisioning failed");
         setProvisioning((previous) => ({
           ...previous,
           running: false,
-          statusMessage: localizedStatusMessage,
+          statusMessage:
+            event.state === "completed"
+              ? previous.operationScope === "runtime"
+                ? t(
+                    "provisioning.runtimeReady",
+                    "Local transcription runtime is ready",
+                  )
+                : previous.operationScope === "pyannote"
+                  ? t("settings.pyannote.readyMessage", "Pyannote is ready")
+                  : t(
+                      "settings.localModels.readyMessage",
+                      "Local models are ready",
+                    )
+              : event.state === "cancelled"
+                ? t("provisioning.cancelled", "Provisioning cancelled")
+                : formatProvisioningFailureMessage(
+                    event.message ||
+                      t("error.provisioningFailed", "Provisioning failed"),
+                    previous.previousInstallationAvailable,
+                  ),
           progress: event.state === "completed" ? previous.progress : null,
           ready: event.state === "completed" ? true : previous.ready,
+          previousInstallationAvailable: false,
         }));
         if (event.state !== "running") {
           provisioningProgressKindRef.current = null;
@@ -6662,18 +6661,6 @@ export function App({
       modelsDir: status.models_dir,
       missing: [...status.missing_models, ...status.missing_encoders],
       pyannote: status.pyannote,
-      running: false,
-      progress: null,
-      statusMessage: status.ready
-        ? t("settings.localModels.readyMessage", "Local models are ready")
-        : t(
-            "settings.localModels.missingAssets",
-            "{count} model assets missing",
-            {
-              count:
-                status.missing_models.length + status.missing_encoders.length,
-            },
-      ),
     }));
   }
 
@@ -7592,6 +7579,8 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "pyannote",
+        previousInstallationAvailable: Boolean(previous.pyannote?.ready),
         statusMessage: getPyannoteBackgroundActionStatusMessage(action),
       }));
 
@@ -7608,7 +7597,11 @@ export function App({
       setProvisioning((previous) => ({
         ...previous,
         running: false,
-        statusMessage: action.message || t("settings.pyannote.desc"),
+        statusMessage: formatProvisioningFailureMessage(
+          action.message || t("settings.pyannote.desc"),
+          previous.previousInstallationAvailable,
+        ),
+        previousInstallationAvailable: false,
       }));
     } catch (error) {
       pyannoteProvisioningActiveRef.current = false;
@@ -7619,6 +7612,15 @@ export function App({
           outcome: "failed",
         });
       }
+      setProvisioning((previous) => ({
+        ...previous,
+        running: false,
+        statusMessage: formatProvisioningFailureMessage(
+          error instanceof Error ? error.message : t("settings.pyannote.desc"),
+          previous.previousInstallationAvailable,
+        ),
+        previousInstallationAvailable: false,
+      }));
       console.warn(`Automatic pyannote action '${trigger}' failed:`, error);
     }
   }
@@ -7645,6 +7647,8 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "runtime",
+        previousInstallationAvailable: Boolean(health.managed_runtime?.ready),
         statusMessage: t(
           "provisioning.repairingRuntime",
           "Repairing local transcription runtime after update...",
@@ -7659,13 +7663,16 @@ export function App({
         ...previous,
         running: false,
         progress: null,
-        statusMessage:
+        statusMessage: formatProvisioningFailureMessage(
           error instanceof Error
             ? error.message
             : t(
                 "error.runtimeInstallFailed",
                 "Local runtime install failed",
               ),
+          previous.previousInstallationAvailable,
+        ),
+        previousInstallationAvailable: false,
       }));
       console.warn("Automatic runtime repair after update failed:", error);
     }
@@ -7675,57 +7682,19 @@ export function App({
     starter: () => Promise<{ started: boolean }>,
     options?: { waitForExistingRun?: boolean },
   ): Promise<void> {
-    let unlisten: (() => void) | undefined;
-
-    try {
-      // Register the listener before starting the native job.  The old
-      // nested async Promise raced a fast local install: a completion event
-      // could be emitted between `starter()` and the resolution of
-      // `listen()`, leaving the UI waiting forever and making Pyannote look
-      // as if it needed another Repair click.
-      let resolveCompletion!: () => void;
-      let rejectCompletion!: (error: Error) => void;
-      const completion = new Promise<void>((resolve, reject) => {
-        resolveCompletion = resolve;
-        rejectCompletion = reject;
-      });
-
-      unlisten = await subscribeProvisioningStatus((event) => {
-        if (event.state === "completed") {
-          resolveCompletion();
-          return;
-        }
-
-        if (event.state === "cancelled") {
-          rejectCompletion(
-            new Error(
-              event.message ||
-                t("provisioning.cancelled", "Provisioning cancelled"),
-            ),
-          );
-          return;
-        }
-
-        if (event.state === "error") {
-          rejectCompletion(
-            new Error(
-              event.message ||
-                t("error.provisioningFailed", "Provisioning failed"),
-            ),
-          );
-        }
-      });
-
-      const result = await starter();
-      if (!result.started && !options?.waitForExistingRun) {
-        resolveCompletion();
-      }
-
-      await completion;
-    } finally {
-      unlisten?.();
-      await loadStartupRequirements();
-    }
+    await runProvisioningAndRefresh({
+      starter,
+      subscribe: subscribeProvisioningStatus,
+      refresh: loadStartupRequirements,
+      timeoutMs: 30 * 60 * 1000,
+      timeoutMessage: t(
+        "error.provisioningTimeout",
+        "Provisioning timed out before completion",
+      ),
+      cancelledMessage: t("provisioning.cancelled", "Provisioning cancelled"),
+      failureMessage: t("error.provisioningFailed", "Provisioning failed"),
+      waitForExistingRun: options?.waitForExistingRun,
+    });
   }
 
   async function acceptPrivacyPolicy(): Promise<void> {
@@ -10183,8 +10152,6 @@ export function App({
 
     try {
       setRealtimePreviewState("connecting");
-      setRealtimeInputLevels([]);
-      setRealtimeTelemetry(null);
       // Parakeet/Nemotron currently cannot maintain real time on the hardware
       // matrix validated for this release. Keep Parakeet available for file
       // transcription, while live sessions transparently use Whisper instead
@@ -10209,7 +10176,6 @@ export function App({
           readiness.message || formatRuntimeNotReadyMessage(runtimeHealth);
         setRealtimeMessage(message);
         setRealtimePreviewState(realtimePreviewStateForReadinessFailure(readiness));
-        setRealtimeInputLevels([]);
         setError(
           message,
         );
@@ -10277,8 +10243,6 @@ export function App({
       setRealtimeSessionOpen(false);
       setRealtimeStartedAtMs(null);
       setRealtimePreviewState("idle");
-      setRealtimeInputLevels([]);
-      setRealtimeTelemetry(null);
       setRealtimeSegments([]);
       setRealtimePreviewSegment(null);
       setError(
@@ -10370,7 +10334,6 @@ export function App({
         activeRealtimeJobIdRef.current = null;
         setActiveRealtimeJobId(null);
         setRealtimePreview("");
-        setRealtimeTelemetry(null);
         setRealtimeFinalLines([]);
         setRealtimeSessionOpen(false);
         setRealtimeStartedAtMs(null);
@@ -10396,7 +10359,6 @@ export function App({
       }
       clearRealtimeSpeakerDetectionRequest();
       setRealtimePreview("");
-      setRealtimeTelemetry(null);
       setRealtimeFinalLines([]);
       setRealtimeSegments([]);
       setRealtimePreviewSegment(null);
@@ -10795,13 +10757,20 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "models",
+        previousInstallationAvailable: false,
         statusMessage: t("provisioning.started", "Provisioning started..."),
       }));
-      await provisioningStart(true);
+      await waitForProvisioningRun(() => provisioningStart(true));
     } catch (provisionError) {
       setProvisioning((previous) => ({
         ...previous,
         running: false,
+        statusMessage: formatUiError(
+          "error.provisioningFailed",
+          "Provisioning failed",
+          provisionError,
+        ),
       }));
       setError(
         formatUiError(
@@ -10819,17 +10788,26 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "models",
+        previousInstallationAvailable: false,
         statusMessage: t(
           "provisioning.downloadingModel",
           "Downloading {model}...",
           { model },
         ),
       }));
-      await provisioningDownloadModel({ model, include_coreml: true });
+      await waitForProvisioningRun(() =>
+        provisioningDownloadModel({ model, include_coreml: true }),
+      );
     } catch (downloadError) {
       setProvisioning((previous) => ({
         ...previous,
         running: false,
+        statusMessage: formatUiError(
+          "error.modelDownloadFailed",
+          "Model download failed",
+          downloadError,
+        ),
       }));
       setError(
         formatUiError(
@@ -10847,6 +10825,10 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "runtime",
+        previousInstallationAvailable: Boolean(
+          runtimeHealth?.managed_runtime?.ready,
+        ),
         statusMessage: force
           ? t(
               "provisioning.repairingRuntime",
@@ -10857,11 +10839,20 @@ export function App({
               "Installing local transcription runtime...",
             ),
       }));
-      await provisioningInstallRuntime(force);
+      await waitForProvisioningRun(() => provisioningInstallRuntime(force));
     } catch (installError) {
       setProvisioning((previous) => ({
         ...previous,
         running: false,
+        statusMessage: formatProvisioningFailureMessage(
+          formatUiError(
+            "error.runtimeInstallFailed",
+            "Local runtime install failed",
+            installError,
+          ),
+          previous.previousInstallationAvailable,
+        ),
+        previousInstallationAvailable: false,
       }));
       setError(
         formatUiError(
@@ -10880,6 +10871,8 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "pyannote",
+        previousInstallationAvailable: Boolean(previous.pyannote?.ready),
         statusMessage: force
           ? t(
               "provisioning.repairingPyannote",
@@ -10903,6 +10896,15 @@ export function App({
       setProvisioning((previous) => ({
         ...previous,
         running: false,
+        statusMessage: formatProvisioningFailureMessage(
+          formatUiError(
+            "error.pyannoteInstallFailed",
+            "Pyannote install failed",
+            installError,
+          ),
+          previous.previousInstallationAvailable,
+        ),
+        previousInstallationAvailable: false,
       }));
       setError(
         formatUiError(
@@ -10921,6 +10923,7 @@ export function App({
         ...previous,
         running: false,
         statusMessage: t("provisioning.cancelled", "Provisioning cancelled"),
+        previousInstallationAvailable: false,
       }));
     } catch (cancelError) {
       setError(
@@ -13470,6 +13473,7 @@ export function App({
         <div className="property-grid">
           <label>{t("metadata.model")}</label>
           <select
+            aria-label={t("metadata.model")}
             value={primaryModelValue}
             onChange={(event) => {
               if (!transcriptionSettings) {
@@ -13493,6 +13497,7 @@ export function App({
 
           <label>{t("metadata.language")}</label>
           <select
+            aria-label={t("metadata.language")}
             value={settings?.transcription.language ?? "auto"}
             onChange={(event) =>
               void onChangeLanguage(event.target.value as LanguageCode)
@@ -13984,7 +13989,6 @@ export function App({
                   )}
                   mode={realtimeState}
                   previewState={realtimePreviewState}
-                  levels={realtimeInputLevels}
                   elapsedSeconds={realtimeElapsedSeconds}
                   runningLabel={t("realtime.waveformRunning", "Mic live")}
                   pausedLabel={t("realtime.waveformPaused", "Preview paused")}
@@ -14199,7 +14203,6 @@ export function App({
               )}
               mode={realtimeState}
               previewState={realtimePreviewState}
-              levels={realtimeInputLevels}
               elapsedSeconds={realtimeElapsedSeconds}
               runningLabel={t("realtime.waveformRunning", "Mic live")}
               pausedLabel={t("realtime.waveformPaused", "Preview paused")}
@@ -16351,13 +16354,8 @@ export function App({
       settings.transcription.speaker_diarization ??
         getDefaultSpeakerDiarizationSettings(),
     );
-    const runtimeBusy =
-      provisioning.running &&
-      provisioning.progress?.asset_kind === "speech_runtime";
     const pyannoteBusy =
-      provisioning.running &&
-      (provisioning.progress?.asset_kind === "pyannote_runtime" ||
-        provisioning.progress?.asset_kind === "pyannote_model");
+      provisioning.running && provisioning.operationScope === "pyannote";
     const pyannoteAction =
       !pyannoteHealth?.runtime_installed || !pyannoteHealth?.model_installed
         ? {
@@ -16732,14 +16730,16 @@ export function App({
             </button>
           </div>
 
-          {provisioning.progress ? (
+          {provisioning.progress && provisioning.operationScope !== "pyannote" ? (
             <div className="inline-progress">
               <div style={{ width: `${provisioning.progress.percentage}%` }} />
             </div>
           ) : null}
-          {(runtimeBusy ||
-            provisioning.progress?.asset_kind !== "speech_runtime") &&
-          provisioning.statusMessage ? (
+          {shouldShowProvisioningStatus(
+            provisioning.operationScope,
+            "local_models",
+            provisioning.statusMessage,
+          ) ? (
             <small className="muted">{provisioning.statusMessage}</small>
           ) : null}
         </section>
@@ -16893,7 +16893,11 @@ export function App({
               <div style={{ width: `${provisioning.progress.percentage}%` }} />
             </div>
           ) : null}
-          {pyannoteBusy && provisioning.statusMessage ? (
+          {shouldShowProvisioningStatus(
+            provisioning.operationScope,
+            "pyannote",
+            provisioning.statusMessage,
+          ) ? (
             <small className="muted">{provisioning.statusMessage}</small>
           ) : null}
         </section>
@@ -18682,6 +18686,7 @@ export function App({
                       <Mic size={12} />
                     </span>
                     <select
+                      aria-label={t("metadata.model")}
                       value={
                         settings
                           ? selectedPrimaryTranscriptionModel(
@@ -18725,6 +18730,7 @@ export function App({
                       <Languages size={12} />
                     </span>
                     <select
+                      aria-label={t("metadata.language")}
                       value={settings?.transcription.language ?? "auto"}
                       onChange={(event) =>
                         void onChangeLanguage(
@@ -18747,6 +18753,7 @@ export function App({
                   <label className="history-filter-chip">
                     <ListFilter size={13} />
                     <select
+                      aria-label={t("metadata.kind")}
                       value={historyKind}
                       onChange={(event) =>
                         setHistoryKind(
