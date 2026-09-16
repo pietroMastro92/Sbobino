@@ -8,6 +8,9 @@ import tempfile
 import unittest
 import wave
 import zipfile
+from unittest import mock
+
+from scripts import validation_evidence
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -48,6 +51,29 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn('subparsers.add_parser("artifacts")', helper)
         self.assertIn('source.read(1024 * 1024)', helper)
         self.assertIn('"dirty_paths": dirty_paths', helper)
+
+    def test_validation_runner_resolves_windows_command_shims(self):
+        completed = subprocess.CompletedProcess([], 0, "ok", "")
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            validation_evidence.shutil,
+            "which",
+            return_value=r"C:\Program Files\nodejs\npm.CMD",
+        ), mock.patch.object(
+            validation_evidence.subprocess,
+            "run",
+            return_value=completed,
+        ) as run, mock.patch.object(
+            validation_evidence.platform, "platform", return_value="Windows-test"
+        ), mock.patch.object(
+            validation_evidence.platform, "machine", return_value="AMD64"
+        ):
+            result = validation_evidence.capture(
+                pathlib.Path(temporary) / "evidence.json",
+                ["npm", "test"],
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_args.args[0][0], r"C:\Program Files\nodejs\npm.CMD")
 
     def test_intel_smoke_accepts_a_complete_local_asset_set(self):
         smoke = INTEL_SMOKE.read_text(encoding="utf-8")

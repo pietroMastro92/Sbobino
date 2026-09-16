@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import platform
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -136,6 +137,8 @@ def write_artifact_manifest(output: pathlib.Path, requested: list[pathlib.Path])
 
 def capture(output: pathlib.Path, command: list[str]) -> int:
     started = datetime.now(timezone.utc)
+    executable = shutil.which(command[0]) or command[0]
+    command = [executable, *command[1:]]
     completed = subprocess.run(command, capture_output=True, text=True, errors="replace")
     finished = datetime.now(timezone.utc)
     output.parent.mkdir(parents=True, exist_ok=True)
