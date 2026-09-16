@@ -11,6 +11,14 @@ import sys
 from datetime import datetime, timezone
 
 
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def write_manifest(output: pathlib.Path) -> int:
     root = pathlib.Path(__file__).resolve().parents[2]
     listed = subprocess.run(
@@ -35,22 +43,33 @@ def write_manifest(output: pathlib.Path) -> int:
         path = root / relative
         if not path.is_file():
             continue
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = sha256_file(path)
         files.append({"path": relative, "bytes": path.stat().st_size, "sha256": digest})
         aggregate.update(f"{digest}  {relative}\n".encode())
 
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
     ).stdout.strip()
-    dirty = bool(
-        subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-    )
+    status_lines = subprocess.run(
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            ".github",
+            "sbobino_desktop",
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    dirty_paths = [
+        line
+        for line in status_lines
+        if "sbobino_desktop/validation-evidence/" not in line
+    ]
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(
@@ -58,7 +77,8 @@ def write_manifest(output: pathlib.Path) -> int:
                 "schema_version": 1,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "git_head": head,
-                "dirty": dirty,
+                "dirty": bool(dirty_paths),
+                "dirty_paths": dirty_paths,
                 "platform": platform.platform(),
                 "architecture": platform.machine(),
                 "aggregate_sha256": aggregate.hexdigest(),
@@ -70,6 +90,48 @@ def write_manifest(output: pathlib.Path) -> int:
         encoding="utf-8",
     )
     return 0
+
+
+def write_artifact_manifest(output: pathlib.Path, requested: list[pathlib.Path]) -> int:
+    files: list[pathlib.Path] = []
+    missing: list[str] = []
+    for requested_path in requested:
+        path = requested_path.resolve()
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            files.extend(candidate for candidate in path.rglob("*") if candidate.is_file())
+        else:
+            missing.append(str(requested_path))
+    records = [
+        {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+        for path in sorted(set(files))
+    ]
+    aggregate = hashlib.sha256()
+    for record in records:
+        aggregate.update(f"{record['sha256']}  {record['path']}\n".encode())
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "platform": platform.platform(),
+                "architecture": platform.machine(),
+                "aggregate_sha256": aggregate.hexdigest(),
+                "missing": missing,
+                "files": records,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return 1 if missing else 0
 
 
 def capture(output: pathlib.Path, command: list[str]) -> int:
@@ -106,12 +168,17 @@ def main() -> int:
     subparsers = parser.add_subparsers(dest="action", required=True)
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("output", type=pathlib.Path)
+    artifacts = subparsers.add_parser("artifacts")
+    artifacts.add_argument("output", type=pathlib.Path)
+    artifacts.add_argument("paths", nargs="+", type=pathlib.Path)
     run = subparsers.add_parser("run")
     run.add_argument("output", type=pathlib.Path)
     run.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.action == "manifest":
         return write_manifest(args.output.resolve())
+    if args.action == "artifacts":
+        return write_artifact_manifest(args.output.resolve(), args.paths)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("run requires a command after --")

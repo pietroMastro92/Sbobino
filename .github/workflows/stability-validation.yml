@@ -2,6 +2,9 @@ name: Stability validation
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/stability-completion-20260916
 
 permissions:
   contents: read
@@ -15,16 +18,20 @@ jobs:
         include:
           - label: linux-x86_64
             runner: ubuntu-latest
-            rust_mode: full
+            rust_mode: linux
+            target: x86_64-unknown-linux-gnu
           - label: macos-arm64
             runner: macos-15
-            rust_mode: full
+            rust_mode: macos
+            target: aarch64-apple-darwin
           - label: macos-x86_64
             runner: macos-15-intel
-            rust_mode: full
+            rust_mode: macos
+            target: x86_64-apple-darwin
           - label: windows-x86_64
             runner: windows-2025
             rust_mode: windows
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -48,6 +55,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: ${{ matrix.target }}
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -72,8 +80,12 @@ jobs:
         run: python scripts/validation_evidence.py run validation-evidence/rust-format.json -- cargo fmt --all -- --check
 
       - name: Rust tests
-        if: matrix.rust_mode == 'full'
+        if: matrix.rust_mode == 'macos'
         run: python scripts/validation_evidence.py run validation-evidence/rust-tests.json -- cargo test --workspace --all-targets -- --test-threads=1
+
+      - name: Linux core crate tests
+        if: matrix.rust_mode == 'linux'
+        run: python scripts/validation_evidence.py run validation-evidence/rust-tests.json -- cargo test -p sbobino-domain -p sbobino-application -p sbobino-infrastructure -- --test-threads=1
 
       - name: Compile all Windows Rust targets
         if: matrix.rust_mode == 'windows'
@@ -83,11 +95,86 @@ jobs:
         if: matrix.rust_mode == 'windows'
         run: python scripts/validation_evidence.py run validation-evidence/windows-portable-tests.json -- cargo test -p sbobino-domain -p sbobino-application -p sbobino-desktop -- --test-threads=1
 
+      - name: Run native Windows infrastructure unit tests
+        if: matrix.rust_mode == 'windows'
+        run: python scripts/validation_evidence.py run validation-evidence/windows-infrastructure-tests.json -- cargo test -p sbobino-infrastructure --lib -- --test-threads=1
+
       - name: Clippy
         run: python scripts/validation_evidence.py run validation-evidence/clippy.json -- cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Runtime and workflow contracts
         run: python scripts/validation_evidence.py run validation-evidence/contracts.json -- python -m unittest scripts/test_release_workflow_contract.py scripts/test_evaluate_live_latency.py scripts/test_run_whisper_live_replay.py
+
+      - name: Install macOS runtime build dependencies
+        if: matrix.rust_mode == 'macos'
+        run: brew install ffmpeg sdl2 nasm
+
+      - name: Build and smoke the local macOS speech runtime
+        if: matrix.rust_mode == 'macos'
+        env:
+          SBOBINO_RUNTIME_STAGE_PARENT: ${{ runner.temp }}
+          SBOBINO_RUNTIME_BUILD_JOBS: "2"
+          SBOBINO_WHISPER_LIVE_RUNTIME_ZIP: ${{ runner.temp }}/stability-artifacts/speech-runtime-macos-${{ matrix.label == 'macos-arm64' && 'aarch64' || 'x86_64' }}.zip
+          SBOBINO_WHISPER_LIVE_ARCH: ${{ matrix.label == 'macos-arm64' && 'arm64' || 'x86_64' }}
+          SBOBINO_WHISPER_ALLOW_PREFLIGHT_REJECTION: ${{ matrix.label == 'macos-arm64' && '1' || '0' }}
+          SBOBINO_WHISPER_EXPECT_PREFLIGHT_REJECTION: ${{ matrix.label == 'macos-x86_64' && '1' || '0' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/stability-artifacts"
+          ./scripts/package_macos_runtime_asset.sh "$SBOBINO_WHISPER_LIVE_RUNTIME_ZIP"
+          ./scripts/release_macos_whisper_live_smoke.sh \
+            "$(node -p "require('./apps/desktop/package.json').version")" \
+            "$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/stability-artifacts/whisper-live-${{ matrix.label }}.json"
+
+      - name: Build local macOS application bundle
+        if: matrix.rust_mode == 'macos'
+        working-directory: sbobino_desktop/apps/desktop
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: none
+          SBOBINO_RELEASE_PROFILE: standalone-dev
+        run: npm run tauri:build:standalone-dev -- --target ${{ matrix.target }} --bundles app
+
+      - name: Build local Windows runtime and sidecars
+        if: matrix.rust_mode == 'windows'
+        shell: pwsh
+        working-directory: sbobino_desktop/apps/desktop
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP "stability-artifacts"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          ../../scripts/package_windows_runtime_asset.ps1 `
+            -OutputZip (Join-Path $staging "speech-runtime-windows-x86_64.zip") `
+            -SidecarDir (Join-Path $PWD "src-tauri\binaries")
+
+      - name: Smoke local Windows Whisper runtime
+        if: matrix.rust_mode == 'windows'
+        shell: pwsh
+        run: |
+          $version = (Get-Content apps/desktop/package.json | ConvertFrom-Json).version
+          ./scripts/release_windows_whisper_live_smoke.ps1 `
+            -Version $version `
+            -RepoSlug $env:GITHUB_REPOSITORY `
+            -ReportPath (Join-Path $env:RUNNER_TEMP "stability-artifacts\windows-whisper-live.json") `
+            -RuntimeZip (Join-Path $env:RUNNER_TEMP "stability-artifacts\speech-runtime-windows-x86_64.zip") `
+            -ExpectPreflightRejection
+
+      - name: Build local Windows installer
+        if: matrix.rust_mode == 'windows'
+        working-directory: sbobino_desktop/apps/desktop
+        shell: pwsh
+        run: npm run tauri:build:standalone-dev -- --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Record macOS artifact manifest
+        if: matrix.rust_mode == 'macos'
+        run: python scripts/validation_evidence.py artifacts validation-evidence/artifact-manifest.json apps/desktop/dist target/${{ matrix.target }}/release/bundle "$RUNNER_TEMP/stability-artifacts"
+
+      - name: Record Windows artifact manifest
+        if: matrix.rust_mode == 'windows'
+        shell: pwsh
+        run: python scripts/validation_evidence.py artifacts validation-evidence/artifact-manifest.json apps/desktop/dist target/x86_64-pc-windows-msvc/release/bundle/nsis (Join-Path $env:RUNNER_TEMP "stability-artifacts")
+
+      - name: Record Linux frontend artifact manifest
+        if: matrix.rust_mode == 'linux'
+        run: python scripts/validation_evidence.py artifacts validation-evidence/artifact-manifest.json apps/desktop/dist
 
       - name: Upload validation evidence
         if: always()
@@ -96,4 +183,15 @@ jobs:
           name: stability-validation-${{ matrix.label }}
           path: sbobino_desktop/validation-evidence/*.json
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload local native packages and runtime proofs
+        if: always() && matrix.rust_mode != 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stability-packages-${{ matrix.label }}
+          path: |
+            ${{ runner.temp }}/stability-artifacts/*
+            sbobino_desktop/target/${{ matrix.target }}/release/bundle/**/*
+          if-no-files-found: warn
           retention-days: 7

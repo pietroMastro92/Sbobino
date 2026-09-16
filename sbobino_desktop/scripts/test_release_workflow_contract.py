@@ -13,6 +13,7 @@ import zipfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT.parent / ".github" / "workflows" / "release.yml"
 STABILITY_VALIDATION = ROOT.parent / ".github" / "workflows" / "stability-validation.yml"
+VALIDATION_EVIDENCE = ROOT / "scripts" / "validation_evidence.py"
 PROMOTION = ROOT / "scripts" / "promote_candidate_release.sh"
 INTEL_VALIDATION = ROOT.parent / ".github" / "workflows" / "intel-runtime-validation.yml"
 ARM_VALIDATION = ROOT.parent / ".github" / "workflows" / "arm-runtime-validation.yml"
@@ -33,9 +34,27 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("windows-2025", workflow)
         self.assertIn("source-manifest.json", workflow)
+        self.assertIn("codex/stability-completion-20260916", workflow)
+        self.assertIn("package_macos_runtime_asset.sh", workflow)
+        self.assertIn("package_windows_runtime_asset.ps1", workflow)
+        self.assertIn("artifact-manifest.json", workflow)
+        self.assertIn("CARGO_PROFILE_RELEASE_STRIP: none", workflow)
         self.assertNotIn("contents: write", workflow)
         self.assertNotIn("gh release", workflow)
         self.assertNotIn("publish_candidate", workflow)
+
+    def test_stability_manifest_hashes_built_artifacts_without_loading_whole_files(self):
+        helper = VALIDATION_EVIDENCE.read_text(encoding="utf-8")
+        self.assertIn('subparsers.add_parser("artifacts")', helper)
+        self.assertIn('source.read(1024 * 1024)', helper)
+        self.assertIn('"dirty_paths": dirty_paths', helper)
+
+    def test_intel_smoke_accepts_a_complete_local_asset_set(self):
+        smoke = INTEL_SMOKE.read_text(encoding="utf-8")
+        self.assertIn("SBOBINO_INTEL_SPEECH_RUNTIME_ZIP", smoke)
+        self.assertIn("SBOBINO_INTEL_PYANNOTE_RUNTIME_ZIP", smoke)
+        self.assertIn("SBOBINO_INTEL_PYANNOTE_MODEL_ZIP", smoke)
+        self.assertIn('else\n  gh release download "$TAG"', smoke)
 
     def test_pull_request_windows_job_compiles_the_workspace_and_is_blocking(self):
         workflow = (ROOT.parent / ".github" / "workflows" / "ci.yml").read_text(

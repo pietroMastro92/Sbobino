@@ -1,0 +1,11 @@
+id	status	area	finding	evidence	next_action
+STAB-001	FIXED_LOCAL	provisioning	Lifecycle timeout started only after subscription and starter returned	provisioningUi.test.ts 12/12	Run native UI flows
+STAB-002	FIXED_LOCAL	provisioning	Terminal error could reject before a handler was attached	provisioningUi.test.ts immediate error regression	Run full native UI flows
+STAB-003	FIXED_LOCAL	provisioning	Final refresh could keep the UI pending indefinitely	provisioningUi.test.ts bounded refresh regression	Run native backend reconciliation
+STAB-004	FIXED_LOCAL	ui	Global terminal listener could clear rollback diagnostics and set aggregate ready incorrectly	npm build and frontend suite	Capture current UI evidence
+STAB-005	PASS	parakeet	Worker capability must recognize only exact --threads and fail closed on timeout	cargo test worker_threads_: 3/3	Verify native worker arguments in CI
+STAB-006	FIXED_LOCAL	ci	Validation workflow lacked native packaging and complete artifact identity	20 workflow contracts plus local manifest checks	Run hosted native jobs
+STAB-007	BLOCKED	platform	Intel macOS and Windows native flows lack current same-SHA evidence	No current runner evidence	Push reviewed branch after explicit approval
+STAB-008	FIXED_LOCAL	packaging	Rust 1.95/LLVM 22 on macOS 27 produced a misaligned release proc-macro	Clean arm64 app and DMG build passed with release stripping disabled; serde_derive stroff mod8=0	Verify the same setting on hosted macOS runners
+STAB-009	BLOCKED	packaging	Standalone macOS bundle has only linker ad-hoc signing and no sealed resources	codesign --verify --deep --strict fails; no TeamIdentifier	Run Developer ID signing and notarization only when credentials are available
+STAB-010	PASS	packaging	Packaged arm64 executable must launch without touching the personal app profile	Five-second native launch with isolated UltraDisk HOME; intentional SIGINT exit 130	Run interactive flows in the same isolated profile

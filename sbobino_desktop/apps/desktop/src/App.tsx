@@ -144,6 +144,7 @@ import {
 import {
   formatProvisioningAssetLabel,
   formatProvisioningFailureMessage,
+  ProvisioningCancelledError,
   provisioningScopeForAssetKind,
   runProvisioningAndRefresh,
   shouldShowProvisioningStatus,
@@ -3643,6 +3644,7 @@ export function App({
     ProvisioningProgressEvent["asset_kind"] | null
   >(null);
   const pyannoteProvisioningActiveRef = useRef(false);
+  const provisioningOperationIdRef = useRef(0);
   const initialSetupReportRef = useRef<InitialSetupReport>(
     initialBootstrap?.setupReport ?? createInitialSetupReport(),
   );
@@ -5497,43 +5499,10 @@ export function App({
           pyannoteProvisioningActiveRef.current = false;
         }
 
-        setProvisioning((previous) => ({
-          ...previous,
-          running: false,
-          statusMessage:
-            event.state === "completed"
-              ? previous.operationScope === "runtime"
-                ? t(
-                    "provisioning.runtimeReady",
-                    "Local transcription runtime is ready",
-                  )
-                : previous.operationScope === "pyannote"
-                  ? t("settings.pyannote.readyMessage", "Pyannote is ready")
-                  : t(
-                      "settings.localModels.readyMessage",
-                      "Local models are ready",
-                    )
-              : event.state === "cancelled"
-                ? t("provisioning.cancelled", "Provisioning cancelled")
-                : formatProvisioningFailureMessage(
-                    event.message ||
-                      t("error.provisioningFailed", "Provisioning failed"),
-                    previous.previousInstallationAvailable,
-                  ),
-          progress: event.state === "completed" ? previous.progress : null,
-          ready: event.state === "completed" ? true : previous.ready,
-          previousInstallationAvailable: false,
-        }));
         if (event.state !== "running") {
           provisioningProgressKindRef.current = null;
         }
 
-        if (event.state === "completed") {
-          void refreshProvisioningModels();
-          if (wasPyannoteProvisioning && !pyannoteProvisioningFailed) {
-            void refreshRuntimeHealth();
-          }
-        }
       });
       if (unmounted) {
         uProvisioningStatus();
@@ -7584,27 +7553,18 @@ export function App({
         statusMessage: getPyannoteBackgroundActionStatusMessage(action),
       }));
 
-      const result = await provisioningInstallPyannote(action.force_reinstall);
-      if (result.started) {
-        return;
-      }
-
+      await waitForProvisioningRun(
+        () => provisioningInstallPyannote(action.force_reinstall),
+        { scope: "pyannote" },
+      );
       pyannoteProvisioningActiveRef.current = false;
       writeLastPyannoteAutoActionMarker({
         ...marker,
-        outcome: "failed",
+        outcome: "succeeded",
       });
-      setProvisioning((previous) => ({
-        ...previous,
-        running: false,
-        statusMessage: formatProvisioningFailureMessage(
-          action.message || t("settings.pyannote.desc"),
-          previous.previousInstallationAvailable,
-        ),
-        previousInstallationAvailable: false,
-      }));
     } catch (error) {
       pyannoteProvisioningActiveRef.current = false;
+      if (error instanceof ProvisioningCancelledError) return;
       const previousMarker = readLastPyannoteAutoActionMarker();
       if (previousMarker) {
         writeLastPyannoteAutoActionMarker({
@@ -7654,8 +7614,11 @@ export function App({
           "Repairing local transcription runtime after update...",
         ),
       }));
-      await waitForProvisioningRun(() => provisioningInstallRuntime(false));
+      await waitForProvisioningRun(() => provisioningInstallRuntime(false), {
+        scope: "runtime",
+      });
     } catch (error) {
+      if (error instanceof ProvisioningCancelledError) return;
       // Keep the app interactive.  The subsequent preflight can still show
       // the precise missing binary and the Local Models screen exposes the
       // explicit Repair action.
@@ -7680,21 +7643,85 @@ export function App({
 
   async function waitForProvisioningRun(
     starter: () => Promise<{ started: boolean }>,
-    options?: { waitForExistingRun?: boolean },
-  ): Promise<void> {
-    await runProvisioningAndRefresh({
-      starter,
-      subscribe: subscribeProvisioningStatus,
-      refresh: loadStartupRequirements,
-      timeoutMs: 30 * 60 * 1000,
-      timeoutMessage: t(
-        "error.provisioningTimeout",
-        "Provisioning timed out before completion",
-      ),
-      cancelledMessage: t("provisioning.cancelled", "Provisioning cancelled"),
-      failureMessage: t("error.provisioningFailed", "Provisioning failed"),
-      waitForExistingRun: options?.waitForExistingRun,
-    });
+    options: {
+      scope: ProvisioningScope;
+      waitForExistingRun?: boolean;
+    },
+  ): Promise<StartupRequirementsSnapshot> {
+    const operationId = ++provisioningOperationIdRef.current;
+    setProvisioning((previous) => ({
+      ...previous,
+      running: true,
+      operationScope: options.scope,
+    }));
+    let snapshot: StartupRequirementsSnapshot;
+    try {
+      snapshot = await runProvisioningAndRefresh({
+        starter,
+        subscribe: subscribeProvisioningStatus,
+        refresh: loadStartupRequirements,
+        timeoutMs: 30 * 60 * 1000,
+        refreshTimeoutMs: 30 * 1000,
+        timeoutMessage: t(
+          "error.provisioningTimeout",
+          "Provisioning timed out before completion",
+        ),
+        cancelledMessage: t(
+          "provisioning.cancelled",
+          "Provisioning cancelled",
+        ),
+        failureMessage: t("error.provisioningFailed", "Provisioning failed"),
+        waitForExistingRun: options.waitForExistingRun,
+      });
+    } catch (error) {
+      if (
+        error instanceof ProvisioningCancelledError &&
+        operationId === provisioningOperationIdRef.current
+      ) {
+        setProvisioning((previous) => ({
+          ...previous,
+          running: false,
+          progress: null,
+          operationScope: options.scope,
+          statusMessage: error.message,
+        }));
+      }
+      throw error;
+    }
+    if (
+      options.scope === "runtime" &&
+      !isRuntimeToolchainReady(snapshot.runtimeHealth)
+    ) {
+      throw new Error(formatRuntimeNotReadyMessage(snapshot.runtimeHealth));
+    }
+    if (options.scope === "pyannote" && !snapshot.runtimeHealth.pyannote?.ready) {
+      throw new Error(
+        snapshot.runtimeHealth.pyannote?.message ||
+          t("error.pyannoteInstallFailed", "Pyannote install failed"),
+      );
+    }
+    if (operationId === provisioningOperationIdRef.current) {
+      setProvisioning((previous) => ({
+        ...previous,
+        running: false,
+        progress: null,
+        operationScope: options.scope,
+        statusMessage:
+          options.scope === "runtime"
+            ? t(
+                "provisioning.runtimeReady",
+                "Local transcription runtime is ready",
+              )
+            : options.scope === "pyannote"
+              ? t("settings.pyannote.readyMessage", "Pyannote is ready")
+              : t(
+                  "settings.localModels.readyMessage",
+                  "Local models are ready",
+                ),
+        previousInstallationAvailable: false,
+      }));
+    }
+    return snapshot;
   }
 
   async function acceptPrivacyPolicy(): Promise<void> {
@@ -7779,7 +7806,9 @@ export function App({
             "Checking local tools and prerequisites.",
           ),
         );
-        await waitForProvisioningRun(() => provisioningInstallRuntime(false));
+        await waitForProvisioningRun(() => provisioningInstallRuntime(false), {
+          scope: "runtime",
+        });
         snapshot = await loadStartupRequirements();
         await updateInitialSetupStepState(
           "speech-runtime",
@@ -7832,11 +7861,13 @@ export function App({
             "This can take a few minutes the first time.",
           ),
         );
-        await waitForProvisioningRun(() =>
-          provisioningDownloadModel({
-            model,
-            include_coreml: currentSnapshot.runtimeHealth.is_apple_silicon,
-          }),
+        await waitForProvisioningRun(
+          () =>
+            provisioningDownloadModel({
+              model,
+              include_coreml: currentSnapshot.runtimeHealth.is_apple_silicon,
+            }),
+          { scope: "models" },
         );
         snapshot = await loadStartupRequirements();
       }
@@ -7874,11 +7905,13 @@ export function App({
             "This can take a few minutes the first time.",
           ),
         );
-        await waitForProvisioningRun(() =>
-          provisioningDownloadModel({
-            model,
-            include_coreml: false,
-          }),
+        await waitForProvisioningRun(
+          () =>
+            provisioningDownloadModel({
+              model,
+              include_coreml: false,
+            }),
+          { scope: "models" },
         );
         snapshot = await loadStartupRequirements();
       }
@@ -10761,8 +10794,11 @@ export function App({
         previousInstallationAvailable: false,
         statusMessage: t("provisioning.started", "Provisioning started..."),
       }));
-      await waitForProvisioningRun(() => provisioningStart(true));
+      await waitForProvisioningRun(() => provisioningStart(true), {
+        scope: "models",
+      });
     } catch (provisionError) {
+      if (provisionError instanceof ProvisioningCancelledError) return;
       setProvisioning((previous) => ({
         ...previous,
         running: false,
@@ -10796,10 +10832,12 @@ export function App({
           { model },
         ),
       }));
-      await waitForProvisioningRun(() =>
-        provisioningDownloadModel({ model, include_coreml: true }),
+      await waitForProvisioningRun(
+        () => provisioningDownloadModel({ model, include_coreml: true }),
+        { scope: "models" },
       );
     } catch (downloadError) {
+      if (downloadError instanceof ProvisioningCancelledError) return;
       setProvisioning((previous) => ({
         ...previous,
         running: false,
@@ -10839,8 +10877,11 @@ export function App({
               "Installing local transcription runtime...",
             ),
       }));
-      await waitForProvisioningRun(() => provisioningInstallRuntime(force));
+      await waitForProvisioningRun(() => provisioningInstallRuntime(force), {
+        scope: "runtime",
+      });
     } catch (installError) {
+      if (installError instanceof ProvisioningCancelledError) return;
       setProvisioning((previous) => ({
         ...previous,
         running: false,
@@ -10889,10 +10930,13 @@ export function App({
       // was written. Previously this awaited only the start command, so a
       // failed download/deep smoke was followed immediately by enabling an
       // unusable Pyannote runtime, forcing users into repeated Repair clicks.
-      await waitForProvisioningRun(() => provisioningInstallPyannote(force));
+      await waitForProvisioningRun(() => provisioningInstallPyannote(force), {
+        scope: "pyannote",
+      });
       await enablePyannoteForTranscriptions();
     } catch (installError) {
       pyannoteProvisioningActiveRef.current = false;
+      if (installError instanceof ProvisioningCancelledError) return;
       setProvisioning((previous) => ({
         ...previous,
         running: false,
@@ -10919,12 +10963,6 @@ export function App({
   async function onCancelProvisioning(): Promise<void> {
     try {
       await provisioningCancel();
-      setProvisioning((previous) => ({
-        ...previous,
-        running: false,
-        statusMessage: t("provisioning.cancelled", "Provisioning cancelled"),
-        previousInstallationAvailable: false,
-      }));
     } catch (cancelError) {
       setError(
         formatUiError(

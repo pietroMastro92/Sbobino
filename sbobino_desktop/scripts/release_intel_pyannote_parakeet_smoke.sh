@@ -42,12 +42,32 @@ for command in gh ditto curl shasum python3; do
   need_cmd "$command"
 done
 
-gh release download "$TAG" \
-  --repo "$REPO_SLUG" \
-  --pattern "speech-runtime-macos-x86_64.zip" \
-  --pattern "pyannote-runtime-macos-x86_64.zip" \
-  --pattern "pyannote-model-community-1.zip" \
-  --dir "$ASSET_DIR"
+if [[ -n "${SBOBINO_INTEL_SPEECH_RUNTIME_ZIP:-}" ||
+      -n "${SBOBINO_INTEL_PYANNOTE_RUNTIME_ZIP:-}" ||
+      -n "${SBOBINO_INTEL_PYANNOTE_MODEL_ZIP:-}" ]]; then
+  for variable in \
+    SBOBINO_INTEL_SPEECH_RUNTIME_ZIP \
+    SBOBINO_INTEL_PYANNOTE_RUNTIME_ZIP \
+    SBOBINO_INTEL_PYANNOTE_MODEL_ZIP; do
+    [[ -n "${!variable:-}" && -f "${!variable}" ]] || {
+      echo "Local Intel smoke asset is missing: $variable=${!variable:-}" >&2
+      exit 1
+    }
+  done
+  cp "$SBOBINO_INTEL_SPEECH_RUNTIME_ZIP" \
+    "$ASSET_DIR/speech-runtime-macos-x86_64.zip"
+  cp "$SBOBINO_INTEL_PYANNOTE_RUNTIME_ZIP" \
+    "$ASSET_DIR/pyannote-runtime-macos-x86_64.zip"
+  cp "$SBOBINO_INTEL_PYANNOTE_MODEL_ZIP" \
+    "$ASSET_DIR/pyannote-model-community-1.zip"
+else
+  gh release download "$TAG" \
+    --repo "$REPO_SLUG" \
+    --pattern "speech-runtime-macos-x86_64.zip" \
+    --pattern "pyannote-runtime-macos-x86_64.zip" \
+    --pattern "pyannote-model-community-1.zip" \
+    --dir "$ASSET_DIR"
+fi
 
 ditto -x -k "$ASSET_DIR/speech-runtime-macos-x86_64.zip" "$SPEECH_DIR"
 ditto -x -k "$ASSET_DIR/pyannote-runtime-macos-x86_64.zip" "$PYANNOTE_DIR"

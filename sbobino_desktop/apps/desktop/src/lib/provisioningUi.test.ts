@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   formatProvisioningAssetLabel,
   formatProvisioningFailureMessage,
+  ProvisioningCancelledError,
   provisioningScopeForAssetKind,
   runProvisioningAndRefresh,
   shouldShowProvisioningStatus,
@@ -44,6 +45,120 @@ describe("provisioningUi", () => {
         failureMessage: "failed",
       }),
     ).rejects.toThrow("install failed");
+  });
+
+  it("times out while subscription or startup is still pending", async () => {
+    vi.useFakeTimers();
+    for (const pendingStep of ["subscribe", "starter"] as const) {
+      const never = new Promise<never>(() => undefined);
+      const run = runProvisioningAndRefresh({
+        starter:
+          pendingStep === "starter"
+            ? vi.fn(() => never)
+            : vi.fn().mockResolvedValue({ started: true }),
+        subscribe:
+          pendingStep === "subscribe"
+            ? vi.fn(() => never)
+            : vi.fn().mockResolvedValue(vi.fn()),
+        refresh: vi.fn().mockResolvedValue(undefined),
+        timeoutMs: 100,
+        timeoutMessage: "timed out",
+        cancelledMessage: "cancelled",
+        failureMessage: "failed",
+      });
+      const rejection = expect(run).rejects.toThrow("timed out");
+      await vi.advanceTimersByTimeAsync(100);
+      await rejection;
+    }
+    vi.useRealTimers();
+  });
+
+  it("releases a subscription that resolves after the lifecycle timeout", async () => {
+    vi.useFakeTimers();
+    const unlisten = vi.fn();
+    const run = runProvisioningAndRefresh({
+      starter: vi.fn().mockResolvedValue({ started: true }),
+      subscribe: vi.fn(
+        () =>
+          new Promise<() => void>((resolve) => {
+            setTimeout(() => resolve(unlisten), 200);
+          }),
+      ),
+      refresh: vi.fn().mockResolvedValue(undefined),
+      timeoutMs: 100,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+    const rejection = expect(run).rejects.toThrow("timed out");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(unlisten).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
+
+  it("captures an immediate terminal error without an unhandled rejection", async () => {
+    vi.useFakeTimers();
+    let onStatus: ((event: { state: string; message: string }) => void) | undefined;
+    const run = runProvisioningAndRefresh({
+      subscribe: vi.fn(async (listener) => {
+        onStatus = listener;
+        return vi.fn();
+      }),
+      starter: vi.fn(async () => {
+        onStatus?.({ state: "error", message: "early native error" });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        return { started: true };
+      }),
+      refresh: vi.fn().mockResolvedValue(undefined),
+      timeoutMs: 5_000,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+    const rejection = expect(run).rejects.toThrow("early native error");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    vi.useRealTimers();
+  });
+
+  it("bounds a refresh that never settles while preserving the primary error", async () => {
+    vi.useFakeTimers();
+    const run = runProvisioningAndRefresh({
+      starter: vi.fn().mockRejectedValue(new Error("install failed")),
+      subscribe: vi.fn().mockResolvedValue(vi.fn()),
+      refresh: vi.fn(() => new Promise<never>(() => undefined)),
+      timeoutMs: 5_000,
+      refreshTimeoutMs: 100,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+    const rejection = expect(run).rejects.toThrow("install failed");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    vi.useRealTimers();
+  });
+
+  it("preserves cancellation as a distinct terminal outcome", async () => {
+    let onStatus: ((event: { state: string; message: string }) => void) | undefined;
+    const run = runProvisioningAndRefresh({
+      subscribe: vi.fn(async (listener) => {
+        onStatus = listener;
+        return vi.fn();
+      }),
+      starter: vi.fn(async () => {
+        onStatus?.({ state: "cancelled", message: "cancelled by user" });
+        return { started: true };
+      }),
+      refresh: vi.fn().mockResolvedValue(undefined),
+      timeoutMs: 100,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+    await expect(run).rejects.toBeInstanceOf(ProvisioningCancelledError);
   });
 
   it("subscribes before starting and accepts an immediate completion", async () => {

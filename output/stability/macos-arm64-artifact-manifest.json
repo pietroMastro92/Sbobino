@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-16T06:47:14.296705+00:00",
+  "platform": "macOS-27.0-arm64-arm-64bit",
+  "architecture": "arm64",
+  "aggregate_sha256": "ff887feaae8eeb8dc150987ccd87f6f1276dedfbd248cf437a8327bae0d97367",
+  "missing": [],
+  "files": [
+    {
+      "path": "/Volumes/UltraDisk/codex-sbobino-tests/stability-20260916/sbobino_desktop/apps/desktop/dist/assets/index-MzHLNezw.css",
+      "bytes": 131546,
+      "sha256": "783ab4ad9295749c1c2d2d0c60fec7383ea182530e0d2eacd2bed0c0c570f404"
+    },
+    {
+      "path": "/Volumes/UltraDisk/codex-sbobino-tests/stability-20260916/sbobino_desktop/apps/desktop/dist/assets/index-df3KO3qi.js",
+      "bytes": 791408,
+      "sha256": "2ce8aeda13e6d35546c99a100927c4df5da3f23b3b98ba3b240ecb44a26f2f6c"
+    },
+    {
+      "path": "/Volumes/UltraDisk/codex-sbobino-tests/stability-20260916/sbobino_desktop/apps/desktop/dist/assets/index-df3KO3qi.js.map",
+      "bytes": 2196399,
+      "sha256": "6e0db453468c4ec46cc04d6538b9603b632238615b9e0c13b687cc80e36a668e"
+    },
+    {
+      "path": "/Volumes/UltraDisk/codex-sbobino-tests/stability-20260916/sbobino_desktop/apps/desktop/dist/index.html",
+      "bytes": 680,
+      "sha256": "038738a3e065966345635bc8aacb0a4a8f572b00bf1f23e45dd2441ac3c1b59f"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/dmg/Sbobino_2.0.32_aarch64.dmg",
+      "bytes": 103936407,
+      "sha256": "1f13e848db44ce2b550d73f5d9cfb44369078e3342d418fd99af7e26a058f7e5"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/dmg/bundle_dmg.sh",
+      "bytes": 19300,
+      "sha256": "3b21448e5eef9b7c4f6bd8593e6c5f577ee5c64db2a237a4908e63fb6d81a89e"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/dmg/icon.icns",
+      "bytes": 1175560,
+      "sha256": "86e47efd7998829f58d92e882b926151f3758972d317de60a8540b0c5f6a4516"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/macos/Sbobino.app/Contents/Info.plist",
+      "bytes": 1099,
+      "sha256": "c81389a642fd9f9bd0760ba194f531beeafeaf92f9b6d6ad6434d0c335428046"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/macos/Sbobino.app/Contents/MacOS/ffmpeg",
+      "bytes": 745,
+      "sha256": "f1023cb85e65155d92869b39e3365067bee30f44db81e16a892d39022ff70396"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/macos/Sbobino.app/Contents/MacOS/parakeet-cli",
+      "bytes": 929,
+      "sha256": "9be51161993ed490eb175e9e3cb39e41eb1c39f6fa30b83c87143b1680af7782"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/macos/Sbobino.app/Contents/MacOS/sbobino-desktop",
+      "bytes": 187981968,
+      "sha256": "c170f2715cd6ff90ae1c3b7ce55090e2f234bce7e750501d5f23317d10ed43e3"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/macos/Sbobino.app/Contents/MacOS/whisper-cli",
+      "bytes": 784,
+      "sha256": "b3ba818b1ffc98c54da25c818ebda8ad0c45f52947da5674385fbbd67c905f2c"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/macos/Sbobino.app/Contents/MacOS/whisper-stream",
+      "bytes": 775,
+      "sha256": "66718e02dbc882803a6f62a632315f0110e44b44d8a315edd0a89cfc2d09774a"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/macos/Sbobino.app/Contents/MacOS/whisperkit-cli",
+      "bytes": 763,
+      "sha256": "55b0d3baa9b7053ac947aed01446f9d19b203b66cc4a9ec0c8d05eb615421fcb"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/macos/Sbobino.app/Contents/Resources/icon.icns",
+      "bytes": 1175560,
+      "sha256": "86e47efd7998829f58d92e882b926151f3758972d317de60a8540b0c5f6a4516"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/macos/Sbobino.app/Contents/Resources/resources/licenses/NotoSans-OFL.txt",
+      "bytes": 4395,
+      "sha256": "e2e177a32561584d4fc13aaa3cd8e53758a12910f013fe9ca125419111722029"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/share/create-dmg/support/eula-resources-template.xml",
+      "bytes": 2376,
+      "sha256": "7d61d948ba7f118306d61107fead78f04e3338585e2ec729abb65d5d2e21012d"
+    },
+    {
+      "path": "/Volumes/UltraDisk/sbobino-target-v2032/aarch64-apple-darwin/release/bundle/share/create-dmg/support/template.applescript",
+      "bytes": 1828,
+      "sha256": "13727c7930c50be639a1eb191e893f1ebc72c270268d4611391b41410a3e862a"
+    }
+  ]
+}
