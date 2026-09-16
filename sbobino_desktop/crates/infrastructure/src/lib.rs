@@ -3733,7 +3733,7 @@ fn pyannote_python_home(runtime_root: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let stdlib_dir = runtime_root.join("Lib");
-        return pyannote_stdlib_looks_complete(&stdlib_dir).then(|| runtime_root.to_path_buf());
+        pyannote_stdlib_looks_complete(&stdlib_dir).then(|| runtime_root.to_path_buf())
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -3774,9 +3774,9 @@ fn pyannote_python_path_env(runtime_root: &Path) -> Option<std::ffi::OsString> {
         .into_iter()
         .filter(|path| path.is_dir())
         .collect::<Vec<_>>();
-        return (!entries.is_empty())
+        (!entries.is_empty())
             .then(|| std::env::join_paths(entries).ok())
-            .flatten();
+            .flatten()
     }
     #[cfg(not(target_os = "windows"))]
     {
