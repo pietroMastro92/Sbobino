@@ -100,7 +100,12 @@ jobs:
         run: python scripts/validation_evidence.py run validation-evidence/windows-infrastructure-tests.json -- cargo test -p sbobino-infrastructure --lib -- --test-threads=1
 
       - name: Clippy
+        if: matrix.rust_mode != 'linux'
         run: python scripts/validation_evidence.py run validation-evidence/clippy.json -- cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Linux core crate Clippy
+        if: matrix.rust_mode == 'linux'
+        run: python scripts/validation_evidence.py run validation-evidence/clippy.json -- cargo clippy -p sbobino-domain -p sbobino-application -p sbobino-infrastructure --all-targets -- -D warnings
 
       - name: Runtime and workflow contracts
         run: python scripts/validation_evidence.py run validation-evidence/contracts.json -- python -m unittest scripts/test_release_workflow_contract.py scripts/test_evaluate_live_latency.py scripts/test_run_whisper_live_replay.py

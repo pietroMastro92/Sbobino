@@ -42,6 +42,10 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("package_windows_runtime_asset.ps1", workflow)
         self.assertIn("artifact-manifest.json", workflow)
         self.assertIn("CARGO_PROFILE_RELEASE_STRIP: none", workflow)
+        self.assertIn(
+            "cargo clippy -p sbobino-domain -p sbobino-application -p sbobino-infrastructure --all-targets -- -D warnings",
+            workflow,
+        )
         self.assertNotIn("contents: write", workflow)
         self.assertNotIn("gh release", workflow)
         self.assertNotIn("publish_candidate", workflow)
