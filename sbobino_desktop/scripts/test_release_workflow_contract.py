@@ -42,6 +42,16 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("package_windows_runtime_asset.ps1", workflow)
         self.assertIn("artifact-manifest.json", workflow)
         self.assertIn("CARGO_PROFILE_RELEASE_STRIP: none", workflow)
+        self.assertIn("adapters::whisper_stream::tests", workflow)
+        self.assertIn("background_process::tests", workflow)
+        self.assertIn(
+            "tests::pyannote_receipt_is_atomic_and_validates_identity_and_deep_smoke_metadata",
+            workflow,
+        )
+        self.assertNotIn(
+            "cargo test -p sbobino-infrastructure --lib -- --test-threads=1",
+            workflow,
+        )
         self.assertIn(
             "cargo clippy -p sbobino-domain -p sbobino-application -p sbobino-infrastructure --all-targets -- -D warnings",
             workflow,

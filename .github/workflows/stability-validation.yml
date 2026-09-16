@@ -95,9 +95,17 @@ jobs:
         if: matrix.rust_mode == 'windows'
         run: python scripts/validation_evidence.py run validation-evidence/windows-portable-tests.json -- cargo test -p sbobino-domain -p sbobino-application -p sbobino-desktop -- --test-threads=1
 
-      - name: Run native Windows infrastructure unit tests
+      - name: Run Windows Whisper lifecycle tests
         if: matrix.rust_mode == 'windows'
-        run: python scripts/validation_evidence.py run validation-evidence/windows-infrastructure-tests.json -- cargo test -p sbobino-infrastructure --lib -- --test-threads=1
+        run: python scripts/validation_evidence.py run validation-evidence/windows-whisper-tests.json -- cargo test -p sbobino-infrastructure --lib adapters::whisper_stream::tests -- --test-threads=1
+
+      - name: Run Windows process integration tests
+        if: matrix.rust_mode == 'windows'
+        run: python scripts/validation_evidence.py run validation-evidence/windows-process-tests.json -- cargo test -p sbobino-infrastructure --lib background_process::tests -- --test-threads=1
+
+      - name: Run Windows Pyannote receipt identity test
+        if: matrix.rust_mode == 'windows'
+        run: python scripts/validation_evidence.py run validation-evidence/windows-pyannote-receipt-test.json -- cargo test -p sbobino-infrastructure --lib tests::pyannote_receipt_is_atomic_and_validates_identity_and_deep_smoke_metadata -- --exact --test-threads=1
 
       - name: Clippy
         if: matrix.rust_mode != 'linux'

@@ -922,52 +922,69 @@ impl WhisperStreamEngine {
         let finalization_started = Instant::now();
         let (mut child, reader_tasks) = {
             let mut state = self.state.lock().await;
-            // Observe an already-exited child before taking ownership of it.
-            // Once `child` is moved out, the reader tasks cannot reliably
-            // distinguish a crash from the intentional stop signal.
-            if let Some(child) = state.child.as_mut() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    Self::mark_terminal_child_failure(&mut state, Some(&status));
-                }
-            }
-            state.stop_requested = true;
             (state.child.take(), std::mem::take(&mut state.reader_tasks))
         };
 
+        // Windows can report a just-exited child a few scheduler ticks after
+        // its pipes close. Observe that exit before classifying our signal as
+        // an intentional stop, otherwise a crashed worker can save preview
+        // text as a successful transcript.
+        let mut child_status = None;
         if let Some(child) = &mut child {
-            if let Some(pid) = child.id() {
-                #[cfg(unix)]
-                let _ = std::process::Command::new("kill")
-                    .arg("-INT")
-                    .arg(pid.to_string())
-                    .status();
-                #[cfg(target_os = "windows")]
-                let _ = std_background_command("taskkill")
-                    .args(["/PID", &pid.to_string()])
-                    .status();
+            for attempt in 0..5 {
+                if let Ok(Some(status)) = child.try_wait() {
+                    child_status = Some(status);
+                    break;
+                }
+                if attempt < 4 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
+        }
+        {
+            let mut state = self.state.lock().await;
+            if let Some(status) = child_status.as_ref() {
+                Self::mark_terminal_child_failure(&mut state, Some(status));
+            }
+            state.stop_requested = true;
+        }
 
-            if timeout(Duration::from_millis(900), child.wait())
-                .await
-                .is_err()
-            {
+        if child_status.is_none() {
+            if let Some(child) = &mut child {
                 if let Some(pid) = child.id() {
                     #[cfg(unix)]
                     let _ = std::process::Command::new("kill")
-                        .arg("-TERM")
+                        .arg("-INT")
                         .arg(pid.to_string())
                         .status();
                     #[cfg(target_os = "windows")]
                     let _ = std_background_command("taskkill")
-                        .args(["/F", "/PID", &pid.to_string()])
+                        .args(["/PID", &pid.to_string()])
                         .status();
                 }
-                if timeout(Duration::from_millis(500), child.wait())
+
+                if timeout(Duration::from_millis(900), child.wait())
                     .await
                     .is_err()
                 {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    if let Some(pid) = child.id() {
+                        #[cfg(unix)]
+                        let _ = std::process::Command::new("kill")
+                            .arg("-TERM")
+                            .arg(pid.to_string())
+                            .status();
+                        #[cfg(target_os = "windows")]
+                        let _ = std_background_command("taskkill")
+                            .args(["/F", "/PID", &pid.to_string()])
+                            .status();
+                    }
+                    if timeout(Duration::from_millis(500), child.wait())
+                        .await
+                        .is_err()
+                    {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                    }
                 }
             }
         }

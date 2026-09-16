@@ -4846,7 +4846,12 @@ mod tests {
             .expect("matching receipt should validate");
 
         let mut mismatched = receipt;
-        mismatched.platform = "windows".to_string();
+        mismatched.platform = if std::env::consts::OS == "windows" {
+            "macos"
+        } else {
+            "windows"
+        }
+        .to_string();
         assert!(factory
             .validate_managed_pyannote_receipt(&mismatched)
             .expect_err("platform mismatch should fail")
