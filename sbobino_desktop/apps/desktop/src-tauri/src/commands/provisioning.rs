@@ -4526,7 +4526,7 @@ fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), St
 
     #[cfg(not(target_os = "macos"))]
     {
-        return extract_zip_archive_with_zip_crate(archive_path, destination);
+        extract_zip_archive_with_zip_crate(archive_path, destination)
     }
 }
 
