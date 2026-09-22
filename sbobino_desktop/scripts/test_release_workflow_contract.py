@@ -338,7 +338,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.assertNotIn("v2.0.25", contents)
             self.assertNotIn("/releases/download/latest/", contents)
             self.assertIn(
-                "BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-30-13-12",
+                "BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-31-13-27",
                 contents,
             )
             self.assertIn(
@@ -346,7 +346,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                 contents,
             )
             self.assertIn(
-                "d0db0a48da22815a04b5ec9e757640dc8069f9f8c37fd4e1b8753a4c0326502c",
+                "0a41f31caff48e3035b48f09f5d840bd8d1863008240fc43e457f15e589cf5b3",
                 contents,
             )
             if script.name == "package_windows_pyannote_runtime.ps1":
