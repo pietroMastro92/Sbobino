@@ -156,11 +156,11 @@ def captured_wav_paths(run_dir: Path, audio: Path, fixture: Path) -> list[Path]:
     return sorted(path for path in run_dir.glob("*.wav") if path.resolve() not in excluded)
 
 
-def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int, int]:
+def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int, int, int]:
     """Mirror the app's bounded thread count and CPU/GPU live window."""
     threads = max(1, min(8, available_cpus or 1))
     step_ms = 1280 if device == "cpu" else 1000
-    return threads, step_ms, 2000
+    return threads, step_ms, 2000, 768
 
 
 def preview_latency_seconds(step_ms: int, inference_ms: float) -> float:
@@ -276,10 +276,10 @@ def main() -> int:
         fixture_duration = handle.getnframes() / handle.getframerate()
     speech_onset = speech_onset_seconds(args.audio)
 
-    threads, step_ms, length_ms = live_command_profile(args.device, os.cpu_count())
+    threads, step_ms, length_ms, audio_ctx = live_command_profile(args.device, os.cpu_count())
     command = [
         str(args.binary), "-m", str(args.model), "-t", str(threads), "--step", str(step_ms),
-        "--length", str(length_ms), "--no-fallback", "--save-audio", "-l", "auto",
+        "--length", str(length_ms), "--audio-ctx", str(audio_ctx), "--no-fallback", "--save-audio", "-l", "auto",
     ]
     if args.device == "cpu":
         command.extend(["-ng", "-nfa"])
@@ -475,6 +475,7 @@ def main() -> int:
             "threads": threads,
             "step_ms": step_ms,
             "length_ms": length_ms,
+            "audio_ctx": audio_ctx,
             "max_tokens": 16,
             "coreml_expected": coreml_expected,
             "coreml_loaded": coreml_loaded,

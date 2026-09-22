@@ -74,6 +74,7 @@ pub type WhisperTelemetrySink = Arc<dyn Fn(WhisperStreamTelemetry) + Send + Sync
 struct WhisperLiveProfile {
     step_ms: u32,
     length_ms: u32,
+    audio_ctx: u32,
 }
 
 impl WhisperLiveProfile {
@@ -88,10 +89,12 @@ impl WhisperLiveProfile {
             TranscriptionComputeDevice::Cpu => Self {
                 step_ms: 1_280,
                 length_ms: if large_model { 4_800 } else { 2_000 },
+                audio_ctx: 768,
             },
             TranscriptionComputeDevice::Gpu | TranscriptionComputeDevice::Auto => Self {
                 step_ms: 1_000,
                 length_ms: if large_model { 4_800 } else { 2_000 },
+                audio_ctx: 768,
             },
         }
     }
@@ -778,6 +781,8 @@ impl WhisperStreamEngine {
             .arg(profile.step_ms.to_string())
             .arg("--length")
             .arg(profile.length_ms.to_string())
+            .arg("--audio-ctx")
+            .arg(profile.audio_ctx.to_string())
             .arg("--no-fallback")
             .arg("--save-audio")
             .stdout(std::process::Stdio::piped())
@@ -1136,14 +1141,16 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_live_profile_scales_cpu_step_without_reducing_context() {
+    fn adaptive_live_profile_scales_cpu_step_and_bounds_audio_context() {
         let cpu = WhisperLiveProfile::for_model("ggml-base.bin", TranscriptionComputeDevice::Cpu);
         let gpu = WhisperLiveProfile::for_model("ggml-base.bin", TranscriptionComputeDevice::Gpu);
         let large =
             WhisperLiveProfile::for_model("ggml-large-v3.bin", TranscriptionComputeDevice::Auto);
         assert_eq!(cpu.step_ms, 1_280);
         assert_eq!(cpu.length_ms, 2_000);
+        assert_eq!(cpu.audio_ctx, 768);
         assert_eq!(gpu.step_ms, 1_000);
+        assert_eq!(gpu.audio_ctx, 768);
         assert_eq!(cpu.length_ms, gpu.length_ms);
         assert!(cpu.step_ms > gpu.step_ms);
         assert!(large.length_ms > gpu.length_ms);
