@@ -416,6 +416,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("import wave", audio_helpers)
         self.assertIn("audio.getframerate() != 16000", audio_helpers)
 
+    @unittest.skipUnless(os.name == "posix", "requires the POSIX shell helper")
     def test_normalized_wav_fast_path_needs_no_host_ffmpeg_or_ffprobe(self):
         helper = ROOT / "scripts" / "lib" / "asr_samples.sh"
         with tempfile.TemporaryDirectory() as temp_dir:
