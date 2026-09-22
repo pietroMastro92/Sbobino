@@ -63,6 +63,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             "$env:SBOBINO_RELEASE_PROFILE = \"standalone-dev\"", workflow
         )
         self.assertIn("npx tauri build --config", workflow)
+        self.assertIn("Set-Content -NoNewline $config", workflow)
         self.assertNotIn(
             "run: npm run tauri:build:standalone-dev -- --target x86_64-pc-windows-msvc",
             workflow,

@@ -176,7 +176,9 @@ jobs:
         shell: pwsh
         run: |
           $env:SBOBINO_RELEASE_PROFILE = "standalone-dev"
-          npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false},"plugins":{"updater":{"active":false}}}' --target x86_64-pc-windows-msvc --bundles nsis
+          $config = Join-Path $env:RUNNER_TEMP "tauri-standalone-dev.json"
+          '{"bundle":{"createUpdaterArtifacts":false},"plugins":{"updater":{"active":false}}}' | Set-Content -NoNewline $config
+          npx tauri build --config $config --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Record macOS artifact manifest
         if: matrix.rust_mode == 'macos'
