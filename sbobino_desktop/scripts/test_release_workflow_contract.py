@@ -59,6 +59,14 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("contents: write", workflow)
         self.assertNotIn("gh release", workflow)
         self.assertNotIn("publish_candidate", workflow)
+        self.assertIn(
+            "$env:SBOBINO_RELEASE_PROFILE = \"standalone-dev\"", workflow
+        )
+        self.assertIn("npx tauri build --config", workflow)
+        self.assertNotIn(
+            "run: npm run tauri:build:standalone-dev -- --target x86_64-pc-windows-msvc",
+            workflow,
+        )
 
     def test_stability_manifest_hashes_built_artifacts_without_loading_whole_files(self):
         helper = VALIDATION_EVIDENCE.read_text(encoding="utf-8")

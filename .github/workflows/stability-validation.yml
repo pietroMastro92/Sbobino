@@ -174,7 +174,9 @@ jobs:
         if: matrix.rust_mode == 'windows'
         working-directory: sbobino_desktop/apps/desktop
         shell: pwsh
-        run: npm run tauri:build:standalone-dev -- --target x86_64-pc-windows-msvc --bundles nsis
+        run: |
+          $env:SBOBINO_RELEASE_PROFILE = "standalone-dev"
+          npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false},"plugins":{"updater":{"active":false}}}' --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Record macOS artifact manifest
         if: matrix.rust_mode == 'macos'
