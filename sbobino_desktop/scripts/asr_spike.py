@@ -178,6 +178,9 @@ class ResidentWorker:
             if self.process and self.process.poll() is None:
                 self.process.kill()
                 self.process.wait()
+            if self.process:
+                for stream in (self.process.stdin, self.process.stdout):
+                    stream.close()
             self.stderr.close()
             raise
 
@@ -212,6 +215,8 @@ class ResidentWorker:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
+        self.process.stdin.close()
+        self.process.stdout.close()
         self.stderr.close()
         return self.memory.close()
 
@@ -513,6 +518,8 @@ def _run_parakeet_worker(args, manifest, temp_dir, language, chunk_count):
                 process.kill()
                 process.wait()
                 failure = failure or error
+        if process is not None:
+            process.stdout.close()
         error_stream.seek(0)
         stderr = error_stream.read()
     peak = memory.close() if memory is not None else None

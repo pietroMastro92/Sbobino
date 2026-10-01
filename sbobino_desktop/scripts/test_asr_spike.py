@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from asr_spike import DIRECT, LlamaServer, _parakeet_manifest, _run_parakeet_batch, _run_parakeet_worker, stitch, windows, write_window
+from asr_spike import DIRECT, LlamaServer, ResidentWorker, _parakeet_manifest, _run_parakeet_batch, _run_parakeet_worker, stitch, windows, write_window
 from asr_spike_score import compare_runs, edits, load_samples, measure, score_run
 
 
@@ -150,6 +150,20 @@ class SpikeChecks(unittest.TestCase):
             self.assertIsInstance(failure, ValueError)
             self.assertIn("more chunks", str(failure))
             self.assertIsNotNone(startup)
+
+    def test_resident_worker_closes_pipes_even_after_process_exit(self):
+        for already_exited in (False, True):
+            with self.subTest(already_exited=already_exited):
+                worker = ResidentWorker.__new__(ResidentWorker)
+                worker.process = mock.Mock(stdin=io.StringIO(), stdout=io.StringIO())
+                worker.process.poll.return_value = 0 if already_exited else None
+                worker.stderr = io.StringIO()
+                worker.memory = mock.Mock()
+                worker.close()
+                self.assertTrue(worker.process.stdin.closed)
+                self.assertTrue(worker.process.stdout.closed)
+                self.assertTrue(worker.stderr.closed)
+                worker.memory.close.assert_called_once()
 
     def test_windows_cover_audio_without_exceeding_gemma_limit(self):
         for overlap in (0, 2):
