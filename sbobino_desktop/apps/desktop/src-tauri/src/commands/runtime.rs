@@ -11,18 +11,14 @@ use tauri::State;
 use tracing::warn;
 
 use sbobino_domain::{
-    whisper_live_model_manifest, LanguageCode, ParakeetModel, SpeechModel,
-    TranscriptionComputeDevice, TranscriptionEngine,
+    whisper_live_model_manifest, AppSettings, LanguageCode, ParakeetModel, SpeechModel,
+    TranscriptionComputeDevice, TranscriptionEngine, WhisperLiveModelManifest,
 };
 use sbobino_infrastructure::{
     background_process::tokio_background_command, ManagedRuntimeHealth, PyannoteRuntimeHealth,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::commands::realtime::{
-    parakeet_live_target_lang, resolve_parakeet_live_library_path, select_parakeet_live_model,
-};
-use crate::parakeet_realtime::ParakeetRealtimeEngine;
 use crate::realtime_audio::probe_input_device_name;
 use crate::{error::CommandError, state::AppState};
 
@@ -138,6 +134,23 @@ fn engine_to_wire(engine: &TranscriptionEngine) -> &'static str {
     match engine {
         TranscriptionEngine::WhisperCpp => "whisper_cpp",
         TranscriptionEngine::ParakeetCpp => "parakeet_cpp",
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LiveTranscriptionSelection {
+    pub engine: TranscriptionEngine,
+    pub manifest: WhisperLiveModelManifest,
+}
+
+// Parakeet streaming cannot keep realtime on the validated hardware matrix.
+// Resolve the session independently of the persisted file-engine preference.
+pub(crate) fn resolve_live_transcription_selection(
+    _requested_engine: TranscriptionEngine,
+) -> LiveTranscriptionSelection {
+    LiveTranscriptionSelection {
+        engine: TranscriptionEngine::WhisperCpp,
+        manifest: whisper_live_model_manifest(),
     }
 }
 
@@ -792,49 +805,44 @@ fn runtime_toolchain_message(
     message
 }
 
-async fn normalize_runtime_settings_for_whisper_cpp(state: &AppState) -> (bool, Option<String>) {
+fn normalize_whisper_runtime_paths(settings: &mut AppSettings) -> bool {
+    let mut changed = false;
+
+    let transcription_path = settings.transcription.whisper_cli_path.trim();
+    if transcription_path.is_empty() || is_legacy_whisperkit_path(transcription_path) {
+        settings.transcription.whisper_cli_path = "whisper-cli".to_string();
+        changed = true;
+    }
+
+    let transcription_stream_path = settings.transcription.whisperkit_cli_path.trim();
+    if transcription_stream_path.is_empty() || is_legacy_whisperkit_path(transcription_stream_path)
+    {
+        settings.transcription.whisperkit_cli_path = "whisper-stream".to_string();
+        changed = true;
+    }
+
+    let legacy_fields_out_of_sync = settings.transcription_engine != settings.transcription.engine
+        || settings.model != settings.transcription.model
+        || settings.language != settings.transcription.language
+        || settings.whisper_cli_path != settings.transcription.whisper_cli_path
+        || settings.whisperkit_cli_path != settings.transcription.whisperkit_cli_path;
+    if changed || legacy_fields_out_of_sync {
+        // Structured transcription settings are canonical. Keep legacy fields
+        // in sync without allowing stale values to overwrite file preferences.
+        settings.sync_legacy_from_sections();
+        return true;
+    }
+
+    false
+}
+
+async fn normalize_whisper_runtime_paths_in_service(state: &AppState) -> (bool, Option<String>) {
     let mut did_setup = false;
     let mut setup_note = None::<String>;
 
     match state.settings_service.snapshot().await {
         Ok(mut settings) => {
-            let mut changed = false;
-
-            if settings.transcription.engine != TranscriptionEngine::WhisperCpp {
-                settings.transcription.engine = TranscriptionEngine::WhisperCpp;
-                settings.transcription_engine = TranscriptionEngine::WhisperCpp;
-                changed = true;
-            }
-
-            let transcription_path = settings.transcription.whisper_cli_path.trim();
-            if transcription_path.is_empty() || is_legacy_whisperkit_path(transcription_path) {
-                settings.transcription.whisper_cli_path = "whisper-cli".to_string();
-                changed = true;
-            }
-
-            let legacy_path = settings.whisper_cli_path.trim();
-            if legacy_path.is_empty() || is_legacy_whisperkit_path(legacy_path) {
-                settings.whisper_cli_path = "whisper-cli".to_string();
-                changed = true;
-            }
-
-            let transcription_stream_path = settings.transcription.whisperkit_cli_path.trim();
-            if transcription_stream_path.is_empty()
-                || is_legacy_whisperkit_path(transcription_stream_path)
-            {
-                settings.transcription.whisperkit_cli_path = "whisper-stream".to_string();
-                changed = true;
-            }
-
-            let legacy_stream_path = settings.whisperkit_cli_path.trim();
-            if legacy_stream_path.is_empty() || is_legacy_whisperkit_path(legacy_stream_path) {
-                settings.whisperkit_cli_path = "whisper-stream".to_string();
-                changed = true;
-            }
-
-            if changed {
-                settings.sync_sections_from_legacy();
-                settings.sync_legacy_from_sections();
+            if normalize_whisper_runtime_paths(&mut settings) {
                 match state.settings_service.update(settings).await {
                     Ok(_) => {
                         did_setup = true;
@@ -885,7 +893,7 @@ pub async fn ensure_transcription_runtime(
     }
 
     let (did_setup, setup_note) = if health.configured_engine == TranscriptionEngine::WhisperCpp {
-        normalize_runtime_settings_for_whisper_cpp(&state).await
+        normalize_whisper_runtime_paths_in_service(&state).await
     } else {
         (false, None)
     };
@@ -928,230 +936,34 @@ pub async fn get_realtime_start_readiness(
     recover_interrupted_runtime_install(&state)?;
     eprintln!("[realtime-readiness] command received payload={payload:?}");
 
-    let mut settings = state
+    let settings = state
         .runtime_factory
         .load_settings()
         .map_err(|e| CommandError::new("settings", e))?;
-    let selected_engine = payload
+    let requested_engine = payload
         .as_ref()
         .and_then(|value| value.engine.clone())
         .unwrap_or_else(|| settings.transcription.engine.clone());
-    eprintln!("[realtime-readiness] selected_engine={selected_engine:?}");
+    let requested_language = payload.as_ref().and_then(|value| value.language.clone());
+    let selection = resolve_live_transcription_selection(requested_engine.clone());
+    let selected_engine = selection.engine;
+    let selected_model = selection.manifest.model.clone();
+    let selected_model_filename = selection.manifest.filename.clone();
+    eprintln!(
+        "[realtime-readiness] requested_engine={requested_engine:?} selected_engine={selected_engine:?} model={selected_model:?} language={requested_language:?}"
+    );
 
-    if selected_engine == TranscriptionEngine::WhisperCpp {
-        let _ = normalize_runtime_settings_for_whisper_cpp(&state).await;
-        settings = state
-            .runtime_factory
-            .load_settings()
-            .map_err(|e| CommandError::new("settings", e))?;
-    }
+    let _ = normalize_whisper_runtime_paths_in_service(&state).await;
 
-    if selected_engine == TranscriptionEngine::ParakeetCpp {
-        let selected_language = payload
-            .as_ref()
-            .and_then(|value| value.language.clone())
-            .unwrap_or_else(|| settings.transcription.language.clone());
-        let requested_parakeet_model = payload
-            .as_ref()
-            .and_then(|value| value.parakeet_model.clone())
-            .unwrap_or_else(|| settings.transcription.parakeet_model.clone());
-        let health = state
-            .runtime_factory
-            .runtime_health_preflight()
-            .map_err(|e| CommandError::new("runtime_health", e))?;
-        let models_dir = PathBuf::from(&health.parakeet_models_dir_resolved);
-        let selected_parakeet_model = match select_parakeet_live_model(
-            &models_dir,
-            requested_parakeet_model.clone(),
-            selected_language.clone(),
-        ) {
-            Ok(model) => model,
-            Err(error) => {
-                let model_filename = requested_parakeet_model.gguf_filename().to_string();
-                return Ok(RealtimeStartReadinessResponse {
-                    allowed: false,
-                    reason_code: "parakeet_realtime_model_missing".to_string(),
-                    message: error.message,
-                    engine: "parakeet_cpp".to_string(),
-                    model_filename: model_filename.clone(),
-                    model_path: models_dir
-                        .join(model_filename)
-                        .to_string_lossy()
-                        .to_string(),
-                    ffmpeg_resolved: health.ffmpeg_resolved,
-                    whisper_stream_resolved: health.whisper_stream_resolved,
-                    parakeet_cli_resolved: health.parakeet_cli_resolved,
-                    input_device_name: None,
-                });
-            }
-        };
-        let model_filename = selected_parakeet_model.gguf_filename().to_string();
-        let model_path_buf = models_dir.join(&model_filename);
-        let model_path = model_path_buf.to_string_lossy().to_string();
-        let parakeet_lib =
-            resolve_parakeet_live_library_path(PathBuf::from(&health.parakeet_cli_resolved));
-
-        eprintln!(
-            "[realtime-readiness] parakeet health cli_available={} cli={} models_dir={}",
-            health.parakeet_cli_available,
-            health.parakeet_cli_resolved,
-            health.parakeet_models_dir_resolved
-        );
-        eprintln!(
-            "[realtime-readiness] parakeet resolved lib={} model={}",
-            parakeet_lib.display(),
-            model_path
-        );
-
-        if !health.parakeet_cli_available {
-            eprintln!("[realtime-readiness] blocked: parakeet_cli_missing");
-            return Ok(RealtimeStartReadinessResponse {
-                allowed: false,
-                reason_code: "parakeet_cli_missing".to_string(),
-                message: format!(
-                    "Parakeet.cpp runtime is not available at {}.",
-                    health.parakeet_cli_resolved
-                ),
-                engine: "parakeet_cpp".to_string(),
-                model_filename,
-                model_path,
-                ffmpeg_resolved: health.ffmpeg_resolved,
-                whisper_stream_resolved: health.whisper_stream_resolved,
-                parakeet_cli_resolved: health.parakeet_cli_resolved,
-                input_device_name: None,
-            });
-        }
-
-        if !parakeet_lib.exists() {
-            eprintln!(
-                "[realtime-readiness] blocked: parakeet_live_library_missing path={}",
-                parakeet_lib.display()
-            );
-            return Ok(RealtimeStartReadinessResponse {
-                allowed: false,
-                reason_code: "parakeet_live_library_missing".to_string(),
-                message: format!(
-                    "Parakeet.cpp live library is missing at {}. Reinstall the local runtime.",
-                    parakeet_lib.display()
-                ),
-                engine: "parakeet_cpp".to_string(),
-                model_filename,
-                model_path,
-                ffmpeg_resolved: health.ffmpeg_resolved,
-                whisper_stream_resolved: health.whisper_stream_resolved,
-                parakeet_cli_resolved: health.parakeet_cli_resolved,
-                input_device_name: None,
-            });
-        }
-
-        if let Err(error) =
-            ParakeetRealtimeEngine::new(parakeet_lib.clone(), models_dir.clone()).validate_library()
-        {
-            eprintln!(
-                "[realtime-readiness] blocked: parakeet_live_library_unloadable path={} error={}",
-                parakeet_lib.display(),
-                error
-            );
-            return Ok(RealtimeStartReadinessResponse {
-                allowed: false,
-                reason_code: "parakeet_live_library_unloadable".to_string(),
-                message: format!(
-                    "Parakeet.cpp live library is not loadable at {}. {}",
-                    parakeet_lib.display(),
-                    error
-                ),
-                engine: "parakeet_cpp".to_string(),
-                model_filename,
-                model_path,
-                ffmpeg_resolved: health.ffmpeg_resolved,
-                whisper_stream_resolved: health.whisper_stream_resolved,
-                parakeet_cli_resolved: health.parakeet_cli_resolved,
-                input_device_name: None,
-            });
-        }
-
-        if !model_path_buf.exists() {
-            eprintln!(
-                "[realtime-readiness] blocked: parakeet_realtime_model_missing path={}",
-                model_path_buf.display()
-            );
-            return Ok(RealtimeStartReadinessResponse {
-                allowed: false,
-                reason_code: "parakeet_realtime_model_missing".to_string(),
-                message: format!(
-                    "Parakeet.cpp live requires the selected streaming model. Download '{}' in Local Models.",
-                    model_filename
-                ),
-                engine: "parakeet_cpp".to_string(),
-                model_filename,
-                model_path,
-                ffmpeg_resolved: health.ffmpeg_resolved,
-                whisper_stream_resolved: health.whisper_stream_resolved,
-                parakeet_cli_resolved: health.parakeet_cli_resolved,
-                input_device_name: None,
-            });
-        }
-
-        let input_device_name = match crate::realtime_audio::probe_input_device_name() {
-            Ok(name) => Some(name),
-            Err(error) => {
-                eprintln!(
-                    "[realtime-readiness] blocked: input_device reason={} message={}",
-                    error.reason_code, error.message
-                );
-                return Ok(RealtimeStartReadinessResponse {
-                    allowed: false,
-                    reason_code: error.reason_code,
-                    message: error.message,
-                    engine: "parakeet_cpp".to_string(),
-                    model_filename,
-                    model_path,
-                    ffmpeg_resolved: health.ffmpeg_resolved,
-                    whisper_stream_resolved: health.whisper_stream_resolved,
-                    parakeet_cli_resolved: health.parakeet_cli_resolved,
-                    input_device_name: None,
-                });
-            }
-        };
-
-        eprintln!(
-            "[realtime-readiness] allowed: parakeet model={} input_device={input_device_name:?}",
-            model_filename
-        );
-        return Ok(RealtimeStartReadinessResponse {
-            allowed: true,
-            reason_code: "ok".to_string(),
-            message: format!(
-                "Parakeet.cpp live is ready with '{}' (lang {}).",
-                model_filename,
-                parakeet_live_target_lang(selected_language)
-            ),
-            engine: "parakeet_cpp".to_string(),
-            model_filename,
-            model_path,
-            ffmpeg_resolved: health.ffmpeg_resolved,
-            whisper_stream_resolved: health.whisper_stream_resolved,
-            parakeet_cli_resolved: health.parakeet_cli_resolved,
-            input_device_name,
-        });
-    }
     // Keep realtime readiness aligned with start_realtime: Tiny is certified
     // for responsive CPU-only live use. File transcription continues to
     // support every model in the catalog.
-    let selected_model = if selected_engine == TranscriptionEngine::WhisperCpp {
-        whisper_live_model_manifest().model
-    } else {
-        payload
-            .as_ref()
-            .map(|value| value.model.clone())
-            .unwrap_or_else(|| settings.transcription.model.clone())
-    };
     let live_health = state
         .runtime_factory
         .live_start_health(selected_model.clone())
         .map_err(|e| CommandError::new("runtime_health", e))?;
 
-    let model_filename = live_health.model_filename.clone();
+    let model_filename = selected_model_filename;
     let model_path = PathBuf::from(&live_health.models_dir_resolved)
         .join(&model_filename)
         .to_string_lossy()
@@ -1165,7 +977,7 @@ pub async fn get_realtime_start_readiness(
                 "FFmpeg is not runnable at '{}'. Repair the local runtime from Settings > Local Models.",
                 live_health.ffmpeg_resolved
             ),
-            engine: "whisper_cpp".to_string(),
+            engine: engine_to_wire(&selected_engine).to_string(),
             model_filename,
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
@@ -1183,7 +995,7 @@ pub async fn get_realtime_start_readiness(
                 "Whisper Stream is not runnable at '{}'. Repair the local runtime from Settings > Local Models.",
                 live_health.whisper_stream_resolved
             ),
-            engine: "whisper_cpp".to_string(),
+            engine: engine_to_wire(&selected_engine).to_string(),
             model_filename,
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
@@ -1201,7 +1013,7 @@ pub async fn get_realtime_start_readiness(
                 "Model file '{}' was not found in '{}'. Download models from Settings > Local Models.",
                 model_filename, live_health.models_dir_resolved
             ),
-            engine: "whisper_cpp".to_string(),
+            engine: engine_to_wire(&selected_engine).to_string(),
             model_filename,
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
@@ -1216,7 +1028,7 @@ pub async fn get_realtime_start_readiness(
             allowed: true,
             reason_code: "ok".to_string(),
             message: "Realtime start readiness passed.".to_string(),
-            engine: "whisper_cpp".to_string(),
+            engine: engine_to_wire(&selected_engine).to_string(),
             model_filename,
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
@@ -1228,7 +1040,7 @@ pub async fn get_realtime_start_readiness(
             allowed: false,
             reason_code: error.reason_code,
             message: error.message,
-            engine: "whisper_cpp".to_string(),
+            engine: engine_to_wire(&selected_engine).to_string(),
             model_filename,
             model_path,
             ffmpeg_resolved: live_health.ffmpeg_resolved,
@@ -1534,6 +1346,64 @@ mod tests {
             },
             setup_complete: parakeet_available,
         }
+    }
+
+    #[test]
+    fn live_selection_pins_certified_whisper_manifest_for_each_engine() {
+        let expected_manifest = whisper_live_model_manifest();
+        assert_eq!(expected_manifest.model, SpeechModel::Tiny);
+        assert_eq!(expected_manifest.filename, "ggml-tiny-q8_0.bin");
+
+        for requested_engine in [
+            TranscriptionEngine::WhisperCpp,
+            TranscriptionEngine::ParakeetCpp,
+        ] {
+            let selection = resolve_live_transcription_selection(requested_engine);
+            assert_eq!(selection.engine, TranscriptionEngine::WhisperCpp);
+            assert_eq!(selection.manifest.model, expected_manifest.model);
+            assert_eq!(selection.manifest.filename, expected_manifest.filename);
+        }
+    }
+
+    #[test]
+    fn whisper_path_normalization_preserves_structured_file_preferences() {
+        let mut settings = AppSettings::default();
+        settings.transcription.engine = TranscriptionEngine::ParakeetCpp;
+        settings.transcription.model = SpeechModel::LargeTurbo;
+        settings.transcription.language = LanguageCode::It;
+        settings.transcription.compute_device = TranscriptionComputeDevice::Gpu;
+        settings.transcription.live_compute_device = TranscriptionComputeDevice::Cpu;
+        settings.transcription.whisper_cli_path = "whisperkit-cli".to_string();
+        settings.transcription.whisperkit_cli_path = "whisperkit-cli".to_string();
+        settings.transcription_engine = TranscriptionEngine::WhisperCpp;
+        settings.model = SpeechModel::Base;
+        settings.language = LanguageCode::Auto;
+        settings.whisper_cli_path = "whisper-cli".to_string();
+        settings.whisperkit_cli_path = "whisper-stream".to_string();
+
+        assert!(normalize_whisper_runtime_paths(&mut settings));
+        assert_eq!(
+            settings.transcription.engine,
+            TranscriptionEngine::ParakeetCpp
+        );
+        assert_eq!(
+            settings.transcription_engine,
+            TranscriptionEngine::ParakeetCpp
+        );
+        assert_eq!(settings.transcription.model, SpeechModel::LargeTurbo);
+        assert_eq!(settings.model, SpeechModel::LargeTurbo);
+        assert_eq!(settings.transcription.language, LanguageCode::It);
+        assert_eq!(settings.language, LanguageCode::It);
+        assert_eq!(
+            settings.transcription.compute_device,
+            TranscriptionComputeDevice::Gpu
+        );
+        assert_eq!(
+            settings.transcription.live_compute_device,
+            TranscriptionComputeDevice::Cpu
+        );
+        assert_eq!(settings.transcription.whisper_cli_path, "whisper-cli");
+        assert_eq!(settings.transcription.whisperkit_cli_path, "whisper-stream");
     }
 
     #[test]
