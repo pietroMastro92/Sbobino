@@ -32,7 +32,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sbobino_desktop -> target
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Release/runtime contract tests
@@ -88,6 +91,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
+          components: clippy, rustfmt
       - name: Check release version wiring
         run: ./scripts/check_release_versions.sh
       - name: Bootstrap metadata smoke
@@ -114,10 +118,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
+          components: clippy, rustfmt
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+          workspaces: sbobino_desktop -> target
       - name: Record runner identity
         run: |
           echo "commit=$GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -140,6 +146,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
+          components: clippy, rustfmt
           targets: x86_64-pc-windows-msvc
       - uses: actions/setup-node@v4
         with:
@@ -147,6 +154,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: x86_64-pc-windows-msvc
+          workspaces: sbobino_desktop -> target
       - name: Record runner identity
         shell: pwsh
         run: |
