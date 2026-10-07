@@ -315,6 +315,7 @@ pub struct StartRealtimePayload {
 pub struct StartRealtimeResponse {
     pub started: bool,
     pub job_id: String,
+    pub model: SpeechModel,
 }
 
 #[derive(Debug, Deserialize)]
@@ -969,6 +970,7 @@ pub async fn start_realtime(
     Ok(StartRealtimeResponse {
         started: true,
         job_id,
+        model: selection.manifest.model,
     })
 }
 

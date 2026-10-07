@@ -2,8 +2,11 @@ name: CI
 
 on:
   push:
-    branches: ["main", "develop"]
+    branches: ["main", "develop", "codex/arm-release-readiness-20261003"]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   rust:
@@ -85,3 +88,76 @@ jobs:
         run: ./scripts/check_release_versions.sh
       - name: Bootstrap metadata smoke
         run: cargo metadata --manifest-path Cargo.toml --format-version 1 >/dev/null
+
+  native-macos:
+    name: Native Rust tests (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: sbobino_desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Record runner identity
+        run: |
+          echo "commit=$GITHUB_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "runner=$(uname -srm), target=${{ matrix.target }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$(uname -m)" = "${{ matrix.arch }}"
+      - name: Test native workspace
+        run: cargo test --workspace --target "${{ matrix.target }}"
+      - name: Lint native workspace
+        run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
+
+  native-windows:
+    name: Native Rust tests (Windows x86_64)
+    runs-on: windows-2025
+    defaults:
+      run:
+        working-directory: sbobino_desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+      - name: Record runner identity
+        shell: pwsh
+        run: |
+          "commit=$env:GITHUB_SHA" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "runner=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription), arch=$env:PROCESSOR_ARCHITECTURE" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          rustc --version | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Windows runner is not x86_64' }
+      - name: Prepare real Windows sidecars
+        shell: pwsh
+        working-directory: sbobino_desktop/apps/desktop
+        run: |
+          ../../scripts/package_windows_runtime_asset.ps1 `
+            -OutputZip (Join-Path $env:RUNNER_TEMP 'speech-runtime-windows-x86_64.zip') `
+            -SidecarDir (Join-Path $PWD 'src-tauri\binaries')
+      - name: Compile Windows workspace tests
+        run: cargo test --workspace --target x86_64-pc-windows-msvc --no-run
+      - name: Run portable Windows tests
+        run: cargo test -p sbobino-domain -p sbobino-application -p sbobino-desktop --target x86_64-pc-windows-msvc -- --test-threads=1
+      - name: Verify Windows credential storage
+        run: cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc secure_storage::tests::windows_credential_manager_roundtrip -- --exact
