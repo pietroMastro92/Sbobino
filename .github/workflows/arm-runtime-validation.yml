@@ -6,7 +6,7 @@ on:
       tag_name:
         description: Candidate tag whose packaged runtime should be validated
         required: true
-        default: v2.0.32
+        default: v2.0.33
         type: string
 
 permissions:
@@ -25,18 +25,20 @@ jobs:
           ref: ${{ inputs.tag_name }}
           fetch-depth: 0
 
-      - name: Validate v2.0.32 candidate tag and versioned notes
+      - name: Validate v2.0.33 candidate tag and versioned notes
         working-directory: sbobino_desktop
         run: |
-          if [[ "$TAG_NAME" != "v2.0.32" ]]; then
-            echo "ARM validation is locked to the v2.0.32 candidate; got $TAG_NAME" >&2
+          if [[ "$TAG_NAME" != "v2.0.33" ]]; then
+            echo "ARM validation is locked to the v2.0.33 candidate; got $TAG_NAME" >&2
             exit 1
           fi
           VERSION="${TAG_NAME#v}"
           SBOBINO_RELEASE_PROFILE=standalone-dev ./scripts/check_release_versions.sh "$VERSION"
           ./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
 
       - name: Install native build dependencies
         run: brew install ffmpeg sdl2 nasm
