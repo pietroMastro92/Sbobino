@@ -343,10 +343,11 @@ function Assert-AppLocalDependencies {
         $packaged[$_.Name.ToLowerInvariant()] = $true
     }
     $systemDlls = @(
-        "advapi32.dll", "avicap32.dll", "avrt.dll", "bcrypt.dll", "cfgmgr32.dll",
-        "crypt32.dll", "d2d1.dll", "dwrite.dll", "gdi32.dll", "imm32.dll",
-        "iphlpapi.dll", "kernel32.dll", "msvcrt.dll", "ncrypt.dll", "ntdll.dll",
-        "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "secur32.dll", "setupapi.dll",
+        "advapi32.dll", "avicap32.dll", "avrt.dll", "bcrypt.dll", "bcryptprimitives.dll",
+        "cfgmgr32.dll", "crypt32.dll", "d2d1.dll", "dnsapi.dll", "dwrite.dll",
+        "gdi32.dll", "imm32.dll", "iphlpapi.dll", "kernel32.dll", "msimg32.dll",
+        "msvcrt.dll", "ncrypt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll",
+        "rpcrt4.dll", "secur32.dll", "setupapi.dll", "userenv.dll",
         "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll", "usp10.dll", "version.dll",
         "winmm.dll", "ws2_32.dll"
     )
