@@ -59,7 +59,7 @@ def normalized(vector, dimension):
     return [x / norm for x in vector]
 
 
-def evaluate(corpus, vectors=None, dimension=256):
+def evaluate(corpus, vectors=None, dimension=256, scope="archive"):
     docs, queries = corpus["documents"], corpus["queries"]
     ids = [doc["id"] for doc in docs]
     if not ids or len(set(ids)) != len(ids) or len({q["id"] for q in queries}) != len(queries):
@@ -76,37 +76,55 @@ def evaluate(corpus, vectors=None, dimension=256):
         if not relevant <= set(ids):
             raise ValueError("unknown relevance ID")
         started = time.perf_counter()
+        if scope == "recording" and not query.get("recording_id"):
+            raise ValueError("recording scope requires query recording_id")
+        eligible = [i for i, doc in enumerate(docs)
+                    if scope == "archive" or doc.get("recording_id") == query.get("recording_id")]
+        if not eligible:
+            raise ValueError("query has no documents in its recording scope")
+        def eligible_ranking(scores, positive_only=False):
+            return [eligible[i] for i in ranked([scores[j] for j in eligible], positive_only)]
         needle = query["query"].strip().lower()
         exact = [float(bool(needle) and needle in text.lower()) for text in texts]
-        lexical = bm25(texts, query["query"])
+        lexical = [0.0] * len(docs)
+        for i, score in zip(eligible, bm25([texts[j] for j in eligible], query["query"])):
+            lexical[i] = score
         chat_scores = [current_chat_score(text, query["query"]) for text in texts]
-        chat = ranked(chat_scores, True)[:10]
+        chat = eligible_ranking(chat_scores, True)[:10]
         if not chat:
-            chat = list(range(min(4, len(docs))))
-        methods = {"history_substring": ranked(exact, True), "current_chat": chat,
-                   "bm25": ranked(lexical, True)}
+            chat = eligible[:4]
+        methods = {"history_substring": eligible_ranking(exact, True), "current_chat": chat,
+                   "bm25": eligible_ranking(lexical, True)}
         semantic_scores = None
         if encoded is not None:
             qv = normalized(vectors["queries"][query["id"]], dimension)
             semantic_scores = [sum(x * y for x, y in zip(qv, dv)) for dv in encoded]
-            methods["semantic"] = ranked(semantic_scores)
+            methods["semantic"] = eligible_ranking(semantic_scores)
             # Fixed reciprocal-rank fusion; never tuned on these query labels.
             fusion = [0.0] * len(docs)
             for ordering in (methods["bm25"], methods["semantic"]):
                 for position, index in enumerate(ordering, 1):
                     fusion[index] += 1.0 / (60 + position)
-            methods["hybrid_rrf"] = ranked(fusion)
+            methods["hybrid_rrf"] = eligible_ranking(fusion)
         for method, ordering in methods.items():
             retrieved = [ids[i] for i in ordering]
             positions = [position for position, key in enumerate(retrieved, 1) if key in relevant]
+            support = set(query.get("support_doc_ids", relevant))
+            if not support <= set(ids):
+                raise ValueError("unknown answer-support ID")
             rows.append({"query_id": query["id"], "category": query["category"],
+                         "split": query.get("split", "test"), "language": query.get("language"),
                          "query": query["query"], "method": method,
+                         "answerable": query.get("answerable", bool(support)),
+                         "support_doc_ids": sorted(support),
+                         "support_hit1": bool(support.intersection(retrieved[:1])),
+                         "support_hit5": bool(support.intersection(retrieved[:5])),
                          "relevant_doc_ids": sorted(relevant), "top5": retrieved[:5],
                          "first_relevant_rank": min(positions) if positions else None,
                          "hit1": bool(relevant.intersection(retrieved[:1])),
                          "hit5": bool(relevant.intersection(retrieved[:5])),
                          "reciprocal_rank": 1 / min(positions) if positions else 0,
-                         "best_cosine": max(semantic_scores) if semantic_scores else None,
+                         "best_cosine": max(semantic_scores[i] for i in eligible) if semantic_scores else None,
                          "scoring_seconds_all_methods": time.perf_counter() - started})
     summary = {}
     for method in sorted({row["method"] for row in rows}):
@@ -119,12 +137,38 @@ def evaluate(corpus, vectors=None, dimension=256):
                     "hit1": sum(row["hit1"] for row in selected) / len(selected),
                     "hit5": sum(row["hit5"] for row in selected) / len(selected),
                     "mrr": sum(row["reciprocal_rank"] for row in selected) / len(selected)}
-    return {"dimension": dimension if vectors else None, "documents": len(docs),
+    support_summary = {}
+    for method in sorted({row["method"] for row in rows}):
+        for split in sorted({row["split"] for row in rows}):
+            selected = [row for row in rows if row["method"] == method and row["split"] == split
+                        and row["answerable"]]
+            if selected:
+                support_summary[f"{method}/{split}"] = {"queries": len(selected),
+                    "support_hit1": sum(row["support_hit1"] for row in selected) / len(selected),
+                    "support_hit5": sum(row["support_hit5"] for row in selected) / len(selected)}
+    calibration = {}
+    if encoded is not None:
+        dev = [row for row in rows if row["method"] == "semantic" and row["split"] == "dev"]
+        positives = [row for row in dev if row["answerable"]]
+        negatives = [row for row in dev if not row["answerable"]]
+        if positives and negatives:
+            # Fixed policy: reject all dev negatives, then measure unchanged on test.
+            threshold = math.nextafter(max(row["best_cosine"] for row in negatives), math.inf)
+            for split in ("dev", "test"):
+                selected = [row for row in rows if row["method"] == "semantic" and row["split"] == split]
+                pos = [row for row in selected if row["answerable"]]
+                neg = [row for row in selected if not row["answerable"]]
+                calibration[split] = {"threshold": threshold, "positives": len(pos), "negatives": len(neg),
+                    "accepted_positives": sum(row["best_cosine"] >= threshold for row in pos),
+                    "false_accept_negatives": sum(row["best_cosine"] >= threshold for row in neg),
+                    "accepted_with_gold_support_top5": sum(row["best_cosine"] >= threshold and row["support_hit5"] for row in pos)}
+    return {"dimension": dimension if vectors else None, "scope": scope, "documents": len(docs),
             "queries": len(queries), "summary": summary, "rows": rows,
-            "negative_policy": "No calibrated semantic abstention threshold. Negative rankings are diagnostic, not answers.",
+            "support_summary": support_summary, "calibration": calibration,
+            "negative_policy": "Dev-only threshold rejects all dev negatives, without test tuning; not proof of answerability." if calibration else "No calibrated semantic abstention threshold. Negative rankings are diagnostic, not answers.",
             "limits": "Manually curated exploratory queries; "
                       + ("real public ASR output; " if corpus.get("provenance", {}).get("asr_run") else "reference text, not ASR output; ")
-                      + "independent short passages, not full recordings."}
+                      + ("timed passages from long recordings; not app chat execution." if corpus.get("long_recordings") else "independent short passages, not full recordings.")}
 
 
 def self_test():
@@ -142,6 +186,21 @@ def self_test():
               "queries": [{"id": "q", "query": "2026", "category": "numbers", "relevant_doc_ids": ["a"]}]}
     result = evaluate(corpus, {"documents": {"a": [1, 0], "b": [0, 1]}, "queries": {"q": [1, 0]}}, 2)
     assert all(row["hit1"] for row in result["rows"])
+    corpus["documents"][0]["recording_id"] = "A"
+    corpus["documents"][1]["recording_id"] = "B"
+    corpus["queries"] = [
+        {"id": key, "query": "budget", "category": "probe", "recording_id": "A",
+         "split": split, "answerable": answerable, "support_doc_ids": ["a"] if answerable else [],
+         "relevant_doc_ids": ["a"]}
+        for key, split, answerable in [("dp", "dev", True), ("dn", "dev", False),
+                                      ("tp", "test", True), ("tn", "test", False)]]
+    vectors = {"documents": {"a": [1, 0], "b": [0, 1]},
+               "queries": {"dp": [1, 0], "dn": [.8, .6], "tp": [0, 1], "tn": [1, 0]}}
+    result = evaluate(corpus, vectors, 2, "recording")
+    assert all(row["top5"] == ["a"] for row in result["rows"])
+    assert result["calibration"]["dev"]["false_accept_negatives"] == 0
+    assert result["calibration"]["test"]["false_accept_negatives"] == 1
+    assert result["calibration"]["test"]["accepted_positives"] == 0
     print("Embedding spike checks passed")
 
 
@@ -150,11 +209,11 @@ def encode(corpus, args):
     import importlib.metadata
     loaded = time.perf_counter()
     if args.runtime == "litert":
-        from litert_lm import Backend, EmbeddingEngine, EmbeddingOptions
+        from litert_lm import Backend, EmbeddingEngine, EmbeddingOptions, InputOverflowStrategy
         backend = Backend.CPU(thread_count=4) if args.backend == "cpu" else Backend.GPU()
         engine = EmbeddingEngine(model_path=args.model, backend=backend)
         engine.__enter__()
-        options = EmbeddingOptions(normalize=True, output_size=768)
+        options = EmbeddingOptions(normalize=True, output_size=768, input_overflow_strategy=InputOverflowStrategy.ERROR)
         inference = lambda text: list(engine.compute_embedding(text, options).embedding)
         versions = {name: importlib.metadata.version(name) for name in ("litert-lm", "litert-lm-api")}
     elif args.runtime == "sentence-transformers":
@@ -227,6 +286,7 @@ def main():
     parser.add_argument("--vectors", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--dimension", type=int, choices=(128, 256, 512, 768), default=256)
+    parser.add_argument("--scope", choices=("archive", "recording"), default="archive")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--runtime", choices=("litert", "sentence-transformers", "llama"))
     parser.add_argument("--model")
@@ -274,7 +334,7 @@ def main():
     vectors = json.loads(args.vectors.read_text()) if args.vectors else None
     if vectors and vectors.get("corpus_sha256") != digest:
         raise ValueError("embedding corpus checksum mismatch")
-    result = evaluate(json.loads(data), vectors, args.dimension)
+    result = evaluate(json.loads(data), vectors, args.dimension, args.scope)
     result.update(corpus_sha256=digest, vectors_sha256=hashlib.sha256(args.vectors.read_bytes()).hexdigest() if args.vectors else None)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")

@@ -1,5 +1,7 @@
 # EmbeddingGemma: primo confronto locale per Sbobino
 
+Il confronto successivo su registrazioni lunghe, domande senza risposta e runtime nativo è nel [report di approfondimento](embedding-gemma-deepening-2026-10-08.md). Questo documento conserva i risultati del primo test.
+
 ## Decisione
 
 La ricerca semantica merita una prova nell'esperienza di consultazione, ma **questo test non giustifica scegliere Gemma 2 al posto di Gemma 1 né integrare subito un nuovo runtime**. Entrambi recuperano al primo posto tutti i 26 passaggi etichettati pertinenti, anche usando gli output reali di Parakeet. Gemma 1 è più veloce nella configurazione CPU provata; Gemma 2 ha download e footprint CPU inferiori e offre un percorso multimodale da valutare separatamente.
