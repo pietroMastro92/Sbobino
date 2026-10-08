@@ -231,6 +231,8 @@ class LlamaServer:
         command = [args.binary, "-m", args.model, "--mmproj", args.mmproj, "--jinja",
                    "--reasoning", "off", "--host", "127.0.0.1", "--port", str(port),
                    "-c", "8192", "-ngl", "all"]
+        if getattr(args, "parallel", None) is not None:
+            command.extend(["--parallel", str(args.parallel)])
         started = time.perf_counter()
         self.process = None
         try:

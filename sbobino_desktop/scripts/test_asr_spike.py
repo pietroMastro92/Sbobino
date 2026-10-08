@@ -41,6 +41,28 @@ class SpikeChecks(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "reference checksum"):
                 load_samples(path)
 
+    def test_llama_parallel_is_explicit_only_when_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for parallel in (None, 1):
+                args = SimpleNamespace(binary="server", model="model", mmproj="projector")
+                if parallel is not None:
+                    args.parallel = parallel
+                process = mock.Mock()
+                process.poll.return_value = None
+                health = mock.MagicMock()
+                health.__enter__.return_value.status = 200
+                with self.subTest(parallel=parallel), mock.patch(
+                        "asr_spike.subprocess.Popen", return_value=process) as launched, mock.patch(
+                        "asr_spike.urllib.request.urlopen", return_value=health):
+                    server = LlamaServer(args, Path(directory) / "runtime.log")
+                    try:
+                        command = launched.call_args.args[0]
+                        self.assertEqual("--parallel" in command, parallel is not None)
+                        if parallel is not None:
+                            self.assertEqual(command[command.index("--parallel") + 1], "1")
+                    finally:
+                        server.close()
+
     def test_llama_dry_diagnostic_is_explicit(self):
         server = LlamaServer.__new__(LlamaServer)
         server.url = "http://127.0.0.1:1"

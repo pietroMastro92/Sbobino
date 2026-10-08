@@ -154,6 +154,8 @@ Clustering, classificazione e ricerca audio sono possibilità future, non risult
 
 **Decisione:** EmbeddingGemma 2 merita la prossima fase come ricerca locale facoltativa con estratti verificabili; l'arricchimento della chat segue la verifica del recupero nell'app. Non è dimostrato superiore in ogni metrica alla baseline Gemma 1 Q8, né rende automaticamente affidabile una risposta generata. Questo approfondimento definisce punti di inserimento e criteri di verifica: non introduce dipendenze, API o modifiche alla pipeline ASR.
 
+Il confronto successivo sul [glossario per il correttore audio-aware](embedding-gemma-glossary-correction-2026-10-08.md) separa il recupero terminologico dalla correzione e include il controllo lessicale. È un esperimento distinto dal retrieval di questo report.
+
 ## Riproduzione e provenienza
 
 Artefatti esterni: `/Volumes/UltraDisk/sbobino-embedding-spike-20261008/deepening`. `data/prepare_long_holdout.py` rigenera i corpus pubblici; `data/audit.md` conserva selezione, intervalli, etichette e hash. `protocol.json` registra le configurazioni predefinite e le correzioni pre-inferenza. `results/provenance.json` registra hash dei dati, modelli, harness, risultati e log; i vettori originali LiteRT sono conservati per il confronto con la verifica overflow.
