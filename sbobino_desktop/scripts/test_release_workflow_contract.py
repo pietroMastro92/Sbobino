@@ -5,6 +5,7 @@ import pathlib
 import os
 import subprocess
 import tempfile
+import sys
 import unittest
 import wave
 import zipfile
@@ -240,9 +241,32 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
         macos = ARM_LIVE_SMOKE.read_text(encoding="utf-8")
         self.assertIn('"live_mode": raw.get("live_mode")', macos)
-        self.assertIn('"realtime_capable": raw.get("realtime_capable", False)', macos)
+        self.assertIn('"realtime_capable": raw.get("realtime_capable", False) and evaluated.get("status") == "passed"', macos)
         self.assertIn('"commit_sha": sys.argv[12]', macos)
         self.assertIn('"repo_slug": sys.argv[13]', macos)
+
+    def test_live_report_cannot_certify_a_failed_evaluation_as_realtime(self):
+        source = ARM_LIVE_SMOKE.read_text(encoding="utf-8")
+        marker = 'python3 - "$EVALUATED_REPORT"'
+        script = source.split(marker, 1)[1].split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            raw = root / "raw.json"
+            raw.write_text(json.dumps({"status": "passed", "realtime_capable": True, "failures": [], "live_mode": "realtime"}))
+            recovery = root / "recovery.json"
+            recovery.write_text(json.dumps({"status": "passed", "failures": []}))
+            evaluated = root / "evaluated.json"
+            output = root / "proof.json"
+            for status in ("passed", "failed"):
+                evaluated.write_text(json.dumps({"status": status, "metrics": {}, "failures": []}))
+                environment = os.environ.copy()
+                environment.pop("GITHUB_ACTIONS", None)
+                environment.pop("SBOBINO_LIVE_RUNNER", None)
+                subprocess.run([sys.executable, "-c", script, str(evaluated), str(raw), str(output), "inputhash", "modelhash", "binaryhash", "auto", "2.0.34", "v2.0.34", str(recovery), "900", "sourcecommit", "pietroMastro92/Sbobino", "encoderhash", "0"], env=environment, check=True)
+                proof = json.loads(output.read_text())
+                self.assertEqual(proof["realtime_capable"], status == "passed")
+                self.assertEqual(proof["evidence_class"], "local-packaged-engine")
+                self.assertEqual(proof["runner"], "local macOS")
 
     def test_pyannote_abi_scan_includes_the_packaged_runtime_lib_directory(self):
         readiness = (ROOT / "scripts" / "distribution_readiness.sh").read_text(
