@@ -132,6 +132,8 @@ jobs:
           test "$(uname -m)" = "${{ matrix.arch }}"
       - name: Test native workspace
         run: cargo test --workspace --target "${{ matrix.target }}"
+      - name: Verify macOS updater signature roundtrip
+        run: python3 scripts/test_macos_bundle_scripts.py
       - name: Lint native workspace
         run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
 

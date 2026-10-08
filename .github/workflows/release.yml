@@ -6,7 +6,7 @@ on:
       tag_name:
         description: Existing git tag to build and publish as a prerelease candidate
         required: true
-        default: v2.0.33
+        default: v2.0.34
         type: string
 
 permissions:
@@ -14,15 +14,15 @@ permissions:
 
 jobs:
   validate-candidate:
-    name: Validate v2.0.33 candidate tag
+    name: Validate v2.0.34 candidate tag
     runs-on: ubuntu-latest
     env:
       TAG_NAME: ${{ inputs.tag_name }}
     steps:
       - name: Require the reviewed candidate tag
         run: |
-          if [[ "$TAG_NAME" != "v2.0.33" ]]; then
-            echo "Release Candidate is locked to v2.0.33; got $TAG_NAME" >&2
+          if [[ "$TAG_NAME" != "v2.0.34" ]]; then
+            echo "Release Candidate is locked to v2.0.34; got $TAG_NAME" >&2
             exit 1
           fi
 
@@ -121,7 +121,9 @@ jobs:
           STAGING_DIR="$RUNNER_TEMP/sbobino-${{ matrix.arch }}"
           mkdir -p "$STAGING_DIR"
 
+          python3 ../../scripts/prepare_macos_bundle_scripts.py "$APP_PATH"
           codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH"
           rm -f "$UPDATER_TAR" "$UPDATER_SIG"
           COPYFILE_DISABLE=1 tar -czf "$UPDATER_TAR" -C "$APP_DIR" "Sbobino.app"
           npx tauri signer sign "$UPDATER_TAR"
