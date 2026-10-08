@@ -192,6 +192,8 @@ class FinalizedTranscriptTests(unittest.TestCase):
             root = pathlib.Path(temporary)
             run_dir = root / "run"
             run_dir.mkdir()
+            invalid_header = b"RIFF\x00\x00\x00\x00WAVEfmt "
+            (run_dir / "invalid.wav").write_bytes(invalid_header)
             audio = root / "audio.wav"
             fixture = root / "fixture.wav"
             for path in (audio, fixture):
@@ -258,6 +260,8 @@ class FinalizedTranscriptTests(unittest.TestCase):
             self.assertIn("[Start speaking]", payload["stdout_raw"])
             self.assertIn("SBOBINO_WHISPER_LIVE_METRIC", payload["stderr_raw"])
             self.assertIn("terminal runtime summary is missing", payload["failures"])
+            self.assertEqual(payload["invalid_captured_audio"], [{"file": "invalid.wav", "error": "not a WAVE file", "header_hex": invalid_header.hex(), "size_bytes": len(invalid_header)}])
+            self.assertIn("invalid captured WAV invalid.wav: not a WAVE file", payload["failures"])
 
     @unittest.skipIf(os.name == "nt", "POSIX fake executable is used for this contract test")
     def test_expected_preflight_rejection_passes_only_before_capture(self):

@@ -377,9 +377,19 @@ def main() -> int:
     output_text = finalized_transcript(stdout)
     saved_audio = captured_wav_paths(args.run_dir, args.audio, args.fixture)
     saved_frames = 0
+    invalid_audio = []
     for path in saved_audio:
-        with wave.open(str(path), "rb") as handle:
-            saved_frames += handle.getnframes()
+        header = b""
+        size_bytes = None
+        try:
+            with path.open("rb") as stream:
+                size_bytes = os.fstat(stream.fileno()).st_size
+                header = stream.read(64)
+                stream.seek(0)
+                with wave.open(stream, "rb") as handle:
+                    saved_frames += handle.getnframes()
+        except (wave.Error, EOFError, OSError) as error:
+            invalid_audio.append({"file": path.name, "error": str(error), "header_hex": header.hex(), "size_bytes": size_bytes})
     normalized = unicodedata.normalize("NFKC", output_text).casefold()
     normalized = " ".join(re.findall(r"[^\W\d_]+(?:['’][^\W\d_]+)?", normalized))
     expected_segments = int(duration // fixture_duration)
@@ -397,7 +407,7 @@ def main() -> int:
     preflight_rejection_mode = args.expect_preflight_rejection or (
         args.allow_preflight_rejection and preflight_rejection_observed
     )
-    failures: list[str] = []
+    failures: list[str] = [f"invalid captured WAV {item['file']}: {item['error']}" for item in invalid_audio]
     if coreml_expected and not coreml_loaded:
         failures.append("expected Core ML encoder was not loaded")
     if timed_out:
@@ -516,6 +526,7 @@ def main() -> int:
         "backlog_reaction_budget_seconds": BACKLOG_REACTION_BUDGET_SECONDS,
         "captured_audio_frames": captured_frames,
         "saved_audio_frames": saved_frames,
+        "invalid_captured_audio": invalid_audio,
         "stdout_transcript": output_text,
         "stderr_tail": stderr[-8000:],
         "stdout_raw": stdout,

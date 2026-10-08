@@ -4,6 +4,7 @@ on:
   push:
     branches: ["main", "develop", "codex/arm-release-readiness-20261003"]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -177,3 +178,36 @@ jobs:
         run: cargo test -p sbobino-domain -p sbobino-application -p sbobino-desktop --target x86_64-pc-windows-msvc -- --test-threads=1
       - name: Verify Windows credential storage
         run: cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc secure_storage::tests::windows_credential_manager_roundtrip -- --exact
+
+  published-intel-runtime:
+    name: Diagnose published 2.0.34 Intel Live runtime
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        working-directory: sbobino_desktop
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record native diagnostic identity
+        run: |
+          echo "harness_commit=$GITHUB_SHA runtime_release=v2.0.34"
+          uname -srm
+          sysctl -n machdep.cpu.brand_string machdep.cpu.features machdep.cpu.leaf7_features
+          test "$(uname -m)" = x86_64
+      - name: Replay exact published Intel runtime with current collector
+        env:
+          SBOBINO_WHISPER_LIVE_ARCH: x86_64
+          SBOBINO_WHISPER_LIVE_DEVICE: auto
+          SBOBINO_WHISPER_EXPECT_PREFLIGHT_REJECTION: "1"
+          SBOBINO_WHISPER_LIVE_DURATION_SECONDS: "65"
+          SBOBINO_LIVE_RUNNER: github-hosted macos-15-intel
+        run: ./scripts/release_macos_whisper_live_smoke.sh 2.0.34 "$GITHUB_REPOSITORY" "$PWD/intel-published-runtime-diagnostics.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: intel-published-runtime-diagnostics
+          path: sbobino_desktop/intel-published-runtime-diagnostics.json
+          if-no-files-found: error
