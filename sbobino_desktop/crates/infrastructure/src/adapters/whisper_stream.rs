@@ -452,10 +452,6 @@ impl WhisperStreamEngine {
     }
 
     fn commit_line(state: &mut StreamState, cleaned: String) -> Option<RealtimeDeltaKind> {
-        if state.lines.last().is_some_and(|last| last == &cleaned) {
-            return None;
-        }
-
         state.lines.push(cleaned);
         state.preview.clear();
         Some(RealtimeDeltaKind::AppendFinal)
@@ -467,6 +463,10 @@ impl WhisperStreamEngine {
         }
 
         let preview = state.preview.trim().to_string();
+        if state.lines.last().is_some_and(|last| last == &preview) {
+            state.preview.clear();
+            return;
+        }
         if Self::commit_line(state, preview.clone()).is_some() {
             let end = Self::elapsed_seconds(state).max(state.last_segment_end_seconds);
             let start = state.last_segment_end_seconds.min(end);
@@ -1091,8 +1091,13 @@ impl WhisperStreamEngine {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
     use super::{StreamState, WhisperLiveProfile, WhisperStreamEngine};
+    use sbobino_application::{RealtimeDelta, RealtimeDeltaKind};
     use sbobino_domain::TranscriptionComputeDevice;
+    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::sync::{oneshot, Mutex};
 
     #[test]
     fn cpu_mode_disables_gpu_and_flash_attention_for_live_whisper() {
@@ -1226,6 +1231,77 @@ mod tests {
             .terminal_error
             .as_deref()
             .is_some_and(|message| message.contains("status 7")));
+    }
+
+    #[tokio::test]
+    async fn reader_preserves_identical_newline_final_records() {
+        let state = Arc::new(Mutex::new(StreamState {
+            active_readers: 1,
+            running: true,
+            ..StreamState::default()
+        }));
+        let (mut writer, reader) = duplex(256);
+        let emitted: Arc<StdMutex<Vec<RealtimeDelta>>> = Arc::new(StdMutex::new(Vec::new()));
+        let emitted_clone = emitted.clone();
+        let (startup_sender, _startup_receiver) = oneshot::channel();
+        let startup_signal = Arc::new(Mutex::new(Some(startup_sender)));
+
+        let reader_task = WhisperStreamEngine::spawn_reader_task(
+            state.clone(),
+            reader,
+            Arc::new(move |delta| {
+                emitted_clone
+                    .lock()
+                    .expect("emit lock poisoned")
+                    .push(delta);
+            }),
+            None,
+            startup_signal,
+        );
+
+        writer
+            .write_all(b"repeated utterance\nrepeated utterance\n")
+            .await
+            .expect("duplex writer should accept final records");
+        drop(writer);
+        reader_task.await.expect("reader task should finish");
+
+        let state = state.lock().await;
+        assert_eq!(
+            state.lines,
+            vec![
+                "repeated utterance".to_string(),
+                "repeated utterance".to_string()
+            ]
+        );
+        assert_eq!(state.segments.len(), 2);
+        assert!(state
+            .segments
+            .iter()
+            .all(|segment| segment.text == "repeated utterance"));
+        drop(state);
+
+        let emitted = emitted.lock().expect("emit lock poisoned");
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|delta| matches!(delta.kind, RealtimeDeltaKind::AppendFinal))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn flush_preview_matching_last_final_does_not_duplicate_it() {
+        let mut state = StreamState::default();
+        state.lines.push("repeated utterance".to_string());
+        state.preview = "repeated utterance".to_string();
+
+        WhisperStreamEngine::flush_preview_into_lines(&mut state);
+
+        assert_eq!(state.lines, vec!["repeated utterance".to_string()]);
+        assert!(state.segments.is_empty());
+        assert!(state.preview.is_empty());
     }
 
     #[tokio::test]
