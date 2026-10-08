@@ -80,13 +80,16 @@ export async function runProvisioningAndRefresh<T>(options: {
       (result) => ({ kind: "started" as const, result }),
       (error: unknown) => ({ kind: "starter-error" as const, error }),
     );
-    const startResult = await Promise.race([starterOutcome, timeout]);
+    const startResult = await Promise.race([starterOutcome, completionOutcome, timeout]);
     if (startResult.kind === "starter-error") throw startResult.error;
-    if (!startResult.result.started && !options.waitForExistingRun) {
-      resolveCompletion();
+    if (startResult.kind === "completion-error") throw startResult.error;
+    if (startResult.kind === "started") {
+      if (!startResult.result.started && !options.waitForExistingRun) {
+        resolveCompletion();
+      }
+      const completionResult = await Promise.race([completionOutcome, timeout]);
+      if (completionResult.kind === "completion-error") throw completionResult.error;
     }
-    const completionResult = await Promise.race([completionOutcome, timeout]);
-    if (completionResult.kind === "completion-error") throw completionResult.error;
   } catch (error) {
     primaryError = error;
     hasPrimaryError = true;
@@ -144,7 +147,7 @@ export function shouldShowProvisioningStatus(
   panel: "local_models" | "pyannote",
   message: string,
 ): boolean {
-  return Boolean(message && scope && (panel === "pyannote" ? scope === "pyannote" : scope !== "pyannote"));
+  return Boolean(message && (panel === "pyannote" ? scope === "pyannote" : scope !== "pyannote"));
 }
 
 export function formatProvisioningFailureMessage(

@@ -8,6 +8,8 @@ describe("provisioningUi", () => {
     expect(shouldShowProvisioningStatus("pyannote", "pyannote", "Failed")).toBe(true);
     expect(shouldShowProvisioningStatus("pyannote", "local_models", "Failed")).toBe(false);
     expect(shouldShowProvisioningStatus("runtime", "local_models", "Ready")).toBe(true);
+    expect(shouldShowProvisioningStatus(null, "local_models", "Local models are ready")).toBe(true);
+    expect(shouldShowProvisioningStatus(null, "pyannote", "Local models are ready")).toBe(false);
     expect(formatProvisioningFailureMessage("Checksum mismatch", true)).toContain("previous installation is still available");
   });
   it("times out a run that never emits a terminal event", async () => {
@@ -97,7 +99,7 @@ describe("provisioningUi", () => {
     vi.useRealTimers();
   });
 
-  it("captures an immediate terminal error without an unhandled rejection", async () => {
+  it("surfaces a terminal error even when the start call never settles", async () => {
     vi.useFakeTimers();
     let onStatus: ((event: { state: string; message: string }) => void) | undefined;
     const run = runProvisioningAndRefresh({
@@ -105,10 +107,9 @@ describe("provisioningUi", () => {
         onStatus = listener;
         return vi.fn();
       }),
-      starter: vi.fn(async () => {
+      starter: vi.fn(() => {
         onStatus?.({ state: "error", message: "early native error" });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        return { started: true };
+        return new Promise<{ started: boolean }>(() => undefined);
       }),
       refresh: vi.fn().mockResolvedValue(undefined),
       timeoutMs: 5_000,
@@ -117,7 +118,6 @@ describe("provisioningUi", () => {
       failureMessage: "failed",
     });
     const rejection = expect(run).rejects.toThrow("early native error");
-    await vi.advanceTimersByTimeAsync(100);
     await rejection;
     vi.useRealTimers();
   });
