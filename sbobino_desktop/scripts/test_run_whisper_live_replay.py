@@ -283,6 +283,7 @@ class FinalizedTranscriptTests(unittest.TestCase):
             binary = root / "fake-whisper"
             binary.write_text(
                 "#!/bin/sh\n"
+                "printf '%s\\n' \"$GGML_METAL_NO_RESIDENCY\" \"$GGML_METAL_SHARED_BUFFERS_DISABLE\" \"$GGML_METAL_CONCURRENCY_DISABLE\" > metal-environment.txt\n"
                 "printf 'SBOBINO_WHISPER_LIVE_PREFLIGHT status=rejected inference_ms=1600.000 budget_ms=720.000 step_ms=1280\\n' 1>&2\n"
                 "exit 8\n",
                 encoding="utf-8",
@@ -303,6 +304,9 @@ class FinalizedTranscriptTests(unittest.TestCase):
                     "--platform", "test",
                     "--expect-preflight-rejection",
                 ],
+                env={**os.environ, "GGML_METAL_NO_RESIDENCY": "0",
+                     "GGML_METAL_SHARED_BUFFERS_DISABLE": "0",
+                     "GGML_METAL_CONCURRENCY_DISABLE": "0"},
                 check=False,
             )
             payload = json.loads(report.read_text(encoding="utf-8"))
@@ -312,6 +316,16 @@ class FinalizedTranscriptTests(unittest.TestCase):
             self.assertEqual(payload["captured_audio_frames"], 0)
             self.assertEqual(payload["saved_audio_frames"], 0)
             self.assertEqual(payload["stdout_transcript"], "")
+
+            self.assertEqual(
+                (run_dir / "metal-environment.txt").read_text().splitlines(),
+                ["1", "1", "1"],
+            )
+            self.assertEqual(payload["profile"]["metal_environment"], {
+                "GGML_METAL_NO_RESIDENCY": "1",
+                "GGML_METAL_SHARED_BUFFERS_DISABLE": "1",
+                "GGML_METAL_CONCURRENCY_DISABLE": "1",
+            })
 
     @unittest.skipIf(os.name == "nt", "POSIX fake executable is used for this contract test")
     def test_allowed_preflight_rejection_accepts_measured_incompatible_device(self):

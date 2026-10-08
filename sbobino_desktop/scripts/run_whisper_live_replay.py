@@ -285,6 +285,13 @@ def main() -> int:
         command.extend(["-ng", "-nfa"])
 
     environment = os.environ.copy()
+    # The desktop startup sets these flags before either engine is initialized.
+    metal_environment = {
+        "GGML_METAL_NO_RESIDENCY": "1",
+        "GGML_METAL_SHARED_BUFFERS_DISABLE": "1",
+        "GGML_METAL_CONCURRENCY_DISABLE": "1",
+    }
+    environment.update(metal_environment)
     environment["SBOBINO_WHISPER_REPLAY_WAV"] = str(args.audio)
     if args.expect_backlog_recovery:
         # Test-only bypass: the recovery proof deliberately reaches capture and
@@ -488,6 +495,7 @@ def main() -> int:
             "max_tokens": 16,
             "coreml_expected": coreml_expected,
             "coreml_loaded": coreml_loaded,
+            "metal_environment": metal_environment,
         },
         "captured_duration_seconds": captured_frames / sample_rate,
         "live_mode": (
