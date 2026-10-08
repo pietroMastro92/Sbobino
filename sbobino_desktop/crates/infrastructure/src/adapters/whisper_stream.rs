@@ -84,6 +84,9 @@ impl WhisperLiveProfile {
     fn for_model(model_filename: &str, device: TranscriptionComputeDevice) -> Self {
         let lower = model_filename.to_ascii_lowercase();
         let large_model = lower.contains("large") || lower.contains("medium");
+        // More context reduced measured word-boundary errors on the certified M3 model.
+        let accelerated_live_model = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && lower == sbobino_domain::whisper_live_model_manifest().filename;
         match device {
             TranscriptionComputeDevice::Cpu => Self {
                 step_ms: 1_280,
@@ -91,7 +94,13 @@ impl WhisperLiveProfile {
             },
             TranscriptionComputeDevice::Gpu | TranscriptionComputeDevice::Auto => Self {
                 step_ms: 1_000,
-                length_ms: if large_model { 4_800 } else { 2_000 },
+                length_ms: if large_model {
+                    4_800
+                } else if accelerated_live_model {
+                    4_000
+                } else {
+                    2_000
+                },
             },
         }
     }
@@ -1135,6 +1144,28 @@ mod tests {
     }
 
     #[test]
+    fn certified_live_model_context_is_scoped_to_apple_silicon_gpu() {
+        let model = sbobino_domain::whisper_live_model_manifest().filename;
+        let expected = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            4_000
+        } else {
+            2_000
+        };
+        for device in [
+            TranscriptionComputeDevice::Auto,
+            TranscriptionComputeDevice::Gpu,
+        ] {
+            let profile = WhisperLiveProfile::for_model(&model, device);
+            assert_eq!(profile.length_ms, expected);
+            assert_eq!(profile.step_ms, 1_000);
+        }
+        assert_eq!(
+            WhisperLiveProfile::for_model(&model, TranscriptionComputeDevice::Cpu).length_ms,
+            2_000
+        );
+    }
+
+    #[test]
     fn language_detection_requires_two_agreeing_windows() {
         let mut state = StreamState::default();
         state.language_detections.push(("it".to_string(), 0.7));
@@ -1231,6 +1262,37 @@ mod tests {
             .terminal_error
             .as_deref()
             .is_some_and(|message| message.contains("status 7")));
+    }
+
+    #[tokio::test]
+    async fn reader_replaces_native_window_previews_before_committing_final() {
+        let state = Arc::new(Mutex::new(StreamState {
+            active_readers: 1,
+            running: true,
+            ..StreamState::default()
+        }));
+        let (mut writer, reader) = duplex(256);
+        let (startup_sender, _receiver) = oneshot::channel();
+        let task = WhisperStreamEngine::spawn_reader_task(
+            state.clone(),
+            reader,
+            Arc::new(|_| {}),
+            None,
+            Arc::new(Mutex::new(Some(startup_sender))),
+        );
+        // Redraw sequence observed in the native four-second-window replay.
+        writer.write_all(
+            b"[Start speaking]\n\x1b[2K\r \x1b[2K\r Well, I don't\x1b[2K\r \x1b[2K\r Well, I don't wish to see it anymore.\x1b[2K\r \x1b[2K\r Well, I don't wish to see it anymore, observe Phoebe.\n"
+        ).await.expect("write native redraws");
+        drop(writer);
+        task.await.expect("reader finishes");
+        let state = state.lock().await;
+        assert_eq!(
+            state.lines,
+            vec!["Well, I don't wish to see it anymore, observe Phoebe."]
+        );
+        assert_eq!(state.segments.len(), 1);
+        assert!(state.preview.is_empty());
     }
 
     #[tokio::test]

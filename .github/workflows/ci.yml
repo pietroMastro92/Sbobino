@@ -180,6 +180,8 @@ jobs:
         run: |
           cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc adapters::whisper_stream::tests::reader_preserves_identical_newline_final_records -- --exact
           cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc adapters::whisper_stream::tests::flush_preview_matching_last_final_does_not_duplicate_it -- --exact
+          cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc adapters::whisper_stream::tests::reader_replaces_native_window_previews_before_committing_final -- --exact
+          cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc adapters::whisper_stream::tests::certified_live_model_context_is_scoped_to_apple_silicon_gpu -- --exact
       - name: Verify Windows credential storage
         run: cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc secure_storage::tests::windows_credential_manager_roundtrip -- --exact
 

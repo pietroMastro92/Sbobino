@@ -9,8 +9,10 @@ import ctypes
 import json
 import math
 import os
+import platform
 import re
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -156,11 +158,16 @@ def captured_wav_paths(run_dir: Path, audio: Path, fixture: Path) -> list[Path]:
     return sorted(path for path in run_dir.glob("*.wav") if path.resolve() not in excluded)
 
 
-def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int, int]:
+def live_command_profile(device: str, available_cpus: int | None, model_filename: str) -> tuple[int, int, int]:
     """Mirror the app's bounded thread count and CPU/GPU live window."""
     threads = max(1, min(8, available_cpus or 1))
     step_ms = 1280 if device == "cpu" else 1000
-    return threads, step_ms, 2000
+    accelerated_live_model = (
+        sys.platform == "darwin" and platform.machine() == "arm64"
+        and model_filename.casefold() == "ggml-tiny-q8_0.bin"
+    )
+    length_ms = 4000 if device == "auto" and accelerated_live_model else 2000
+    return threads, step_ms, length_ms
 
 
 def preview_latency_seconds(step_ms: int, inference_ms: float) -> float:
@@ -273,10 +280,11 @@ def main() -> int:
         sample_rate = handle.getframerate()
         duration = input_frames / sample_rate
     with wave.open(str(args.fixture), "rb") as handle:
-        fixture_duration = handle.getnframes() / handle.getframerate()
+        fixture_frames = handle.getnframes()
+        fixture_sample_rate = handle.getframerate()
     speech_onset = speech_onset_seconds(args.audio)
 
-    threads, step_ms, length_ms = live_command_profile(args.device, os.cpu_count())
+    threads, step_ms, length_ms = live_command_profile(args.device, os.cpu_count(), args.model.name)
     command = [
         str(args.binary), "-m", str(args.model), "-t", str(threads), "--step", str(step_ms),
         "--length", str(length_ms), "--no-fallback", "--save-audio", "-l", "auto",
@@ -399,7 +407,7 @@ def main() -> int:
             invalid_audio.append({"file": path.name, "error": str(error), "header_hex": header.hex(), "size_bytes": size_bytes})
     normalized = unicodedata.normalize("NFKC", output_text).casefold()
     normalized = " ".join(re.findall(r"[^\W\d_]+(?:['’][^\W\d_]+)?", normalized))
-    expected_segments = int(duration // fixture_duration)
+    expected_segments = input_frames * fixture_sample_rate // (fixture_frames * sample_rate)
     observed_segments = count_fixture_utterances(normalized)
     final_summary = final_runtime_summary(stderr, sample_rate)
     preflight = final_preflight_result(stderr)

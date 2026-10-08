@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import wave
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -123,9 +124,24 @@ class FinalizedTranscriptTests(unittest.TestCase):
         self.assertEqual(count_fixture_utterances(transcript), 1)
 
     def test_live_command_profile_matches_cpu_and_auto_runtime_windows(self):
-        self.assertEqual(live_command_profile("cpu", 4), (4, 1280, 2000))
-        self.assertEqual(live_command_profile("auto", 12), (8, 1000, 2000))
-        self.assertEqual(live_command_profile("cpu", None), (1, 1280, 2000))
+        self.assertEqual(live_command_profile("cpu", 4, "ggml-base.bin"), (4, 1280, 2000))
+        self.assertEqual(live_command_profile("auto", 12, "ggml-base.bin"), (8, 1000, 2000))
+        self.assertEqual(live_command_profile("cpu", None, "ggml-base.bin"), (1, 1280, 2000))
+
+    def test_certified_gpu_context_is_scoped_to_apple_silicon(self):
+        for system, machine, expected_length in (
+            ("darwin", "arm64", 4000),
+            ("darwin", "x86_64", 2000),
+            ("win32", "AMD64", 2000),
+            ("linux", "aarch64", 2000),
+        ):
+            with mock.patch("sys.platform", system), mock.patch("platform.machine", return_value=machine):
+                self.assertEqual(
+                    live_command_profile("auto", 12, "ggml-tiny-q8_0.bin"),
+                    (8, 1000, expected_length),
+                )
+                self.assertEqual(live_command_profile("cpu", 4, "ggml-tiny-q8_0.bin"), (4, 1280, 2000))
+                self.assertEqual(live_command_profile("auto", 4, "ggml-base.bin"), (4, 1000, 2000))
 
     def test_preview_latency_uses_the_selected_profile_step(self):
         self.assertAlmostEqual(preview_latency_seconds(1280, 374.0), 1.654)
@@ -201,7 +217,7 @@ class FinalizedTranscriptTests(unittest.TestCase):
                     handle.setnchannels(1)
                     handle.setsampwidth(2)
                     handle.setframerate(16000)
-                    handle.writeframes(b"\x00\x00" * 320)
+                    handle.writeframes(b"\x00\x00" * 118960 * (10 if path == audio else 1))
             model = root / "model.bin"
             model.write_bytes(b"fake")
             report = root / "report.json"
@@ -254,6 +270,7 @@ class FinalizedTranscriptTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 1)
             self.assertEqual(payload["status"], "failed")
             self.assertEqual(payload["dropped_samples"], -1)
+            self.assertEqual(payload["missing_segments"], 10)
             self.assertEqual(payload["exit_code"], 0)
             self.assertFalse(payload["realtime_capable"])
             self.assertEqual(payload["command"][0], str(binary))
