@@ -253,6 +253,7 @@ class FinalizedTranscriptTests(unittest.TestCase):
             self.assertEqual(payload["status"], "failed")
             self.assertEqual(payload["dropped_samples"], -1)
             self.assertEqual(payload["exit_code"], 0)
+            self.assertFalse(payload["realtime_capable"])
             self.assertEqual(payload["command"][0], str(binary))
             self.assertIn("[Start speaking]", payload["stdout_raw"])
             self.assertIn("SBOBINO_WHISPER_LIVE_METRIC", payload["stderr_raw"])

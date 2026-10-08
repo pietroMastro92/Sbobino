@@ -123,7 +123,7 @@ try {
         $evaluateStatus = $LASTEXITCODE
         $evaluated = Get-Content $evaluatedReport -Raw | ConvertFrom-Json
         $evaluated | Add-Member -Force live_mode "realtime"
-        $evaluated | Add-Member -Force realtime_capable $true
+        $evaluated | Add-Member -Force realtime_capable $raw.realtime_capable
         $evaluated | Add-Member -Force preflight_rejected $false
         $evaluated | Add-Member -Force preflight $raw.preflight
         $evaluated | Add-Member -Force requested_duration_seconds $raw.requested_duration_seconds

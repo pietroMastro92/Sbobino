@@ -240,7 +240,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
         macos = ARM_LIVE_SMOKE.read_text(encoding="utf-8")
         self.assertIn('"live_mode": raw.get("live_mode")', macos)
-        self.assertIn('"realtime_capable": raw.get("live_mode") == "realtime"', macos)
+        self.assertIn('"realtime_capable": raw.get("realtime_capable", False)', macos)
         self.assertIn('"commit_sha": sys.argv[12]', macos)
         self.assertIn('"repo_slug": sys.argv[13]', macos)
 

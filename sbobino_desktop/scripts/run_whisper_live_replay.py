@@ -487,6 +487,7 @@ def main() -> int:
             if args.expect_backlog_recovery
             else "realtime"
         ),
+        "realtime_capable": not failures and not (preflight_rejection_mode or args.expect_backlog_recovery),
         "samples": samples,
         "first_preview_seconds": 0.0 if preflight_rejection_mode else (
             max(0.0, first_preview_wall - replay_started_wall - speech_onset)

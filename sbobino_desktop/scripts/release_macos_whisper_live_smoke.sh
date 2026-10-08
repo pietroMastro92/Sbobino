@@ -10,6 +10,7 @@ VERSION=$1
 REPO_SLUG=$2
 REPORT_PATH=$3
 TAG="v$VERSION"
+COMMIT_SHA=$(git rev-parse HEAD)
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sbobino-macos-whisper-live.XXXXXX")
 ASSET_DIR="$RUN_DIR/assets"
@@ -269,7 +270,6 @@ else
 fi
 
 LIB_SHA256=$(shasum -a 256 "$WHISPER_BIN" | awk '{print $1}')
-COMMIT_SHA=$(git rev-parse HEAD)
 python3 - "$EVALUATED_REPORT" "$RAW_REPORT" "$REPORT_PATH" "$INPUT_SHA256" "$MODEL_SHA256" "$LIB_SHA256" "$DEVICE" "$VERSION" "$TAG" "$RECOVERY_REPORT" "$LIVE_DURATION_SECONDS" "$COMMIT_SHA" "$REPO_SLUG" "$ENCODER_SHA256" "$EXPECT_COREML" <<'PY'
 import json
 import os
@@ -301,7 +301,7 @@ evaluated.update({
     "raw_recovery": recovery,
     "version": sys.argv[8],
     "release_tag": sys.argv[9],
-    "evidence_class": "hosted-packaged-engine",
+    "evidence_class": "local-packaged-engine" if os.environ.get("SBOBINO_LIVE_RUNNER", "").startswith("local ") else "hosted-packaged-engine",
     "real_engine": True,
     "real_harness": True,
     "runner": os.environ.get("SBOBINO_LIVE_RUNNER", "github-hosted macos-15"),
@@ -312,7 +312,7 @@ evaluated.update({
     "requested_duration_seconds": raw.get("requested_duration_seconds"),
     "captured_duration_seconds": raw.get("captured_duration_seconds"),
     "live_mode": raw.get("live_mode"),
-    "realtime_capable": raw.get("live_mode") == "realtime",
+    "realtime_capable": raw.get("realtime_capable", False),
     "preflight_rejected": raw.get("preflight_rejected", False),
     "preflight": raw.get("preflight"),
     "profile": raw.get("profile"),
