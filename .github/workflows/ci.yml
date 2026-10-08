@@ -202,7 +202,7 @@ jobs:
           SBOBINO_WHISPER_LIVE_ARCH: x86_64
           SBOBINO_WHISPER_LIVE_DEVICE: auto
           SBOBINO_WHISPER_EXPECT_PREFLIGHT_REJECTION: "1"
-          SBOBINO_WHISPER_LIVE_DURATION_SECONDS: "65"
+          SBOBINO_WHISPER_LIVE_DURATION_SECONDS: "900"
           SBOBINO_LIVE_RUNNER: github-hosted macos-15-intel
         run: ./scripts/release_macos_whisper_live_smoke.sh 2.0.34 "$GITHUB_REPOSITORY" "$PWD/intel-published-runtime-diagnostics.json"
       - uses: actions/upload-artifact@v4
