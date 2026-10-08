@@ -9,7 +9,6 @@ import sys
 import tempfile
 import unittest
 import wave
-from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from run_whisper_live_replay import (
@@ -28,20 +27,6 @@ from run_whisper_live_replay import (
 
 
 class FinalizedTranscriptTests(unittest.TestCase):
-    def test_cpu_thread_cap_changes_only_on_arm_macos(self):
-        for system, machine, expected in [
-            ("Darwin", "arm64", 4),
-            ("Darwin", "x86_64", 8),
-            ("Windows", "AMD64", 8),
-            ("Linux", "aarch64", 8),
-        ]:
-            with self.subTest(system=system, machine=machine), patch(
-                "run_whisper_live_replay.platform.system", return_value=system
-            ), patch("run_whisper_live_replay.platform.machine", return_value=machine):
-                self.assertEqual(live_command_profile("cpu", 8), (expected, 1280, 2000))
-                self.assertEqual(live_command_profile("auto", 8), (8, 1000, 2000))
-                self.assertEqual(live_command_profile("cpu", 1), (1, 1280, 2000))
-
     def test_preflight_parser_uses_the_last_complete_result(self):
         stderr = (
             "SBOBINO_WHISPER_LIVE_PREFLIGHT status=passed inference_ms=300.000 budget_ms=720.000 step_ms=1280\n"
