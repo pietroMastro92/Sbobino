@@ -297,6 +297,8 @@ if recovery.get("failures") or recovery.get("status") != "passed":
     )
     evaluated["status"] = "failed"
 evaluated.update({
+    "raw_run": raw,
+    "raw_recovery": recovery,
     "version": sys.argv[8],
     "release_tag": sys.argv[9],
     "evidence_class": "hosted-packaged-engine",

@@ -517,6 +517,10 @@ def main() -> int:
         "saved_audio_frames": saved_frames,
         "stdout_transcript": output_text,
         "stderr_tail": stderr[-8000:],
+        "stdout_raw": stdout,
+        "stderr_raw": stderr,
+        "command": command,
+        "exit_code": return_code,
         "failures": failures,
     }
     args.report.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

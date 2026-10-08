@@ -171,6 +171,8 @@ try {
     })
     $parent = Split-Path -Parent $ReportPath
     if ($parent) { New-Item -ItemType Directory -Force $parent | Out-Null }
+    $evaluated | Add-Member -Force raw_run $raw
+    $evaluated | Add-Member -Force raw_recovery $recovery
     $evaluated | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $ReportPath
 
     if ($runStatus -ne 0 -or $recoveryStatus -ne 0 -or $evaluateStatus -ne 0 -or $evaluated.status -ne "passed") {
