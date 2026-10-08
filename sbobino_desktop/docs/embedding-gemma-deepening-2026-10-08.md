@@ -104,13 +104,55 @@ Generazione residente: mediana 8,98 s, p95 16,17 s, massimo 25,03 s; 947,2 s tot
 
 Il guadagno tra manuale e Parakeet dipende anche dal formato, ad esempio dalla punteggiatura AMI, e non prova che gli errori ASR aiutino. L'esito pratico è favorevole al recupero semantico e sfavorevole all'idea che ranking, soglia o istruzioni rigide bastino a rendere sicura una risposta generata.
 
-## Cosa conviene portare nella prossima fase
+## Proposta focalizzata su EmbeddingGemma 2 per Sbobino
 
-1. **Ricerca e consultazione prima della generazione.** Userei la ricerca lessicale come base senza pesi aggiuntivi e proverei EmbeddingGemma 2 come download facoltativo per parafrasi e query tra lingue. Può migliorare la scelta dei passaggi da fornire anche ai provider AI già disponibili, senza cambiare il transcript. I risultati devono mostrare il testo salvato e la finestra audio, non una citazione ricopiata dal generatore.
-2. **Gemma 1 Q8 resta la baseline di qualità.** In questa configurazione vince sul primo risultato e sulla latenza delle query; Gemma 2 offre meno pesi, indicizzazione più rapida e meno footprint nel wrapper provato. Gemma 1 Q4 non mostra un vantaggio sufficiente rispetto a Q8: risparmia relativamente poco e perde precisione. Nessuna regola di scelta automatica per hardware è dedotta da un solo Mac.
-3. **La chat richiede una verifica ulteriore.** Il ranking semantico non certifica che il passaggio contenga il dettaglio richiesto. La soglia cosine non risolve l'astensione, e il generatore può etichettare come risposta una citazione vera ma insufficiente. Non introdurrei il generatore 4B come componente sempre residente per questa funzione. Riassunti, decisioni e attività restano elaborati distinti dalla trascrizione letterale; non sono stati valutati da questo test.
+**La funzione da portare per prima è «trova dove si parla di…», con passaggio originale e accesso all'audio.** EmbeddingGemma 2 permette di cercare per significato senza generare una risposta, riscrivere il transcript o caricare un modello generativo aggiuntivo. È un miglioramento della consultazione dopo la trascrizione: non rende l'ASR più preciso o veloce.
 
-Prima di integrare: un binding Rust minimo al runtime scelto, prova nativa completa con gli stessi documenti/prefissi, budget di contesto della chat, aggiornamento dell'indice dopo una modifica del testo, gestione della memoria/cancellazione durante ASR, firma e pacchetto distribuibile. Poi Intel e Windows reali, altre lingue e archivi più grandi. Il successo arm64 non dimostra queste proprietà. Python resta soltanto nello spike; nessuna nuova dipendenza dell'app, API pubblica o selezione dei motori ASR è cambiata.
+Esempio di esperienza: una domanda in spagnolo sui luoghi citati nel talk italiano recupera il passaggio su Silicon Valley e Rovigo/Polesine. Nella funzione proposta, l'interfaccia mostrerebbe il testo salvato e aprirebbe la finestra audio disponibile, così l'utente potrebbe verificare ciò che è stato detto. Questo caso è presente nel test. La funzione non deve mostrare un riassunto inventato come risultato della ricerca.
+
+| Priorità | Funzione | Evidenza e limite |
+|---|---|---|
+| 1 | Ricerca per significato nella registrazione aperta, con estratti e riascolto | Gemma 2 CPU trova il supporto nei primi cinque in 28/28 query positive Parakeet. Prima area da validare nell'app, essendo lo scope principale del benchmark. |
+| 2 | Ricerca nell'archivio completo, rispettando workspace e filtri | 27/28 nei primi cinque sul piccolo archivio Parakeet. Serve una prova su archivi grandi e su domande ambigue tra registrazioni. |
+| 3 | Migliore selezione dei passaggi per la chat esistente | Il probe Parakeet ottiene 8/8 citazioni positive valide, ma 2/8 false risposte su negative. Migliora il contesto; non certifica la risposta del generatore. |
+| Successiva | Passaggi correlati e raggruppamenti tematici suggeriti | Potenziale coerente con il modello, non misurato nello spike. Nessuna classificazione o riorganizzazione automatica dei documenti in questa fase. |
+
+La ricerca esatta resta disponibile per nomi, codici, numeri e frasi letterali. Sul campione italiano BM25 recupera già 11/11 al primo posto: non c'è motivo di eliminare il percorso lessicale. La futura combinazione con il ranking semantico va misurata, senza sommare direttamente punteggi cosine e lessicali con scale diverse. In assenza del modello, o se il runtime fallisce, la ricerca testuale continua a funzionare. Un risultato semanticamente vicino viene presentato come passaggio pertinente, non come prova che contenga ogni dettaglio richiesto.
+
+### Inserimento minimo nei flussi esistenti
+
+La mappatura riguarda il checkout verificato, non codice già implementato:
+
+- **Ricerca:** `apps/desktop/src/App.tsx::filteredArtifacts` oggi applica `includes` a titolo, fonte e transcript dei soli artifact caricati; lo storico iniziale usa `listRecentArtifacts` con limite 40. Per la ricerca completa serve recupero nel backend vicino a `commands/artifacts.rs::list_artifacts`, esposto tramite `src/lib/tauri.ts`. Riutilizzare apertura documento e seek audio esistenti; i risultati devono includere artifact, revisione, fonte testuale, posizione del passaggio e tempi reali quando disponibili. Filtri workspace/tipo ed esclusione degli eliminati precedono la selezione finale dei risultati.
+- **Chat:** `commands/artifacts.rs::build_chat_context_candidates` è il punto del recupero, prima del packing. Conservare il provider e il fallback di `TranscriptEnhancer` esistenti: EmbeddingGemma 2 restituisce vettori e non è un enhancer generativo. Il packing attuale ordina cronologicamente prima di limitare numero e caratteri; può quindi scartare un passaggio prioritario tardivo. La selezione deve rispettare il budget in ordine di rilevanza e poi ordinare temporalmente i passaggi scelti. Il benchmark non ha esercitato questi budget dell'app.
+- **Fonte e citazioni:** `commands/prepared_transcript.rs::effective_transcript` privilegia il testo ottimizzato; `PreparedTranscriptContext::from_artifact` riduce inoltre le ripetizioni nel testo AI. Non usare quel testo trasformato come citazione letterale dell'originale. Riutilizzare il parser della timeline, verificando che segmenti e testo indicizzato appartengano alla stessa versione. Conservare le ripetizioni autentiche; distinguere chiaramente transcript originale e vista ottimizzata. Senza tempi non inventare timestamp; senza audio disponibile non offrire il riascolto.
+- **Persistenza:** `crates/domain/src/artifact.rs::TranscriptArtifact` ha già `revision`; `sqlite_artifact_repository.rs` conserva transcript cifrati e cancellazioni. Usare revisione e hash della fonte per scartare risultati obsoleti, insieme a versione del modello, prefissi e dimensione dei vettori. Una modifica del solo titolo non richiede ricodifica se la fonte dell'embedding resta identica; modifica del testo/timeline la richiede. Non serve un nuovo database vettoriale per il primo prototipo: indice in memoria e confronto locale bastano sul campione. Una cache persistente deve seguire la cifratura dell'archivio, essere ricostruibile e rispettare eliminazione, importazione e cambio workspace.
+- **Download:** riutilizzare manifest, checksum, stati e gestione modelli di `commands/provisioning.rs` e `ModelManagerSheet`. È una capacità facoltativa, caricata quando richiesta; non entra nei modelli obbligatori di `initialSetup.ts` e non blocca la trascrizione. La chat oggi salva testo, senza citazioni strutturate: i risultati di ricerca proposti mostrerebbero estratti originali, ma citazioni cliccabili nella chat richiedono anche DTO, persistenza e UI dedicati.
+
+### Peso e adattamento all'hardware
+
+La configurazione iniziale proposta è **solo encoder testuale 270M, quantizzato, 256 dimensioni**, con LiteRT-LM e binding Rust all'API C fissata alla versione verificata. Il percorso senza Python ha funzionato nello smoke arm64; non è ancora integrato in Tauri. La [model card ufficiale](https://huggingface.co/google/embeddinggemma-2) documenta encoder separati e dimensioni riducibili: per queste funzioni non servono pesi audio o visione. Il supporto dichiarato a oltre 100 lingue resta una proprietà upstream, non una copertura dimostrata dai nostri test.
+
+Sul Mac M3, la query CPU a caldo richiede circa 48 ms nel wrapper dello spike, abbastanza poco rispetto ai secondi della generazione. I pesi sono 164,6 MB; lo smoke nativo CPU registra 176,5 MB di footprint di processo. **Non sono il peso totale dell'app né la RAM end-to-end:** la dylib macOS universale estratta aggiunge 137,8 MB su disco, e il pacchetto finale per architettura deve essere misurato. GPU riduce il tempo di indicizzazione nel wrapper, ma il percorso nativo GPU resta da verificare.
+
+Indicizzare dopo il salvataggio, soltanto le fonti nuove o modificate, con priorità inferiore all'ASR e cancellazione. Un solo engine quando necessario; scaricarlo quando inattivo o sotto pressione di memoria. CPU è il primo percorso da validare per contenere risorse; GPU è un'opzione da misurare per l'indicizzazione. Nessuna soglia automatica di RAM o promessa su vecchie CPU viene dedotta da un solo M3. La ricerca con modello assente deve restare utile; download e caricamento non devono essere richiesti per trascrivere.
+
+Un indice float32 a 256 dimensioni richiede circa 10,24 MB per 10.000 passaggi, esclusi metadati e testo. È una stima del solo indice, non un test di scalabilità. Nessun motore generativo 4B sempre residente è necessario per la ricerca proposta; la chat continua a usare il provider scelto dall'utente.
+
+### Potenzialità da tenere distinte
+
+EmbeddingGemma 2 può aiutare a selezionare il materiale per domande, analisi e riassunti; il contenuto finale viene comunque prodotto da un altro modello o mostrato come estratto. Non corregge parole sentite male, non traduce e non produce da solo attività o decisioni. Riassunti e FAQ già generati non sono prove letterali primarie e devono restare distinti dal transcript.
+
+Clustering, classificazione e ricerca audio sono possibilità future, non risultati di questo test. La documentazione distingue i prefissi per ricerca, domande, classificazione e clustering: non riutilizzare i vettori dello spike come se validassero tutti questi compiti. La ricerca semantica direttamente sull'audio richiederebbe encoder, pesi e corpus dedicati; anche un hit audio non dimostrerebbe una correzione letterale dell'ASR. Non aggiungere questi componenti al primo rilascio.
+
+### Criteri per passare dal potenziale alla release
+
+1. Riprodurre il recupero nativo sugli stessi testi, prefissi e dimensioni, controllando overflow e ranking CPU/GPU; verificare caricamento, cancellazione e chiusura senza Python.
+2. Provare nell'app ricerca e citazioni dopo modifica, ottimizzazione, cancellazione, cambio workspace e importazione; mai mostrare una citazione da un indice obsoleto o da un documento escluso. Verificare ripetizioni, cifre e passaggi privi di timestamp/audio.
+3. Verificare il contesto realmente inviato alla chat, inclusi tutti i budget: il supporto trovato deve arrivare al provider. Citazioni risolte dal testo salvato, non ricopiate dal generatore; dettaglio assente segnalato anche quando il tema è pertinente.
+4. Misurare pacchetto firmato, avvio, memoria e latenza mentre l'ASR lavora, su archivi più grandi e Intel/Windows reali. Confermare il fallback quando modello o runtime non sono disponibili; estendere lingue e domande prima di dichiarare copertura generale.
+
+**Decisione:** EmbeddingGemma 2 merita la prossima fase come ricerca locale facoltativa con estratti verificabili; l'arricchimento della chat segue la verifica del recupero nell'app. Non è dimostrato superiore in ogni metrica alla baseline Gemma 1 Q8, né rende automaticamente affidabile una risposta generata. Questo approfondimento definisce punti di inserimento e criteri di verifica: non introduce dipendenze, API o modifiche alla pipeline ASR.
 
 ## Riproduzione e provenienza
 
