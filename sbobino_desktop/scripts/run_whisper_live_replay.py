@@ -9,6 +9,7 @@ import ctypes
 import json
 import math
 import os
+import platform
 import re
 import subprocess
 import threading
@@ -158,7 +159,8 @@ def captured_wav_paths(run_dir: Path, audio: Path, fixture: Path) -> list[Path]:
 
 def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int, int]:
     """Mirror the app's bounded thread count and CPU/GPU live window."""
-    threads = max(1, min(8, available_cpus or 1))
+    limit = 4 if device == "cpu" and platform.system() == "Darwin" and platform.machine() == "arm64" else 8
+    threads = max(1, min(limit, available_cpus or 1))
     step_ms = 1280 if device == "cpu" else 1000
     return threads, step_ms, 2000
 

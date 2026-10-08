@@ -127,15 +127,23 @@ impl WhisperStreamEngine {
         }
     }
 
-    fn bounded_thread_count(available: usize) -> usize {
-        available.clamp(1, 8)
+    fn bounded_thread_count(available: usize, device: TranscriptionComputeDevice) -> usize {
+        // Eight CPU threads stalled the packaged ARM/CoreML live preflight; four complete it.
+        let limit = if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && device == TranscriptionComputeDevice::Cpu
+        {
+            4
+        } else {
+            8
+        };
+        available.clamp(1, limit)
     }
 
-    fn live_thread_count() -> usize {
+    fn live_thread_count(device: TranscriptionComputeDevice) -> usize {
         let available = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1);
-        Self::bounded_thread_count(available)
+        Self::bounded_thread_count(available, device)
     }
 
     fn child_exit_diagnostic(status: Option<&ExitStatus>) -> String {
@@ -767,7 +775,7 @@ impl WhisperStreamEngine {
         let session_dir = Self::create_session_dir()?;
         let mut command = tokio_background_command(&self.binary_path);
         let profile = WhisperLiveProfile::for_model(model_filename, self.compute_device);
-        let thread_count = Self::live_thread_count();
+        let thread_count = Self::live_thread_count(self.compute_device);
         command
             .kill_on_drop(true)
             .arg("-m")
@@ -1115,9 +1123,39 @@ mod tests {
 
     #[test]
     fn live_threads_are_bounded_to_available_parallelism() {
-        assert_eq!(WhisperStreamEngine::bounded_thread_count(0), 1);
-        assert_eq!(WhisperStreamEngine::bounded_thread_count(4), 4);
-        assert_eq!(WhisperStreamEngine::bounded_thread_count(32), 8);
+        assert_eq!(
+            WhisperStreamEngine::bounded_thread_count(0, TranscriptionComputeDevice::Auto),
+            1
+        );
+        assert_eq!(
+            WhisperStreamEngine::bounded_thread_count(4, TranscriptionComputeDevice::Auto),
+            4
+        );
+        assert_eq!(
+            WhisperStreamEngine::bounded_thread_count(32, TranscriptionComputeDevice::Auto),
+            8
+        );
+    }
+
+    #[test]
+    fn cpu_live_threads_avoid_arm_macos_oversubscription() {
+        let expected = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            4
+        } else {
+            8
+        };
+        assert_eq!(
+            WhisperStreamEngine::bounded_thread_count(8, TranscriptionComputeDevice::Cpu),
+            expected
+        );
+        assert_eq!(
+            WhisperStreamEngine::bounded_thread_count(1, TranscriptionComputeDevice::Cpu),
+            1
+        );
+        assert_eq!(
+            WhisperStreamEngine::bounded_thread_count(8, TranscriptionComputeDevice::Gpu),
+            8
+        );
     }
 
     #[test]
