@@ -250,6 +250,36 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn('root / "lib" / "embedded-dylibs",\n            root / "lib",', readiness)
 
+    def test_intel_torchaudio_selector_handles_conda_records_without_url(self):
+        source = (ROOT / "scripts" / "setup_bundled_pyannote.sh").read_text()
+        selector = source.split("  package_url=$(", 1)[1].split("python3 -c '\n", 1)[1].split("\n')", 1)[0]
+        record = {
+            "subdir": "osx-64",
+            "version": "2.9.1",
+            "build": "cpu_py311fixture_0",
+            "build_number": 0,
+            "depends": ["pytorch >=2.9.1,<2.10.0a0"],
+            "channel": "https://conda.anaconda.org/conda-forge/osx-64",
+            "fn": "torchaudio-fixture.conda",
+        }
+        env = os.environ | {
+            "PYANNOTE_INTEL_TORCH_VERSION": "2.9.1",
+            "PYANNOTE_INTEL_TORCHAUDIO_VERSION": "2.9.1",
+            "PYANNOTE_INTEL_PYTHON_VERSION": "3.11",
+        }
+        for url in (None, "https://example.org/pinned.conda"):
+            candidate = record | ({"url": url} if url else {})
+            result = subprocess.run(
+                ["python3", "-c", selector],
+                input=json.dumps({"torchaudio": [candidate]}),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), url or record["channel"] + "/" + record["fn"])
+
     def test_windows_packagers_do_not_depend_on_deleted_release_assets(self):
         for script in (WINDOWS_RUNTIME_PACKAGER, WINDOWS_PYANNOTE_PACKAGER):
             contents = script.read_text(encoding="utf-8")
