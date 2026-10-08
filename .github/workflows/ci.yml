@@ -176,6 +176,10 @@ jobs:
         run: cargo test --workspace --target x86_64-pc-windows-msvc --no-run
       - name: Run portable Windows tests
         run: cargo test -p sbobino-domain -p sbobino-application -p sbobino-desktop --target x86_64-pc-windows-msvc -- --test-threads=1
+      - name: Verify Windows Live stream record preservation
+        run: |
+          cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc adapters::whisper_stream::tests::reader_preserves_identical_newline_final_records -- --exact
+          cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc adapters::whisper_stream::tests::flush_preview_matching_last_final_does_not_duplicate_it -- --exact
       - name: Verify Windows credential storage
         run: cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc secure_storage::tests::windows_credential_manager_roundtrip -- --exact
 
