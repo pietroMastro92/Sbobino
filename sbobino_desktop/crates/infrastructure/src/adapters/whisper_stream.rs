@@ -288,8 +288,9 @@ impl WhisperStreamEngine {
     }
 
     fn should_skip_line(text: &str) -> bool {
-        const PREFIXES: [&str; 12] = [
+        const PREFIXES: [&str; 13] = [
             "init:",
+            "audio replay:",
             "whisper_init",
             "whisper_context",
             "whisper_model_load:",
@@ -406,7 +407,8 @@ impl WhisperStreamEngine {
 
     fn should_store_diagnostic(text: &str) -> bool {
         let lower = text.to_ascii_lowercase();
-        lower.contains("failed")
+        text.starts_with("audio replay:")
+            || lower.contains("failed")
             || lower.contains("error")
             || lower.contains("capture device")
             || lower.contains("audio device")
@@ -414,7 +416,9 @@ impl WhisperStreamEngine {
     }
 
     fn parse_runtime_metric(text: &str) -> Option<WhisperStreamTelemetry> {
-        if !text.starts_with("SBOBINO_WHISPER_LIVE_METRIC ") {
+        if !text.starts_with("SBOBINO_WHISPER_LIVE_METRIC ")
+            && !text.starts_with("SBOBINO_WHISPER_LIVE_METRICS ")
+        {
             return None;
         }
         let value = |key: &str| {
@@ -513,6 +517,7 @@ impl WhisperStreamEngine {
             let mut reader = BufReader::new(reader);
             let mut pending = Vec::<u8>::new();
             let mut buffer = [0_u8; 2048];
+            let mut redraw_pending = false;
 
             let process_record = |raw_line: String,
                                   shared_state: Arc<Mutex<StreamState>>,
@@ -536,7 +541,10 @@ impl WhisperStreamEngine {
                     state.captured_seconds = state.captured_seconds.max(metric.captured_seconds);
                     state.processed_seconds = state.processed_seconds.max(metric.processed_seconds);
                     state.backlog_seconds = metric.backlog_seconds.max(0.0);
-                    state.last_inference_ms = metric.inference_ms;
+                    state.last_inference_ms = metric.inference_ms.or(state.last_inference_ms);
+                    if cleaned.starts_with("SBOBINO_WHISPER_LIVE_METRICS ") {
+                        state.diagnostics.push(cleaned);
+                    }
                     let mut metric = metric;
                     metric.first_preview_ms = state.first_preview_ms;
                     Self::emit_telemetry(telemetry_sink.as_ref(), metric);
@@ -673,6 +681,9 @@ impl WhisperStreamEngine {
                                 continue;
                             }
 
+                            let redraw_marker = pending[record_start..index]
+                                .windows(4)
+                                .any(|bytes| bytes == b"\x1b[2K" || bytes == b"[2K]");
                             if index > record_start {
                                 let raw_line =
                                     String::from_utf8_lossy(&pending[record_start..index])
@@ -687,12 +698,26 @@ impl WhisperStreamEngine {
                                 .await;
                             }
 
+                            redraw_pending = byte == b'\r' && redraw_marker;
                             record_start = index + 1;
                             separators_consumed = record_start;
                         }
 
                         if separators_consumed > 0 {
                             pending.drain(0..separators_consumed);
+                        }
+                        // Native redraw text is flushed without a trailing delimiter.
+                        if redraw_pending && !pending.is_empty() && !pending.contains(&0x1b) {
+                            if let Ok(text) = std::str::from_utf8(&pending) {
+                                process_record(
+                                    format!("\u{001b}[2K{text}"),
+                                    shared_state.clone(),
+                                    emit_delta.clone(),
+                                    telemetry_sink.clone(),
+                                    startup_signal.clone(),
+                                )
+                                .await;
+                            }
                         }
                     }
                     Err(_) => break,
@@ -1262,6 +1287,90 @@ mod tests {
             .terminal_error
             .as_deref()
             .is_some_and(|message| message.contains("status 7")));
+    }
+
+    #[tokio::test]
+    async fn reader_emits_redraw_preview_without_waiting_for_next_record() {
+        let state = Arc::new(Mutex::new(StreamState {
+            active_readers: 1,
+            running: true,
+            ..StreamState::default()
+        }));
+        let (mut writer, reader) = duplex(256);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (startup_sender, _startup_receiver) = oneshot::channel();
+        let task = WhisperStreamEngine::spawn_reader_task(
+            state.clone(),
+            reader,
+            Arc::new(move |delta| {
+                let _ = sender.send(delta);
+            }),
+            None,
+            Arc::new(Mutex::new(Some(startup_sender))),
+        );
+        writer
+            .write_all(b"[Start speaking]\n\x1b[2K\r Bonjour")
+            .await
+            .unwrap();
+        let preview = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("preview must arrive before the next redraw")
+            .unwrap();
+        assert!(matches!(preview.kind, RealtimeDeltaKind::UpdatePreview));
+        assert_eq!(preview.text, "Bonjour");
+        assert!(state.lock().await.lines.is_empty());
+        // A split UTF-8 character must not become a replacement character in the UI.
+        writer.write_all(b" \xc3").await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+        writer.write_all(b"\xa9").await.unwrap();
+        let preview = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.text, "Bonjour é");
+        writer.write_all(b"\x1b[").await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+        writer.write_all(b"2K\r Bonjour \xc3\xa9\n").await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        let state = state.lock().await;
+        assert_eq!(state.lines, vec!["Bonjour é"]);
+        assert_eq!(state.segments.len(), 1);
+        assert!(state.preview.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reader_keeps_native_replay_and_summary_diagnostics_out_of_transcript() {
+        let state = Arc::new(Mutex::new(StreamState {
+            active_readers: 1,
+            running: true,
+            ..StreamState::default()
+        }));
+        let (mut writer, reader) = duplex(512);
+        let (startup_sender, _receiver) = oneshot::channel();
+        let task = WhisperStreamEngine::spawn_reader_task(
+            state.clone(),
+            reader,
+            Arc::new(|_| {}),
+            None,
+            Arc::new(Mutex::new(Some(startup_sender))),
+        );
+        writer.write_all(b"audio replay: streaming '/test/speech.wav' at 16000 Hz\n[Start speaking]\nActual speech.\nSBOBINO_WHISPER_LIVE_METRICS captured_seconds=89.220 processed_seconds=89.220 backlog_seconds=0.000 dropped_samples=0\n").await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        let state = state.lock().await;
+        assert_eq!(state.lines, vec!["Actual speech."]);
+        assert_eq!(state.segments.len(), 1);
+        assert_eq!(state.diagnostics.len(), 2);
+        assert_eq!(state.captured_seconds, 89.220);
     }
 
     #[tokio::test]
