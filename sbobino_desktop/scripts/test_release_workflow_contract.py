@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
 import json
+import hashlib
+import re
+import textwrap
+from unittest.mock import patch
 import pathlib
 import os
 import subprocess
@@ -26,6 +30,56 @@ DISPATCHER = ROOT / "scripts" / "dispatch_release_candidate.sh"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_verification_installers_only_upload_current_snapshot(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-packages.yml").read_text()
+        for expected in ("contents: read", "ref: ${{ github.sha }}", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", '"createUpdaterArtifacts": False', "--no-sign --ci", "actions/upload-artifact@v4"):
+            self.assertIn(expected, workflow)
+        for forbidden in ("secrets.", "gh release create", "git push"):
+            self.assertNotIn(forbidden, workflow)
+        blocks = re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)
+        self.assertEqual(len(blocks), 3)
+        for block in blocks:
+            compile(textwrap.dedent(block), "verification-packages.yml", "exec")
+
+    def test_verification_manifest_hashes_files_and_excludes_untracked_sources(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-packages.yml").read_text()
+        code = textwrap.dedent(re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)[-1])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            target = "aarch64-apple-darwin"
+            frontend = root / "sbobino_desktop/apps/desktop/dist"
+            release = root / "sbobino_desktop/target" / target / "release"
+            app = release / "bundle/macos/Sbobino.app"
+            config = root / "sbobino_desktop/apps/desktop/src-tauri"
+            output = root / "runner/verification-output"
+            runtime_dir = root / "runner/runtime-input"
+            for directory in (frontend, app, config, output, runtime_dir):
+                directory.mkdir(parents=True, exist_ok=True)
+            (root / "source.rs").write_bytes(b"source")
+            (root / "untracked-private.txt").write_bytes(b"exclude")
+            (frontend / "index.html").write_bytes(b"frontend")
+            (app / "binary").write_bytes(b"actual app")
+            (output / "installer.dmg").write_bytes(b"actual installer")
+            (config / "verification-build.json").write_text(json.dumps({"app_commit_sha": "tested-sha", "runtime_commit_sha": "older-runtime-sha"}))
+            with zipfile.ZipFile(runtime_dir / "runtime.zip", "w") as archive:
+                archive.writestr("runtime/bin/whisper-stream", b"actual runtime")
+            def command(args, **kwargs):
+                return b"source.rs\0" if args[0] == "git" else "rustc test"
+            previous = pathlib.Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(os.environ, {"RUNNER_TEMP": str(root / "runner"), "TARGET": target, "RUNTIME_ASSET": "runtime.zip"}), patch("platform.system", return_value="Darwin"), patch("platform.platform", return_value="test host"), patch("subprocess.check_output", side_effect=command):
+                    exec(compile(code, "verification-manifest", "exec"), {})
+            finally:
+                os.chdir(previous)
+            manifest = json.loads((output / "verification-manifest.json").read_text())
+            self.assertEqual(manifest["source_sha256"], {"source.rs": hashlib.sha256(b"source").hexdigest()})
+            self.assertEqual(manifest["runtime_members_sha256"]["runtime/bin/whisper-stream"], hashlib.sha256(b"actual runtime").hexdigest())
+            self.assertEqual(manifest["artifact_sha256"]["installer.dmg"], hashlib.sha256(b"actual installer").hexdigest())
+            self.assertEqual(manifest["functional_ui_validation"], "not performed")
+            self.assertEqual(manifest["app_commit_sha"], "tested-sha")
+            self.assertEqual(manifest["runtime_commit_sha"], "older-runtime-sha")
+
     def test_candidate_validation_is_bound_to_the_requested_tag_revision(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         dispatcher = DISPATCHER.read_text(encoding="utf-8")

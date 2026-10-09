@@ -1,0 +1,184 @@
+name: Verification installers
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/arm-release-readiness-20261003]
+    paths: [.github/workflows/verification-packages.yml]
+
+concurrency:
+  group: verification-installers-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Verification installer (${{ matrix.target }})
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            machine: arm64
+            runtime: speech-runtime-macos-aarch64.zip
+            digest: 5831267413b9edf4e72c1e2303368fbae4c89bf1a53d6f765141c2dccdfe91e0
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            machine: x86_64
+            runtime: speech-runtime-macos-x86_64.zip
+            digest: dd3112dba1b3f16e65d06d2b4e815fe37553223626c5070e36f318953fe86404
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            machine: AMD64
+            runtime: speech-runtime-windows-x86_64.zip
+            digest: 43cc3ea4ae1a4737da3be5cd5494df7319ccad5ec2387cde7d6d1ddcf455497d
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      EXPECTED_MACHINE: ${{ matrix.machine }}
+      RUNTIME_ASSET: ${{ matrix.runtime }}
+      RUNTIME_DIGEST: ${{ matrix.digest }}
+      RUNTIME_SOURCE: 34906f99e4e359d532a185bc8a35e9fc55718377
+      SBOBINO_RELEASE_PROFILE: public
+      CARGO_PROFILE_RELEASE_STRIP: none
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sbobino_desktop/apps/desktop/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+        if: runner.os == 'Windows'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+        if: runner.os == 'macOS'
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: verification-${{ matrix.target }}
+          workspaces: sbobino_desktop -> target
+      - name: Verify snapshot, runner and unchanged runtime sources
+        run: |
+          test "$GITHUB_REF" = refs/heads/codex/arm-release-readiness-20261003
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse 'v2.0.34^{commit}')" = "$RUNTIME_SOURCE"
+          git diff --exit-code "$RUNTIME_SOURCE" HEAD -- sbobino_desktop/scripts/package_macos_runtime_asset.sh sbobino_desktop/scripts/package_windows_runtime_asset.ps1 sbobino_desktop/scripts/patches
+          python -c 'import os, platform; assert platform.machine() == os.environ["EXPECTED_MACHINE"], platform.machine(); print(platform.platform())'
+          rustc --version
+          node --version
+          ./sbobino_desktop/scripts/check_release_versions.sh 2.0.34
+      - name: Prepare verification configuration and provenance
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path("sbobino_desktop/apps/desktop/src-tauri")
+          metadata = {"app_commit_sha": os.environ["GITHUB_SHA"], "mode": "verification-only", "runtime_verification_scope": "speech archive only; Pyannote and models not downloaded by this build", "runtime_release_tag": "v2.0.34", "runtime_commit_sha": os.environ["RUNTIME_SOURCE"], "runtime_asset": os.environ["RUNTIME_ASSET"], "runtime_sha256": os.environ["RUNTIME_DIGEST"], "updater_artifacts_enabled": False}
+          (root / "verification-build.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          overlay = {"bundle": {"createUpdaterArtifacts": False, "resources": ["resources/licenses/NotoSans-OFL.txt", "verification-build.json"]}}
+          (root / "verification-tauri.json").write_text(json.dumps(overlay))
+          Path(os.environ["RUNNER_TEMP"], "verification-output").mkdir()
+          PY
+      - name: Verify immutable managed runtime bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v2.0.34 --repo "$GITHUB_REPOSITORY" --pattern "$RUNTIME_ASSET" --dir "$RUNNER_TEMP/runtime-input"
+          python - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          path = Path(os.environ["RUNNER_TEMP"], "runtime-input", os.environ["RUNTIME_ASSET"])
+          with path.open("rb") as stream:
+              assert hashlib.file_digest(stream, "sha256").hexdigest() == os.environ["RUNTIME_DIGEST"], "runtime checksum mismatch"
+          PY
+      - name: Build current-source app without updater artifacts or production signatures
+        working-directory: sbobino_desktop/apps/desktop
+        run: |
+          set -o pipefail
+          npm ci 2>&1 | tee "$RUNNER_TEMP/verification-output/npm.log"
+          if [[ "$TARGET" == *windows* ]]; then BUNDLE=nsis; else BUNDLE=app; fi
+          npx tauri build --target "$TARGET" --bundles "$BUNDLE" --no-sign --ci --config src-tauri/verification-tauri.json 2>&1 | tee "$RUNNER_TEMP/verification-output/build.log"
+      - name: Seal native macOS app and create verification DMG
+        if: runner.os == 'macOS'
+        run: |
+          set -o pipefail
+          APP="sbobino_desktop/target/$TARGET/release/bundle/macos/Sbobino.app"
+          python sbobino_desktop/scripts/prepare_macos_bundle_scripts.py "$APP"
+          lipo -verify_arch "$EXPECTED_MACHINE" "$APP/Contents/MacOS/sbobino-desktop"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          codesign -dv --verbose=4 "$APP" 2> "$RUNNER_TEMP/verification-output/signature.log"
+          STAGE="$RUNNER_TEMP/dmg-stage"
+          mkdir "$STAGE"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          DMG="$RUNNER_TEMP/verification-output/Sbobino_VERIFY_${GITHUB_SHA:0:7}_${TARGET}.dmg"
+          hdiutil create -volname "Sbobino verification" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+          hdiutil verify "$DMG"
+          MOUNT="$RUNNER_TEMP/dmg-mount"
+          mkdir "$MOUNT"
+          hdiutil attach "$DMG" -nobrowse -mountpoint "$MOUNT"
+          trap 'hdiutil detach "$MOUNT"' EXIT
+          codesign --verify --deep --strict "$MOUNT/Sbobino.app"
+      - name: Stage Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem "sbobino_desktop/target/$env:TARGET/release/bundle/nsis" -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw 'Expected exactly one NSIS installer' }
+          Copy-Item $installers[0].FullName "$env:RUNNER_TEMP/verification-output/Sbobino_VERIFY_$($env:GITHUB_SHA.Substring(0,7))_$($env:TARGET)-setup.exe"
+          Get-AuthenticodeSignature $installers[0].FullName | Format-List | Out-File "$env:RUNNER_TEMP/verification-output/signature.log"
+      - name: Hash actual source, frontend, app, runtime and installer
+        if: success()
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, platform, subprocess, zipfile
+          from pathlib import Path
+          def digest(stream):
+              return hashlib.file_digest(stream, "sha256").hexdigest()
+          def hashes(paths, root):
+              result = {}
+              for path in paths:
+                  if path.is_file():
+                      with path.open("rb") as stream:
+                          result[str(path.relative_to(root))] = digest(stream)
+              return result
+          root = Path.cwd()
+          output = Path(os.environ["RUNNER_TEMP"], "verification-output")
+          frontend = root / "sbobino_desktop/apps/desktop/dist"
+          release = root / "sbobino_desktop/target" / os.environ["TARGET"] / "release"
+          app = release / "bundle/macos/Sbobino.app" if platform.system() == "Darwin" else release / "sbobino-desktop.exe"
+          assert app.exists(), app
+          files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          runtime = Path(os.environ["RUNNER_TEMP"], "runtime-input", os.environ["RUNTIME_ASSET"])
+          with zipfile.ZipFile(runtime) as archive:
+              members = {name: digest(archive.open(name)) for name in archive.namelist() if not name.endswith("/")}
+          metadata = json.loads((root / "sbobino_desktop/apps/desktop/src-tauri/verification-build.json").read_text())
+          metadata.update({"runner": platform.platform(), "machine": platform.machine(), "target": os.environ["TARGET"], "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(), "source_sha256": hashes([root / name for name in files if name], root), "frontend_sha256": hashes(frontend.rglob("*"), frontend), "app_sha256": hashes(app.rglob("*") if app.is_dir() else [app], release), "runtime_members_sha256": members, "artifact_sha256": hashes(output.iterdir(), output), "signing": "ad-hoc, not notarized" if platform.system() == "Darwin" else "no production signature requested", "functional_ui_validation": "not performed"})
+          (output / "verification-manifest.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ runner.temp }}/verification-output/*
+          if-no-files-found: error
+          retention-days: 14
