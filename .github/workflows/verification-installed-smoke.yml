@@ -29,8 +29,8 @@ jobs:
         shell: bash
     env:
       GH_TOKEN: ${{ github.token }}
-      PACKAGE_RUN: '38032737216'
-      PACKAGE_SHA: b773331d3b308f3dbecb489dbfc5942fe503fafd
+      PACKAGE_RUN: '38070301111'
+      PACKAGE_SHA: 864ba4ddcbbfaa3599abca68d5deff67b6503ba4
       TARGET: ${{ matrix.target }}
       EXPECTED_MACHINE: ${{ matrix.machine }}
       SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS: '1'
