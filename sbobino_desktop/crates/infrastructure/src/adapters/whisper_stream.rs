@@ -307,7 +307,10 @@ impl WhisperStreamEngine {
         PREFIXES.iter().any(|prefix| text.starts_with(prefix))
             || matches!(
                 text,
-                "[Start speaking]" | "[Start speaking...]" | "[BLANK_AUDIO]"
+                "[Start speaking]"
+                    | "[Start speaking...]"
+                    | "[BLANK_AUDIO]"
+                    | "pause: already paused!"
             )
     }
 
@@ -408,6 +411,7 @@ impl WhisperStreamEngine {
     fn should_store_diagnostic(text: &str) -> bool {
         let lower = text.to_ascii_lowercase();
         text.starts_with("audio replay:")
+            || text == "pause: already paused!"
             || lower.contains("failed")
             || lower.contains("error")
             || lower.contains("capture device")
@@ -1371,6 +1375,37 @@ mod tests {
         assert_eq!(state.segments.len(), 1);
         assert_eq!(state.diagnostics.len(), 2);
         assert_eq!(state.captured_seconds, 89.220);
+    }
+
+    #[tokio::test]
+    async fn reader_preserves_stop_diagnostic_without_polluting_transcript() {
+        let state = Arc::new(Mutex::new(StreamState {
+            active_readers: 1,
+            running: true,
+            ..StreamState::default()
+        }));
+        let (mut writer, reader) = duplex(512);
+        let (startup_sender, _receiver) = oneshot::channel();
+        let task = WhisperStreamEngine::spawn_reader_task(
+            state.clone(),
+            reader,
+            Arc::new(|_| {}),
+            None,
+            Arc::new(Mutex::new(Some(startup_sender))),
+        );
+        writer.write_all(b"Actual speech.\npause: already paused!\npause: already paused!\npause: a spoken instruction.\n").await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        let state = state.lock().await;
+        assert_eq!(
+            state.lines,
+            vec!["Actual speech.", "pause: a spoken instruction."]
+        );
+        assert_eq!(
+            state.diagnostics,
+            vec!["pause: already paused!", "pause: already paused!"]
+        );
+        assert_eq!(state.segments.len(), 2);
     }
 
     #[tokio::test]
