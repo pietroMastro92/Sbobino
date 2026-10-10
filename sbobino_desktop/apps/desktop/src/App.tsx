@@ -162,6 +162,7 @@ import {
   getRuntimeToolchainFailureMessage,
   getInitialSetupMissingModels,
   isInitialSetupComplete,
+  inferInitialSetupReasonCode,
   isRuntimeToolchainReady,
   isProvisionedModelReady,
   shouldBlockMainUiDuringStartup,
@@ -4828,7 +4829,10 @@ export function App({
     if (
       !startupRequirementsLoaded ||
       initialSetupRunning ||
-      initialSetupReady
+      (initialSetupReady && canWarmStartFromSetupReport(
+        privacyPolicyAccepted,
+        initialSetupReportRef.current,
+      ))
     ) {
       return;
     }
@@ -7529,28 +7533,6 @@ export function App({
     );
   }
 
-  function inferInitialSetupReasonCode(
-    snapshot: StartupRequirementsSnapshot | null,
-  ): string {
-    if (!snapshot) {
-      return "setup_incomplete";
-    }
-    if (!isRuntimeToolchainReady(snapshot.runtimeHealth)) {
-      return "runtime_repair_required";
-    }
-    if (
-      getInitialSetupMissingModels(
-        snapshot.modelCatalog,
-        snapshot.runtimeHealth.is_apple_silicon,
-        snapshot.runtimeHealth.configured_engine,
-      ).length > 0
-    ) {
-      return "models_missing";
-    }
-    return snapshot.runtimeHealth.setup_complete
-      ? "setup_complete"
-      : "setup_incomplete";
-  }
 
   async function maybeStartPyannoteBackgroundAction(
     trigger: PyannoteBackgroundActionTrigger,
@@ -7967,7 +7949,7 @@ export function App({
           ),
         );
       }
-      if (!snapshot.runtimeHealth.setup_complete) {
+      if (!isInitialSetupComplete(privacyPolicyAccepted, snapshot.runtimeHealth, snapshot.modelCatalog)) {
         throw new Error(
           t(
             "setup.firstLaunch.assetsStillMissing",
@@ -7984,8 +7966,8 @@ export function App({
       );
       await persistInitialSetupReport((current) => ({
         ...current,
-        setup_complete: snapshot?.runtimeHealth.setup_complete ?? false,
-        final_reason_code: inferInitialSetupReasonCode(snapshot),
+        setup_complete: true,
+        final_reason_code: inferInitialSetupReasonCode(snapshot, privacyPolicyAccepted),
         final_error: null,
         runtime_health: snapshot?.runtimeHealth ?? null,
         updated_at: new Date().toISOString(),
@@ -8016,7 +7998,7 @@ export function App({
       await persistInitialSetupReport((current) => ({
         ...current,
         setup_complete: false,
-        final_reason_code: inferInitialSetupReasonCode(snapshot),
+        final_reason_code: inferInitialSetupReasonCode(snapshot, privacyPolicyAccepted),
         final_error: finalError,
         runtime_health: snapshot?.runtimeHealth ?? current.runtime_health,
         updated_at: new Date().toISOString(),

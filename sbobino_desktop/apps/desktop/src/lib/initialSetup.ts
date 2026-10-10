@@ -152,6 +152,31 @@ export function isInitialSetupComplete(
   return runtimeReady && pyannoteReady && modelsReady;
 }
 
+export function inferInitialSetupReasonCode(
+  snapshot: {
+    runtimeHealth: RuntimeHealth;
+    modelCatalog: ProvisioningModelCatalogEntry[];
+  } | null,
+  privacyAccepted: boolean,
+): string {
+  if (!snapshot) {
+    return "setup_incomplete";
+  }
+  if (!isRuntimeToolchainReady(snapshot.runtimeHealth)) {
+    return "runtime_repair_required";
+  }
+  if (getInitialSetupMissingModels(
+    snapshot.modelCatalog,
+    snapshot.runtimeHealth.is_apple_silicon,
+    snapshot.runtimeHealth.configured_engine,
+  ).length > 0) {
+    return "models_missing";
+  }
+  return isInitialSetupComplete(privacyAccepted, snapshot.runtimeHealth, snapshot.modelCatalog)
+    ? "setup_complete"
+    : "setup_incomplete";
+}
+
 export function canWarmStartFromSetupReport(
   privacyAccepted: boolean,
   report: InitialSetupReport | null | undefined,

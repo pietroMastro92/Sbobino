@@ -4,6 +4,7 @@ import type { ProvisioningModelCatalogEntry, RuntimeHealth } from "../types";
 import {
   canWarmStartFromSetupReport,
   getInitialSetupMissingModels,
+  inferInitialSetupReasonCode,
   isInitialSetupComplete,
   shouldBlockMainUiDuringStartup,
   getRuntimeToolchainFailureMessage,
@@ -330,6 +331,86 @@ describe("initialSetup helpers", () => {
         steps: [],
         updated_at: new Date().toISOString(),
         trusted_for_fast_start: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("uses required setup invariants when the persisted health flag is stale", () => {
+    const runtimeHealth = createRuntimeHealthFixture();
+    runtimeHealth.setup_complete = false;
+    runtimeHealth.missing_models = ["ggml-tiny.bin", "ggml-small.bin", "ggml-medium.bin"];
+    runtimeHealth.missing_encoders = ["ggml-tiny-encoder.mlmodelc"];
+    runtimeHealth.pyannote.ready = false;
+    const modelCatalog = createModelCatalogFixture();
+    const snapshot = { runtimeHealth, modelCatalog };
+    const setupComplete = isInitialSetupComplete(
+      true,
+      runtimeHealth,
+      modelCatalog,
+    );
+    const report = {
+      build_version: runtimeHealth.app_version,
+      privacy_accepted: true,
+      setup_complete: setupComplete,
+      final_reason_code: inferInitialSetupReasonCode(snapshot, true),
+      final_error: null,
+      runtime_health: runtimeHealth,
+      steps: [],
+      updated_at: new Date().toISOString(),
+      trusted_for_fast_start: true,
+    };
+
+    expect(setupComplete).toBe(true);
+    expect(report.final_reason_code).toBe("setup_complete");
+    expect(canWarmStartFromSetupReport(true, report)).toBe(true);
+    expect(isInitialSetupComplete(false, runtimeHealth, modelCatalog)).toBe(
+      false,
+    );
+    expect(canWarmStartFromSetupReport(false, report)).toBe(false);
+
+    const missingBaseCoreml = modelCatalog.map((entry) =>
+      entry.key === "base" ? { ...entry, coreml_installed: false } : entry,
+    );
+    expect(isInitialSetupComplete(true, runtimeHealth, missingBaseCoreml)).toBe(
+      false,
+    );
+    const missingModelsReason = inferInitialSetupReasonCode(
+      { runtimeHealth, modelCatalog: missingBaseCoreml },
+      true,
+    );
+    expect(missingModelsReason).toBe("models_missing");
+    expect(
+      canWarmStartFromSetupReport(true, {
+        ...report,
+        setup_complete: false,
+        final_reason_code: missingModelsReason,
+      }),
+    ).toBe(false);
+
+    const missingWhisperRuntime: RuntimeHealth = {
+      ...runtimeHealth,
+      whisper_cli_available: false,
+      managed_runtime: {
+        ...runtimeHealth.managed_runtime,
+        whisper_cli: {
+          ...runtimeHealth.managed_runtime.whisper_cli,
+          available: false,
+        },
+      },
+    };
+    expect(
+      isInitialSetupComplete(true, missingWhisperRuntime, modelCatalog),
+    ).toBe(false);
+    const missingRuntimeReason = inferInitialSetupReasonCode(
+      { runtimeHealth: missingWhisperRuntime, modelCatalog },
+      true,
+    );
+    expect(missingRuntimeReason).toBe("runtime_repair_required");
+    expect(
+      canWarmStartFromSetupReport(true, {
+        ...report,
+        setup_complete: false,
+        final_reason_code: missingRuntimeReason,
       }),
     ).toBe(false);
   });
