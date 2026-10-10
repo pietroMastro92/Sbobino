@@ -193,6 +193,7 @@ export function canWarmStartFromSetupReport(
 
   return (
     report.setup_complete &&
+    report.runtime_health?.setup_complete === true &&
     !report.final_error &&
     report.final_reason_code === "setup_complete"
   );

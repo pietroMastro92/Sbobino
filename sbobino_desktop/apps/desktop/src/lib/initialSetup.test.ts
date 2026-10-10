@@ -382,7 +382,7 @@ describe("initialSetup helpers", () => {
 
     expect(setupComplete).toBe(true);
     expect(report.final_reason_code).toBe("setup_complete");
-    expect(canWarmStartFromSetupReport(true, report)).toBe(true);
+    expect(canWarmStartFromSetupReport(true, report)).toBe(false);
     expect(isInitialSetupComplete(false, runtimeHealth, modelCatalog)).toBe(
       false,
     );
