@@ -98,4 +98,25 @@ describe("RenameDialog", () => {
     expect(document.activeElement).toBe(opener);
     opener.remove();
   });
+  it("focuses the history row before restoring its hidden action", () => {
+    const row = document.createElement("article");
+    row.className = "history-item";
+    const main = document.createElement("button");
+    main.className = "history-main";
+    const opener = document.createElement("button");
+    row.append(main, opener);
+    document.body.append(row);
+    const focused: HTMLElement[] = [];
+    main.addEventListener("focus", () => focused.push(main));
+    opener.addEventListener("focus", () => focused.push(opener));
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 0;
+    });
+    restoreRenameFocus(opener);
+    expect(focused).toEqual([main, opener]);
+    expect(document.activeElement).toBe(opener);
+    row.remove();
+  });
+
 });

@@ -3104,6 +3104,8 @@ export function restoreRenameFocus(opener: HTMLElement | null): void {
   if (!opener?.isConnected) return;
   window.requestAnimationFrame(() => {
     if (opener.isConnected) {
+      // Reveal hover-only history actions before focusing their opener.
+      opener.closest(".history-item")?.querySelector<HTMLButtonElement>(".history-main")?.focus();
       opener.focus();
     }
   });
