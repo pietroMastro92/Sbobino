@@ -81,6 +81,25 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.assertEqual(manifest["app_commit_sha"], "tested-sha")
             self.assertEqual(manifest["runtime_commit_sha"], "older-runtime-sha")
 
+    def test_installed_smoke_rejects_corrupted_package(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-installed-smoke.yml").read_text()
+        blocks = re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)
+        for block in blocks:
+            compile(textwrap.dedent(block), "installed-smoke", "exec")
+        for forbidden in ("secrets.", "gh release create", "git push"):
+            self.assertNotIn(forbidden, workflow)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "installed-proof/package"
+            root.mkdir(parents=True)
+            (root / "installer.dmg").write_bytes(b"installer")
+            manifest = {"app_commit_sha": "sha", "target": "target", "artifact_sha256": {"installer.dmg": hashlib.sha256(b"installer").hexdigest()}}
+            (root / "verification-manifest.json").write_text(json.dumps(manifest))
+            with patch.dict(os.environ, {"RUNNER_TEMP": temporary, "PACKAGE_SHA": "sha", "TARGET": "target", "EXPECTED_MACHINE": "arm64"}), patch("platform.machine", return_value="arm64"):
+                exec(compile(textwrap.dedent(blocks[0]), "installed-smoke", "exec"), {})
+                (root / "installer.dmg").write_bytes(b"tampered")
+                with self.assertRaises(AssertionError):
+                    exec(compile(textwrap.dedent(blocks[0]), "installed-smoke", "exec"), {})
+
     def test_candidate_validation_is_bound_to_the_requested_tag_revision(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         dispatcher = DISPATCHER.read_text(encoding="utf-8")
