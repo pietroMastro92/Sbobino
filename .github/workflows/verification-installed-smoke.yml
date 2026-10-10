@@ -123,7 +123,11 @@ jobs:
           $apps = @(Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter 'sbobino-desktop.exe' -ErrorAction SilentlyContinue)
           if ($apps.Count -ne 1) { throw 'Expected one installed app' }
           $manifest = Get-Content "$root/package/verification-manifest.json" -Raw | ConvertFrom-Json
-          if ((Get-FileHash $apps[0].FullName -Algorithm SHA256).Hash.ToLower() -ne $manifest.app_sha256.'sbobino-desktop.exe') { throw 'Installed binary hash mismatch' }
+          $actual = (Get-FileHash $apps[0].FullName -Algorithm SHA256).Hash.ToLower()
+          $expected = $manifest.app_sha256.'sbobino-desktop.exe'
+          @{ path = $apps[0].FullName; actual_sha256 = $actual; expected_sha256 = $expected; version = $apps[0].VersionInfo.FileVersion; signature = (Get-AuthenticodeSignature $apps[0].FullName).Status.ToString() } | ConvertTo-Json | Tee-Object "$root/installed-binary-identity.json"
+          Copy-Item $apps[0].FullName "$root/installed-binary.exe"
+          if ($actual -ne $expected) { throw 'Installed binary hash mismatch' }
           $apps[0].FullName | Out-File "$root/installed-path.txt"
           ./sbobino_desktop/scripts/windows_gui_smoke.ps1 -AppPath $apps[0].FullName -HarnessPath "$root/helper/windows_background_process_smoke.exe" -SpeechRuntimeZip "$root/speech-runtime-windows-x86_64.zip" -PyannoteRuntimeZip "$root/pyannote-runtime-windows-x86_64.zip" -ReportPath "$root/windows-gui-smoke-report.json"
       - uses: actions/upload-artifact@v4
@@ -135,5 +139,6 @@ jobs:
             ${{ runner.temp }}/installed-proof/*.txt
             ${{ runner.temp }}/installed-proof/*.json
             ${{ runner.temp }}/installed-proof/*.sha256
+            ${{ runner.temp }}/installed-proof/installed-binary.exe
           if-no-files-found: warn
           retention-days: 14
