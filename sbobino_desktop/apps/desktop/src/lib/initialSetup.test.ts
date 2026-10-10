@@ -134,10 +134,30 @@ function createModelCatalogFixture(): ProvisioningModelCatalogEntry[] {
       engine: "parakeet_cpp",
       experimental: false,
     },
+    {
+      key: "tiny",
+      label: "Tiny",
+      model_file: "ggml-tiny.bin",
+      installed: true,
+      coreml_installed: true,
+      engine: "whisper_cpp",
+      experimental: false,
+    },
   ];
 }
 
 describe("initialSetup helpers", () => {
+  it("blocks first-install readiness until the Tiny catalog includes the certified Live assets", () => {
+    const health = createRuntimeHealthFixture();
+    const catalog = createModelCatalogFixture().map((entry) =>
+      entry.key === "tiny" ? { ...entry, installed: false } : entry,
+    );
+    expect(getInitialSetupMissingModels(catalog, true, "whisper_cpp")).toEqual(["tiny"]);
+    expect(isInitialSetupComplete(true, health, catalog)).toBe(false);
+    expect(inferInitialSetupReasonCode({ runtimeHealth: health, modelCatalog: catalog }, true)).toBe("models_missing");
+    expect(getInitialSetupMissingModels(catalog, true, "parakeet_cpp")).toEqual(["tiny"]);
+  });
+
   it("marks version and repair errors as auto-repairable", () => {
     expect(
       shouldRepairPyannoteRuntime({
@@ -338,8 +358,8 @@ describe("initialSetup helpers", () => {
   it("uses required setup invariants when the persisted health flag is stale", () => {
     const runtimeHealth = createRuntimeHealthFixture();
     runtimeHealth.setup_complete = false;
-    runtimeHealth.missing_models = ["ggml-tiny.bin", "ggml-small.bin", "ggml-medium.bin"];
-    runtimeHealth.missing_encoders = ["ggml-tiny-encoder.mlmodelc"];
+    runtimeHealth.missing_models = ["ggml-small.bin", "ggml-medium.bin"];
+    runtimeHealth.missing_encoders = ["ggml-small-encoder.mlmodelc"];
     runtimeHealth.pyannote.ready = false;
     const modelCatalog = createModelCatalogFixture();
     const snapshot = { runtimeHealth, modelCatalog };

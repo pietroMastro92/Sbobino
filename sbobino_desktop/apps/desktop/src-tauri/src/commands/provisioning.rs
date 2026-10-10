@@ -881,6 +881,44 @@ fn coreml_missing_for(models_dir: &Path, dir_name: &str) -> bool {
     !coreml_encoder_is_installed(models_dir, dir_name)
 }
 
+fn model_catalog_entry_is_installed(
+    models_dir: &Path,
+    model_key: &str,
+    model_filename: &str,
+) -> bool {
+    whisper_model_is_installed(models_dir, model_filename)
+        && (model_key != "tiny" || whisper_live_model_is_valid(models_dir))
+}
+
+fn plan_whisper_model_download(
+    models_dir: &Path,
+    model_key: &str,
+    model_filename: &str,
+    encoder_dir: &str,
+    encoder_archive: &str,
+    include_coreml: bool,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut missing_models = Vec::new();
+    if !whisper_model_is_installed(models_dir, model_filename) {
+        missing_models.push(model_filename.to_string());
+    }
+
+    if model_key == "tiny" {
+        let live_model_filename = whisper_live_model_manifest().filename;
+        if !whisper_model_is_installed(models_dir, &live_model_filename) {
+            missing_models.push(live_model_filename);
+        }
+    }
+
+    let missing_encoders = if include_coreml && coreml_missing_for(models_dir, encoder_dir) {
+        vec![(encoder_dir.to_string(), encoder_archive.to_string())]
+    } else {
+        Vec::new()
+    };
+
+    (missing_models, missing_encoders)
+}
+
 #[tauri::command]
 pub async fn provisioning_status(
     state: State<'_, AppState>,
@@ -942,7 +980,7 @@ pub async fn provisioning_models(
                 key: (*key).to_string(),
                 label: (*label).to_string(),
                 model_file: (*model_file).to_string(),
-                installed: whisper_model_is_installed(&models_dir, model_file),
+                installed: model_catalog_entry_is_installed(&models_dir, key, model_file),
                 coreml_installed: coreml_encoder_is_installed(&models_dir, encoder_dir),
                 engine: "whisper_cpp".to_string(),
                 experimental: false,
@@ -1402,15 +1440,14 @@ pub async fn provisioning_download_model(
         ));
     };
 
-    let mut missing_models = Vec::new();
-    if !whisper_model_is_installed(&models_dir, model_file) {
-        missing_models.push((*model_file).to_string());
-    }
-
-    let mut missing_encoders = Vec::new();
-    if include_coreml && coreml_missing_for(&models_dir, encoder_dir) {
-        missing_encoders.push(((*encoder_dir).to_string(), (*encoder_archive).to_string()));
-    }
+    let (missing_models, missing_encoders) = plan_whisper_model_download(
+        &models_dir,
+        &payload.model,
+        model_file,
+        encoder_dir,
+        encoder_archive,
+        include_coreml,
+    );
 
     let total = missing_models.len() + missing_encoders.len();
     if total == 0 {
@@ -4674,6 +4711,67 @@ mod tests {
         assert!(coreml_encoder_is_installed(
             temp.path(),
             "ggml-tiny-encoder.mlmodelc"
+        ));
+    }
+
+    #[test]
+    fn tiny_download_plan_repairs_live_sidecar_and_shared_encoder() {
+        let temp = tempdir().expect("model tempdir should create");
+
+        let (missing_models, missing_encoders) = super::plan_whisper_model_download(
+            temp.path(),
+            "tiny",
+            "ggml-tiny.bin",
+            "ggml-tiny-encoder.mlmodelc",
+            "ggml-tiny-encoder.mlmodelc.zip",
+            true,
+        );
+        assert_eq!(missing_models, ["ggml-tiny.bin", "ggml-tiny-q8_0.bin"]);
+        assert_eq!(
+            missing_encoders,
+            [(
+                "ggml-tiny-encoder.mlmodelc".to_string(),
+                "ggml-tiny-encoder.mlmodelc.zip".to_string()
+            )]
+        );
+
+        std::fs::write(temp.path().join("ggml-tiny.bin"), b"offline-tiny")
+            .expect("offline Tiny model should write");
+        std::fs::write(temp.path().join("ggml-tiny-q8_0.bin"), b"corrupt-live-tiny")
+            .expect("corrupt live Tiny model should write");
+
+        let (missing_models, missing_encoders) = super::plan_whisper_model_download(
+            temp.path(),
+            "tiny",
+            "ggml-tiny.bin",
+            "ggml-tiny-encoder.mlmodelc",
+            "ggml-tiny-encoder.mlmodelc.zip",
+            false,
+        );
+        assert_eq!(missing_models, ["ggml-tiny-q8_0.bin"]);
+        assert!(missing_encoders.is_empty());
+    }
+
+    #[test]
+    fn tiny_catalog_readiness_requires_validated_live_sidecar() {
+        let temp = tempdir().expect("model tempdir should create");
+        std::fs::write(temp.path().join("ggml-tiny.bin"), b"offline-tiny")
+            .expect("offline Tiny model should write");
+        std::fs::write(temp.path().join("ggml-tiny-q8_0.bin"), b"corrupt-live-tiny")
+            .expect("corrupt live Tiny model should write");
+
+        assert!(!super::model_catalog_entry_is_installed(
+            temp.path(),
+            "tiny",
+            "ggml-tiny.bin"
+        ));
+
+        std::fs::write(temp.path().join("ggml-base.bin"), b"base")
+            .expect("Base model should write");
+        assert!(super::model_catalog_entry_is_installed(
+            temp.path(),
+            "base",
+            "ggml-base.bin"
         ));
     }
 

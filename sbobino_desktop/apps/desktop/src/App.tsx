@@ -2629,7 +2629,7 @@ type DetailToolbarProps = {
   speakerDiarizationProgress: number;
   onToggleSidebar: () => void;
   onBack: () => void;
-  onRenameTitle?: () => void;
+  onRenameTitle?: (opener: HTMLElement) => void;
   onSelectMode: (mode: "transcript" | "summary" | "emotion" | "chat") => void;
   onOpenExport: () => void;
   onShowDetailsPanel: () => void;
@@ -2763,7 +2763,7 @@ function DetailToolbar({
           {hasArtifact && onRenameTitle ? (
             <button
               className="icon-button detail-title-rename-button"
-              onClick={onRenameTitle}
+              onClick={(event) => onRenameTitle(event.currentTarget)}
               title={t("rename.title", "Rename transcription")}
               aria-label={t("rename.title", "Rename transcription")}
             >
@@ -3091,6 +3091,112 @@ type AppProps = {
     setupReport: InitialSetupReport | null;
   };
 };
+
+type RenameDialogProps = {
+  draft: string;
+  busy: boolean;
+  onDraftChange: (draft: string) => void;
+  onConfirm: () => void;
+  onClose: () => void;
+};
+
+export function restoreRenameFocus(opener: HTMLElement | null): void {
+  if (!opener?.isConnected) return;
+  window.requestAnimationFrame(() => {
+    if (opener.isConnected) {
+      opener.focus();
+    }
+  });
+}
+
+export function RenameDialog({
+  draft,
+  busy,
+  onDraftChange,
+  onConfirm,
+  onClose,
+}: RenameDialogProps): JSX.Element {
+  const { t } = useTranslation();
+
+  return (
+    <div className="sheet-overlay" role="presentation">
+      <section
+        className="rename-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("rename.title", "Rename transcription")}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!busy) {
+              onClose();
+            }
+            return;
+          }
+
+          if (event.key !== "Tab") return;
+
+          const focusableElements = Array.from(
+            event.currentTarget.querySelectorAll<HTMLElement>(
+              "input:not([disabled]), button:not([disabled])",
+            ),
+          );
+          if (focusableElements.length === 0) return;
+
+          const currentIndex = focusableElements.indexOf(
+            document.activeElement as HTMLElement,
+          );
+          const nextIndex =
+            currentIndex === -1
+              ? event.shiftKey
+                ? focusableElements.length - 1
+                : 0
+              : (currentIndex +
+                  (event.shiftKey ? -1 : 1) +
+                  focusableElements.length) %
+                focusableElements.length;
+
+          event.preventDefault();
+          focusableElements[nextIndex]?.focus();
+        }}
+      >
+        <header className="rename-sheet-head">
+          <h3>{t("rename.title")}</h3>
+        </header>
+        <input
+          className="rename-sheet-input"
+          value={draft}
+          onChange={(event) => onDraftChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              onConfirm();
+            }
+          }}
+          autoFocus
+          placeholder={t("rename.placeholder", "Transcription title")}
+        />
+        <div className="rename-sheet-actions">
+          <button
+            className="secondary-button"
+            onClick={onClose}
+            disabled={busy}
+          >
+            {t("rename.cancel", "Cancel")}
+          </button>
+          <button
+            className="primary-button"
+            onClick={onConfirm}
+            disabled={busy || draft.trim().length === 0}
+          >
+            {busy ? t("rename.saving", "Saving...") : t("rename.save", "Save")}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
 
 export type GroupedArtifact = TranscriptArtifact & {
   children?: GroupedArtifact[];
@@ -3637,6 +3743,7 @@ export function App({
   const transcriptionStartInFlightRef = useRef(false);
   const appCloseDialogOpenRef = useRef(false);
   const appCloseAllowedRef = useRef(false);
+  const renameOpenerRef = useRef<HTMLElement | null>(null);
   const segmentElementMapRef = useRef<Map<number, HTMLElement>>(new Map());
   const windowFrameRef = useRef<HTMLElement | null>(null);
   const detailLayoutRef = useRef<HTMLDivElement | null>(null);
@@ -9699,15 +9806,22 @@ export function App({
     void onClearSpeakerForSegment(segmentContextMenu.sourceIndex);
   }
 
-  function onRenameArtifact(artifact: TranscriptArtifact): void {
+  function onRenameArtifact(
+    artifact: TranscriptArtifact,
+    opener: HTMLElement,
+  ): void {
+    renameOpenerRef.current = opener;
     setRenameTarget(artifact);
     setRenameDraft(artifact.title);
   }
 
-  function closeRenameDialog(): void {
-    if (isRenamingArtifact) return;
+  function closeRenameDialog(options?: { allowWhileBusy?: boolean }): void {
+    if (isRenamingArtifact && !options?.allowWhileBusy) return;
+    const opener = renameOpenerRef.current;
+    renameOpenerRef.current = null;
     setRenameTarget(null);
     setRenameDraft("");
+    restoreRenameFocus(opener);
   }
 
   async function confirmRenameArtifact(): Promise<void> {
@@ -9746,7 +9860,7 @@ export function App({
       }
 
       setError(null);
-      closeRenameDialog();
+      closeRenameDialog({ allowWhileBusy: true });
     } catch (renameError) {
       setError(
         formatUiError("error.renameFailed", "Rename failed", renameError),
@@ -11848,7 +11962,9 @@ export function App({
                 <>
                   <button
                     className="secondary-button history-action-button"
-                    onClick={() => void onRenameArtifact(artifact)}
+                    onClick={(event) =>
+                      onRenameArtifact(artifact, event.currentTarget)
+                    }
                   >
                     <Pencil size={14} />
                     {t("history.rename", "Rename")}
@@ -13827,7 +13943,7 @@ export function App({
             }}
             onRenameTitle={
               activeArtifact
-                ? () => onRenameArtifact(activeArtifact)
+                ? (opener) => onRenameArtifact(activeArtifact, opener)
                 : undefined
             }
             onSelectMode={(mode) => {
@@ -18840,53 +18956,13 @@ export function App({
       </section>
 
       {renameTarget ? (
-        <div className="sheet-overlay" role="presentation">
-          <section
-            className="rename-sheet"
-            role="dialog"
-            aria-modal="true"
-            aria-label={t("rename.title", "Rename transcription")}
-          >
-            <header className="rename-sheet-head">
-              <h3>{t("rename.title")}</h3>
-            </header>
-            <input
-              className="rename-sheet-input"
-              value={renameDraft}
-              onChange={(event) => setRenameDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void confirmRenameArtifact();
-                }
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  closeRenameDialog();
-                }
-              }}
-              autoFocus
-              placeholder={t("rename.placeholder", "Transcription title")}
-            />
-            <div className="rename-sheet-actions">
-              <button
-                className="secondary-button"
-                onClick={closeRenameDialog}
-                disabled={isRenamingArtifact}
-              >
-                {t("rename.cancel", "Cancel")}
-              </button>
-              <button
-                className="primary-button"
-                onClick={() => void confirmRenameArtifact()}
-                disabled={isRenamingArtifact || renameDraft.trim().length === 0}
-              >
-                {isRenamingArtifact
-                  ? t("rename.saving", "Saving...")
-                  : t("rename.save", "Save")}
-              </button>
-            </div>
-          </section>
-        </div>
+        <RenameDialog
+          draft={renameDraft}
+          busy={isRenamingArtifact}
+          onDraftChange={setRenameDraft}
+          onConfirm={() => void confirmRenameArtifact()}
+          onClose={closeRenameDialog}
+        />
       ) : null}
 
       <ModelManagerSheet

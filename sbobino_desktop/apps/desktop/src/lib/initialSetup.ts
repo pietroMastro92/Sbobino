@@ -8,6 +8,7 @@ import type {
 } from "../types";
 
 export const INITIAL_SETUP_REQUIRED_MODELS: SpeechModel[] = [
+  "tiny",
   "base",
   "large_turbo",
 ];
@@ -93,8 +94,9 @@ export function getInitialSetupMissingModels(
   const includeParakeet = !engine || engine === "parakeet_cpp";
 
   const missing: Array<SpeechModel | ParakeetModel> = [];
-  if (includeWhisper) {
-    for (const model of INITIAL_SETUP_REQUIRED_MODELS) {
+  // Live always uses the certified Whisper model, including with Parakeet selected for files.
+  for (const model of INITIAL_SETUP_REQUIRED_MODELS) {
+    if (includeWhisper || model === "tiny") {
       if (
         !isProvisionedModelReady(
           findProvisioningModelEntry(modelCatalog, model),
