@@ -2,12 +2,17 @@ name: Verification installers
 
 on:
   workflow_dispatch:
+    inputs:
+      isolated_ui:
+        description: Build an isolated UI verification variant (not a release installer)
+        type: boolean
+        default: false
   push:
     branches: [codex/arm-release-readiness-20261003]
     paths: [.github/workflows/verification-packages.yml]
 
 concurrency:
-  group: verification-installers-${{ github.ref }}
+  group: verification-installers-${{ github.ref }}-${{ inputs.isolated_ui || false }}
   cancel-in-progress: true
 
 permissions:
@@ -38,6 +43,7 @@ jobs:
             digest: 43cc3ea4ae1a4737da3be5cd5494df7319ccad5ec2387cde7d6d1ddcf455497d
     runs-on: ${{ matrix.runner }}
     env:
+      ISOLATED_UI: ${{ inputs.isolated_ui || false }}
       TARGET: ${{ matrix.target }}
       EXPECTED_MACHINE: ${{ matrix.machine }}
       RUNTIME_ASSET: ${{ matrix.runtime }}
@@ -92,8 +98,15 @@ jobs:
           from pathlib import Path
           root = Path("sbobino_desktop/apps/desktop/src-tauri")
           metadata = {"app_commit_sha": os.environ["GITHUB_SHA"], "mode": "verification-only", "runtime_verification_scope": "speech archive only; Pyannote and models not downloaded by this build", "runtime_release_tag": "v2.0.34", "runtime_commit_sha": os.environ["RUNTIME_SOURCE"], "runtime_asset": os.environ["RUNTIME_ASSET"], "runtime_sha256": os.environ["RUNTIME_DIGEST"], "updater_artifacts_enabled": False}
-          (root / "verification-build.json").write_text(json.dumps(metadata, indent=2) + "\n")
           overlay = {"bundle": {"createUpdaterArtifacts": False, "resources": ["resources/licenses/NotoSans-OFL.txt", "verification-build.json"]}}
+          if os.environ.get("ISOLATED_UI") == "true":
+              windows = json.loads((root / "tauri.conf.json").read_text())["app"]["windows"]
+              for window in windows:
+                  window.update({"incognito": True, "title": "Sbobino — isolated UI verification"})
+              overlay.update({"identifier": "com.sbobino.verification", "app": {"windows": windows}})
+              metadata.update({"mode": "isolated-ui-verification-only", "launch_requires": "SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS=1; isolated synthetic data only"})
+          metadata["verification_config"] = overlay
+          (root / "verification-build.json").write_text(json.dumps(metadata, indent=2) + "\n")
           (root / "verification-tauri.json").write_text(json.dumps(overlay))
           Path(os.environ["RUNNER_TEMP"], "verification-output").mkdir()
           PY
@@ -178,7 +191,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: verification-${{ matrix.target }}-${{ github.sha }}
+          name: verification-${{ inputs.isolated_ui && 'isolated-ui-' || '' }}${{ matrix.target }}-${{ github.sha }}
           path: ${{ runner.temp }}/verification-output/*
           if-no-files-found: error
           retention-days: 14

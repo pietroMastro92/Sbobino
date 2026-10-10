@@ -42,6 +42,33 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         for block in blocks:
             compile(textwrap.dedent(block), "verification-packages.yml", "exec")
 
+    def test_isolated_ui_configuration_separates_data_and_webview(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-packages.yml").read_text()
+        code = textwrap.dedent(re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)[0])
+        base = json.loads((ROOT / "apps/desktop/src-tauri/tauri.conf.json").read_text())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = root / "sbobino_desktop/apps/desktop/src-tauri"
+            config.mkdir(parents=True)
+            (config / "tauri.conf.json").write_text(json.dumps(base))
+            for isolated in ("false", "true"):
+                runner = root / isolated
+                runner.mkdir()
+                env = dict(os.environ, RUNNER_TEMP=str(runner), GITHUB_SHA="app", RUNTIME_SOURCE="runtime", RUNTIME_ASSET="runtime.zip", RUNTIME_DIGEST="digest", ISOLATED_UI=isolated)
+                subprocess.run([sys.executable, "-c", code], cwd=root, env=env, check=True)
+                overlay = json.loads((config / "verification-tauri.json").read_text())
+                metadata = json.loads((config / "verification-build.json").read_text())
+                self.assertEqual(metadata["verification_config"], overlay)
+                self.assertFalse(overlay["bundle"]["createUpdaterArtifacts"])
+                if isolated == "true":
+                    self.assertEqual(overlay["identifier"], "com.sbobino.verification")
+                    expected = dict(base["app"]["windows"][0], incognito=True, title="Sbobino — isolated UI verification")
+                    self.assertEqual(overlay["app"]["windows"][0], expected)
+                    self.assertIn("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS=1", metadata["launch_requires"])
+                else:
+                    self.assertNotIn("identifier", overlay)
+                    self.assertNotIn("app", overlay)
+
     def test_verification_manifest_hashes_files_and_excludes_untracked_sources(self):
         workflow = (ROOT.parent / ".github/workflows/verification-packages.yml").read_text()
         code = textwrap.dedent(re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)[-1])

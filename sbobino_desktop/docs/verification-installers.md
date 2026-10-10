@@ -20,3 +20,11 @@ Usare un utente OS o una VM di test. Il pacchetto mantiene l’identità `com.sb
 Le prove prestazionali richiedono stessa macchina, audio e impostazioni tra baseline e candidato: una prova a freddo, tre a caldo e una lunga. Il WER/CER si calcola soltanto rispetto a riferimenti revisionati.
 
 Su Windows `app_sha256` del manifest di build misura l’eseguibile compilato ripristinato da Tauri dopo il bundling. Tauri CLI 2.10 inserisce nel payload NSIS il marcatore `NSS` al posto di `UNK`: lo smoke registra separatamente l’hash reale installato e controlla che ripristinando soltanto quei tre byte si ottenga esattamente l’hash compilato. Qualsiasi altra differenza o firma inattesa fa fallire il controllo. `verified-installed-binary.json` conserva l’identità effettiva. Gli originali dei due smoke falliti restano disponibili.
+
+## Variante UI isolata
+
+Il workflow `verification-packages.yml` accetta `isolated_ui=true` solo per la verifica interattiva: configura `com.sbobino.verification` e WebKit non persistente, conservando codice e dimensioni della finestra. Il manifest registra l'overlay effettivo e distingue questa variante dai pacchetti destinati alla distribuzione. Non installarla sopra Sbobino personale: copiare l'app in una directory di test su UltraDisk.
+
+Prima dell'avvio creare il profilo `~/Library/Application Support/com.sbobino.verification` collegato a una directory nuova su UltraDisk, verificando che non esista già. Avviare il binario direttamente con `SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS=1`: il backend esistente conserva soltanto segreti sintetici nel profilo di test e non consulta il Keychain personale. Non inserire credenziali personali in questa variante. Cambiare soltanto HOME resta insufficiente. Rimuovere il collegamento di test soltanto dopo la chiusura del processo e la conservazione delle prove.
+
+Questi controlli verificano i flussi dell'identico codice applicativo, ma non sostituiscono firma, notarizzazione, migrazione o installazione del pacchetto con identità di produzione. Pyannote runtime e modello sono già distribuiti negli asset pubblici: una prova offline con il pacchetto integro non richiede un token Hugging Face.
