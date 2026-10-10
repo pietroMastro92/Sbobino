@@ -122,7 +122,7 @@ jobs:
           set -o pipefail
           APP="sbobino_desktop/target/$TARGET/release/bundle/macos/Sbobino.app"
           python sbobino_desktop/scripts/prepare_macos_bundle_scripts.py "$APP"
-          lipo -verify_arch "$EXPECTED_MACHINE" "$APP/Contents/MacOS/sbobino-desktop"
+          lipo "$APP/Contents/MacOS/sbobino-desktop" -verify_arch "$EXPECTED_MACHINE"
           codesign --force --deep --sign - "$APP"
           codesign --verify --deep --strict "$APP"
           codesign -dv --verbose=4 "$APP" 2> "$RUNNER_TEMP/verification-output/signature.log"

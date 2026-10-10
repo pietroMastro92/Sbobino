@@ -36,6 +36,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.assertIn(expected, workflow)
         for forbidden in ("secrets.", "gh release create", "git push"):
             self.assertNotIn(forbidden, workflow)
+        self.assertIn('lipo "$APP/Contents/MacOS/sbobino-desktop" -verify_arch "$EXPECTED_MACHINE"', workflow)
         blocks = re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)
         self.assertEqual(len(blocks), 3)
         for block in blocks:
