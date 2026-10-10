@@ -18,3 +18,5 @@ Usare un utente OS o una VM di test. Il pacchetto mantiene l’identità `com.sb
 6. Restituire log grezzi, manifest, esiti e riferimenti audio revisionati. Distinguere PASS, FAIL e BLOCKED. Installazione o avvio riusciti non certificano questi flussi.
 
 Le prove prestazionali richiedono stessa macchina, audio e impostazioni tra baseline e candidato: una prova a freddo, tre a caldo e una lunga. Il WER/CER si calcola soltanto rispetto a riferimenti revisionati.
+
+Su Windows `app_sha256` del manifest di build misura l’eseguibile compilato ripristinato da Tauri dopo il bundling. Tauri CLI 2.10 inserisce nel payload NSIS il marcatore `NSS` al posto di `UNK`: lo smoke registra separatamente l’hash reale installato e controlla che ripristinando soltanto quei tre byte si ottenga esattamente l’hash compilato. Qualsiasi altra differenza o firma inattesa fa fallire il controllo. `verified-installed-binary.json` conserva l’identità effettiva. Gli originali dei due smoke falliti restano disponibili.

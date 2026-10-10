@@ -100,6 +100,26 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     exec(compile(textwrap.dedent(blocks[0]), "installed-smoke", "exec"), {})
 
+    def test_installed_nsis_marker_verification_rejects_other_binary_changes(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-installed-smoke.yml").read_text()
+        blocks = re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)
+        block = next(block for block in blocks if "compiled = data.replace" in block)
+        code = compile(textwrap.dedent(block), "installed-nsis", "exec")
+        compiled = b"binary-prefix__TAURI_BUNDLE_TYPE_VAR_UNKbinary-suffix"
+        installed = compiled.replace(b"__TAURI_BUNDLE_TYPE_VAR_UNK", b"__TAURI_BUNDLE_TYPE_VAR_NSS")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "installed-proof"
+            root.mkdir()
+            with patch.dict(os.environ, {"RUNNER_TEMP": temporary}):
+                for data in (installed, installed + b"tampered", compiled, installed + installed):
+                    (root / "installed-binary.exe").write_bytes(data)
+                    (root / "installed-binary-identity.json").write_text(json.dumps({"signature": "NotSigned", "actual_sha256": hashlib.sha256(data).hexdigest(), "expected_sha256": hashlib.sha256(compiled).hexdigest()}))
+                    if data == installed:
+                        exec(code, {})
+                    else:
+                        with self.assertRaises(AssertionError):
+                            exec(code, {})
+
     def test_candidate_validation_is_bound_to_the_requested_tag_revision(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         dispatcher = DISPATCHER.read_text(encoding="utf-8")

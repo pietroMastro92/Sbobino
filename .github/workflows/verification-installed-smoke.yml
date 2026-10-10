@@ -127,9 +127,33 @@ jobs:
           $expected = $manifest.app_sha256.'sbobino-desktop.exe'
           @{ path = $apps[0].FullName; actual_sha256 = $actual; expected_sha256 = $expected; version = $apps[0].VersionInfo.FileVersion; signature = (Get-AuthenticodeSignature $apps[0].FullName).Status.ToString() } | ConvertTo-Json | Tee-Object "$root/installed-binary-identity.json"
           Copy-Item $apps[0].FullName "$root/installed-binary.exe"
-          if ($actual -ne $expected) { throw 'Installed binary hash mismatch' }
           $apps[0].FullName | Out-File "$root/installed-path.txt"
-          ./sbobino_desktop/scripts/windows_gui_smoke.ps1 -AppPath $apps[0].FullName -HarnessPath "$root/helper/windows_background_process_smoke.exe" -SpeechRuntimeZip "$root/speech-runtime-windows-x86_64.zip" -PyannoteRuntimeZip "$root/pyannote-runtime-windows-x86_64.zip" -ReportPath "$root/windows-gui-smoke-report.json"
+      - name: Verify exact unsigned NSIS bundle marker transformation
+        if: runner.os == 'Windows'
+        run: |
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'], 'installed-proof')
+          identity = json.loads((root / 'installed-binary-identity.json').read_text())
+          data = (root / 'installed-binary.exe').read_bytes()
+          # shortcut: unsigned Tauri 2.10 NSIS only; extract signed payload when enabling signing.
+          marker = b'__TAURI_BUNDLE_TYPE_VAR_NSS'
+          assert identity['signature'] == 'NotSigned'
+          assert data.count(marker) == 1 and data.count(b'__TAURI_BUNDLE_TYPE_VAR_UNK') == 0
+          assert hashlib.sha256(data).hexdigest() == identity['actual_sha256']
+          compiled = data.replace(marker, b'__TAURI_BUNDLE_TYPE_VAR_UNK', 1)
+          assert hashlib.sha256(compiled).hexdigest() == identity['expected_sha256'], 'Installed bytes differ beyond the NSIS marker'
+          identity['verification'] = 'Exact compiled hash after restoring only Tauri NSIS marker; actual installed SHA retained'
+          (root / 'verified-installed-binary.json').write_text(json.dumps(identity, indent=2))
+          PY
+      - name: Observe installed Windows GUI with existing helper probes
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'installed-proof'
+          $identity = Get-Content "$root/verified-installed-binary.json" -Raw | ConvertFrom-Json
+          ./sbobino_desktop/scripts/windows_gui_smoke.ps1 -AppPath $identity.path -HarnessPath "$root/helper/windows_background_process_smoke.exe" -SpeechRuntimeZip "$root/speech-runtime-windows-x86_64.zip" -PyannoteRuntimeZip "$root/pyannote-runtime-windows-x86_64.zip" -ReportPath "$root/windows-gui-smoke-report.json"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
