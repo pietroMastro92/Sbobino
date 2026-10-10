@@ -1,0 +1,168 @@
+name: Verification installed smoke
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/arm-release-readiness-20261003]
+    paths: [.github/workflows/verification-installed-smoke.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  installed:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            machine: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            machine: x86_64
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            machine: AMD64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PACKAGE_RUN: '38072128775'
+      PACKAGE_SHA: d13ed98adfa7b5bd8833850d08b22baa45608c37
+      TARGET: ${{ matrix.target }}
+      EXPECTED_MACHINE: ${{ matrix.machine }}
+      SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Download exact verification package and validate its hashes
+        run: |
+          git diff --exit-code "$PACKAGE_SHA" HEAD -- sbobino_desktop/apps sbobino_desktop/crates sbobino_desktop/Cargo.toml sbobino_desktop/Cargo.lock
+          mkdir -p "$RUNNER_TEMP/installed-proof/package"
+          gh run watch "$PACKAGE_RUN" --repo "$GITHUB_REPOSITORY" --exit-status --interval 60
+          gh run download "$PACKAGE_RUN" --repo "$GITHUB_REPOSITORY" --name "verification-$TARGET-$PACKAGE_SHA" --dir "$RUNNER_TEMP/installed-proof/package"
+          python - <<'PY'
+          import hashlib, json, os, platform
+          from datetime import datetime, timezone
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'], 'installed-proof/package')
+          manifest = json.loads((root / 'verification-manifest.json').read_text())
+          assert manifest['app_commit_sha'] == os.environ['PACKAGE_SHA']
+          assert manifest['target'] == os.environ['TARGET']
+          assert platform.machine() == os.environ['EXPECTED_MACHINE']
+          for name, expected in manifest['artifact_sha256'].items():
+              with (root / name).open('rb') as stream:
+                  assert hashlib.file_digest(stream, 'sha256').hexdigest() == expected, name
+          (root.parent / 'package-manifest.json').write_text(json.dumps(manifest, indent=2))
+          (root.parent / 'installed-environment.json').write_text(json.dumps({'runner': platform.platform(), 'machine': platform.machine(), 'package_sha': os.environ['PACKAGE_SHA'], 'tested_at_utc': datetime.now(timezone.utc).isoformat(), 'scope': 'install/startup only; functional flows not verified'}, indent=2))
+          PY
+      - name: Install and observe native macOS startup on disposable runner
+        if: runner.os == 'macOS'
+        run: |
+          set -o pipefail
+          ROOT="$RUNNER_TEMP/installed-proof"
+          MOUNT="$RUNNER_TEMP/verify-mount"
+          mkdir "$MOUNT"
+          hdiutil attach "$ROOT/package/"*.dmg -readonly -nobrowse -mountpoint "$MOUNT"
+          trap 'hdiutil detach "$MOUNT"' EXIT
+          ditto "$MOUNT/Sbobino.app" "$ROOT/Sbobino.app"
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'], 'installed-proof')
+          manifest = json.loads((root / 'package-manifest.json').read_text())
+          prefix = 'bundle/macos/Sbobino.app/'
+          for name, expected in manifest['app_sha256'].items():
+              assert name.startswith(prefix), name
+              with (root / 'Sbobino.app' / name[len(prefix):]).open('rb') as stream:
+                  assert hashlib.file_digest(stream, 'sha256').hexdigest() == expected, name
+          PY
+          codesign --verify --deep --strict "$ROOT/Sbobino.app"
+          lipo "$ROOT/Sbobino.app/Contents/MacOS/sbobino-desktop" -verify_arch "$EXPECTED_MACHINE"
+          shasum -a 256 "$ROOT/Sbobino.app/Contents/MacOS/sbobino-desktop" > "$ROOT/installed-binary.sha256"
+          "$ROOT/Sbobino.app/Contents/MacOS/sbobino-desktop" > "$ROOT/startup.log" 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true; hdiutil detach "$MOUNT"' EXIT
+          sleep 20
+          kill -0 "$PID"
+          printf 'PASS: packaged process alive after 20s; no microphone, transcription or accessibility validation\n' > "$ROOT/startup-result.txt"
+      - name: Retrieve unchanged Windows background helper and runtime probes
+        if: runner.os == 'Windows'
+        run: |
+          git diff --exit-code 34906f99e4e359d532a185bc8a35e9fc55718377 HEAD -- sbobino_desktop/crates/infrastructure/src/background_process.rs sbobino_desktop/crates/infrastructure/src/bin/windows_background_process_smoke.rs
+          gh api repos/pietroMastro92/Sbobino/actions/artifacts/11551231138/zip > "$RUNNER_TEMP/helper.zip"
+          gh release download v2.0.34 --repo "$GITHUB_REPOSITORY" --pattern speech-runtime-windows-x86_64.zip --pattern pyannote-runtime-windows-x86_64.zip --dir "$RUNNER_TEMP/installed-proof"
+          python - <<'PY'
+          import hashlib, os, zipfile
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          expected = {'helper.zip': '9b7dc4e48fdeb53f0da572afc30e4cf648e4edb969be7d5eac99c35f0732a47f', 'installed-proof/speech-runtime-windows-x86_64.zip': '43cc3ea4ae1a4737da3be5cd5494df7319ccad5ec2387cde7d6d1ddcf455497d', 'installed-proof/pyannote-runtime-windows-x86_64.zip': '3cb2c3e934ca38d776b380fbf8c941bf5e39badb9034451c2e595c8c24a44a33'}
+          for name, digest in expected.items():
+              with (root / name).open('rb') as stream:
+                  assert hashlib.file_digest(stream, 'sha256').hexdigest() == digest, name
+          with zipfile.ZipFile(root / 'helper.zip') as archive:
+              assert archive.namelist() == ['windows_background_process_smoke.exe']
+              archive.extractall(root / 'installed-proof/helper')
+          PY
+      - name: Install Windows package and run existing GUI smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'installed-proof'
+          $installer = @(Get-ChildItem "$root/package" -Filter '*-setup.exe')
+          if ($installer.Count -ne 1) { throw 'Expected one verification installer' }
+          $install = Start-Process $installer[0].FullName -ArgumentList '/S' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Installer exit $($install.ExitCode)" }
+          $apps = @(Get-ChildItem $env:LOCALAPPDATA -Recurse -File -Filter 'sbobino-desktop.exe' -ErrorAction SilentlyContinue)
+          if ($apps.Count -ne 1) { throw 'Expected one installed app' }
+          $manifest = Get-Content "$root/package/verification-manifest.json" -Raw | ConvertFrom-Json
+          $actual = (Get-FileHash $apps[0].FullName -Algorithm SHA256).Hash.ToLower()
+          $expected = $manifest.app_sha256.'sbobino-desktop.exe'
+          @{ path = $apps[0].FullName; actual_sha256 = $actual; expected_sha256 = $expected; version = $apps[0].VersionInfo.FileVersion; signature = (Get-AuthenticodeSignature $apps[0].FullName).Status.ToString() } | ConvertTo-Json | Tee-Object "$root/installed-binary-identity.json"
+          Copy-Item $apps[0].FullName "$root/installed-binary.exe"
+          $apps[0].FullName | Out-File "$root/installed-path.txt"
+      - name: Verify exact unsigned NSIS bundle marker transformation
+        if: runner.os == 'Windows'
+        run: |
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'], 'installed-proof')
+          identity = json.loads((root / 'installed-binary-identity.json').read_text())
+          data = (root / 'installed-binary.exe').read_bytes()
+          # shortcut: unsigned Tauri 2.10 NSIS only; extract signed payload when enabling signing.
+          marker = b'__TAURI_BUNDLE_TYPE_VAR_NSS'
+          assert identity['signature'] == 'NotSigned'
+          assert data.count(marker) == 1 and data.count(b'__TAURI_BUNDLE_TYPE_VAR_UNK') == 0
+          assert hashlib.sha256(data).hexdigest() == identity['actual_sha256']
+          compiled = data.replace(marker, b'__TAURI_BUNDLE_TYPE_VAR_UNK', 1)
+          assert hashlib.sha256(compiled).hexdigest() == identity['expected_sha256'], 'Installed bytes differ beyond the NSIS marker'
+          identity['verification'] = 'Exact compiled hash after restoring only Tauri NSIS marker; actual installed SHA retained'
+          (root / 'verified-installed-binary.json').write_text(json.dumps(identity, indent=2))
+          PY
+      - name: Observe installed Windows GUI with existing helper probes
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'installed-proof'
+          $identity = Get-Content "$root/verified-installed-binary.json" -Raw | ConvertFrom-Json
+          ./sbobino_desktop/scripts/windows_gui_smoke.ps1 -AppPath $identity.path -HarnessPath "$root/helper/windows_background_process_smoke.exe" -SpeechRuntimeZip "$root/speech-runtime-windows-x86_64.zip" -PyannoteRuntimeZip "$root/pyannote-runtime-windows-x86_64.zip" -ReportPath "$root/windows-gui-smoke-report.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installed-smoke-${{ matrix.target }}-${{ env.PACKAGE_SHA }}
+          path: |
+            ${{ runner.temp }}/installed-proof/*.log
+            ${{ runner.temp }}/installed-proof/*.txt
+            ${{ runner.temp }}/installed-proof/*.json
+            ${{ runner.temp }}/installed-proof/*.sha256
+            ${{ runner.temp }}/installed-proof/installed-binary.exe
+          if-no-files-found: warn
+          retention-days: 14

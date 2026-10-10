@@ -6,7 +6,7 @@ on:
       tag_name:
         description: Existing git tag to build and publish as a prerelease candidate
         required: true
-        default: v2.0.32
+        default: v2.0.34
         type: string
 
 permissions:
@@ -14,15 +14,15 @@ permissions:
 
 jobs:
   validate-candidate:
-    name: Validate v2.0.32 candidate tag
+    name: Validate v2.0.34 candidate tag
     runs-on: ubuntu-latest
     env:
       TAG_NAME: ${{ inputs.tag_name }}
     steps:
       - name: Require the reviewed candidate tag
         run: |
-          if [[ "$TAG_NAME" != "v2.0.32" ]]; then
-            echo "Release Candidate is locked to v2.0.32; got $TAG_NAME" >&2
+          if [[ "$TAG_NAME" != "v2.0.34" ]]; then
+            echo "Release Candidate is locked to v2.0.34; got $TAG_NAME" >&2
             exit 1
           fi
 
@@ -58,8 +58,9 @@ jobs:
           cache: npm
           cache-dependency-path: sbobino_desktop/apps/desktop/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
       - name: Install Intel conda build environment
@@ -91,6 +92,7 @@ jobs:
 
       - name: Build, sign, and stage native artifacts
         env:
+          CARGO_PROFILE_RELEASE_STRIP: none
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -119,7 +121,9 @@ jobs:
           STAGING_DIR="$RUNNER_TEMP/sbobino-${{ matrix.arch }}"
           mkdir -p "$STAGING_DIR"
 
+          python3 ../../scripts/prepare_macos_bundle_scripts.py "$APP_PATH"
           codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH"
           rm -f "$UPDATER_TAR" "$UPDATER_SIG"
           COPYFILE_DISABLE=1 tar -czf "$UPDATER_TAR" -C "$APP_DIR" "Sbobino.app"
           npx tauri signer sign "$UPDATER_TAR"
@@ -190,8 +194,9 @@ jobs:
           cache: npm
           cache-dependency-path: sbobino_desktop/apps/desktop/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.95.0"
           targets: x86_64-pc-windows-msvc
 
       - uses: actions/setup-python@v5
@@ -445,7 +450,9 @@ jobs:
             ${{ runner.temp }}/whisper-live-readiness-fixture
           key: whisper-live-model-${{ hashFiles('sbobino_desktop/crates/domain/src/whisper_live_model.json') }}-fixture-5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
 
       - name: Validate public assets on the matching architecture
         working-directory: sbobino_desktop
@@ -716,7 +723,9 @@ jobs:
           cache: npm
           cache-dependency-path: sbobino_desktop/apps/desktop/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
 
       - name: Cache pinned Parakeet readiness model
         uses: actions/cache@v4

@@ -461,10 +461,6 @@ impl ParakeetRealtimeEngine {
         }
     }
 
-    pub fn validate_library(&self) -> Result<(), ApplicationError> {
-        self.load_api().map(|_| ())
-    }
-
     fn load_api(&self) -> Result<ParakeetApi, ApplicationError> {
         if !self.lib_path.exists() {
             return Err(ApplicationError::SpeechToText(format!(

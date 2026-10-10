@@ -10,11 +10,11 @@ use uuid::Uuid;
 
 use sbobino_application::{ApplicationError, RealtimeDelta};
 use sbobino_domain::{
-    whisper_live_model_manifest, ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage,
-    LanguageCode, ParakeetModel, SpeechModel, TimedSegment, TranscriptArtifact,
-    TranscriptionComputeDevice, TranscriptionEngine, TranscriptionOutput,
+    ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel,
+    SpeechModel, TimedSegment, TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
 };
 
+use crate::commands::runtime::resolve_live_transcription_selection;
 use crate::commands::transcription::{JobFailedEvent, JobProgressEvent};
 use crate::parakeet_realtime::ParakeetRealtimeEngine;
 use crate::realtime_audio::{emit_level_event, RealtimeInputLevelEvent};
@@ -66,17 +66,6 @@ fn reject_if_realtime_stop_in_progress() -> Result<(), CommandError> {
             stops.iter().next().map(String::as_str),
         ))
     }
-}
-
-fn ensure_parakeet_live_device_supported(
-    device: TranscriptionComputeDevice,
-) -> Result<(), CommandError> {
-    let _ = device;
-
-    Err(CommandError::new(
-        "parakeet_live_realtime_unsupported",
-        "Parakeet live is temporarily disabled because the packaged streaming models cannot keep real time on the validated computers. Sbobino uses Whisper for live sessions; Parakeet file transcription remains available.",
-    ))
 }
 
 fn reserve_realtime_stop(job_id: &str) -> Result<RealtimeStopMarker, CommandError> {
@@ -326,6 +315,7 @@ pub struct StartRealtimePayload {
 pub struct StartRealtimeResponse {
     pub started: bool,
     pub job_id: String,
+    pub model: SpeechModel,
 }
 
 #[derive(Debug, Deserialize)]
@@ -718,30 +708,27 @@ pub async fn start_realtime(
         .load_settings()
         .map_err(|e| CommandError::new("settings", e))?;
 
-    let default_model = settings.transcription.model;
     let default_language = settings.transcription.language;
-    let engine_kind = payload
+    let requested_engine = payload
         .engine
         .unwrap_or_else(|| settings.transcription.engine.clone());
-    if matches!(&engine_kind, TranscriptionEngine::ParakeetCpp) {
-        ensure_parakeet_live_device_supported(settings.transcription.live_compute_device)?;
+    let selection = resolve_live_transcription_selection(requested_engine.clone());
+    let engine_kind = selection.engine;
+    let model = selection.manifest.model.clone();
+    let live_model_filename = selection.manifest.filename.clone();
+    eprintln!(
+        "[realtime-start] requested engine={requested_engine:?} selected engine={engine_kind:?} model={model:?}"
+    );
+    if payload
+        .model
+        .as_ref()
+        .is_some_and(|requested_model| requested_model != &model)
+    {
+        eprintln!(
+            "[realtime-start] ignoring unvalidated live model {:?}; using certified {:?}",
+            payload.model, model
+        );
     }
-    let model = if engine_kind == TranscriptionEngine::WhisperCpp {
-        let certified_model = whisper_live_model_manifest().model;
-        if payload
-            .model
-            .as_ref()
-            .is_some_and(|requested| requested != &certified_model)
-        {
-            eprintln!(
-                "[realtime-start] ignoring unvalidated Whisper live model {:?}; using certified {:?}",
-                payload.model, certified_model
-            );
-        }
-        certified_model
-    } else {
-        payload.model.unwrap_or(default_model)
-    };
     let language = payload.language.unwrap_or(default_language);
     let job_id = Uuid::new_v4().to_string();
     let requested_title = clean_optional_title(payload.title.clone());
@@ -762,8 +749,7 @@ pub async fn start_realtime(
 
     *state.realtime.active_job_id.lock().await = Some(job_id.clone());
     *state.realtime.session_name.lock().await = Some(session_title.clone());
-    // Persist the user's preference separately from the engine's runtime flag.
-    // Both live engines are started in automatic detection mode.
+    // Persist the user's language preference separately from the runtime flag.
     *state.realtime.language_code.lock().await = language.as_code().to_string();
     *state.realtime.active_engine.lock().await = engine_kind.clone();
     *state.realtime.model.lock().await = Some(model.clone());
@@ -835,7 +821,6 @@ pub async fn start_realtime(
             } else {
                 engine.reset().await;
             }
-            let live_model_filename = whisper_live_model_manifest().filename;
             *state.realtime.model_filename.lock().await = Some(live_model_filename.clone());
 
             if let Err(error) = engine
@@ -985,6 +970,7 @@ pub async fn start_realtime(
     Ok(StartRealtimeResponse {
         started: true,
         job_id,
+        model: selection.manifest.model,
     })
 }
 
@@ -1382,21 +1368,6 @@ pub async fn load_realtime_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parakeet_live_rejects_devices_that_cannot_keep_realtime() {
-        for device in [
-            TranscriptionComputeDevice::Cpu,
-            TranscriptionComputeDevice::Auto,
-            TranscriptionComputeDevice::Gpu,
-        ] {
-            let error = ensure_parakeet_live_device_supported(device)
-                .expect_err("Parakeet live must fail fast instead of accumulating backlog");
-            assert_eq!(error.code, "parakeet_live_realtime_unsupported");
-            assert!(error.message.contains("Whisper"));
-            assert!(error.message.contains("Parakeet file transcription"));
-        }
-    }
 
     #[test]
     fn parakeet_live_uses_installed_multilingual_model_when_tdt_is_selected() {

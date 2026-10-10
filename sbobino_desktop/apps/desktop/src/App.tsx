@@ -142,8 +142,14 @@ import {
   writeSetupReport,
 } from "./lib/tauri";
 import {
+  formatProvisioningFailureMessage,
   formatProvisioningAssetLabel,
+  ProvisioningCancelledError,
+  provisioningScopeForAssetKind,
+  runProvisioningAndRefresh,
+  shouldShowProvisioningStatus,
   shouldOfferLocalModelsCta,
+  type ProvisioningScope,
 } from "./lib/provisioningUi";
 import {
   canWarmStartFromSetupReport,
@@ -156,6 +162,7 @@ import {
   getRuntimeToolchainFailureMessage,
   getInitialSetupMissingModels,
   isInitialSetupComplete,
+  inferInitialSetupReasonCode,
   isRuntimeToolchainReady,
   isProvisionedModelReady,
   shouldBlockMainUiDuringStartup,
@@ -2622,7 +2629,7 @@ type DetailToolbarProps = {
   speakerDiarizationProgress: number;
   onToggleSidebar: () => void;
   onBack: () => void;
-  onRenameTitle?: () => void;
+  onRenameTitle?: (opener: HTMLElement) => void;
   onSelectMode: (mode: "transcript" | "summary" | "emotion" | "chat") => void;
   onOpenExport: () => void;
   onShowDetailsPanel: () => void;
@@ -2756,7 +2763,7 @@ function DetailToolbar({
           {hasArtifact && onRenameTitle ? (
             <button
               className="icon-button detail-title-rename-button"
-              onClick={onRenameTitle}
+              onClick={(event) => onRenameTitle(event.currentTarget)}
               title={t("rename.title", "Rename transcription")}
               aria-label={t("rename.title", "Rename transcription")}
             >
@@ -3085,6 +3092,114 @@ type AppProps = {
   };
 };
 
+type RenameDialogProps = {
+  draft: string;
+  busy: boolean;
+  onDraftChange: (draft: string) => void;
+  onConfirm: () => void;
+  onClose: () => void;
+};
+
+export function restoreRenameFocus(opener: HTMLElement | null): void {
+  if (!opener?.isConnected) return;
+  window.requestAnimationFrame(() => {
+    if (opener.isConnected) {
+      // Reveal hover-only history actions before focusing their opener.
+      opener.closest(".history-item")?.querySelector<HTMLButtonElement>(".history-main")?.focus();
+      opener.focus();
+    }
+  });
+}
+
+export function RenameDialog({
+  draft,
+  busy,
+  onDraftChange,
+  onConfirm,
+  onClose,
+}: RenameDialogProps): JSX.Element {
+  const { t } = useTranslation();
+
+  return (
+    <div className="sheet-overlay" role="presentation">
+      <section
+        className="rename-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("rename.title", "Rename transcription")}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!busy) {
+              onClose();
+            }
+            return;
+          }
+
+          if (event.key !== "Tab") return;
+
+          const focusableElements = Array.from(
+            event.currentTarget.querySelectorAll<HTMLElement>(
+              "input:not([disabled]), button:not([disabled])",
+            ),
+          );
+          if (focusableElements.length === 0) return;
+
+          const currentIndex = focusableElements.indexOf(
+            document.activeElement as HTMLElement,
+          );
+          const nextIndex =
+            currentIndex === -1
+              ? event.shiftKey
+                ? focusableElements.length - 1
+                : 0
+              : (currentIndex +
+                  (event.shiftKey ? -1 : 1) +
+                  focusableElements.length) %
+                focusableElements.length;
+
+          event.preventDefault();
+          focusableElements[nextIndex]?.focus();
+        }}
+      >
+        <header className="rename-sheet-head">
+          <h3>{t("rename.title")}</h3>
+        </header>
+        <input
+          className="rename-sheet-input"
+          value={draft}
+          onChange={(event) => onDraftChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              onConfirm();
+            }
+          }}
+          autoFocus
+          placeholder={t("rename.placeholder", "Transcription title")}
+        />
+        <div className="rename-sheet-actions">
+          <button
+            className="secondary-button"
+            onClick={onClose}
+            disabled={busy}
+          >
+            {t("rename.cancel", "Cancel")}
+          </button>
+          <button
+            className="primary-button"
+            onClick={onConfirm}
+            disabled={busy || draft.trim().length === 0}
+          >
+            {busy ? t("rename.saving", "Saving...") : t("rename.save", "Save")}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 export type GroupedArtifact = TranscriptArtifact & {
   children?: GroupedArtifact[];
 };
@@ -3099,6 +3214,7 @@ function createProvisioningUiState(
   running: boolean;
   progress: ProvisioningProgressEvent | null;
   statusMessage: string;
+  operationScope: ProvisioningScope | null;
 } {
   if (!status) {
     return {
@@ -3109,6 +3225,7 @@ function createProvisioningUiState(
       running: false,
       progress: null,
       statusMessage: "",
+      operationScope: null,
     };
   }
 
@@ -3120,6 +3237,7 @@ function createProvisioningUiState(
     running: false,
     progress: null,
     statusMessage: "",
+    operationScope: null,
   };
 }
 
@@ -3468,6 +3586,7 @@ export function App({
     running: boolean;
     progress: ProvisioningProgressEvent | null;
     statusMessage: string;
+    operationScope: ProvisioningScope | null;
   }>(() => createProvisioningUiState(initialBootstrap?.provisioning));
   const [startupRequirementsLoaded, setStartupRequirementsLoaded] = useState(
     standaloneSettingsWindow ||
@@ -3626,6 +3745,7 @@ export function App({
   const transcriptionStartInFlightRef = useRef(false);
   const appCloseDialogOpenRef = useRef(false);
   const appCloseAllowedRef = useRef(false);
+  const renameOpenerRef = useRef<HTMLElement | null>(null);
   const segmentElementMapRef = useRef<Map<number, HTMLElement>>(new Map());
   const windowFrameRef = useRef<HTMLElement | null>(null);
   const detailLayoutRef = useRef<HTMLDivElement | null>(null);
@@ -3634,6 +3754,7 @@ export function App({
     ProvisioningProgressEvent["asset_kind"] | null
   >(null);
   const pyannoteProvisioningActiveRef = useRef(false);
+  const provisioningOperationIdRef = useRef(0);
   const initialSetupReportRef = useRef<InitialSetupReport>(
     initialBootstrap?.setupReport ?? createInitialSetupReport(),
   );
@@ -4817,7 +4938,10 @@ export function App({
     if (
       !startupRequirementsLoaded ||
       initialSetupRunning ||
-      initialSetupReady
+      (initialSetupReady && canWarmStartFromSetupReport(
+        privacyPolicyAccepted,
+        initialSetupReportRef.current,
+      ))
     ) {
       return;
     }
@@ -5455,6 +5579,7 @@ export function App({
             ...previous,
             running: true,
             progress: event,
+            operationScope: provisioningScopeForAssetKind(event.asset_kind),
             statusMessage: `${formatProvisioningAssetLabel(event)} (${event.current}/${event.total})`,
           }));
         },
@@ -5504,20 +5629,7 @@ export function App({
               : t("settings.localModels.readyMessage", "Local models are ready")
             : event.state === "cancelled"
               ? t("provisioning.cancelled", "Provisioning cancelled")
-              : event.reason_code === "pyannote_install_incomplete" ||
-                  event.reason_code === "pyannote_checksum_invalid" ||
-                  event.reason_code === "pyannote_receipt_required" ||
-                  event.reason_code === "pyannote_receipt_invalid" ||
-                  event.reason_code === "pyannote_import_load_failed"
-                ? event.message || t("settings.pyannote.desc")
-                : event.reason_code === "pyannote_runtime_missing" ||
-                    event.reason_code === "pyannote_model_missing" ||
-                    event.reason_code === "pyannote_repair_required" ||
-                    event.reason_code === "pyannote_validation_required" ||
-                    event.reason_code === "pyannote_version_mismatch" ||
-                    event.reason_code === "pyannote_arch_mismatch"
-                  ? t("settings.pyannote.desc")
-                  : t("error.provisioningFailed", "Provisioning failed");
+              : event.message || t("error.provisioningFailed", "Provisioning failed");
         setProvisioning((previous) => ({
           ...previous,
           running: false,
@@ -6662,9 +6774,11 @@ export function App({
       modelsDir: status.models_dir,
       missing: [...status.missing_models, ...status.missing_encoders],
       pyannote: status.pyannote,
-      running: false,
-      progress: null,
-      statusMessage: status.ready
+      running: previous.running,
+      progress: previous.progress,
+      statusMessage: previous.operationScope
+        ? previous.statusMessage
+        : status.ready
         ? t("settings.localModels.readyMessage", "Local models are ready")
         : t(
             "settings.localModels.missingAssets",
@@ -7528,34 +7642,13 @@ export function App({
     );
   }
 
-  function inferInitialSetupReasonCode(
-    snapshot: StartupRequirementsSnapshot | null,
-  ): string {
-    if (!snapshot) {
-      return "setup_incomplete";
-    }
-    if (!isRuntimeToolchainReady(snapshot.runtimeHealth)) {
-      return "runtime_repair_required";
-    }
-    if (
-      getInitialSetupMissingModels(
-        snapshot.modelCatalog,
-        snapshot.runtimeHealth.is_apple_silicon,
-        snapshot.runtimeHealth.configured_engine,
-      ).length > 0
-    ) {
-      return "models_missing";
-    }
-    return snapshot.runtimeHealth.setup_complete
-      ? "setup_complete"
-      : "setup_incomplete";
-  }
 
   async function maybeStartPyannoteBackgroundAction(
     trigger: PyannoteBackgroundActionTrigger,
     appVersionOverride?: string | null,
   ): Promise<void> {
     const appVersion = appVersionOverride ?? currentBuildVersion;
+    const previousInstallationAvailable = Boolean(runtimeHealth?.pyannote.ready);
     if (!appVersion) {
       return;
     }
@@ -7592,26 +7685,27 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "pyannote",
         statusMessage: getPyannoteBackgroundActionStatusMessage(action),
       }));
 
-      const result = await provisioningInstallPyannote(action.force_reinstall);
-      if (result.started) {
-        return;
-      }
-
+      await waitForProvisioningRun(
+        () => provisioningInstallPyannote(action.force_reinstall),
+        { scope: "pyannote" },
+      );
       pyannoteProvisioningActiveRef.current = false;
       writeLastPyannoteAutoActionMarker({
         ...marker,
-        outcome: "failed",
+        outcome: "succeeded",
       });
       setProvisioning((previous) => ({
         ...previous,
         running: false,
-        statusMessage: action.message || t("settings.pyannote.desc"),
+        statusMessage: t("settings.pyannote.readyMessage", "Pyannote is ready"),
       }));
     } catch (error) {
       pyannoteProvisioningActiveRef.current = false;
+      if (error instanceof ProvisioningCancelledError) return;
       const previousMarker = readLastPyannoteAutoActionMarker();
       if (previousMarker) {
         writeLastPyannoteAutoActionMarker({
@@ -7619,6 +7713,15 @@ export function App({
           outcome: "failed",
         });
       }
+      setProvisioning((previous) => ({
+        ...previous,
+        running: false,
+        operationScope: "pyannote",
+        statusMessage: formatProvisioningFailureMessage(
+          error instanceof Error ? error.message : t("settings.pyannote.desc"),
+          previousInstallationAvailable,
+        ),
+      }));
       console.warn(`Automatic pyannote action '${trigger}' failed:`, error);
     }
   }
@@ -7645,12 +7748,15 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "runtime",
         statusMessage: t(
           "provisioning.repairingRuntime",
           "Repairing local transcription runtime after update...",
         ),
       }));
-      await waitForProvisioningRun(() => provisioningInstallRuntime(false));
+      await waitForProvisioningRun(() => provisioningInstallRuntime(false), {
+        scope: "runtime",
+      });
     } catch (error) {
       // Keep the app interactive.  The subsequent preflight can still show
       // the precise missing binary and the Local Models screen exposes the
@@ -7673,58 +7779,57 @@ export function App({
 
   async function waitForProvisioningRun(
     starter: () => Promise<{ started: boolean }>,
-    options?: { waitForExistingRun?: boolean },
-  ): Promise<void> {
-    let unlisten: (() => void) | undefined;
-
+    options: { scope: ProvisioningScope; waitForExistingRun?: boolean },
+  ): Promise<StartupRequirementsSnapshot> {
+    const operationId = ++provisioningOperationIdRef.current;
+    setProvisioning((previous) => ({
+      ...previous,
+      running: true,
+      operationScope: options.scope,
+    }));
     try {
-      // Register the listener before starting the native job.  The old
-      // nested async Promise raced a fast local install: a completion event
-      // could be emitted between `starter()` and the resolution of
-      // `listen()`, leaving the UI waiting forever and making Pyannote look
-      // as if it needed another Repair click.
-      let resolveCompletion!: () => void;
-      let rejectCompletion!: (error: Error) => void;
-      const completion = new Promise<void>((resolve, reject) => {
-        resolveCompletion = resolve;
-        rejectCompletion = reject;
+      const snapshot = await runProvisioningAndRefresh({
+        starter,
+        subscribe: subscribeProvisioningStatus,
+        refresh: loadStartupRequirements,
+        timeoutMs: 30 * 60 * 1000,
+        refreshTimeoutMs: 30 * 1000,
+        timeoutMessage: t("error.provisioningTimeout", "Provisioning timed out"),
+        cancelledMessage: t("provisioning.cancelled", "Provisioning cancelled"),
+        failureMessage: t("error.provisioningFailed", "Provisioning failed"),
+        waitForExistingRun: options.waitForExistingRun,
       });
-
-      unlisten = await subscribeProvisioningStatus((event) => {
-        if (event.state === "completed") {
-          resolveCompletion();
-          return;
-        }
-
-        if (event.state === "cancelled") {
-          rejectCompletion(
-            new Error(
-              event.message ||
-                t("provisioning.cancelled", "Provisioning cancelled"),
-            ),
-          );
-          return;
-        }
-
-        if (event.state === "error") {
-          rejectCompletion(
-            new Error(
-              event.message ||
-                t("error.provisioningFailed", "Provisioning failed"),
-            ),
-          );
-        }
-      });
-
-      const result = await starter();
-      if (!result.started && !options?.waitForExistingRun) {
-        resolveCompletion();
+      if (options.scope === "runtime" && !isRuntimeToolchainReady(snapshot.runtimeHealth)) {
+        throw new Error(formatRuntimeNotReadyMessage(snapshot.runtimeHealth));
       }
-
-      await completion;
-    } finally {
-      unlisten?.();
-      await loadStartupRequirements();
+      if (options.scope === "pyannote" && !snapshot.runtimeHealth.pyannote.ready) {
+        throw new Error(snapshot.runtimeHealth.pyannote.message || t("error.pyannoteInstallFailed", "Pyannote install failed"));
+      }
+      if (operationId === provisioningOperationIdRef.current) {
+        setProvisioning((previous) => ({
+          ...previous,
+          running: false,
+          progress: null,
+          operationScope: options.scope,
+          statusMessage: options.scope === "runtime"
+            ? t("provisioning.runtimeReady", "Local transcription runtime is ready")
+            : options.scope === "pyannote"
+              ? t("settings.pyannote.readyMessage", "Pyannote is ready")
+              : t("settings.localModels.readyMessage", "Local models are ready"),
+        }));
+      }
+      return snapshot;
+    } catch (error) {
+      if (operationId === provisioningOperationIdRef.current) {
+        setProvisioning((previous) => ({
+          ...previous,
+          running: false,
+          progress: null,
+          operationScope: options.scope,
+          statusMessage: error instanceof Error ? error.message : t("error.provisioningFailed", "Provisioning failed"),
+        }));
+      }
+      throw error;
     }
   }
 
@@ -7810,7 +7915,9 @@ export function App({
             "Checking local tools and prerequisites.",
           ),
         );
-        await waitForProvisioningRun(() => provisioningInstallRuntime(false));
+        await waitForProvisioningRun(() => provisioningInstallRuntime(false), {
+          scope: "runtime",
+        });
         snapshot = await loadStartupRequirements();
         await updateInitialSetupStepState(
           "speech-runtime",
@@ -7863,11 +7970,12 @@ export function App({
             "This can take a few minutes the first time.",
           ),
         );
-        await waitForProvisioningRun(() =>
-          provisioningDownloadModel({
+        await waitForProvisioningRun(
+          () => provisioningDownloadModel({
             model,
             include_coreml: currentSnapshot.runtimeHealth.is_apple_silicon,
           }),
+          { scope: "models" },
         );
         snapshot = await loadStartupRequirements();
       }
@@ -7905,11 +8013,12 @@ export function App({
             "This can take a few minutes the first time.",
           ),
         );
-        await waitForProvisioningRun(() =>
-          provisioningDownloadModel({
+        await waitForProvisioningRun(
+          () => provisioningDownloadModel({
             model,
             include_coreml: false,
           }),
+          { scope: "models" },
         );
         snapshot = await loadStartupRequirements();
       }
@@ -7949,7 +8058,7 @@ export function App({
           ),
         );
       }
-      if (!snapshot.runtimeHealth.setup_complete) {
+      if (!isInitialSetupComplete(privacyPolicyAccepted, snapshot.runtimeHealth, snapshot.modelCatalog)) {
         throw new Error(
           t(
             "setup.firstLaunch.assetsStillMissing",
@@ -7966,8 +8075,8 @@ export function App({
       );
       await persistInitialSetupReport((current) => ({
         ...current,
-        setup_complete: snapshot?.runtimeHealth.setup_complete ?? false,
-        final_reason_code: inferInitialSetupReasonCode(snapshot),
+        setup_complete: true,
+        final_reason_code: inferInitialSetupReasonCode(snapshot, privacyPolicyAccepted),
         final_error: null,
         runtime_health: snapshot?.runtimeHealth ?? null,
         updated_at: new Date().toISOString(),
@@ -7998,7 +8107,7 @@ export function App({
       await persistInitialSetupReport((current) => ({
         ...current,
         setup_complete: false,
-        final_reason_code: inferInitialSetupReasonCode(snapshot),
+        final_reason_code: inferInitialSetupReasonCode(snapshot, privacyPolicyAccepted),
         final_error: finalError,
         runtime_health: snapshot?.runtimeHealth ?? current.runtime_health,
         updated_at: new Date().toISOString(),
@@ -9699,15 +9808,22 @@ export function App({
     void onClearSpeakerForSegment(segmentContextMenu.sourceIndex);
   }
 
-  function onRenameArtifact(artifact: TranscriptArtifact): void {
+  function onRenameArtifact(
+    artifact: TranscriptArtifact,
+    opener: HTMLElement,
+  ): void {
+    renameOpenerRef.current = opener;
     setRenameTarget(artifact);
     setRenameDraft(artifact.title);
   }
 
-  function closeRenameDialog(): void {
-    if (isRenamingArtifact) return;
+  function closeRenameDialog(options?: { allowWhileBusy?: boolean }): void {
+    if (isRenamingArtifact && !options?.allowWhileBusy) return;
+    const opener = renameOpenerRef.current;
+    renameOpenerRef.current = null;
     setRenameTarget(null);
     setRenameDraft("");
+    restoreRenameFocus(opener);
   }
 
   async function confirmRenameArtifact(): Promise<void> {
@@ -9746,7 +9862,7 @@ export function App({
       }
 
       setError(null);
-      closeRenameDialog();
+      closeRenameDialog({ allowWhileBusy: true });
     } catch (renameError) {
       setError(
         formatUiError("error.renameFailed", "Rename failed", renameError),
@@ -10185,18 +10301,10 @@ export function App({
       setRealtimePreviewState("connecting");
       setRealtimeInputLevels([]);
       setRealtimeTelemetry(null);
-      // Parakeet/Nemotron currently cannot maintain real time on the hardware
-      // matrix validated for this release. Keep Parakeet available for file
-      // transcription, while live sessions transparently use Whisper instead
-      // of accumulating an ever-growing audio backlog.
-      const liveEngine =
-        settings.transcription.engine === "parakeet_cpp"
-          ? "whisper_cpp"
-          : settings.transcription.engine;
 
       const readiness = await withTimeout(
         fetchRealtimeStartReadiness({
-          engine: liveEngine,
+          engine: settings.transcription.engine,
           model: settings.transcription.model,
           parakeet_model: settings.transcription.parakeet_model,
           language: settings.transcription.language,
@@ -10223,7 +10331,7 @@ export function App({
       setRealtimePreviewSegment(null);
       setRealtimeSessionOpen(false);
       const startResult = await startRealtime({
-        engine: liveEngine,
+        engine: settings.transcription.engine,
         model: settings.transcription.model,
         parakeet_model: settings.transcription.parakeet_model,
         language: settings.transcription.language,
@@ -10246,7 +10354,7 @@ export function App({
         inputPath: "realtime://microphone",
         sourceOrigin: "realtime",
         sourceLabel: t("realtime.liveMicrophone", "Live microphone"),
-        model: settings.transcription.model,
+        model: startResult.model,
         language: settings.transcription.language,
         progress: realtimeProgress,
       });
@@ -10795,10 +10903,14 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "models",
         statusMessage: t("provisioning.started", "Provisioning started..."),
       }));
-      await provisioningStart(true);
+      await waitForProvisioningRun(() => provisioningStart(true), {
+        scope: "models",
+      });
     } catch (provisionError) {
+      if (provisionError instanceof ProvisioningCancelledError) return;
       setProvisioning((previous) => ({
         ...previous,
         running: false,
@@ -10819,14 +10931,19 @@ export function App({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "models",
         statusMessage: t(
           "provisioning.downloadingModel",
           "Downloading {model}...",
           { model },
         ),
       }));
-      await provisioningDownloadModel({ model, include_coreml: true });
+      await waitForProvisioningRun(
+        () => provisioningDownloadModel({ model, include_coreml: true }),
+        { scope: "models" },
+      );
     } catch (downloadError) {
+      if (downloadError instanceof ProvisioningCancelledError) return;
       setProvisioning((previous) => ({
         ...previous,
         running: false,
@@ -10842,11 +10959,13 @@ export function App({
   }
 
   async function onInstallRuntime(force = false): Promise<void> {
+    const previousInstallationAvailable = runtimeToolchainReady;
     try {
       setProvisioning((previous) => ({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "runtime",
         statusMessage: force
           ? t(
               "provisioning.repairingRuntime",
@@ -10857,11 +10976,18 @@ export function App({
               "Installing local transcription runtime...",
             ),
       }));
-      await provisioningInstallRuntime(force);
+      await waitForProvisioningRun(() => provisioningInstallRuntime(force), {
+        scope: "runtime",
+      });
     } catch (installError) {
+      if (installError instanceof ProvisioningCancelledError) return;
       setProvisioning((previous) => ({
         ...previous,
         running: false,
+        statusMessage: formatProvisioningFailureMessage(
+          formatUiError("error.runtimeInstallFailed", "Local runtime install failed", installError),
+          previousInstallationAvailable,
+        ),
       }));
       setError(
         formatUiError(
@@ -10874,12 +11000,14 @@ export function App({
   }
 
   async function onInstallPyannote(force = false): Promise<void> {
+    const previousInstallationAvailable = Boolean(runtimeHealth?.pyannote.ready);
     try {
       pyannoteProvisioningActiveRef.current = true;
       setProvisioning((previous) => ({
         ...previous,
         running: true,
         progress: null,
+        operationScope: "pyannote",
         statusMessage: force
           ? t(
               "provisioning.repairingPyannote",
@@ -10896,13 +11024,20 @@ export function App({
       // was written. Previously this awaited only the start command, so a
       // failed download/deep smoke was followed immediately by enabling an
       // unusable Pyannote runtime, forcing users into repeated Repair clicks.
-      await waitForProvisioningRun(() => provisioningInstallPyannote(force));
+      await waitForProvisioningRun(() => provisioningInstallPyannote(force), {
+        scope: "pyannote",
+      });
       await enablePyannoteForTranscriptions();
     } catch (installError) {
       pyannoteProvisioningActiveRef.current = false;
+      if (installError instanceof ProvisioningCancelledError) return;
       setProvisioning((previous) => ({
         ...previous,
         running: false,
+        statusMessage: formatProvisioningFailureMessage(
+          formatUiError("error.pyannoteInstallFailed", "Pyannote install failed", installError),
+          previousInstallationAvailable,
+        ),
       }));
       setError(
         formatUiError(
@@ -11829,7 +11964,9 @@ export function App({
                 <>
                   <button
                     className="secondary-button history-action-button"
-                    onClick={() => void onRenameArtifact(artifact)}
+                    onClick={(event) =>
+                      onRenameArtifact(artifact, event.currentTarget)
+                    }
                   >
                     <Pencil size={14} />
                     {t("history.rename", "Rename")}
@@ -13808,7 +13945,7 @@ export function App({
             }}
             onRenameTitle={
               activeArtifact
-                ? () => onRenameArtifact(activeArtifact)
+                ? (opener) => onRenameArtifact(activeArtifact, opener)
                 : undefined
             }
             onSelectMode={(mode) => {
@@ -16351,13 +16488,8 @@ export function App({
       settings.transcription.speaker_diarization ??
         getDefaultSpeakerDiarizationSettings(),
     );
-    const runtimeBusy =
-      provisioning.running &&
-      provisioning.progress?.asset_kind === "speech_runtime";
     const pyannoteBusy =
-      provisioning.running &&
-      (provisioning.progress?.asset_kind === "pyannote_runtime" ||
-        provisioning.progress?.asset_kind === "pyannote_model");
+      provisioning.running && provisioning.operationScope === "pyannote";
     const pyannoteAction =
       !pyannoteHealth?.runtime_installed || !pyannoteHealth?.model_installed
         ? {
@@ -16732,14 +16864,16 @@ export function App({
             </button>
           </div>
 
-          {provisioning.progress ? (
+          {provisioning.progress && provisioning.operationScope !== "pyannote" ? (
             <div className="inline-progress">
               <div style={{ width: `${provisioning.progress.percentage}%` }} />
             </div>
           ) : null}
-          {(runtimeBusy ||
-            provisioning.progress?.asset_kind !== "speech_runtime") &&
-          provisioning.statusMessage ? (
+          {shouldShowProvisioningStatus(
+            provisioning.operationScope,
+            "local_models",
+            provisioning.statusMessage,
+          ) ? (
             <small className="muted">{provisioning.statusMessage}</small>
           ) : null}
         </section>
@@ -16893,7 +17027,11 @@ export function App({
               <div style={{ width: `${provisioning.progress.percentage}%` }} />
             </div>
           ) : null}
-          {pyannoteBusy && provisioning.statusMessage ? (
+          {shouldShowProvisioningStatus(
+            provisioning.operationScope,
+            "pyannote",
+            provisioning.statusMessage,
+          ) ? (
             <small className="muted">{provisioning.statusMessage}</small>
           ) : null}
         </section>
@@ -18820,53 +18958,13 @@ export function App({
       </section>
 
       {renameTarget ? (
-        <div className="sheet-overlay" role="presentation">
-          <section
-            className="rename-sheet"
-            role="dialog"
-            aria-modal="true"
-            aria-label={t("rename.title", "Rename transcription")}
-          >
-            <header className="rename-sheet-head">
-              <h3>{t("rename.title")}</h3>
-            </header>
-            <input
-              className="rename-sheet-input"
-              value={renameDraft}
-              onChange={(event) => setRenameDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void confirmRenameArtifact();
-                }
-                if (event.key === "Escape") {
-                  event.preventDefault();
-                  closeRenameDialog();
-                }
-              }}
-              autoFocus
-              placeholder={t("rename.placeholder", "Transcription title")}
-            />
-            <div className="rename-sheet-actions">
-              <button
-                className="secondary-button"
-                onClick={closeRenameDialog}
-                disabled={isRenamingArtifact}
-              >
-                {t("rename.cancel", "Cancel")}
-              </button>
-              <button
-                className="primary-button"
-                onClick={() => void confirmRenameArtifact()}
-                disabled={isRenamingArtifact || renameDraft.trim().length === 0}
-              >
-                {isRenamingArtifact
-                  ? t("rename.saving", "Saving...")
-                  : t("rename.save", "Save")}
-              </button>
-            </div>
-          </section>
-        </div>
+        <RenameDialog
+          draft={renameDraft}
+          busy={isRenamingArtifact}
+          onDraftChange={setRenameDraft}
+          onConfirm={() => void confirmRenameArtifact()}
+          onClose={closeRenameDialog}
+        />
       ) : null}
 
       <ModelManagerSheet

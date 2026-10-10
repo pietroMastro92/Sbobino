@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 
 import json
+import hashlib
+import re
+import textwrap
+from unittest.mock import patch
 import pathlib
 import os
 import subprocess
 import tempfile
+import sys
 import unittest
 import wave
 import zipfile
@@ -25,6 +30,123 @@ DISPATCHER = ROOT / "scripts" / "dispatch_release_candidate.sh"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_verification_installers_only_upload_current_snapshot(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-packages.yml").read_text()
+        for expected in ("contents: read", "ref: ${{ github.sha }}", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", '"createUpdaterArtifacts": False', "--no-sign --ci", "actions/upload-artifact@v4"):
+            self.assertIn(expected, workflow)
+        for forbidden in ("secrets.", "gh release create", "git push"):
+            self.assertNotIn(forbidden, workflow)
+        self.assertIn('lipo "$APP/Contents/MacOS/sbobino-desktop" -verify_arch "$EXPECTED_MACHINE"', workflow)
+        blocks = re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)
+        self.assertEqual(len(blocks), 3)
+        for block in blocks:
+            compile(textwrap.dedent(block), "verification-packages.yml", "exec")
+
+    def test_isolated_ui_configuration_separates_data_and_webview(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-packages.yml").read_text()
+        code = textwrap.dedent(re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)[0])
+        base = json.loads((ROOT / "apps/desktop/src-tauri/tauri.conf.json").read_text())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            config = root / "sbobino_desktop/apps/desktop/src-tauri"
+            config.mkdir(parents=True)
+            (config / "tauri.conf.json").write_text(json.dumps(base))
+            for isolated in ("false", "true"):
+                runner = root / isolated
+                runner.mkdir()
+                env = dict(os.environ, RUNNER_TEMP=str(runner), GITHUB_SHA="app", RUNTIME_SOURCE="runtime", RUNTIME_ASSET="runtime.zip", RUNTIME_DIGEST="digest", ISOLATED_UI=isolated)
+                subprocess.run([sys.executable, "-c", code], cwd=root, env=env, check=True)
+                overlay = json.loads((config / "verification-tauri.json").read_text())
+                metadata = json.loads((config / "verification-build.json").read_text())
+                self.assertEqual(metadata["verification_config"], overlay)
+                self.assertFalse(overlay["bundle"]["createUpdaterArtifacts"])
+                if isolated == "true":
+                    self.assertEqual(overlay["identifier"], "com.sbobino.verification")
+                    expected = dict(base["app"]["windows"][0], incognito=True, title="Sbobino — isolated UI verification")
+                    self.assertEqual(overlay["app"]["windows"][0], expected)
+                    self.assertIn("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS=1", metadata["launch_requires"])
+                else:
+                    self.assertNotIn("identifier", overlay)
+                    self.assertNotIn("app", overlay)
+
+    def test_verification_manifest_hashes_files_and_excludes_untracked_sources(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-packages.yml").read_text()
+        code = textwrap.dedent(re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)[-1])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            target = "aarch64-apple-darwin"
+            frontend = root / "sbobino_desktop/apps/desktop/dist"
+            release = root / "sbobino_desktop/target" / target / "release"
+            app = release / "bundle/macos/Sbobino.app"
+            config = root / "sbobino_desktop/apps/desktop/src-tauri"
+            output = root / "runner/verification-output"
+            runtime_dir = root / "runner/runtime-input"
+            for directory in (frontend, app, config, output, runtime_dir):
+                directory.mkdir(parents=True, exist_ok=True)
+            (root / "source.rs").write_bytes(b"source")
+            (root / "untracked-private.txt").write_bytes(b"exclude")
+            (frontend / "index.html").write_bytes(b"frontend")
+            (app / "binary").write_bytes(b"actual app")
+            (output / "installer.dmg").write_bytes(b"actual installer")
+            (config / "verification-build.json").write_text(json.dumps({"app_commit_sha": "tested-sha", "runtime_commit_sha": "older-runtime-sha"}))
+            with zipfile.ZipFile(runtime_dir / "runtime.zip", "w") as archive:
+                archive.writestr("runtime/bin/whisper-stream", b"actual runtime")
+            def command(args, **kwargs):
+                return b"source.rs\0" if args[0] == "git" else "rustc test"
+            previous = pathlib.Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(os.environ, {"RUNNER_TEMP": str(root / "runner"), "TARGET": target, "RUNTIME_ASSET": "runtime.zip"}), patch("platform.system", return_value="Darwin"), patch("platform.platform", return_value="test host"), patch("subprocess.check_output", side_effect=command):
+                    exec(compile(code, "verification-manifest", "exec"), {})
+            finally:
+                os.chdir(previous)
+            manifest = json.loads((output / "verification-manifest.json").read_text())
+            self.assertEqual(manifest["source_sha256"], {"source.rs": hashlib.sha256(b"source").hexdigest()})
+            self.assertEqual(manifest["runtime_members_sha256"]["runtime/bin/whisper-stream"], hashlib.sha256(b"actual runtime").hexdigest())
+            self.assertEqual(manifest["artifact_sha256"]["installer.dmg"], hashlib.sha256(b"actual installer").hexdigest())
+            self.assertEqual(manifest["functional_ui_validation"], "not performed")
+            self.assertEqual(manifest["app_commit_sha"], "tested-sha")
+            self.assertEqual(manifest["runtime_commit_sha"], "older-runtime-sha")
+
+    def test_installed_smoke_rejects_corrupted_package(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-installed-smoke.yml").read_text()
+        blocks = re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)
+        for block in blocks:
+            compile(textwrap.dedent(block), "installed-smoke", "exec")
+        for forbidden in ("secrets.", "gh release create", "git push"):
+            self.assertNotIn(forbidden, workflow)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "installed-proof/package"
+            root.mkdir(parents=True)
+            (root / "installer.dmg").write_bytes(b"installer")
+            manifest = {"app_commit_sha": "sha", "target": "target", "artifact_sha256": {"installer.dmg": hashlib.sha256(b"installer").hexdigest()}}
+            (root / "verification-manifest.json").write_text(json.dumps(manifest))
+            with patch.dict(os.environ, {"RUNNER_TEMP": temporary, "PACKAGE_SHA": "sha", "TARGET": "target", "EXPECTED_MACHINE": "arm64"}), patch("platform.machine", return_value="arm64"):
+                exec(compile(textwrap.dedent(blocks[0]), "installed-smoke", "exec"), {})
+                (root / "installer.dmg").write_bytes(b"tampered")
+                with self.assertRaises(AssertionError):
+                    exec(compile(textwrap.dedent(blocks[0]), "installed-smoke", "exec"), {})
+
+    def test_installed_nsis_marker_verification_rejects_other_binary_changes(self):
+        workflow = (ROOT.parent / ".github/workflows/verification-installed-smoke.yml").read_text()
+        blocks = re.findall(r"          python - <<'PY'\n(.*?)\n          PY", workflow, re.S)
+        block = next(block for block in blocks if "compiled = data.replace" in block)
+        code = compile(textwrap.dedent(block), "installed-nsis", "exec")
+        compiled = b"binary-prefix__TAURI_BUNDLE_TYPE_VAR_UNKbinary-suffix"
+        installed = compiled.replace(b"__TAURI_BUNDLE_TYPE_VAR_UNK", b"__TAURI_BUNDLE_TYPE_VAR_NSS")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "installed-proof"
+            root.mkdir()
+            with patch.dict(os.environ, {"RUNNER_TEMP": temporary}):
+                for data in (installed, installed + b"tampered", compiled, installed + installed):
+                    (root / "installed-binary.exe").write_bytes(data)
+                    (root / "installed-binary-identity.json").write_text(json.dumps({"signature": "NotSigned", "actual_sha256": hashlib.sha256(data).hexdigest(), "expected_sha256": hashlib.sha256(compiled).hexdigest()}))
+                    if data == installed:
+                        exec(code, {})
+                    else:
+                        with self.assertRaises(AssertionError):
+                            exec(code, {})
+
     def test_candidate_validation_is_bound_to_the_requested_tag_revision(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         dispatcher = DISPATCHER.read_text(encoding="utf-8")
@@ -240,15 +362,68 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
         macos = ARM_LIVE_SMOKE.read_text(encoding="utf-8")
         self.assertIn('"live_mode": raw.get("live_mode")', macos)
-        self.assertIn('"realtime_capable": raw.get("live_mode") == "realtime"', macos)
+        self.assertIn('"realtime_capable": raw.get("realtime_capable", False) and evaluated.get("status") == "passed"', macos)
         self.assertIn('"commit_sha": sys.argv[12]', macos)
         self.assertIn('"repo_slug": sys.argv[13]', macos)
+
+    def test_live_report_cannot_certify_a_failed_evaluation_as_realtime(self):
+        source = ARM_LIVE_SMOKE.read_text(encoding="utf-8")
+        marker = 'python3 - "$EVALUATED_REPORT"'
+        script = source.split(marker, 1)[1].split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            raw = root / "raw.json"
+            raw.write_text(json.dumps({"status": "passed", "realtime_capable": True, "failures": [], "live_mode": "realtime"}))
+            recovery = root / "recovery.json"
+            recovery.write_text(json.dumps({"status": "passed", "failures": []}))
+            evaluated = root / "evaluated.json"
+            output = root / "proof.json"
+            for status in ("passed", "failed"):
+                evaluated.write_text(json.dumps({"status": status, "metrics": {}, "failures": []}))
+                environment = os.environ.copy()
+                environment.pop("GITHUB_ACTIONS", None)
+                environment.pop("SBOBINO_LIVE_RUNNER", None)
+                subprocess.run([sys.executable, "-c", script, str(evaluated), str(raw), str(output), "inputhash", "modelhash", "binaryhash", "auto", "2.0.34", "v2.0.34", str(recovery), "900", "sourcecommit", "pietroMastro92/Sbobino", "encoderhash", "0"], env=environment, check=True)
+                proof = json.loads(output.read_text())
+                self.assertEqual(proof["realtime_capable"], status == "passed")
+                self.assertEqual(proof["evidence_class"], "local-packaged-engine")
+                self.assertEqual(proof["runner"], "local macOS")
 
     def test_pyannote_abi_scan_includes_the_packaged_runtime_lib_directory(self):
         readiness = (ROOT / "scripts" / "distribution_readiness.sh").read_text(
             encoding="utf-8"
         )
         self.assertIn('root / "lib" / "embedded-dylibs",\n            root / "lib",', readiness)
+
+    def test_intel_torchaudio_selector_handles_conda_records_without_url(self):
+        source = (ROOT / "scripts" / "setup_bundled_pyannote.sh").read_text()
+        selector = source.split("  package_url=$(", 1)[1].split("python3 -c '\n", 1)[1].split("\n')", 1)[0]
+        record = {
+            "subdir": "osx-64",
+            "version": "2.9.1",
+            "build": "cpu_py311fixture_0",
+            "build_number": 0,
+            "depends": ["pytorch >=2.9.1,<2.10.0a0"],
+            "channel": "https://conda.anaconda.org/conda-forge/osx-64",
+            "fn": "torchaudio-fixture.conda",
+        }
+        env = os.environ | {
+            "PYANNOTE_INTEL_TORCH_VERSION": "2.9.1",
+            "PYANNOTE_INTEL_TORCHAUDIO_VERSION": "2.9.1",
+            "PYANNOTE_INTEL_PYTHON_VERSION": "3.11",
+        }
+        for url in (None, "https://example.org/pinned.conda"):
+            candidate = record | ({"url": url} if url else {})
+            result = subprocess.run(
+                ["python3", "-c", selector],
+                input=json.dumps({"torchaudio": [candidate]}),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), url or record["channel"] + "/" + record["fn"])
 
     def test_windows_packagers_do_not_depend_on_deleted_release_assets(self):
         for script in (WINDOWS_RUNTIME_PACKAGER, WINDOWS_PYANNOTE_PACKAGER):
@@ -259,15 +434,15 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.assertNotIn("v2.0.25", contents)
             self.assertNotIn("/releases/download/latest/", contents)
             self.assertIn(
-                "BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-30-13-12",
+                "BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-05-13-07",
                 contents,
             )
             self.assertIn(
-                "ffmpeg-n8.1.2-50-g1a748fe2cd-win64-gpl-shared-8.1.zip",
+                "ffmpeg-n8.1.3-14-g330caae0c1-win64-gpl-shared-8.1.zip",
                 contents,
             )
             self.assertIn(
-                "d0db0a48da22815a04b5ec9e757640dc8069f9f8c37fd4e1b8753a4c0326502c",
+                "817ae73c5e6aeba48ce998be093f55db80389ffcdeb855bc712ebe54301719f2",
                 contents,
             )
             if script.name == "package_windows_pyannote_runtime.ps1":

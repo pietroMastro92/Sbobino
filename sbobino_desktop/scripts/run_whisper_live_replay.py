@@ -9,8 +9,10 @@ import ctypes
 import json
 import math
 import os
+import platform
 import re
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -156,11 +158,16 @@ def captured_wav_paths(run_dir: Path, audio: Path, fixture: Path) -> list[Path]:
     return sorted(path for path in run_dir.glob("*.wav") if path.resolve() not in excluded)
 
 
-def live_command_profile(device: str, available_cpus: int | None) -> tuple[int, int, int]:
+def live_command_profile(device: str, available_cpus: int | None, model_filename: str) -> tuple[int, int, int]:
     """Mirror the app's bounded thread count and CPU/GPU live window."""
     threads = max(1, min(8, available_cpus or 1))
     step_ms = 1280 if device == "cpu" else 1000
-    return threads, step_ms, 2000
+    accelerated_live_model = (
+        sys.platform == "darwin" and platform.machine() == "arm64"
+        and model_filename.casefold() == "ggml-tiny-q8_0.bin"
+    )
+    length_ms = 4000 if device == "auto" and accelerated_live_model else 2000
+    return threads, step_ms, length_ms
 
 
 def preview_latency_seconds(step_ms: int, inference_ms: float) -> float:
@@ -273,10 +280,11 @@ def main() -> int:
         sample_rate = handle.getframerate()
         duration = input_frames / sample_rate
     with wave.open(str(args.fixture), "rb") as handle:
-        fixture_duration = handle.getnframes() / handle.getframerate()
+        fixture_frames = handle.getnframes()
+        fixture_sample_rate = handle.getframerate()
     speech_onset = speech_onset_seconds(args.audio)
 
-    threads, step_ms, length_ms = live_command_profile(args.device, os.cpu_count())
+    threads, step_ms, length_ms = live_command_profile(args.device, os.cpu_count(), args.model.name)
     command = [
         str(args.binary), "-m", str(args.model), "-t", str(threads), "--step", str(step_ms),
         "--length", str(length_ms), "--no-fallback", "--save-audio", "-l", "auto",
@@ -285,6 +293,13 @@ def main() -> int:
         command.extend(["-ng", "-nfa"])
 
     environment = os.environ.copy()
+    # The desktop startup sets these flags before either engine is initialized.
+    metal_environment = {
+        "GGML_METAL_NO_RESIDENCY": "1",
+        "GGML_METAL_SHARED_BUFFERS_DISABLE": "1",
+        "GGML_METAL_CONCURRENCY_DISABLE": "1",
+    }
+    environment.update(metal_environment)
     environment["SBOBINO_WHISPER_REPLAY_WAV"] = str(args.audio)
     if args.expect_backlog_recovery:
         # Test-only bypass: the recovery proof deliberately reaches capture and
@@ -377,12 +392,22 @@ def main() -> int:
     output_text = finalized_transcript(stdout)
     saved_audio = captured_wav_paths(args.run_dir, args.audio, args.fixture)
     saved_frames = 0
+    invalid_audio = []
     for path in saved_audio:
-        with wave.open(str(path), "rb") as handle:
-            saved_frames += handle.getnframes()
+        header = b""
+        size_bytes = None
+        try:
+            with path.open("rb") as stream:
+                size_bytes = os.fstat(stream.fileno()).st_size
+                header = stream.read(64)
+                stream.seek(0)
+                with wave.open(stream, "rb") as handle:
+                    saved_frames += handle.getnframes()
+        except (wave.Error, EOFError, OSError) as error:
+            invalid_audio.append({"file": path.name, "error": str(error), "header_hex": header.hex(), "size_bytes": size_bytes})
     normalized = unicodedata.normalize("NFKC", output_text).casefold()
     normalized = " ".join(re.findall(r"[^\W\d_]+(?:['’][^\W\d_]+)?", normalized))
-    expected_segments = int(duration // fixture_duration)
+    expected_segments = input_frames * fixture_sample_rate // (fixture_frames * sample_rate)
     observed_segments = count_fixture_utterances(normalized)
     final_summary = final_runtime_summary(stderr, sample_rate)
     preflight = final_preflight_result(stderr)
@@ -397,7 +422,7 @@ def main() -> int:
     preflight_rejection_mode = args.expect_preflight_rejection or (
         args.allow_preflight_rejection and preflight_rejection_observed
     )
-    failures: list[str] = []
+    failures: list[str] = [f"invalid captured WAV {item['file']}: {item['error']}" for item in invalid_audio]
     if coreml_expected and not coreml_loaded:
         failures.append("expected Core ML encoder was not loaded")
     if timed_out:
@@ -478,6 +503,7 @@ def main() -> int:
             "max_tokens": 16,
             "coreml_expected": coreml_expected,
             "coreml_loaded": coreml_loaded,
+            "metal_environment": metal_environment,
         },
         "captured_duration_seconds": captured_frames / sample_rate,
         "live_mode": (
@@ -487,6 +513,7 @@ def main() -> int:
             if args.expect_backlog_recovery
             else "realtime"
         ),
+        "realtime_capable": not failures and not (preflight_rejection_mode or args.expect_backlog_recovery),
         "samples": samples,
         "first_preview_seconds": 0.0 if preflight_rejection_mode else (
             max(0.0, first_preview_wall - replay_started_wall - speech_onset)
@@ -515,8 +542,13 @@ def main() -> int:
         "backlog_reaction_budget_seconds": BACKLOG_REACTION_BUDGET_SECONDS,
         "captured_audio_frames": captured_frames,
         "saved_audio_frames": saved_frames,
+        "invalid_captured_audio": invalid_audio,
         "stdout_transcript": output_text,
         "stderr_tail": stderr[-8000:],
+        "stdout_raw": stdout,
+        "stderr_raw": stderr,
+        "command": command,
+        "exit_code": return_code,
         "failures": failures,
     }
     args.report.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")

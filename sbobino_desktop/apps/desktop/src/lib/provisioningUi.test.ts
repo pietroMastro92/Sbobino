@@ -1,8 +1,187 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { formatProvisioningAssetLabel, shouldOfferLocalModelsCta } from "./provisioningUi";
+import { formatProvisioningAssetLabel, formatProvisioningFailureMessage, provisioningScopeForAssetKind, ProvisioningCancelledError, runProvisioningAndRefresh, shouldOfferLocalModelsCta, shouldShowProvisioningStatus } from "./provisioningUi";
 
 describe("provisioningUi", () => {
+  it("keeps operation outcomes in their owning panel and preserves a usable repair", () => {
+    expect(provisioningScopeForAssetKind("pyannote_runtime")).toBe("pyannote");
+    expect(shouldShowProvisioningStatus("pyannote", "pyannote", "Failed")).toBe(true);
+    expect(shouldShowProvisioningStatus("pyannote", "local_models", "Failed")).toBe(false);
+    expect(shouldShowProvisioningStatus("runtime", "local_models", "Ready")).toBe(true);
+    expect(shouldShowProvisioningStatus(null, "local_models", "Local models are ready")).toBe(true);
+    expect(shouldShowProvisioningStatus(null, "pyannote", "Local models are ready")).toBe(false);
+    expect(formatProvisioningFailureMessage("Checksum mismatch", true)).toContain("previous installation is still available");
+  });
+  it("times out a run that never emits a terminal event", async () => {
+    vi.useFakeTimers();
+    const unlisten = vi.fn();
+    const refresh = vi.fn().mockResolvedValue(undefined);
+    const run = runProvisioningAndRefresh({
+      starter: vi.fn().mockResolvedValue({ started: true }),
+      subscribe: vi.fn().mockResolvedValue(unlisten),
+      refresh,
+      timeoutMs: 100,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+
+    const rejection = expect(run).rejects.toThrow("timed out");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    expect(unlisten).toHaveBeenCalledOnce();
+    expect(refresh).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
+
+  it("preserves the provisioning error when the refresh also fails", async () => {
+    await expect(
+      runProvisioningAndRefresh({
+        starter: vi.fn().mockRejectedValue(new Error("install failed")),
+        subscribe: vi.fn().mockResolvedValue(vi.fn()),
+        refresh: vi.fn().mockRejectedValue(new Error("refresh failed")),
+        timeoutMs: 100,
+        timeoutMessage: "timed out",
+        cancelledMessage: "cancelled",
+        failureMessage: "failed",
+      }),
+    ).rejects.toThrow("install failed");
+  });
+
+  it("times out while subscription or startup is still pending", async () => {
+    vi.useFakeTimers();
+    for (const pendingStep of ["subscribe", "starter"] as const) {
+      const never = new Promise<never>(() => undefined);
+      const run = runProvisioningAndRefresh({
+        starter:
+          pendingStep === "starter"
+            ? vi.fn(() => never)
+            : vi.fn().mockResolvedValue({ started: true }),
+        subscribe:
+          pendingStep === "subscribe"
+            ? vi.fn(() => never)
+            : vi.fn().mockResolvedValue(vi.fn()),
+        refresh: vi.fn().mockResolvedValue(undefined),
+        timeoutMs: 100,
+        timeoutMessage: "timed out",
+        cancelledMessage: "cancelled",
+        failureMessage: "failed",
+      });
+      const rejection = expect(run).rejects.toThrow("timed out");
+      await vi.advanceTimersByTimeAsync(100);
+      await rejection;
+    }
+    vi.useRealTimers();
+  });
+
+  it("releases a subscription that resolves after the lifecycle timeout", async () => {
+    vi.useFakeTimers();
+    const unlisten = vi.fn();
+    const run = runProvisioningAndRefresh({
+      starter: vi.fn().mockResolvedValue({ started: true }),
+      subscribe: vi.fn(
+        () =>
+          new Promise<() => void>((resolve) => {
+            setTimeout(() => resolve(unlisten), 200);
+          }),
+      ),
+      refresh: vi.fn().mockResolvedValue(undefined),
+      timeoutMs: 100,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+    const rejection = expect(run).rejects.toThrow("timed out");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(unlisten).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
+
+  it("surfaces a terminal error even when the start call never settles", async () => {
+    vi.useFakeTimers();
+    let onStatus: ((event: { state: string; message: string }) => void) | undefined;
+    const run = runProvisioningAndRefresh({
+      subscribe: vi.fn(async (listener) => {
+        onStatus = listener;
+        return vi.fn();
+      }),
+      starter: vi.fn(() => {
+        onStatus?.({ state: "error", message: "early native error" });
+        return new Promise<{ started: boolean }>(() => undefined);
+      }),
+      refresh: vi.fn().mockResolvedValue(undefined),
+      timeoutMs: 5_000,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+    const rejection = expect(run).rejects.toThrow("early native error");
+    await rejection;
+    vi.useRealTimers();
+  });
+
+  it("bounds a refresh that never settles while preserving the primary error", async () => {
+    vi.useFakeTimers();
+    const run = runProvisioningAndRefresh({
+      starter: vi.fn().mockRejectedValue(new Error("install failed")),
+      subscribe: vi.fn().mockResolvedValue(vi.fn()),
+      refresh: vi.fn(() => new Promise<never>(() => undefined)),
+      timeoutMs: 5_000,
+      refreshTimeoutMs: 100,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+    const rejection = expect(run).rejects.toThrow("install failed");
+    await vi.advanceTimersByTimeAsync(100);
+    await rejection;
+    vi.useRealTimers();
+  });
+
+  it("preserves cancellation as a distinct terminal outcome", async () => {
+    let onStatus: ((event: { state: string; message: string }) => void) | undefined;
+    const run = runProvisioningAndRefresh({
+      subscribe: vi.fn(async (listener) => {
+        onStatus = listener;
+        return vi.fn();
+      }),
+      starter: vi.fn(async () => {
+        onStatus?.({ state: "cancelled", message: "cancelled by user" });
+        return { started: true };
+      }),
+      refresh: vi.fn().mockResolvedValue(undefined),
+      timeoutMs: 100,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+    await expect(run).rejects.toBeInstanceOf(ProvisioningCancelledError);
+  });
+
+  it("subscribes before starting and accepts an immediate completion", async () => {
+    let onStatus: ((event: { state: string; message: string }) => void) | undefined;
+    const order: string[] = [];
+    await runProvisioningAndRefresh({
+      subscribe: vi.fn(async (listener) => {
+        order.push("subscribe");
+        onStatus = listener;
+        return vi.fn();
+      }),
+      starter: vi.fn(async () => {
+        order.push("start");
+        onStatus?.({ state: "completed", message: "ready" });
+        return { started: true };
+      }),
+      refresh: vi.fn().mockResolvedValue(undefined),
+      timeoutMs: 100,
+      timeoutMessage: "timed out",
+      cancelledMessage: "cancelled",
+      failureMessage: "failed",
+    });
+    expect(order).toEqual(["subscribe", "start"]);
+  });
   it("formats pyannote progress labels distinctly", () => {
     expect(
       formatProvisioningAssetLabel({

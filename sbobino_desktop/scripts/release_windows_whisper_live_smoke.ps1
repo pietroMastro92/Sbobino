@@ -10,6 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $tag = "v$Version"
+$commitSha = git rev-parse HEAD
 $runDir = Join-Path $env:RUNNER_TEMP ("sbobino-whisper-live-" + [Guid]::NewGuid().ToString("N"))
 $assetDir = Join-Path $runDir "assets"
 $speechDir = Join-Path $runDir "speech"
@@ -123,7 +124,6 @@ try {
         $evaluateStatus = $LASTEXITCODE
         $evaluated = Get-Content $evaluatedReport -Raw | ConvertFrom-Json
         $evaluated | Add-Member -Force live_mode "realtime"
-        $evaluated | Add-Member -Force realtime_capable $true
         $evaluated | Add-Member -Force preflight_rejected $false
         $evaluated | Add-Member -Force preflight $raw.preflight
         $evaluated | Add-Member -Force requested_duration_seconds $raw.requested_duration_seconds
@@ -140,16 +140,19 @@ try {
         $evaluated.failures = @($evaluated.failures) + @($recovery.failures | ForEach-Object { "backlog recovery: $_" })
         $evaluated.status = "failed"
     }
-    $evaluated | Add-Member -Force evidence_class "hosted-packaged-engine"
+    $evaluated | Add-Member -Force realtime_capable ($raw.realtime_capable -and ($evaluated.status -eq "passed"))
+    $evidenceClass = if ($env:GITHUB_ACTIONS -eq "true") { "hosted-packaged-engine" } else { "local-packaged-engine" }
+    $evaluated | Add-Member -Force evidence_class $evidenceClass
     $evaluated | Add-Member -Force version $Version
     $evaluated | Add-Member -Force release_tag $tag
     $evaluated | Add-Member -Force real_engine $true
     $evaluated | Add-Member -Force real_harness $true
-    $evaluated | Add-Member -Force runner "github-hosted windows-2025"
+    $runner = if ($env:GITHUB_ACTIONS -eq "true") { "github-hosted windows-2025" } else { "local Windows x86_64" }
+    $evaluated | Add-Member -Force runner $runner
     $evaluated | Add-Member -Force harness "release_windows_whisper_live_smoke.ps1@v1"
     $evaluated | Add-Member -Force compute_device "cpu"
     $evaluated | Add-Member -Force duration_seconds $DurationSeconds
-    $evaluated | Add-Member -Force commit_sha (git rev-parse HEAD)
+    $evaluated | Add-Member -Force commit_sha $commitSha
     $evaluated | Add-Member -Force repo_slug $RepoSlug
     $evaluated | Add-Member -Force input_audio_sha256 ((Get-FileHash -Algorithm SHA256 $audio).Hash.ToLowerInvariant())
     $runtimeHashes = [PSCustomObject]@{
@@ -171,6 +174,8 @@ try {
     })
     $parent = Split-Path -Parent $ReportPath
     if ($parent) { New-Item -ItemType Directory -Force $parent | Out-Null }
+    $evaluated | Add-Member -Force raw_run $raw
+    $evaluated | Add-Member -Force raw_recovery $recovery
     $evaluated | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $ReportPath
 
     if ($runStatus -ne 0 -or $recoveryStatus -ne 0 -or $evaluateStatus -ne 0 -or $evaluated.status -ne "passed") {

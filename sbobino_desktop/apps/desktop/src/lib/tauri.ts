@@ -371,8 +371,8 @@ export async function startRealtime(payload?: {
   language?: AppSettings["language"];
   resume_artifact_id?: string;
   title?: string;
-}): Promise<{ started: boolean; job_id: string }> {
-  return invoke<{ started: boolean; job_id: string }>("start_realtime", { payload });
+}): Promise<{ started: boolean; job_id: string; model: AppSettings["model"] }> {
+  return invoke<{ started: boolean; job_id: string; model: AppSettings["model"] }>("start_realtime", { payload });
 }
 
 export async function pauseRealtime(): Promise<void> {

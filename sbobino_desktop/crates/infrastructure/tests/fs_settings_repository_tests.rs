@@ -21,12 +21,26 @@ async fn secure_storage_test_guard() -> MutexGuard<'static, ()> {
 }
 
 #[tokio::test]
+async fn initialization_reports_secure_storage_failure_without_panicking() {
+    let _guard = secure_storage_test_guard().await;
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("failed to create temp dir");
+    let blocked_root = temp.path().join("not-a-directory");
+    fs::write(&blocked_root, b"blocked").expect("failed to create blocking file");
+
+    let error = FsSettingsRepository::new(blocked_root.join("settings.json"))
+        .expect_err("invalid secure storage path must fail");
+    assert!(error.to_string().contains("secure storage directory"));
+}
+
+#[tokio::test]
 async fn load_creates_default_settings_when_file_is_missing() {
     let _guard = secure_storage_test_guard().await;
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("config").join("settings.json");
-    let repo = FsSettingsRepository::new(settings_path.clone());
+    let repo = FsSettingsRepository::new(settings_path.clone())
+        .expect("settings repository should initialize");
 
     let settings = repo.load().await.expect("load should create defaults");
 
@@ -53,7 +67,8 @@ async fn load_migrates_streaming_parakeet_model_to_file_tdt_and_persists_it() {
     )
     .expect("legacy settings should write");
 
-    let repo = FsSettingsRepository::new(settings_path.clone());
+    let repo = FsSettingsRepository::new(settings_path.clone())
+        .expect("settings repository should initialize");
     let loaded = repo.load().await.expect("settings migration should load");
     assert_eq!(
         loaded.transcription.parakeet_model,
@@ -70,7 +85,8 @@ async fn save_then_load_round_trips_settings() {
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
-    let repo = FsSettingsRepository::new(settings_path);
+    let repo =
+        FsSettingsRepository::new(settings_path).expect("settings repository should initialize");
 
     let mut settings = repo.load().await.expect("initial load should succeed");
     settings.model = SpeechModel::LargeTurbo;
@@ -103,7 +119,8 @@ async fn save_then_load_persists_new_ai_provider_secrets() {
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
-    let repo = FsSettingsRepository::new(settings_path);
+    let repo =
+        FsSettingsRepository::new(settings_path).expect("settings repository should initialize");
 
     let mut settings = repo.load().await.expect("initial load should succeed");
     settings.ai.providers.gemini.api_key = Some("gemini-secret".to_string());
@@ -138,7 +155,8 @@ async fn redacted_ai_updates_keep_secrets_until_explicitly_cleared() {
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
-    let repo = FsSettingsRepository::new(settings_path);
+    let repo =
+        FsSettingsRepository::new(settings_path).expect("settings repository should initialize");
     let mut settings = repo.load().await.expect("initial load should succeed");
     settings.ai.providers.gemini.api_key = Some("gemini-secret".to_string());
     settings.ai.providers.gemini.has_api_key = true;
@@ -193,7 +211,8 @@ async fn save_then_load_preserves_structured_transcription_settings() {
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
-    let repo = FsSettingsRepository::new(settings_path);
+    let repo =
+        FsSettingsRepository::new(settings_path).expect("settings repository should initialize");
 
     let mut settings = repo.load().await.expect("initial load should succeed");
     settings.transcription.enable_ai_post_processing = true;
@@ -229,7 +248,8 @@ async fn save_then_load_preserves_automatic_import_and_workspace_settings() {
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
-    let repo = FsSettingsRepository::new(settings_path);
+    let repo =
+        FsSettingsRepository::new(settings_path).expect("settings repository should initialize");
 
     let mut settings = repo.load().await.expect("initial load should succeed");
     settings.automation.enabled = true;
@@ -329,7 +349,8 @@ async fn load_backfills_legacy_automatic_import_source_model_and_language() {
     )
     .expect("write legacy settings");
 
-    let repo = FsSettingsRepository::new(settings_path);
+    let repo =
+        FsSettingsRepository::new(settings_path).expect("settings repository should initialize");
     let loaded = repo.load().await.expect("legacy load should succeed");
 
     assert_eq!(
@@ -368,7 +389,8 @@ async fn load_migrates_legacy_plaintext_provider_keys_and_redacts_file() {
     )
     .expect("write legacy settings");
 
-    let repo = FsSettingsRepository::new(settings_path.clone());
+    let repo = FsSettingsRepository::new(settings_path.clone())
+        .expect("settings repository should initialize");
     let loaded = repo.load().await.expect("legacy load should succeed");
     assert_eq!(
         loaded.ai.providers.gemini.api_key.as_deref(),
@@ -436,7 +458,8 @@ async fn load_redacts_plaintext_when_secure_storage_already_has_newer_keys() {
     )
     .expect("write legacy settings");
 
-    let repo = FsSettingsRepository::new(settings_path.clone());
+    let repo = FsSettingsRepository::new(settings_path.clone())
+        .expect("settings repository should initialize");
     let loaded = repo.load().await.expect("legacy load should succeed");
     assert_eq!(
         loaded.ai.providers.gemini.api_key.as_deref(),
@@ -460,7 +483,8 @@ async fn removing_remote_service_deletes_its_secure_secret() {
     enable_local_secure_storage_for_tests();
     let temp = tempdir().expect("failed to create temp dir");
     let settings_path = temp.path().join("settings.json");
-    let repo = FsSettingsRepository::new(settings_path);
+    let repo =
+        FsSettingsRepository::new(settings_path).expect("settings repository should initialize");
     let mut settings = repo.load().await.expect("initial load should succeed");
     settings.ai.remote_services.push(RemoteServiceConfig {
         id: "to-remove".to_string(),

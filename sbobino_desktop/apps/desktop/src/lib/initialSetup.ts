@@ -8,6 +8,7 @@ import type {
 } from "../types";
 
 export const INITIAL_SETUP_REQUIRED_MODELS: SpeechModel[] = [
+  "tiny",
   "base",
   "large_turbo",
 ];
@@ -93,8 +94,9 @@ export function getInitialSetupMissingModels(
   const includeParakeet = !engine || engine === "parakeet_cpp";
 
   const missing: Array<SpeechModel | ParakeetModel> = [];
-  if (includeWhisper) {
-    for (const model of INITIAL_SETUP_REQUIRED_MODELS) {
+  // Live always uses the certified Whisper model, including with Parakeet selected for files.
+  for (const model of INITIAL_SETUP_REQUIRED_MODELS) {
+    if (includeWhisper || model === "tiny") {
       if (
         !isProvisionedModelReady(
           findProvisioningModelEntry(modelCatalog, model),
@@ -152,6 +154,31 @@ export function isInitialSetupComplete(
   return runtimeReady && pyannoteReady && modelsReady;
 }
 
+export function inferInitialSetupReasonCode(
+  snapshot: {
+    runtimeHealth: RuntimeHealth;
+    modelCatalog: ProvisioningModelCatalogEntry[];
+  } | null,
+  privacyAccepted: boolean,
+): string {
+  if (!snapshot) {
+    return "setup_incomplete";
+  }
+  if (!isRuntimeToolchainReady(snapshot.runtimeHealth)) {
+    return "runtime_repair_required";
+  }
+  if (getInitialSetupMissingModels(
+    snapshot.modelCatalog,
+    snapshot.runtimeHealth.is_apple_silicon,
+    snapshot.runtimeHealth.configured_engine,
+  ).length > 0) {
+    return "models_missing";
+  }
+  return isInitialSetupComplete(privacyAccepted, snapshot.runtimeHealth, snapshot.modelCatalog)
+    ? "setup_complete"
+    : "setup_incomplete";
+}
+
 export function canWarmStartFromSetupReport(
   privacyAccepted: boolean,
   report: InitialSetupReport | null | undefined,
@@ -166,6 +193,7 @@ export function canWarmStartFromSetupReport(
 
   return (
     report.setup_complete &&
+    report.runtime_health?.setup_complete === true &&
     !report.final_error &&
     report.final_reason_code === "setup_complete"
   );
