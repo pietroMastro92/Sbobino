@@ -63,7 +63,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_runtime_workflows_collect_fallback_diagnostics_without_large_assets(self):
         for path, prefix in ((ARM_VALIDATION, "sbobino-macos-whisper-live.*"), (INTEL_VALIDATION, "sbobino-macos-whisper-live.*")):
             workflow = path.read_text()
-            self.assertIn("TMPDIR: ${{ runner.temp }}", workflow)
+            self.assertIn('TMPDIR="$RUNNER_TEMP"', workflow)
+            self.assertNotIn("TMPDIR: ${{ runner.temp }}", workflow)
             for suffix in ("json", "log", "stderr", "stdout", "txt"):
                 self.assertIn(prefix + "/**/*." + suffix, workflow)
         windows = (ROOT.parent / ".github/workflows/windows-port.yml").read_text()

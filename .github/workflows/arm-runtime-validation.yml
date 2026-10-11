@@ -24,7 +24,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG_NAME: ${{ inputs.tag_name }}
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,6 +68,7 @@ jobs:
       - name: Replay packaged Whisper through the production stream binary
         working-directory: sbobino_desktop
         run: |
+          TMPDIR="$RUNNER_TEMP" \
           SBOBINO_WHISPER_LIVE_ARCH=arm64 \
           SBOBINO_WHISPER_ALLOW_PREFLIGHT_REJECTION=1 \
           SBOBINO_WHISPER_LIVE_RUNTIME_ZIP="$RUNNER_TEMP/speech-runtime-macos-aarch64.zip" \

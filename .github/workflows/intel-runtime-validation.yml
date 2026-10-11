@@ -24,7 +24,6 @@ jobs:
     timeout-minutes: 120
     env:
       TAG_NAME: ${{ inputs.tag_name }}
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -120,6 +119,7 @@ jobs:
       - name: Run real packaged Whisper live replay on Intel Auto
         working-directory: sbobino_desktop
         run: |
+          TMPDIR="$RUNNER_TEMP" \
           SBOBINO_WHISPER_LIVE_ARCH=x86_64 \
           SBOBINO_WHISPER_LIVE_DEVICE=auto \
           SBOBINO_WHISPER_EXPECT_PREFLIGHT_REJECTION=1 \
