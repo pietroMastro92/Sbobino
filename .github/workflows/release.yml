@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAG_NAME: ${{ inputs.tag_name }}
+      REVIEWED_PRODUCT_SHA: 81a1e3eb15b2054f31efb18ce07834189b34d8b7
     steps:
       - name: Require the reviewed candidate tag
         run: |
@@ -25,6 +26,15 @@ jobs:
             echo "Release Candidate is locked to v2.0.35; got $TAG_NAME" >&2
             exit 1
           fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag_name }}
+          fetch-depth: 0
+      - name: Require the verified application and runtime sources
+        run: |
+          git diff --exit-code "$REVIEWED_PRODUCT_SHA" HEAD -- \
+            sbobino_desktop/apps sbobino_desktop/crates sbobino_desktop/scripts \
+            sbobino_desktop/Cargo.toml sbobino_desktop/Cargo.lock
 
   build-native:
     name: Build native macOS ${{ matrix.arch }}
