@@ -34,6 +34,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         for path in (ARM_VALIDATION, INTEL_VALIDATION):
             workflow = path.read_text()
             self.assertIn("ref: ${{ inputs.source_ref || inputs.tag_name }}", workflow)
+            self.assertIn('./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md" v2.0.33', workflow)
             self.assertIn("runtime-validation-source.txt", workflow)
             self.assertIn("-smoke-proof.raw/", workflow)
             self.assertNotIn("contents: write", workflow)

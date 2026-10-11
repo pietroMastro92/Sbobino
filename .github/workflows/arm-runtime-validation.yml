@@ -44,7 +44,7 @@ jobs:
           fi
           VERSION="${TAG_NAME#v}"
           SBOBINO_RELEASE_PROFILE=standalone-dev ./scripts/check_release_versions.sh "$VERSION"
-          ./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md"
+          ./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md" v2.0.33
 
       - uses: dtolnay/rust-toolchain@master
         with:
