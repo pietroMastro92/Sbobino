@@ -60,6 +60,20 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.assertIn("original failure", failed.stderr)
             self.assertTrue((run / "failed.json").exists())
 
+    def test_runtime_workflows_collect_fallback_diagnostics_without_large_assets(self):
+        for path, prefix in ((ARM_VALIDATION, "sbobino-macos-whisper-live.*"), (INTEL_VALIDATION, "sbobino-macos-whisper-live.*")):
+            workflow = path.read_text()
+            self.assertIn("TMPDIR: ${{ runner.temp }}", workflow)
+            for suffix in ("json", "log", "stderr", "stdout", "txt"):
+                self.assertIn(prefix + "/**/*." + suffix, workflow)
+        windows = (ROOT.parent / ".github/workflows/windows-port.yml").read_text()
+        runtime_only = windows.split("  runtime-only:", 1)[1].split("  windows-native:", 1)[0]
+        for suffix in ("json", "log", "stderr", "stdout", "txt"):
+            self.assertIn("sbobino-whisper-live-*/**/*." + suffix, runtime_only)
+        for forbidden in ("secrets.", "TAURI_SIGNING", "gh release create", "gh release upload", "git push", "**/*.wav", "**/*.bin", "**/*.zip"):
+            self.assertNotIn(forbidden, runtime_only)
+        self.assertIn("if: ${{ !inputs.runtime_only }}", windows)
+
     def test_runtime_validation_can_use_current_source_without_publication(self):
         for path in (ARM_VALIDATION, INTEL_VALIDATION):
             workflow = path.read_text()

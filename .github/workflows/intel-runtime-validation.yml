@@ -24,6 +24,7 @@ jobs:
     timeout-minutes: 120
     env:
       TAG_NAME: ${{ inputs.tag_name }}
+      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -136,5 +137,10 @@ jobs:
             ${{ runner.temp }}/*-smoke-proof.json
             ${{ runner.temp }}/*-smoke-proof.raw/
             ${{ runner.temp }}/runtime-validation-source.txt
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.json
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.log
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.stderr
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.stdout
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.txt
           if-no-files-found: error
           retention-days: 3

@@ -61,6 +61,11 @@ jobs:
             ${{ runner.temp }}/windows-whisper-live-smoke-proof.json
             ${{ runner.temp }}/windows-whisper-live-smoke-proof.raw/
             ${{ runner.temp }}/runtime-validation-source.txt
+            ${{ runner.temp }}/sbobino-whisper-live-*/**/*.json
+            ${{ runner.temp }}/sbobino-whisper-live-*/**/*.log
+            ${{ runner.temp }}/sbobino-whisper-live-*/**/*.stderr
+            ${{ runner.temp }}/sbobino-whisper-live-*/**/*.stdout
+            ${{ runner.temp }}/sbobino-whisper-live-*/**/*.txt
           if-no-files-found: error
           retention-days: 3
   windows-native:
