@@ -3,6 +3,15 @@ name: Windows Port Validation
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: Optional source commit to validate without publishing a release
+        required: false
+        default: ""
+        type: string
+      runtime_only:
+        description: Validate real packaged Whisper only, without installer signing
+        type: boolean
+        default: false
       tag_name:
         description: Candidate tag whose Windows package should be validated
         required: true
@@ -16,7 +25,46 @@ permissions:
   contents: read
 
 jobs:
+  runtime-only:
+    if: inputs.runtime_only
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || inputs.tag_name }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Record source and run smoke contracts on native Windows
+        shell: pwsh
+        run: |
+          git rev-parse HEAD | Out-File "$env:RUNNER_TEMP/runtime-validation-source.txt"
+          python -c "import platform; print(platform.platform(), platform.machine())" | Out-File -Append "$env:RUNNER_TEMP/runtime-validation-source.txt"
+          python sbobino_desktop/scripts/test_release_workflow_contract.py
+          if ($LASTEXITCODE -ne 0) { throw 'Native smoke contracts failed' }
+      - name: Build and replay the actual Windows runtime
+        shell: pwsh
+        working-directory: sbobino_desktop
+        run: |
+          $runtime = Join-Path $env:RUNNER_TEMP 'speech-runtime-windows-x86_64.zip'
+          ./scripts/package_windows_runtime_asset.ps1 -OutputZip $runtime
+          $version = (Get-Content apps/desktop/package.json | ConvertFrom-Json).version
+          ./scripts/release_windows_whisper_live_smoke.ps1 -Version $version -RepoSlug $env:GITHUB_REPOSITORY -ReportPath "$env:RUNNER_TEMP/windows-whisper-live-smoke-proof.json" -RuntimeZip $runtime -ExpectPreflightRejection
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-runtime-validation-proofs
+          path: |
+            ${{ runner.temp }}/windows-whisper-live-smoke-proof.json
+            ${{ runner.temp }}/windows-whisper-live-smoke-proof.raw/
+            ${{ runner.temp }}/runtime-validation-source.txt
+          if-no-files-found: error
+          retention-days: 3
   windows-native:
+    if: ${{ !inputs.runtime_only }}
     runs-on: windows-2025
     env:
       TAG_NAME: ${{ inputs.tag_name || github.ref_name }}
@@ -27,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag_name || github.ref }}
+          ref: ${{ inputs.source_ref || inputs.tag_name || github.ref }}
           fetch-depth: 0
 
       - name: Validate v2.0.34 candidate tag and versioned notes
@@ -41,7 +89,7 @@ jobs:
           fi
           VERSION="${TAG_NAME#v}"
           SBOBINO_RELEASE_PROFILE=standalone-dev ./scripts/check_release_versions.sh "$VERSION"
-          ./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md"
+          ./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md" v2.0.33
 
       - uses: actions/setup-node@v4
         with:

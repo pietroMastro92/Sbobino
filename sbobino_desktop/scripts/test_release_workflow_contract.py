@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import shutil
 import hashlib
 import re
 import textwrap
@@ -30,6 +31,35 @@ DISPATCHER = ROOT / "scripts" / "dispatch_release_candidate.sh"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("pwsh"), "requires native PowerShell")
+    def test_windows_cleanup_preserves_nested_diagnostics_and_original_failure(self):
+        cleanup = WINDOWS_LIVE_SMOKE.read_text().rsplit("finally {", 1)[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            run = root / "run"
+            (run / "recovery").mkdir(parents=True)
+            (run / "input.json").write_text('{"input": true}')
+            (run / "recovery/input.json").write_text('{"recovery": true}')
+            (run / "model.bin").write_bytes(b"reproducible")
+            script = root / "cleanup.ps1"
+            script.write_text('$ErrorActionPreference = "Stop"\n$runDir = $args[0]\n$ReportPath = $args[1]\ntry { throw "original failure" } finally {' + cleanup)
+            result = subprocess.run(["pwsh", "-NoProfile", "-File", str(script), str(run), str(root / "proof.json")], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("original failure", result.stderr)
+            raw = root / "proof.raw"
+            self.assertEqual(json.loads((raw / "recovery/input.json").read_text()), {"recovery": True})
+            self.assertTrue((raw / "input.json").exists())
+            self.assertFalse((raw / "model.bin").exists())
+            self.assertFalse(run.exists())
+            run.mkdir()
+            (run / "failed.json").write_text('{}')
+            blocked = root / "blocked"
+            blocked.write_text("not a directory")
+            failed = subprocess.run(["pwsh", "-NoProfile", "-File", str(script), str(run), str(blocked / "proof.json")], capture_output=True, text=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("original failure", failed.stderr)
+            self.assertTrue((run / "failed.json").exists())
+
     def test_runtime_validation_can_use_current_source_without_publication(self):
         for path in (ARM_VALIDATION, INTEL_VALIDATION):
             workflow = path.read_text()

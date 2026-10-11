@@ -183,5 +183,21 @@ try {
     }
 }
 finally {
-    if (Test-Path $runDir) { Remove-Item -Recurse -Force $runDir }
+    if (Test-Path $runDir) {
+        try {
+            $rawDir = [IO.Path]::ChangeExtension($ReportPath, 'raw')
+            New-Item -ItemType Directory -Force $rawDir | Out-Null
+            Get-ChildItem $runDir -Recurse -File | Where-Object {
+                $_.Extension -in '.json', '.log', '.stdout', '.stderr', '.txt'
+            } | ForEach-Object {
+                $destination = Join-Path $rawDir ([IO.Path]::GetRelativePath($runDir, $_.FullName))
+                New-Item -ItemType Directory -Force (Split-Path -Parent $destination) | Out-Null
+                Copy-Item $_.FullName $destination
+            }
+            Remove-Item -Recurse -Force $runDir
+        }
+        catch {
+            Write-Warning "Raw diagnostic copy failed; preserving $runDir : $_"
+        }
+    }
 }
