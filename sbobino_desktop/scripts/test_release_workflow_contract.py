@@ -30,6 +30,44 @@ DISPATCHER = ROOT / "scripts" / "dispatch_release_candidate.sh"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_runtime_validation_can_use_current_source_without_publication(self):
+        for path in (ARM_VALIDATION, INTEL_VALIDATION):
+            workflow = path.read_text()
+            self.assertIn("ref: ${{ inputs.source_ref || inputs.tag_name }}", workflow)
+            self.assertIn("runtime-validation-source.txt", workflow)
+            self.assertIn("-smoke-proof.raw/", workflow)
+            self.assertNotIn("contents: write", workflow)
+            self.assertNotIn("gh release create", workflow)
+
+    def test_live_cleanup_preserves_nested_raw_diagnostics_and_exit_status(self):
+        script = ARM_LIVE_SMOKE.read_text()
+        cleanup = script.split("cleanup() {", 1)[1].split("\ntrap cleanup EXIT", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            run = root / "run"
+            (run / "backlog-recovery").mkdir(parents=True)
+            (run / "live-input.json").write_text('{"real": true}')
+            (run / "backlog-recovery/live-input.json").write_text('{"recovery": true}')
+            (run / "model.bin").write_bytes(b"reproducible")
+            report = root / "proof.json"
+            code = "set -euo pipefail\nRUN_DIR=$1\nREPORT_PATH=$2\ncleanup() {" + cleanup + "\ntrap cleanup EXIT\nexit 7\n"
+            result = subprocess.run(["bash", "-c", code, "cleanup-test", str(run), str(report)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 7, result.stderr)
+            raw = root / "proof.raw"
+            self.assertEqual((raw / "exit-code.txt").read_text(), "7\n")
+            self.assertEqual(json.loads((raw / "live-input.json").read_text()), {"real": True})
+            self.assertEqual(json.loads((raw / "backlog-recovery/live-input.json").read_text()), {"recovery": True})
+            self.assertFalse((raw / "model.bin").exists())
+            self.assertFalse(run.exists())
+            run.mkdir()
+            (run / "failed.json").write_text('{"failed": true}')
+            blocked = root / "blocked"
+            blocked.write_text("not a directory")
+            failed_copy = subprocess.run(["bash", "-c", code, "cleanup-test", str(run), str(blocked / "proof.json")], capture_output=True, text=True)
+            self.assertEqual(failed_copy.returncode, 7)
+            self.assertTrue((run / "failed.json").exists())
+            self.assertIn("preserving", failed_copy.stderr)
+
     def test_pyannote_terminal_events_follow_rollback_and_pending_marker_cleanup(self):
         source = PROVISIONING.read_text()
         for name, following in (

@@ -3,6 +3,11 @@ name: ARM Runtime Validation
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: Optional source commit to validate without publishing a release
+        required: false
+        default: ""
+        type: string
       tag_name:
         description: Candidate tag whose packaged runtime should be validated
         required: true
@@ -22,8 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag_name }}
+          ref: ${{ inputs.source_ref || inputs.tag_name }}
           fetch-depth: 0
+
+      - name: Record actual source and native architecture
+        run: |
+          git rev-parse HEAD | tee "$RUNNER_TEMP/runtime-validation-source.txt"
+          uname -a | tee -a "$RUNNER_TEMP/runtime-validation-source.txt"
 
       - name: Validate v2.0.34 candidate tag and versioned notes
         working-directory: sbobino_desktop
@@ -70,6 +80,9 @@ jobs:
         if: always()
         with:
           name: arm-whisper-live-replay
-          path: ${{ runner.temp }}/arm-whisper-live-smoke-proof.json
+          path: |
+            ${{ runner.temp }}/arm-whisper-live-smoke-proof.json
+            ${{ runner.temp }}/arm-whisper-live-smoke-proof.raw/
+            ${{ runner.temp }}/runtime-validation-source.txt
           if-no-files-found: error
           retention-days: 3

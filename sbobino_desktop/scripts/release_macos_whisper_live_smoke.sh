@@ -19,7 +19,25 @@ MODEL_DIR="$RUN_DIR/models"
 mkdir -p "$ASSET_DIR" "$SPEECH_DIR" "$MODEL_DIR"
 
 cleanup() {
-  rm -rf "$RUN_DIR"
+  local status=$?
+  # Preserve small raw diagnostics before deleting reproducible models/audio.
+  if python3 - "$RUN_DIR" "${REPORT_PATH%.json}.raw" "$status" <<'PYRAW'
+import pathlib, shutil, sys
+source, target = map(pathlib.Path, sys.argv[1:3])
+target.mkdir(parents=True, exist_ok=True)
+(target / "exit-code.txt").write_text(sys.argv[3] + "\n")
+for path in source.rglob("*"):
+    if path.is_file() and path.suffix in {".json", ".log", ".stdout", ".stderr", ".txt"}:
+        destination = target / path.relative_to(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
+PYRAW
+  then
+    rm -rf "$RUN_DIR"
+  else
+    echo "Raw diagnostic copy failed; preserving $RUN_DIR" >&2
+  fi
+  return "$status"
 }
 trap cleanup EXIT
 
