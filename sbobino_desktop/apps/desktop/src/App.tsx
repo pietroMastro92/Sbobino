@@ -11056,12 +11056,12 @@ export function App({
 
   async function onCancelProvisioning(): Promise<void> {
     try {
-      await provisioningCancel();
       setProvisioning((previous) => ({
         ...previous,
-        running: false,
-        statusMessage: t("provisioning.cancelled", "Provisioning cancelled"),
+        // Cancellation acknowledges the request; the terminal event follows rollback.
+        statusMessage: t("provisioning.cancelling", "Cancelling provisioning..."),
       }));
+      await provisioningCancel();
     } catch (cancelError) {
       setError(
         formatUiError(

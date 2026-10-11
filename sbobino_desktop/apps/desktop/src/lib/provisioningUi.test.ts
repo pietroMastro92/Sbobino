@@ -160,6 +160,30 @@ describe("provisioningUi", () => {
     await expect(run).rejects.toBeInstanceOf(ProvisioningCancelledError);
   });
 
+  it("waits for rollback's terminal event before refreshing cancelled provisioning", async () => {
+    let onStatus!: (event: { state: string; message: string }) => void;
+    let ready = false;
+    const refresh = vi.fn(async () => { expect(ready).toBe(true); return { ready }; });
+    const started = vi.fn().mockResolvedValue({ started: true });
+    const run = runProvisioningAndRefresh({
+      subscribe: async (listener) => { onStatus = listener; return () => undefined; },
+      starter: started,
+      refresh,
+      timeoutMs: 5_000,
+      cancelledMessage: "cancelled",
+      timeoutMessage: "timed out",
+      failureMessage: "failed",
+    });
+    const rejection = expect(run).rejects.toBeInstanceOf(ProvisioningCancelledError);
+    await vi.waitFor(() => expect(started).toHaveBeenCalledOnce());
+    // Native cancellation acknowledgment is not a terminal status event.
+    expect(refresh).not.toHaveBeenCalled();
+    ready = true;
+    onStatus({ state: "cancelled", message: "cancelled after rollback" });
+    await rejection;
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
   it("subscribes before starting and accepts an immediate completion", async () => {
     let onStatus: ((event: { state: string; message: string }) => void) | undefined;
     const order: string[] = [];

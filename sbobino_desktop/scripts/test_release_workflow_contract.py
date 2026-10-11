@@ -30,6 +30,19 @@ DISPATCHER = ROOT / "scripts" / "dispatch_release_candidate.sh"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_pyannote_terminal_events_follow_rollback_and_pending_marker_cleanup(self):
+        source = PROVISIONING.read_text()
+        for name, following in (
+            ("spawn_pyannote_bundled_install", "spawn_pyannote_provisioning_download"),
+            ("spawn_pyannote_provisioning_download", "spawn_runtime_provisioning_download"),
+        ):
+            body = source.split("fn " + name + "(", 1)[1].split("fn " + following + "(", 1)[0]
+            probe_failure = body.split('let reason_code = if error == "cancelled"', 1)[1].split("return;", 1)[0]
+            self.assertLess(probe_failure.index("rollback_pyannote_runtime_swap("), probe_failure.index("emit_provisioning_status("))
+            self.assertLess(probe_failure.index("persist_pyannote_install_failure("), probe_failure.index("emit_provisioning_status("))
+            self.assertIn('"cancelled"', probe_failure.split("emit_provisioning_status(", 1)[1])
+            self.assertLess(body.index("finalize_pyannote_runtime_swap("), body.index('"completed"'))
+
     def test_verification_installers_only_upload_current_snapshot(self):
         workflow = (ROOT.parent / ".github/workflows/verification-packages.yml").read_text()
         for expected in ("contents: read", "ref: ${{ github.sha }}", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", '"createUpdaterArtifacts": False', "--no-sign --ci", "actions/upload-artifact@v4"):
