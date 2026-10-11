@@ -25,15 +25,23 @@ jobs:
             machine: arm64
             asset: speech-runtime-macos-aarch64.zip
             digest: 5831267413b9edf4e72c1e2303368fbae4c89bf1a53d6f765141c2dccdfe91e0
+            pyannote_asset: pyannote-runtime-macos-aarch64.zip
+            pyannote_digest: 036a0bab02e9766ede5669b0fbee6bec09c8fd6b47bae9571db8f101eff46105
           - runner: macos-15-intel
             machine: x86_64
             asset: speech-runtime-macos-x86_64.zip
             digest: dd3112dba1b3f16e65d06d2b4e815fe37553223626c5070e36f318953fe86404
+            pyannote_asset: pyannote-runtime-macos-x86_64.zip
+            pyannote_digest: b6e5687246feed70c2210e2345bb513da39ece99d12e4378235e3aa1538fd134
           - runner: windows-2025
             machine: AMD64
             asset: speech-runtime-windows-x86_64.zip
             digest: 43cc3ea4ae1a4737da3be5cd5494df7319ccad5ec2387cde7d6d1ddcf455497d
+            pyannote_asset: pyannote-runtime-windows-x86_64.zip
+            pyannote_digest: 3cb2c3e934ca38d776b380fbf8c941bf5e39badb9034451c2e595c8c24a44a33
     env:
+      PYANNOTE_ASSET: ${{ matrix.pyannote_asset }}
+      PYANNOTE_DIGEST: ${{ matrix.pyannote_digest }}
       RUNTIME_ASSET: ${{ matrix.asset }}
       RUNTIME_DIGEST: ${{ matrix.digest }}
       EXPECTED_MACHINE: ${{ matrix.machine }}
@@ -131,6 +139,82 @@ jobs:
           finally:
               report["sha256"] = {str(p.relative_to(root)): sha256(p) for p in (archive, cli, model, audio, base.with_suffix(".json"), base.with_suffix(".txt"))}
               (output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          raise SystemExit(report["assertion_exit_code"])
+          PY
+      - name: Run real offline CPU diarization with the packaged Pyannote helper
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, math, os, platform, subprocess, time, zipfile
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "file-transcription"
+          output = root / "proof"
+          inputs = root / "pyannote-download"
+          inputs.mkdir()
+          stage = root / "pyannote-stage"
+          model_stage = root / "pyannote-model"
+          archive = inputs / os.environ["PYANNOTE_ASSET"]
+          model_zip = inputs / "pyannote-model-community-1.zip"
+          helper = Path("sbobino_desktop/scripts/pyannote_diarize.py").resolve()
+          report = {"status": "failed", "source_sha": os.environ["GITHUB_SHA"], "platform": platform.platform(), "architecture": platform.machine(), "scope": "real packaged CPU offline helper inference; not app rollback or DER quality", "exit_code": None, "assertion_exit_code": 1}
+
+          def sha256(path):
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+
+          try:
+              with (output / "pyannote-setup.log").open("wb") as log:
+                  subprocess.run(["gh", "release", "download", "v2.0.34", "--repo", os.environ["GITHUB_REPOSITORY"], "--pattern", archive.name, "--pattern", model_zip.name, "--dir", str(inputs)], check=True, timeout=600, stdout=log, stderr=log)
+                  report["sha256"] = {archive.name: sha256(archive), model_zip.name: sha256(model_zip), "helper": sha256(helper), "audio": sha256(root / "speech.wav")}
+                  assert report["sha256"][archive.name] == os.environ["PYANNOTE_DIGEST"], "Pyannote runtime checksum mismatch"
+                  assert report["sha256"][model_zip.name] == "c2e98a01cf0bcb467a34da9b5ece993116b78b84161c191d5be0e873b76f0e34", "Pyannote model checksum mismatch"
+                  for bundle, target in ((archive, stage), (model_zip, model_stage)):
+                      if os.name == "nt":
+                          with zipfile.ZipFile(bundle) as zip_file:
+                              zip_file.extractall(target)
+                      else:
+                          target.mkdir()
+                          subprocess.run(["ditto", "-x", "-k", str(bundle), str(target)], check=True, stdout=log, stderr=log)
+              python_home = stage / "python"
+              executable = python_home / ("python.exe" if os.name == "nt" else "bin/python3")
+              env = os.environ.copy()
+              env.update(PYTHONHOME=str(python_home), PYTHONNOUSERSITE="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HOME=str(root / "isolated-hf"), TORCH_HOME=str(root / "isolated-torch"))
+              if os.name == "nt":
+                  env["PYTHONPATH"] = os.pathsep.join(map(str, (python_home / "Lib", python_home / "Lib/site-packages")))
+                  bins = (python_home, python_home / "DLLs", root / "runtime/bin", root / "runtime/lib", Path(os.environ["SystemRoot"]) / "System32")
+              else:
+                  stdlib = next(p for p in (python_home / "lib").glob("python3.*") if p.is_dir())
+                  env["PYTHONPATH"] = os.pathsep.join(map(str, (stdlib, stdlib / "lib-dynload", stdlib / "site-packages")))
+                  bins = (python_home / "bin", root / "runtime/bin", Path("/usr/bin"), Path("/bin"))
+              env["PATH"] = os.pathsep.join(map(str, bins))
+              command = [str(executable), str(helper), "--audio-path", str(root / "speech.wav"), "--model-path", str(model_stage / "model"), "--device", "cpu"]
+              report.update(command=command, python_sha256=sha256(executable), timeout_seconds=300)
+              started = time.monotonic()
+              try:
+                  result = subprocess.run(command, capture_output=True, timeout=300, env=env)
+              except subprocess.TimeoutExpired as error:
+                  (output / "pyannote.stdout").write_bytes(error.stdout or b"")
+                  (output / "pyannote.stderr").write_bytes(error.stderr or b"")
+                  raise
+              finally:
+                  report["elapsed_seconds"] = time.monotonic() - started
+              report["exit_code"] = result.returncode
+              (output / "pyannote.stdout").write_bytes(result.stdout)
+              (output / "pyannote.stderr").write_bytes(result.stderr)
+              assert result.returncode == 0, f"Pyannote helper failed: {result.returncode}"
+              turns = json.loads(result.stdout)["speakers"]
+              assert isinstance(turns, list) and turns, "no speaker turns"
+              for turn in turns:
+                  start, end = turn["start_seconds"], turn["end_seconds"]
+                  assert math.isfinite(start) and math.isfinite(end) and end > start >= 0 and turn["speaker_id"], "invalid speaker turn"
+              report.update(status="passed", assertion_exit_code=0, speaker_turn_count=len(turns))
+          except Exception as error:
+              report["error"] = f"{type(error).__name__}: {error}"
+          finally:
+              (output / "pyannote-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
           raise SystemExit(report["assertion_exit_code"])
           PY
       - uses: actions/upload-artifact@v4
