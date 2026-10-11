@@ -1,0 +1,142 @@
+name: Verification file transcription
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/arm-release-readiness-20261003]
+    paths: [.github/workflows/verification-file-transcription.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verification-file-transcription-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  file-transcription:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            machine: arm64
+            asset: speech-runtime-macos-aarch64.zip
+            digest: 5831267413b9edf4e72c1e2303368fbae4c89bf1a53d6f765141c2dccdfe91e0
+          - runner: macos-15-intel
+            machine: x86_64
+            asset: speech-runtime-macos-x86_64.zip
+            digest: dd3112dba1b3f16e65d06d2b4e815fe37553223626c5070e36f318953fe86404
+          - runner: windows-2025
+            machine: AMD64
+            asset: speech-runtime-windows-x86_64.zip
+            digest: 43cc3ea4ae1a4737da3be5cd5494df7319ccad5ec2387cde7d6d1ddcf455497d
+    env:
+      RUNTIME_ASSET: ${{ matrix.asset }}
+      RUNTIME_DIGEST: ${{ matrix.digest }}
+      EXPECTED_MACHINE: ${{ matrix.machine }}
+      RUNTIME_SOURCE: 34906f99e4e359d532a185bc8a35e9fc55718377
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Transcribe real speech with the immutable packaged CPU runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, math, os, platform, subprocess, time, zipfile
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "file-transcription"
+          output = root / "proof"
+          output.mkdir(parents=True, exist_ok=True)
+          archive = root / os.environ["RUNTIME_ASSET"]
+          runtime = root / "runtime"
+          cli = runtime / "bin" / ("whisper-cli.exe" if os.name == "nt" else "whisper-cli")
+          model_manifest = json.loads(Path("sbobino_desktop/crates/domain/src/whisper_live_model.json").read_text())
+          model = root / model_manifest["filename"]
+          audio = root / "speech.wav"
+          base = output / "transcription"
+          command = [str(cli), "-m", str(model), "-f", str(audio), "-l", "en", "-ng", "-nfa", "-ojf", "-otxt", "-of", str(base), "-np"]
+          report = {
+              "status": "failed", "scope": "packaged Whisper CPU file smoke; no app UI, Live or WER/CER acceptance",
+              "source_sha": os.environ["GITHUB_SHA"], "runtime_source": os.environ["RUNTIME_SOURCE"],
+              "platform": platform.platform(), "architecture": platform.machine(),
+              "runtime_asset": archive.name, "runtime_expected_sha256": os.environ["RUNTIME_DIGEST"],
+              "model_expected_sha256": model_manifest["sha256"], "command": command, "timeout_seconds": 120,
+              "exit_code": None, "assertion_exit_code": 1,
+          }
+
+          def sha256(path):
+              if not path.is_file():
+                  return None
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+
+          try:
+              assert platform.machine() == os.environ["EXPECTED_MACHINE"], "wrong native architecture"
+              with (output / "setup.log").open("wb") as log:
+                  subprocess.run(["git", "diff", "--exit-code", os.environ["RUNTIME_SOURCE"], "HEAD", "--", "sbobino_desktop/scripts/package_macos_runtime_asset.sh", "sbobino_desktop/scripts/package_windows_runtime_asset.ps1", "sbobino_desktop/scripts/patches"], check=True, stdout=log, stderr=log)
+                  subprocess.run(["gh", "release", "download", "v2.0.34", "--repo", os.environ["GITHUB_REPOSITORY"], "--pattern", archive.name, "--dir", str(root)], check=True, timeout=300, stdout=log, stderr=log)
+                  assert sha256(archive) == os.environ["RUNTIME_DIGEST"], "runtime checksum mismatch"
+                  fixture_url = "https://raw.githubusercontent.com/mudler/parakeet.cpp/9edf17c3ada66e0f881dcff155492867db7ac4cf/tests/fixtures/speech.wav"
+                  for url, target in ((fixture_url, audio), (model_manifest["url"], model)):
+                      assert "/resolve/main/" not in url, "mutable input URL"
+                      subprocess.run(["curl", "--fail", "--location", "--retry", "3", url, "--output", str(target)], check=True, timeout=300, stdout=log, stderr=log)
+                  assert sha256(audio) == "5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150", "audio checksum mismatch"
+                  assert sha256(model) == model_manifest["sha256"], "model checksum mismatch"
+                  if os.name == "nt":
+                      with zipfile.ZipFile(archive) as bundle:
+                          bundle.extractall(root)
+                  else:
+                      # ditto preserves packaged dylib symlinks on macOS.
+                      subprocess.run(["ditto", "-x", "-k", str(archive), str(root)], check=True, stdout=log, stderr=log)
+              environment = os.environ.copy()
+              environment["PATH"] = str(runtime / "bin") + os.pathsep + environment.get("PATH", "")
+              if platform.system() == "Darwin":
+                  environment["DYLD_LIBRARY_PATH"] = str(runtime / "lib")
+              started = time.monotonic()
+              try:
+                  result = subprocess.run(command, capture_output=True, timeout=120, env=environment)
+              except subprocess.TimeoutExpired as error:
+                  (output / "stdout.log").write_bytes(error.stdout or b"")
+                  (output / "stderr.log").write_bytes(error.stderr or b"")
+                  raise
+              finally:
+                  report["elapsed_seconds"] = time.monotonic() - started
+              report["exit_code"] = result.returncode
+              (output / "stdout.log").write_bytes(result.stdout)
+              (output / "stderr.log").write_bytes(result.stderr)
+              assert result.returncode == 0, f"CLI failed: {result.returncode}"
+              payload = json.loads(base.with_suffix(".json").read_text(encoding="utf-8"))
+              segments = payload["transcription"]
+              assert isinstance(segments, list) and segments, "missing speech segments"
+              previous = -1
+              for segment in segments:
+                  start, end = segment["offsets"]["from"], segment["offsets"]["to"]
+                  assert math.isfinite(start) and math.isfinite(end) and start >= previous and end > start, "invalid timestamps"
+                  assert isinstance(segment["text"], str) and segment["text"].strip(), "empty speech segment"
+                  previous = start
+              assert base.with_suffix(".txt").read_text(encoding="utf-8").strip(), "empty TXT output"
+              report.update(status="passed", assertion_exit_code=0, segment_count=len(segments))
+          except Exception as error:
+              report["error"] = f"{type(error).__name__}: {error}"
+          finally:
+              report["sha256"] = {str(p.relative_to(root)): sha256(p) for p in (archive, cli, model, audio, base.with_suffix(".json"), base.with_suffix(".txt"))}
+              (output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          raise SystemExit(report["assertion_exit_code"])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: file-transcription-${{ matrix.machine }}-${{ github.sha }}
+          path: ${{ runner.temp }}/file-transcription/proof/
+          if-no-files-found: error
+          retention-days: 3
