@@ -43,7 +43,7 @@ jobs:
         run: |
           git rev-parse HEAD | Out-File "$env:RUNNER_TEMP/runtime-validation-source.txt"
           python -c "import platform; print(platform.platform(), platform.machine())" | Out-File -Append "$env:RUNNER_TEMP/runtime-validation-source.txt"
-          python sbobino_desktop/scripts/test_release_workflow_contract.py
+          python sbobino_desktop/scripts/test_release_workflow_contract.py ReleaseWorkflowContractTests.test_windows_cleanup_preserves_nested_diagnostics_and_original_failure
           if ($LASTEXITCODE -ne 0) { throw 'Native smoke contracts failed' }
       - name: Build and replay the actual Windows runtime
         shell: pwsh
