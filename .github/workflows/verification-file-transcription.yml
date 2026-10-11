@@ -272,6 +272,13 @@ jobs:
               report = {"status": "passed" if passed else "failed", "source_sha": os.environ["GITHUB_SHA"], "command": command, "exit_code": result.returncode, "elapsed_seconds_including_cargo": time.monotonic() - started, "model_sha256": inputs[0 if engine == "whisper" else 1][2], "scope": "real CPU engine through production TranscriptionService; in-memory test repository, not installed UI/export or quality benchmark"}
               (output / (engine + "-service-report.json")).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
               failed |= not passed
+          if not failed:
+              # Discover the already-built test executable; no compilation in measured runs.
+              metadata = subprocess.run(["cargo", "test", "-p", "sbobino-infrastructure", "--target", os.environ["NATIVE_TARGET"], "--test", "parakeet_real_service_smoke_tests", "--no-run", "--message-format=json"], cwd="sbobino_desktop", capture_output=True, text=True, check=True)
+              artifacts = [json.loads(line) for line in metadata.stdout.splitlines() if line.startswith("{")]
+              binary = next(item["executable"] for item in artifacts if item.get("executable") and item.get("target", {}).get("name") == "parakeet_real_service_smoke_tests")
+              subprocess.run(["python", "-m", "unittest", "discover", "-s", "sbobino_desktop/scripts", "-p", "test_benchmark_transcription_service.py"], check=True)
+              subprocess.run(["python", "sbobino_desktop/scripts/benchmark_transcription_service.py", "--binary", binary, "--audio", str(root / "speech.wav"), "--output", str(output / "benchmark")], env=env, check=True)
           raise SystemExit(int(failed))
           PY
       - uses: actions/upload-artifact@v4
