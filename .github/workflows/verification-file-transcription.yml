@@ -23,18 +23,21 @@ jobs:
         include:
           - runner: macos-15
             machine: arm64
+            target: aarch64-apple-darwin
             asset: speech-runtime-macos-aarch64.zip
             digest: 5831267413b9edf4e72c1e2303368fbae4c89bf1a53d6f765141c2dccdfe91e0
             pyannote_asset: pyannote-runtime-macos-aarch64.zip
             pyannote_digest: 036a0bab02e9766ede5669b0fbee6bec09c8fd6b47bae9571db8f101eff46105
           - runner: macos-15-intel
             machine: x86_64
+            target: x86_64-apple-darwin
             asset: speech-runtime-macos-x86_64.zip
             digest: dd3112dba1b3f16e65d06d2b4e815fe37553223626c5070e36f318953fe86404
             pyannote_asset: pyannote-runtime-macos-x86_64.zip
             pyannote_digest: b6e5687246feed70c2210e2345bb513da39ece99d12e4378235e3aa1538fd134
           - runner: windows-2025
             machine: AMD64
+            target: x86_64-pc-windows-msvc
             asset: speech-runtime-windows-x86_64.zip
             digest: 43cc3ea4ae1a4737da3be5cd5494df7319ccad5ec2387cde7d6d1ddcf455497d
             pyannote_asset: pyannote-runtime-windows-x86_64.zip
@@ -44,6 +47,9 @@ jobs:
       PYANNOTE_DIGEST: ${{ matrix.pyannote_digest }}
       RUNTIME_ASSET: ${{ matrix.asset }}
       RUNTIME_DIGEST: ${{ matrix.digest }}
+      NATIVE_TARGET: ${{ matrix.target }}
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
       EXPECTED_MACHINE: ${{ matrix.machine }}
       RUNTIME_SOURCE: 34906f99e4e359d532a185bc8a35e9fc55718377
     steps:
@@ -216,6 +222,57 @@ jobs:
           finally:
               (output / "pyannote-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
           raise SystemExit(report["assertion_exit_code"])
+          PY
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: sbobino_desktop -> target
+      - name: Run existing real Whisper and Parakeet service smokes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, subprocess, time
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "file-transcription"
+          output = root / "proof"
+          inputs = (
+              ("ggml-tiny.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.bin?download=true", "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21"),
+              ("tdt-0.6b-v3-q4_k.gguf", "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/bf0af9f425fa01809cadec671b3cb672709d13e9/tdt-0.6b-v3-q4_k.gguf?download=true", "993d73feb4206dadda865ab25bd64b50c48dc4d013c3bf6126a721f28b1d5ee8"),
+          )
+          with (output / "service-setup.log").open("wb") as log:
+              for filename, url, expected in inputs:
+                  target = root / filename
+                  subprocess.run(["curl", "--fail", "--location", "--retry", "3", url, "--output", str(target)], check=True, timeout=600, stdout=log, stderr=log)
+                  with target.open("rb") as stream:
+                      assert hashlib.file_digest(stream, "sha256").hexdigest() == expected, "service model checksum mismatch"
+          suffix = ".exe" if os.name == "nt" else ""
+          env = os.environ.copy()
+          env.update(
+              SBOBINO_WHISPER_CLI=str(root / "runtime/bin" / ("whisper-cli" + suffix)),
+              SBOBINO_WHISPER_FFMPEG=str(root / "runtime/bin" / ("ffmpeg" + suffix)),
+              SBOBINO_WHISPER_MODELS_DIR=str(root), SBOBINO_WHISPER_MODEL="ggml-tiny.bin", SBOBINO_WHISPER_AUDIO=str(root / "speech.wav"),
+              SBOBINO_PARAKEET_CLI=str(root / "runtime/bin" / ("parakeet-cli" + suffix)),
+              SBOBINO_PARAKEET_MODELS_DIR=str(root), SBOBINO_PARAKEET_MODEL="tdt-0.6b-v3-q4_k.gguf", SBOBINO_PARAKEET_AUDIO=str(root / "speech.wav"),
+              SBOBINO_PARAKEET_FORCE_CPU="1", SBOBINO_PARAKEET_EXPECTED_DETECTED_LANGUAGE="en", SBOBINO_PARAKEET_EXPECTED_PROCESSING_LANGUAGE="en",
+          )
+          failed = False
+          for engine, test in (("whisper", "whisper_service_real_smoke_preserves_timeline_and_plain_text"), ("parakeet", "parakeet_service_real_smoke_persists_metadata")):
+              env["SBOBINO_ASR_TIMELINE_OUTPUT"] = str(output / (engine + "-service-timeline.json"))
+              command = ["cargo", "test", "-p", "sbobino-infrastructure", "--target", os.environ["NATIVE_TARGET"], "--test", "parakeet_real_service_smoke_tests", test, "--", "--ignored", "--exact", "--nocapture"]
+              started = time.monotonic()
+              with (output / (engine + "-service.log")).open("wb") as log:
+                  result = subprocess.run(command, cwd="sbobino_desktop", env=env, stdout=log, stderr=log)
+              text = (output / (engine + "-service.log")).read_text(encoding="utf-8", errors="replace")
+              passed = result.returncode == 0 and "1 passed; 0 failed" in text and (output / (engine + "-service-timeline.json")).is_file()
+              report = {"status": "passed" if passed else "failed", "source_sha": os.environ["GITHUB_SHA"], "command": command, "exit_code": result.returncode, "elapsed_seconds_including_cargo": time.monotonic() - started, "model_sha256": inputs[0 if engine == "whisper" else 1][2], "scope": "real CPU engine through production TranscriptionService; in-memory test repository, not installed UI/export or quality benchmark"}
+              (output / (engine + "-service-report.json")).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+              failed |= not passed
+          raise SystemExit(int(failed))
           PY
       - uses: actions/upload-artifact@v4
         if: always()

@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -15,7 +13,7 @@ use sbobino_application::{
 };
 use sbobino_domain::{
     ArtifactKind, ArtifactSourceOrigin, LanguageCode, ParakeetModel, SpeechModel,
-    TranscriptArtifact, TranscriptionEngine, WhisperOptions,
+    TranscriptArtifact, TranscriptionComputeDevice, TranscriptionEngine, WhisperOptions,
 };
 use sbobino_infrastructure::adapters::{
     ffmpeg::FfmpegAdapter, noop_enhancer::NoopEnhancer, parakeet_cpp::ParakeetCppEngine,
@@ -482,7 +480,10 @@ async fn whisper_service_real_smoke_preserves_timeline_and_plain_text() {
         Arc::new(FfmpegAdapter::new(
             optional_env("SBOBINO_WHISPER_FFMPEG").unwrap_or_else(|| "ffmpeg".to_string()),
         )),
-        Arc::new(WhisperCppEngine::new(cli_path, models_dir)),
+        Arc::new(
+            WhisperCppEngine::new(cli_path, models_dir)
+                .with_compute_device(TranscriptionComputeDevice::Cpu),
+        ),
         Arc::new(NoopEnhancer),
         repository,
     );
