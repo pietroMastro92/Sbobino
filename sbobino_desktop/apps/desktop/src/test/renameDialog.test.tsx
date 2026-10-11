@@ -119,4 +119,28 @@ describe("RenameDialog", () => {
     row.remove();
   });
 
+  it("restores the replacement history opener after a saved title changes its date group", () => {
+    const original = document.createElement("button");
+    original.dataset.renameArtifactId = "test-artifact";
+    document.body.append(original);
+    let frame: FrameRequestCallback | undefined;
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frame = callback;
+      return 0;
+    });
+    restoreRenameFocus(original);
+    original.remove();
+    const row = document.createElement("article");
+    row.className = "history-item";
+    const main = document.createElement("button");
+    main.className = "history-main";
+    const replacement = document.createElement("button");
+    replacement.dataset.renameArtifactId = "test-artifact";
+    row.append(main, replacement);
+    document.body.append(row);
+    frame?.(0);
+    expect(document.activeElement).toBe(replacement);
+    row.remove();
+  });
+
 });

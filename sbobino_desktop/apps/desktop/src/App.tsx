@@ -3101,13 +3101,18 @@ type RenameDialogProps = {
 };
 
 export function restoreRenameFocus(opener: HTMLElement | null): void {
-  if (!opener?.isConnected) return;
+  if (!opener) return;
+  const artifactId = opener.dataset.renameArtifactId;
   window.requestAnimationFrame(() => {
-    if (opener.isConnected) {
-      // Reveal hover-only history actions before focusing their opener.
-      opener.closest(".history-item")?.querySelector<HTMLButtonElement>(".history-main")?.focus();
-      opener.focus();
-    }
+    // Saving can move the history row into a different date group.
+    const target = opener.isConnected
+      ? opener
+      : Array.from(document.querySelectorAll<HTMLElement>("[data-rename-artifact-id]"))
+          .find((button) => artifactId && button.dataset.renameArtifactId === artifactId);
+    if (!target) return;
+    // Reveal hover-only history actions before focusing their opener.
+    target.closest(".history-item")?.querySelector<HTMLButtonElement>(".history-main")?.focus();
+    target.focus();
   });
 }
 
@@ -11964,6 +11969,7 @@ export function App({
                 <>
                   <button
                     className="secondary-button history-action-button"
+                    data-rename-artifact-id={artifact.id}
                     onClick={(event) =>
                       onRenameArtifact(artifact, event.currentTarget)
                     }
