@@ -50,7 +50,8 @@ jobs:
       - name: Clippy
         run: cargo clippy -p sbobino-domain -p sbobino-application -p sbobino-infrastructure --all-targets -- -D warnings
       - name: Tests
-        run: cargo test -p sbobino-domain -p sbobino-application -p sbobino-infrastructure
+        # Parallel generated-script setup can race exec on Linux (ETXTBSY).
+        run: cargo test -p sbobino-domain -p sbobino-application -p sbobino-infrastructure -- --test-threads=1
 
   frontend:
     runs-on: ubuntu-latest
