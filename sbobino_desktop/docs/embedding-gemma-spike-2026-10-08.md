@@ -83,3 +83,7 @@ python3 scripts/embedding_spike.py --corpus "$SPIKE/data/corpus.json" \
 I prefissi [Google/HF](https://huggingface.co/google/embeddinggemma-2) (`task: search result | query:` / `title: none | text:`) e quelli della [guida LiteRT](https://developers.google.com/edge/litert-lm/embedding_models) (`task: search query | text:` / `task: search result | text:`) differiscono. L'API installata passa il testo senza prefissi automatici; per questo sono state conservate le tre ablation esplicite, senza eleggerne una tramite questo test piccolo.
 
 Prima di una decisione d'integrazione serve un holdout pubblico con registrazioni lunghe, distrattori simili, errori ASR su entità/numeri, domande pertinenti ma non rispondibili e più coppie linguistiche. Deve misurare anche citazioni corrette e astensione nella chat. Restano da verificare binding C++/Rust, artefatti distribuibili e Intel/Windows reali: il successo del wrapper Python non certifica il packaging nativo. Gemma 2 è un candidato leggero valido, non un aggiornamento automaticamente migliore: Gemma 1 resta un confronto obbligatorio e BM25 un'alternativa utile senza pesi aggiuntivi.
+
+## Aggiornamento del 12 ottobre 2026
+
+È disponibile un adattamento ASR separato, [EG2-Transcribe](eg2-transcribe-feasibility-2026-10-12.md), con reader addestrato e modelli CoreML propri. La verifica statica non modifica i risultati dello spike testuale né dimostra qualità ASR in italiano; chiarisce che il modello embedding di base può essere adattato a compiti diversi con componenti aggiuntivi.
