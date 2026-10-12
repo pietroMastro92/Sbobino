@@ -6,7 +6,7 @@ on:
       tag_name:
         description: Existing git tag to build and publish as a prerelease candidate
         required: true
-        default: v2.0.35
+        default: v2.0.36
         type: string
 
 permissions:
@@ -14,16 +14,16 @@ permissions:
 
 jobs:
   validate-candidate:
-    name: Validate v2.0.35 candidate tag
+    name: Validate v2.0.36 candidate tag
     runs-on: ubuntu-latest
     env:
       TAG_NAME: ${{ inputs.tag_name }}
-      REVIEWED_PRODUCT_SHA: 81a1e3eb15b2054f31efb18ce07834189b34d8b7
+      REVIEWED_PRODUCT_SHA: 70a7e0abdf69f8261209ff9513cec0224530d53e
     steps:
       - name: Require the reviewed candidate tag
         run: |
-          if [[ "$TAG_NAME" != "v2.0.35" ]]; then
-            echo "Release Candidate is locked to v2.0.35; got $TAG_NAME" >&2
+          if [[ "$TAG_NAME" != "v2.0.36" ]]; then
+            echo "Release Candidate is locked to v2.0.36; got $TAG_NAME" >&2
             exit 1
           fi
       - uses: actions/checkout@v4

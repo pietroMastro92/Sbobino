@@ -90,7 +90,7 @@ jobs:
           python -c 'import os, platform; assert platform.machine() == os.environ["EXPECTED_MACHINE"], platform.machine(); print(platform.platform())'
           rustc --version
           node --version
-          ./sbobino_desktop/scripts/check_release_versions.sh 2.0.35
+          ./sbobino_desktop/scripts/check_release_versions.sh 2.0.36
       - name: Prepare verification configuration and provenance
         run: |
           python - <<'PY'
