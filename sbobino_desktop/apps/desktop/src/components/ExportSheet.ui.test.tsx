@@ -20,12 +20,14 @@ afterEach(() => {
 });
 
 function renderExportSheet(options?: {
+  open?: boolean;
+  onClose?: () => void;
   onPreview?: (payload: ExportRequest) => Promise<ExportPreview>;
   onExport?: (payload: ExportRequest) => Promise<boolean>;
-}): void {
-  render(
+}): ReturnType<typeof render> {
+  return render(
     <ExportSheet
-      open
+      open={options?.open ?? true}
       transcriptText="Hello world"
       segments={[
         {
@@ -36,7 +38,7 @@ function renderExportSheet(options?: {
           speakerLabel: "Alice",
         },
       ]}
-      onClose={vi.fn()}
+      onClose={options?.onClose ?? vi.fn()}
       onPreview={
         options?.onPreview ??
         vi.fn().mockResolvedValue({ content: "Backend preview", mode: "exact" })
@@ -142,5 +144,78 @@ describe("ExportSheet", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^Copy$/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /^Export$/i })).toBeDisabled();
+  });
+
+  it("focuses the dialog and cycles only through enabled controls", () => {
+    renderExportSheet();
+
+    const dialog = screen.getByRole("dialog");
+    const closeButton = screen.getByRole("button", { name: /Close export preview/i });
+    const timestamps = screen.getByRole("checkbox", { name: /Show Timestamps/i });
+
+    expect(closeButton).toHaveFocus();
+
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+    expect(timestamps).toHaveFocus();
+
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(closeButton).toHaveFocus();
+
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(screen.getByRole("button", { name: /^Transcript$/i })).toHaveFocus();
+  });
+
+  it("restores the opener after Escape closes the sheet", () => {
+    const opener = document.createElement("button");
+    opener.type = "button";
+    opener.textContent = "Open export";
+    document.body.appendChild(opener);
+    opener.focus();
+    const onClose = vi.fn();
+    const onPreview = vi.fn().mockResolvedValue({ content: "Backend preview", mode: "exact" });
+    const view = renderExportSheet({ onClose, onPreview });
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    view.rerender(
+      <ExportSheet
+        open={false}
+        transcriptText="Hello world"
+        segments={[]}
+        onClose={onClose}
+        onPreview={onPreview}
+        onExport={vi.fn().mockResolvedValue(true)}
+      />,
+    );
+    expect(opener).toHaveFocus();
+    opener.remove();
+  });
+
+  it("keeps Escape inert while exporting and focuses the busy dialog fallback", async () => {
+    let resolveExport!: (didExport: boolean) => void;
+    const onExport = vi.fn(
+      () => new Promise<boolean>((resolve) => {
+        resolveExport = resolve;
+      }),
+    );
+    const onClose = vi.fn();
+    renderExportSheet({ onClose, onExport });
+
+    const exportButton = screen.getByRole("button", { name: /^Export$/i });
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    fireEvent.click(exportButton);
+    await waitFor(() => expect(exportButton).toBeDisabled());
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveAttribute("tabindex", "-1");
+    expect(dialog).toHaveFocus();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveExport(false);
+    });
   });
 });

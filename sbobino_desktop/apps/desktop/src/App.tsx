@@ -2929,7 +2929,10 @@ function DetailToolbar({
           {hasArtifact ? (
             <button
               className="secondary-button export-toolbar-button"
-              onClick={onOpenExport}
+              onClick={(event) => {
+                event.currentTarget.focus();
+                onOpenExport();
+              }}
             >
               {t("detail.export", "Export")}
               <ChevronDown size={14} />
@@ -14500,6 +14503,10 @@ export function App({
             </div>
             <input
               type="checkbox"
+              aria-label={t(
+                "settings.general.autoUpdate",
+                "Enable auto update checks",
+              )}
               checked={settings.general.auto_update_enabled}
               onChange={(event) => {
                 void patchSettings((current) => ({
@@ -14526,6 +14533,7 @@ export function App({
               </small>
             </div>
             <select
+              aria-label={t("settings.general.appearanceMode", "Appearance")}
               value={settings.general.appearance_mode ?? "system"}
               onChange={(event) => {
                 const value = event.target.value as AppearanceMode;
@@ -14561,6 +14569,7 @@ export function App({
               </small>
             </div>
             <select
+              aria-label={t("settings.general.appLanguage", "App Language")}
               value={settings.general.app_language ?? "en"}
               onChange={(event) => {
                 const value = event.target.value as AppLanguage;
