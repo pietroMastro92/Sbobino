@@ -881,6 +881,44 @@ fn coreml_missing_for(models_dir: &Path, dir_name: &str) -> bool {
     !coreml_encoder_is_installed(models_dir, dir_name)
 }
 
+fn model_catalog_entry_is_installed(
+    models_dir: &Path,
+    model_key: &str,
+    model_filename: &str,
+) -> bool {
+    whisper_model_is_installed(models_dir, model_filename)
+        && (model_key != "tiny" || whisper_live_model_is_valid(models_dir))
+}
+
+fn plan_whisper_model_download(
+    models_dir: &Path,
+    model_key: &str,
+    model_filename: &str,
+    encoder_dir: &str,
+    encoder_archive: &str,
+    include_coreml: bool,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut missing_models = Vec::new();
+    if !whisper_model_is_installed(models_dir, model_filename) {
+        missing_models.push(model_filename.to_string());
+    }
+
+    if model_key == "tiny" {
+        let live_model_filename = whisper_live_model_manifest().filename;
+        if !whisper_model_is_installed(models_dir, &live_model_filename) {
+            missing_models.push(live_model_filename);
+        }
+    }
+
+    let missing_encoders = if include_coreml && coreml_missing_for(models_dir, encoder_dir) {
+        vec![(encoder_dir.to_string(), encoder_archive.to_string())]
+    } else {
+        Vec::new()
+    };
+
+    (missing_models, missing_encoders)
+}
+
 #[tauri::command]
 pub async fn provisioning_status(
     state: State<'_, AppState>,
@@ -942,7 +980,7 @@ pub async fn provisioning_models(
                 key: (*key).to_string(),
                 label: (*label).to_string(),
                 model_file: (*model_file).to_string(),
-                installed: whisper_model_is_installed(&models_dir, model_file),
+                installed: model_catalog_entry_is_installed(&models_dir, key, model_file),
                 coreml_installed: coreml_encoder_is_installed(&models_dir, encoder_dir),
                 engine: "whisper_cpp".to_string(),
                 experimental: false,
@@ -1402,15 +1440,14 @@ pub async fn provisioning_download_model(
         ));
     };
 
-    let mut missing_models = Vec::new();
-    if !whisper_model_is_installed(&models_dir, model_file) {
-        missing_models.push((*model_file).to_string());
-    }
-
-    let mut missing_encoders = Vec::new();
-    if include_coreml && coreml_missing_for(&models_dir, encoder_dir) {
-        missing_encoders.push(((*encoder_dir).to_string(), (*encoder_archive).to_string()));
-    }
+    let (missing_models, missing_encoders) = plan_whisper_model_download(
+        &models_dir,
+        &payload.model,
+        model_file,
+        encoder_dir,
+        encoder_archive,
+        include_coreml,
+    );
 
     let total = missing_models.len() + missing_encoders.len();
     if total == 0 {
@@ -2133,17 +2170,17 @@ fn spawn_pyannote_bundled_install(
     tauri::async_runtime::spawn(async move {
         let _slot_guard = slot_guard;
         if cancel_token.is_cancelled() {
-            emit_provisioning_status(
-                &app,
-                "cancelled",
-                "Pyannote installation cancelled.",
-                Some("cancelled"),
-            );
             persist_pyannote_install_failure(
                 runtime_factory.as_ref(),
                 had_ready_install,
                 "cancelled",
                 "Pyannote installation was cancelled before completion.",
+            );
+            emit_provisioning_status(
+                &app,
+                "cancelled",
+                "Pyannote installation cancelled.",
+                Some("cancelled"),
             );
             return;
         }
@@ -2153,17 +2190,17 @@ fn spawn_pyannote_bundled_install(
             match prepare_pyannote_runtime_swap(&runtime_dir, true) {
                 Ok(value) => value,
                 Err(error) => {
-                    emit_provisioning_status(
-                        &app,
-                        "error",
-                        &error,
-                        Some("pyannote_install_incomplete"),
-                    );
                     persist_pyannote_install_failure(
                         runtime_factory.as_ref(),
                         had_ready_install,
                         "pyannote_install_incomplete",
                         &error,
+                    );
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_install_incomplete"),
                     );
                     return;
                 }
@@ -2188,13 +2225,13 @@ fn spawn_pyannote_bundled_install(
             {
                 tracing::warn!("failed to rollback bundled pyannote runtime: {restore_error}");
             }
-            emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"));
             persist_pyannote_install_failure(
                 runtime_factory.as_ref(),
                 had_ready_install,
                 "pyannote_repair_required",
                 &error,
             );
+            emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"));
             return;
         }
 
@@ -2244,23 +2281,26 @@ fn spawn_pyannote_bundled_install(
                             "failed to rollback bundled pyannote runtime after probe error: {restore_error}"
                         );
                         }
-                        emit_provisioning_status(&app, "error", &error, Some(reason_code));
                         persist_pyannote_install_failure(
                             runtime_factory.as_ref(),
                             had_ready_install,
                             reason_code,
                             &error,
                         );
+                        emit_provisioning_status(
+                            &app,
+                            if reason_code == "cancelled" {
+                                "cancelled"
+                            } else {
+                                "error"
+                            },
+                            &error,
+                            Some(reason_code),
+                        );
                         return;
                     }
                 };
                 if let Err(error) = runtime_factory.write_managed_pyannote_receipt(&receipt) {
-                    emit_provisioning_status(
-                        &app,
-                        "error",
-                        &error,
-                        Some("pyannote_install_incomplete"),
-                    );
                     if let Err(restore_error) =
                         rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
                     {
@@ -2274,17 +2314,17 @@ fn spawn_pyannote_bundled_install(
                         "pyannote_install_incomplete",
                         &error,
                     );
-                    return;
-                }
-                if let Err(error) = runtime_factory
-                    .write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")
-                {
                     emit_provisioning_status(
                         &app,
                         "error",
                         &error,
                         Some("pyannote_install_incomplete"),
                     );
+                    return;
+                }
+                if let Err(error) = runtime_factory
+                    .write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")
+                {
                     if let Err(restore_error) =
                         rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
                     {
@@ -2298,14 +2338,14 @@ fn spawn_pyannote_bundled_install(
                         "pyannote_install_incomplete",
                         &error,
                     );
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_install_incomplete"),
+                    );
                     return;
                 }
-                emit_provisioning_status(
-                    &app,
-                    "completed",
-                    "Pyannote diarization runtime installed successfully.",
-                    None,
-                );
                 if let Err(cleanup_error) =
                     finalize_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir)
                 {
@@ -2313,6 +2353,12 @@ fn spawn_pyannote_bundled_install(
                         "failed to clean up bundled pyannote runtime backup: {cleanup_error}"
                     );
                 }
+                emit_provisioning_status(
+                    &app,
+                    "completed",
+                    "Pyannote diarization runtime installed successfully.",
+                    None,
+                );
             }
             Err(error) => {
                 if let Err(restore_error) =
@@ -2322,13 +2368,13 @@ fn spawn_pyannote_bundled_install(
                         "failed to rollback bundled pyannote runtime after validation error: {restore_error}"
                     );
                 }
-                emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"));
                 persist_pyannote_install_failure(
                     runtime_factory.as_ref(),
                     had_ready_install,
                     "pyannote_repair_required",
                     &error,
-                )
+                );
+                emit_provisioning_status(&app, "error", &error, Some("pyannote_repair_required"));
             }
         }
     });
@@ -2350,17 +2396,17 @@ fn spawn_pyannote_provisioning_download(
         let stage_dir = match prepare_pyannote_runtime_stage(&runtime_dir) {
             Ok(value) => value,
             Err(error) => {
-                emit_provisioning_status(
-                    &app,
-                    "error",
-                    &error,
-                    Some("pyannote_install_incomplete"),
-                );
                 persist_pyannote_install_failure(
                     runtime_factory.as_ref(),
                     had_ready_install,
                     "pyannote_install_incomplete",
                     &error,
+                );
+                emit_provisioning_status(
+                    &app,
+                    "error",
+                    &error,
+                    Some("pyannote_install_incomplete"),
                 );
                 return;
             }
@@ -2369,12 +2415,6 @@ fn spawn_pyannote_provisioning_download(
         let selection = match fetch_pyannote_asset_selection(&client).await {
             Ok(value) => value,
             Err(error) => {
-                emit_provisioning_status(
-                    &app,
-                    "error",
-                    &error,
-                    Some("pyannote_install_incomplete"),
-                );
                 if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                     tracing::warn!(
                         "failed to clean up pyannote runtime stage after selection error: {cleanup_error}"
@@ -2386,12 +2426,17 @@ fn spawn_pyannote_provisioning_download(
                     "pyannote_install_incomplete",
                     &error,
                 );
+                emit_provisioning_status(
+                    &app,
+                    "error",
+                    &error,
+                    Some("pyannote_install_incomplete"),
+                );
                 return;
             }
         };
 
         if let Err(error) = ensure_pyannote_install_has_free_space(&stage_dir, &selection) {
-            emit_provisioning_status(&app, "error", &error, Some("pyannote_install_incomplete"));
             if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                 tracing::warn!(
                     "failed to clean up pyannote runtime stage after disk-space check: {cleanup_error}"
@@ -2403,6 +2448,7 @@ fn spawn_pyannote_provisioning_download(
                 "pyannote_install_incomplete",
                 &error,
             );
+            emit_provisioning_status(&app, "error", &error, Some("pyannote_install_incomplete"));
             return;
         }
 
@@ -2424,12 +2470,6 @@ fn spawn_pyannote_provisioning_download(
         let mut completed = 0usize;
         for (asset, asset_kind, expected_root, destination) in downloads {
             if cancel_token.is_cancelled() {
-                emit_provisioning_status(
-                    &app,
-                    "cancelled",
-                    "Pyannote installation cancelled.",
-                    Some("cancelled"),
-                );
                 if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                     tracing::warn!(
                         "failed to clean up pyannote runtime stage after cancellation: {cleanup_error}"
@@ -2440,6 +2480,12 @@ fn spawn_pyannote_provisioning_download(
                     had_ready_install,
                     "pyannote_install_incomplete",
                     "Pyannote installation was cancelled before completion.",
+                );
+                emit_provisioning_status(
+                    &app,
+                    "cancelled",
+                    "Pyannote installation cancelled.",
+                    Some("cancelled"),
                 );
                 return;
             }
@@ -2456,12 +2502,6 @@ fn spawn_pyannote_provisioning_download(
             {
                 let _ = tokio::fs::remove_file(&archive_path).await;
                 if error == "cancelled" {
-                    emit_provisioning_status(
-                        &app,
-                        "cancelled",
-                        "Pyannote installation cancelled.",
-                        Some("cancelled"),
-                    );
                     if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                         tracing::warn!(
                             "failed to clean up pyannote runtime stage after download cancellation: {cleanup_error}"
@@ -2473,14 +2513,14 @@ fn spawn_pyannote_provisioning_download(
                             "Pyannote installation was cancelled before completion.",
                         );
                     }
+                    emit_provisioning_status(
+                        &app,
+                        "cancelled",
+                        "Pyannote installation cancelled.",
+                        Some("cancelled"),
+                    );
                     return;
                 }
-                emit_provisioning_status(
-                    &app,
-                    "error",
-                    &format!("Failed to download {}: {error}", asset.name),
-                    Some("pyannote_install_incomplete"),
-                );
                 if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                     tracing::warn!(
                         "failed to clean up pyannote runtime stage after download error: {cleanup_error}"
@@ -2492,6 +2532,12 @@ fn spawn_pyannote_provisioning_download(
                     "pyannote_install_incomplete",
                     &format!("Failed to download {}: {error}", asset.name),
                 );
+                emit_provisioning_status(
+                    &app,
+                    "error",
+                    &format!("Failed to download {}: {error}", asset.name),
+                    Some("pyannote_install_incomplete"),
+                );
                 return;
             }
 
@@ -2499,12 +2545,6 @@ fn spawn_pyannote_provisioning_download(
                 Ok(()) => {}
                 Err(error) => {
                     let _ = tokio::fs::remove_file(&archive_path).await;
-                    emit_provisioning_status(
-                        &app,
-                        "error",
-                        &error,
-                        Some("pyannote_checksum_invalid"),
-                    );
                     if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                         tracing::warn!(
                             "failed to clean up pyannote runtime stage after checksum error: {cleanup_error}"
@@ -2515,6 +2555,12 @@ fn spawn_pyannote_provisioning_download(
                         had_ready_install,
                         "pyannote_checksum_invalid",
                         &error,
+                    );
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_checksum_invalid"),
                     );
                     return;
                 }
@@ -2541,12 +2587,6 @@ fn spawn_pyannote_provisioning_download(
             match extraction {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    emit_provisioning_status(
-                        &app,
-                        "error",
-                        &error,
-                        Some("pyannote_install_incomplete"),
-                    );
                     if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                         tracing::warn!(
                             "failed to clean up pyannote runtime stage after extraction error: {cleanup_error}"
@@ -2558,17 +2598,17 @@ fn spawn_pyannote_provisioning_download(
                         "pyannote_install_incomplete",
                         &error,
                     );
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_install_incomplete"),
+                    );
                     return;
                 }
                 Err(error) => {
                     let message =
                         format!("Failed to install {}: task join error: {error}", asset.name);
-                    emit_provisioning_status(
-                        &app,
-                        "error",
-                        &message,
-                        Some("pyannote_install_incomplete"),
-                    );
                     if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                         tracing::warn!(
                             "failed to clean up pyannote runtime stage after extraction task failure: {cleanup_error}"
@@ -2579,6 +2619,12 @@ fn spawn_pyannote_provisioning_download(
                         had_ready_install,
                         "pyannote_install_incomplete",
                         &message,
+                    );
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &message,
+                        Some("pyannote_install_incomplete"),
                     );
                     return;
                 }
@@ -2612,7 +2658,6 @@ fn spawn_pyannote_provisioning_download(
         };
 
         if let Err(error) = write_staged_pyannote_manifest(&stage_dir, &manifest) {
-            emit_provisioning_status(&app, "error", &error, Some("pyannote_install_incomplete"));
             if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                 tracing::warn!(
                     "failed to clean up pyannote runtime stage after staged manifest error: {cleanup_error}"
@@ -2624,6 +2669,7 @@ fn spawn_pyannote_provisioning_download(
                 "pyannote_install_incomplete",
                 &error,
             );
+            emit_provisioning_status(&app, "error", &error, Some("pyannote_install_incomplete"));
             return;
         }
 
@@ -2634,12 +2680,6 @@ fn spawn_pyannote_provisioning_download(
         ) {
             Ok(value) => value,
             Err(error) => {
-                emit_provisioning_status(
-                    &app,
-                    "error",
-                    &error,
-                    Some("pyannote_install_incomplete"),
-                );
                 if let Err(cleanup_error) = cleanup_pyannote_runtime_stage(&stage_dir) {
                     tracing::warn!(
                             "failed to clean up pyannote runtime stage after promotion error: {cleanup_error}"
@@ -2650,6 +2690,12 @@ fn spawn_pyannote_provisioning_download(
                     had_ready_install,
                     "pyannote_install_incomplete",
                     &error,
+                );
+                emit_provisioning_status(
+                    &app,
+                    "error",
+                    &error,
+                    Some("pyannote_install_incomplete"),
                 );
                 return;
             }
@@ -2670,7 +2716,6 @@ fn spawn_pyannote_provisioning_download(
                         } else {
                             "pyannote_import_load_failed"
                         };
-                        emit_provisioning_status(&app, "error", &error, Some(reason_code));
                         if let Err(restore_error) = rollback_pyannote_runtime_swap(
                             &runtime_dir,
                             backup_runtime_dir.as_deref(),
@@ -2683,16 +2728,20 @@ fn spawn_pyannote_provisioning_download(
                             reason_code,
                             &error,
                         );
+                        emit_provisioning_status(
+                            &app,
+                            if reason_code == "cancelled" {
+                                "cancelled"
+                            } else {
+                                "error"
+                            },
+                            &error,
+                            Some(reason_code),
+                        );
                         return;
                     }
                 };
                 if let Err(error) = runtime_factory.write_managed_pyannote_receipt(&receipt) {
-                    emit_provisioning_status(
-                        &app,
-                        "error",
-                        &error,
-                        Some("pyannote_install_incomplete"),
-                    );
                     if let Err(restore_error) =
                         rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
                     {
@@ -2706,17 +2755,17 @@ fn spawn_pyannote_provisioning_download(
                         "pyannote_install_incomplete",
                         &error,
                     );
-                    return;
-                }
-                if let Err(error) = runtime_factory
-                    .write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")
-                {
                     emit_provisioning_status(
                         &app,
                         "error",
                         &error,
                         Some("pyannote_install_incomplete"),
                     );
+                    return;
+                }
+                if let Err(error) = runtime_factory
+                    .write_managed_pyannote_status("ok", "Pyannote diarization runtime is ready.")
+                {
                     if let Err(restore_error) =
                         rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
                     {
@@ -2728,7 +2777,18 @@ fn spawn_pyannote_provisioning_download(
                         "pyannote_install_incomplete",
                         &error,
                     );
+                    emit_provisioning_status(
+                        &app,
+                        "error",
+                        &error,
+                        Some("pyannote_install_incomplete"),
+                    );
                     return;
+                }
+                if let Err(cleanup_error) =
+                    finalize_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir)
+                {
+                    tracing::warn!("failed to clean up pyannote runtime backup: {cleanup_error}");
                 }
                 emit_provisioning_status(
                     &app,
@@ -2736,19 +2796,8 @@ fn spawn_pyannote_provisioning_download(
                     "Pyannote diarization runtime installed successfully.",
                     None,
                 );
-                if let Err(cleanup_error) =
-                    finalize_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir)
-                {
-                    tracing::warn!("failed to clean up pyannote runtime backup: {cleanup_error}");
-                }
             }
             Err(error) => {
-                emit_provisioning_status(
-                    &app,
-                    "error",
-                    &error,
-                    Some("pyannote_install_incomplete"),
-                );
                 if let Err(restore_error) =
                     rollback_pyannote_runtime_swap(&runtime_dir, backup_runtime_dir.as_deref())
                 {
@@ -2759,6 +2808,12 @@ fn spawn_pyannote_provisioning_download(
                     had_ready_install,
                     "pyannote_install_incomplete",
                     &error,
+                );
+                emit_provisioning_status(
+                    &app,
+                    "error",
+                    &error,
+                    Some("pyannote_install_incomplete"),
                 );
             }
         }
@@ -4674,6 +4729,67 @@ mod tests {
         assert!(coreml_encoder_is_installed(
             temp.path(),
             "ggml-tiny-encoder.mlmodelc"
+        ));
+    }
+
+    #[test]
+    fn tiny_download_plan_repairs_live_sidecar_and_shared_encoder() {
+        let temp = tempdir().expect("model tempdir should create");
+
+        let (missing_models, missing_encoders) = super::plan_whisper_model_download(
+            temp.path(),
+            "tiny",
+            "ggml-tiny.bin",
+            "ggml-tiny-encoder.mlmodelc",
+            "ggml-tiny-encoder.mlmodelc.zip",
+            true,
+        );
+        assert_eq!(missing_models, ["ggml-tiny.bin", "ggml-tiny-q8_0.bin"]);
+        assert_eq!(
+            missing_encoders,
+            [(
+                "ggml-tiny-encoder.mlmodelc".to_string(),
+                "ggml-tiny-encoder.mlmodelc.zip".to_string()
+            )]
+        );
+
+        std::fs::write(temp.path().join("ggml-tiny.bin"), b"offline-tiny")
+            .expect("offline Tiny model should write");
+        std::fs::write(temp.path().join("ggml-tiny-q8_0.bin"), b"corrupt-live-tiny")
+            .expect("corrupt live Tiny model should write");
+
+        let (missing_models, missing_encoders) = super::plan_whisper_model_download(
+            temp.path(),
+            "tiny",
+            "ggml-tiny.bin",
+            "ggml-tiny-encoder.mlmodelc",
+            "ggml-tiny-encoder.mlmodelc.zip",
+            false,
+        );
+        assert_eq!(missing_models, ["ggml-tiny-q8_0.bin"]);
+        assert!(missing_encoders.is_empty());
+    }
+
+    #[test]
+    fn tiny_catalog_readiness_requires_validated_live_sidecar() {
+        let temp = tempdir().expect("model tempdir should create");
+        std::fs::write(temp.path().join("ggml-tiny.bin"), b"offline-tiny")
+            .expect("offline Tiny model should write");
+        std::fs::write(temp.path().join("ggml-tiny-q8_0.bin"), b"corrupt-live-tiny")
+            .expect("corrupt live Tiny model should write");
+
+        assert!(!super::model_catalog_entry_is_installed(
+            temp.path(),
+            "tiny",
+            "ggml-tiny.bin"
+        ));
+
+        std::fs::write(temp.path().join("ggml-base.bin"), b"base")
+            .expect("Base model should write");
+        assert!(super::model_catalog_entry_is_installed(
+            temp.path(),
+            "base",
+            "ggml-base.bin"
         ));
     }
 

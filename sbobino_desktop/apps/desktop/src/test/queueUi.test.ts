@@ -81,9 +81,10 @@ describe("queue UI wiring", () => {
     const onStartRealtime = extractFunction(appSource, "onStartRealtime");
 
     expect(onStartRealtime).toContain("const realtimeJobId = startResult.job_id");
-    expect(onStartRealtime).toContain('const liveEngine =');
-    expect(onStartRealtime).toContain('? "whisper_cpp"');
-    expect(onStartRealtime).toContain('engine: liveEngine');
+    expect(onStartRealtime).not.toContain("const liveEngine =");
+    expect(onStartRealtime).not.toContain('? "whisper_cpp"');
+    expect(onStartRealtime.match(/engine: settings\.transcription\.engine/g)).toHaveLength(2);
+    expect(onStartRealtime.match(/language: settings\.transcription\.language/g)).toHaveLength(3);
     expect(onStartRealtime).toContain("const realtimeProgress: JobProgress");
     expect(onStartRealtime).toContain("setActiveRealtimeJobId(realtimeJobId)");
     expect(onStartRealtime).toContain("upsertQueueItem(previous, realtimeProgress)");

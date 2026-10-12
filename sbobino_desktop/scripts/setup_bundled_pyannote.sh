@@ -692,7 +692,8 @@ if len(matches) != 1:
         "Could not resolve native osx-64 TorchAudio matching "
         f"Python {python_tag}, Torch {torch_requirement}: {matches}"
     )
-print(matches[0]["url"])
+match = matches[0]
+print(match.get("url") or match["channel"].rstrip("/") + "/" + match["fn"])
 ')
 
   conda install -y --no-deps -p "$STAGE_RUNTIME_DIR" "$package_url"

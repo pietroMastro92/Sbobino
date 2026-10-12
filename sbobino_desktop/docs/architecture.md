@@ -23,7 +23,9 @@
 ### Infrastructure (`crates/infrastructure`)
 - Process adapters:
   - `FfmpegAdapter`
-  - `WhisperCppEngine` (CLI first, embedded `whisper-rs` fallback)
+  - `WhisperCppEngine` (file transcription through the native CLI)
+  - `ParakeetCppEngine` (resident batch file transcription)
+  - `WhisperStreamEngine` (Live transcription through the native streaming runtime)
 - API adapters:
   - `GeminiEnhancer`
   - `NoopEnhancer`
@@ -61,3 +63,15 @@
 - Persistence is strongly typed and centralized in repository adapters.
 - Frontend communicates via stable commands/events, mirroring native desktop app boundaries.
 - Clear module ownership enables team parallelism and lower regression risk.
+
+## Native transcription selection
+
+The domain terms are defined in [GLOSSARY.md](../../GLOSSARY.md). The configured engine is a persistent file-transcription preference; the effective engine belongs to a particular session. A Live fallback must not replace the configured engine.
+
+The runtime command module owns the Live selection interface used by readiness and start. It resolves both configured engines to Whisper and the existing certified Live model manifest. The frontend forwards the configured engine instead of repeating this decision. File transcription continues to select the Whisper or Parakeet adapter through `RuntimeTranscriptionFactory`.
+
+This seam concentrates the current engine/model policy: one decision gives locality to changes and leverage to both command callers. Runtime executability, model presence, microphone readiness, language routing and device checks remain in their existing implementation. Passing readiness is not a guarantee of realtime throughput on every device.
+
+Whisper runtime path normalization repairs legacy executable paths without changing the configured engine. Readiness therefore cannot silently replace a Parakeet file preference with Whisper while preparing a Live session.
+
+The meaningful regression cases are a Parakeet-configured session resolving to the same certified Whisper model in readiness and start, preservation of the file preference during runtime path normalization, and unchanged explicit language and compute-device routing. Gemma and Redux remain isolated benchmark candidates.

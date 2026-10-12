@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import wave
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -123,9 +124,24 @@ class FinalizedTranscriptTests(unittest.TestCase):
         self.assertEqual(count_fixture_utterances(transcript), 1)
 
     def test_live_command_profile_matches_cpu_and_auto_runtime_windows(self):
-        self.assertEqual(live_command_profile("cpu", 4), (4, 1280, 2000))
-        self.assertEqual(live_command_profile("auto", 12), (8, 1000, 2000))
-        self.assertEqual(live_command_profile("cpu", None), (1, 1280, 2000))
+        self.assertEqual(live_command_profile("cpu", 4, "ggml-base.bin"), (4, 1280, 2000))
+        self.assertEqual(live_command_profile("auto", 12, "ggml-base.bin"), (8, 1000, 2000))
+        self.assertEqual(live_command_profile("cpu", None, "ggml-base.bin"), (1, 1280, 2000))
+
+    def test_certified_gpu_context_is_scoped_to_apple_silicon(self):
+        for system, machine, expected_length in (
+            ("darwin", "arm64", 4000),
+            ("darwin", "x86_64", 2000),
+            ("win32", "AMD64", 2000),
+            ("linux", "aarch64", 2000),
+        ):
+            with mock.patch("sys.platform", system), mock.patch("platform.machine", return_value=machine):
+                self.assertEqual(
+                    live_command_profile("auto", 12, "ggml-tiny-q8_0.bin"),
+                    (8, 1000, expected_length),
+                )
+                self.assertEqual(live_command_profile("cpu", 4, "ggml-tiny-q8_0.bin"), (4, 1280, 2000))
+                self.assertEqual(live_command_profile("auto", 4, "ggml-base.bin"), (4, 1000, 2000))
 
     def test_preview_latency_uses_the_selected_profile_step(self):
         self.assertAlmostEqual(preview_latency_seconds(1280, 374.0), 1.654)
@@ -192,6 +208,8 @@ class FinalizedTranscriptTests(unittest.TestCase):
             root = pathlib.Path(temporary)
             run_dir = root / "run"
             run_dir.mkdir()
+            invalid_header = b"RIFF\x00\x00\x00\x00WAVEfmt "
+            (run_dir / "invalid.wav").write_bytes(invalid_header)
             audio = root / "audio.wav"
             fixture = root / "fixture.wav"
             for path in (audio, fixture):
@@ -199,7 +217,7 @@ class FinalizedTranscriptTests(unittest.TestCase):
                     handle.setnchannels(1)
                     handle.setsampwidth(2)
                     handle.setframerate(16000)
-                    handle.writeframes(b"\x00\x00" * 320)
+                    handle.writeframes(b"\x00\x00" * 118960 * (10 if path == audio else 1))
             model = root / "model.bin"
             model.write_bytes(b"fake")
             report = root / "report.json"
@@ -252,7 +270,15 @@ class FinalizedTranscriptTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 1)
             self.assertEqual(payload["status"], "failed")
             self.assertEqual(payload["dropped_samples"], -1)
+            self.assertEqual(payload["missing_segments"], 10)
+            self.assertEqual(payload["exit_code"], 0)
+            self.assertFalse(payload["realtime_capable"])
+            self.assertEqual(payload["command"][0], str(binary))
+            self.assertIn("[Start speaking]", payload["stdout_raw"])
+            self.assertIn("SBOBINO_WHISPER_LIVE_METRIC", payload["stderr_raw"])
             self.assertIn("terminal runtime summary is missing", payload["failures"])
+            self.assertEqual(payload["invalid_captured_audio"], [{"file": "invalid.wav", "error": "not a WAVE file", "header_hex": invalid_header.hex(), "size_bytes": len(invalid_header)}])
+            self.assertIn("invalid captured WAV invalid.wav: not a WAVE file", payload["failures"])
 
     @unittest.skipIf(os.name == "nt", "POSIX fake executable is used for this contract test")
     def test_expected_preflight_rejection_passes_only_before_capture(self):
@@ -274,6 +300,7 @@ class FinalizedTranscriptTests(unittest.TestCase):
             binary = root / "fake-whisper"
             binary.write_text(
                 "#!/bin/sh\n"
+                "printf '%s\\n' \"$GGML_METAL_NO_RESIDENCY\" \"$GGML_METAL_SHARED_BUFFERS_DISABLE\" \"$GGML_METAL_CONCURRENCY_DISABLE\" > metal-environment.txt\n"
                 "printf 'SBOBINO_WHISPER_LIVE_PREFLIGHT status=rejected inference_ms=1600.000 budget_ms=720.000 step_ms=1280\\n' 1>&2\n"
                 "exit 8\n",
                 encoding="utf-8",
@@ -294,6 +321,9 @@ class FinalizedTranscriptTests(unittest.TestCase):
                     "--platform", "test",
                     "--expect-preflight-rejection",
                 ],
+                env={**os.environ, "GGML_METAL_NO_RESIDENCY": "0",
+                     "GGML_METAL_SHARED_BUFFERS_DISABLE": "0",
+                     "GGML_METAL_CONCURRENCY_DISABLE": "0"},
                 check=False,
             )
             payload = json.loads(report.read_text(encoding="utf-8"))
@@ -303,6 +333,16 @@ class FinalizedTranscriptTests(unittest.TestCase):
             self.assertEqual(payload["captured_audio_frames"], 0)
             self.assertEqual(payload["saved_audio_frames"], 0)
             self.assertEqual(payload["stdout_transcript"], "")
+
+            self.assertEqual(
+                (run_dir / "metal-environment.txt").read_text().splitlines(),
+                ["1", "1", "1"],
+            )
+            self.assertEqual(payload["profile"]["metal_environment"], {
+                "GGML_METAL_NO_RESIDENCY": "1",
+                "GGML_METAL_SHARED_BUFFERS_DISABLE": "1",
+                "GGML_METAL_CONCURRENCY_DISABLE": "1",
+            })
 
     @unittest.skipIf(os.name == "nt", "POSIX fake executable is used for this contract test")
     def test_allowed_preflight_rejection_accepts_measured_incompatible_device(self):
