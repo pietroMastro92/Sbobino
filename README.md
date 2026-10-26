@@ -1,5 +1,7 @@
 # Sbobino
 
+The canonical development branch is `main`, which includes the published [2.0.36](https://github.com/pietroMastro92/Sbobino/releases/tag/v2.0.36) fixes. See [repository state and integration boundaries](docs/REPOSITORY_STATE.md) before resuming an old checkout or mobile integration.
+
 <div align="center">
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/pietromastro)
