@@ -18,18 +18,19 @@ $ParakeetUrl = "https://github.com/mudler/parakeet.cpp/releases/download/v$Parak
 $ParakeetSha256 = "2880150a1bad2944baed46f2e6bb9f1bc55263a9f2bb85573785a7ec4fa35f27"
 $ParakeetSourceUrl = "https://github.com/mudler/parakeet.cpp.git"
 $ParakeetSourceRef = "fa5aeef1e3d353679cbd374a426fee28387deb6e"
+# Pin a month-end build: upstream deletes daily archives after 14 days.
 # The shared FFmpeg archive is pinned by SHA-256. The URL is intentionally
 # overridable so release jobs can stage an archive in the same workspace; a
 # moving URL can never silently change the bytes accepted by this packager.
 $FfmpegUrl = if ($env:SBOBINO_FFMPEG_RUNTIME_URL) {
     $env:SBOBINO_FFMPEG_RUNTIME_URL
 } else {
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-05-13-07/ffmpeg-n8.1.3-14-g330caae0c1-win64-gpl-shared-8.1.zip"
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n8.1.3-9-g29e619e767-win64-gpl-shared-8.1.zip"
 }
 $FfmpegSha256 = if ($env:SBOBINO_FFMPEG_RUNTIME_SHA256) {
     $env:SBOBINO_FFMPEG_RUNTIME_SHA256
 } else {
-    "817ae73c5e6aeba48ce998be093f55db80389ffcdeb855bc712ebe54301719f2"
+    "dfe81c3aa0a546ee81980b1b824486dd0fe0a1d452f00cb55135379a74be7bcf"
 }
 $TargetTriple = "x86_64-pc-windows-msvc"
 

@@ -531,15 +531,15 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.assertNotIn("v2.0.25", contents)
             self.assertNotIn("/releases/download/latest/", contents)
             self.assertIn(
-                "BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-05-13-07",
+                "BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08",
                 contents,
             )
             self.assertIn(
-                "ffmpeg-n8.1.3-14-g330caae0c1-win64-gpl-shared-8.1.zip",
+                "ffmpeg-n8.1.3-9-g29e619e767-win64-gpl-shared-8.1.zip",
                 contents,
             )
             self.assertIn(
-                "817ae73c5e6aeba48ce998be093f55db80389ffcdeb855bc712ebe54301719f2",
+                "dfe81c3aa0a546ee81980b1b824486dd0fe0a1d452f00cb55135379a74be7bcf",
                 contents,
             )
             if script.name == "package_windows_pyannote_runtime.ps1":

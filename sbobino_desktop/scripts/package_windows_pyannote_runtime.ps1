@@ -10,18 +10,19 @@ $ProgressPreference = "SilentlyContinue"
 
 $PythonCommand = (Get-Command python.exe -ErrorAction Stop).Source
 $PythonBase = (& $PythonCommand -c "import sys; print(sys.base_prefix)").Trim()
+# Pin a month-end build: upstream deletes daily archives after 14 days.
 # TorchCodec requires a shared FFmpeg build on Windows. The archive is pinned
 # by SHA-256; callers may provide a staged speech runtime or override the URL,
 # but no unverified bytes are accepted.
 $FfmpegUrl = if ($env:SBOBINO_FFMPEG_RUNTIME_URL) {
     $env:SBOBINO_FFMPEG_RUNTIME_URL
 } else {
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-05-13-07/ffmpeg-n8.1.3-14-g330caae0c1-win64-gpl-shared-8.1.zip"
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-30-13-08/ffmpeg-n8.1.3-9-g29e619e767-win64-gpl-shared-8.1.zip"
 }
 $FfmpegSha256 = if ($env:SBOBINO_FFMPEG_RUNTIME_SHA256) {
     $env:SBOBINO_FFMPEG_RUNTIME_SHA256
 } else {
-    "817ae73c5e6aeba48ce998be093f55db80389ffcdeb855bc712ebe54301719f2"
+    "dfe81c3aa0a546ee81980b1b824486dd0fe0a1d452f00cb55135379a74be7bcf"
 }
 $TargetTriple = "x86_64-pc-windows-msvc"
 
