@@ -15,17 +15,16 @@ pub struct FsSettingsRepository {
 }
 
 impl FsSettingsRepository {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Result<Self, ApplicationError> {
         let fallback_root = path
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        let secure_storage = SecureStorage::load_or_create_with_fallback(&fallback_root)
-            .expect("secure storage should initialize before settings repository");
-        Self {
+        let secure_storage = SecureStorage::load_or_create_with_fallback(&fallback_root)?;
+        Ok(Self {
             path,
             secure_storage,
-        }
+        })
     }
 
     pub fn load_sync(&self) -> Result<AppSettings, ApplicationError> {
@@ -404,7 +403,7 @@ impl SettingsRepository for FsSettingsRepository {
     async fn load(&self) -> Result<AppSettings, ApplicationError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let repo = FsSettingsRepository::new(path);
+            let repo = FsSettingsRepository::new(path)?;
             repo.load_sync()
         })
         .await
@@ -415,7 +414,7 @@ impl SettingsRepository for FsSettingsRepository {
         let path = self.path.clone();
         let settings = settings.clone();
         tokio::task::spawn_blocking(move || {
-            let repo = FsSettingsRepository::new(path);
+            let repo = FsSettingsRepository::new(path)?;
             repo.save_sync(&settings)
         })
         .await

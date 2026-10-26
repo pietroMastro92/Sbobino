@@ -1,0 +1,290 @@
+name: Verification file transcription
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/arm-release-readiness-20261003]
+    paths: [.github/workflows/verification-file-transcription.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verification-file-transcription-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  file-transcription:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            machine: arm64
+            target: aarch64-apple-darwin
+            asset: speech-runtime-macos-aarch64.zip
+            digest: 5831267413b9edf4e72c1e2303368fbae4c89bf1a53d6f765141c2dccdfe91e0
+            pyannote_asset: pyannote-runtime-macos-aarch64.zip
+            pyannote_digest: 036a0bab02e9766ede5669b0fbee6bec09c8fd6b47bae9571db8f101eff46105
+          - runner: macos-15-intel
+            machine: x86_64
+            target: x86_64-apple-darwin
+            asset: speech-runtime-macos-x86_64.zip
+            digest: dd3112dba1b3f16e65d06d2b4e815fe37553223626c5070e36f318953fe86404
+            pyannote_asset: pyannote-runtime-macos-x86_64.zip
+            pyannote_digest: b6e5687246feed70c2210e2345bb513da39ece99d12e4378235e3aa1538fd134
+          - runner: windows-2025
+            machine: AMD64
+            target: x86_64-pc-windows-msvc
+            asset: speech-runtime-windows-x86_64.zip
+            digest: 43cc3ea4ae1a4737da3be5cd5494df7319ccad5ec2387cde7d6d1ddcf455497d
+            pyannote_asset: pyannote-runtime-windows-x86_64.zip
+            pyannote_digest: 3cb2c3e934ca38d776b380fbf8c941bf5e39badb9034451c2e595c8c24a44a33
+    env:
+      PYANNOTE_ASSET: ${{ matrix.pyannote_asset }}
+      PYANNOTE_DIGEST: ${{ matrix.pyannote_digest }}
+      RUNTIME_ASSET: ${{ matrix.asset }}
+      RUNTIME_DIGEST: ${{ matrix.digest }}
+      NATIVE_TARGET: ${{ matrix.target }}
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      EXPECTED_MACHINE: ${{ matrix.machine }}
+      RUNTIME_SOURCE: 34906f99e4e359d532a185bc8a35e9fc55718377
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Transcribe real speech with the immutable packaged CPU runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, math, os, platform, subprocess, time, zipfile
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "file-transcription"
+          output = root / "proof"
+          output.mkdir(parents=True, exist_ok=True)
+          archive = root / os.environ["RUNTIME_ASSET"]
+          runtime = root / "runtime"
+          cli = runtime / "bin" / ("whisper-cli.exe" if os.name == "nt" else "whisper-cli")
+          model_manifest = json.loads(Path("sbobino_desktop/crates/domain/src/whisper_live_model.json").read_text())
+          model = root / model_manifest["filename"]
+          audio = root / "speech.wav"
+          base = output / "transcription"
+          command = [str(cli), "-m", str(model), "-f", str(audio), "-l", "en", "-ng", "-nfa", "-ojf", "-otxt", "-of", str(base), "-np"]
+          report = {
+              "status": "failed", "scope": "packaged Whisper CPU file smoke; no app UI, Live or WER/CER acceptance",
+              "source_sha": os.environ["GITHUB_SHA"], "runtime_source": os.environ["RUNTIME_SOURCE"],
+              "platform": platform.platform(), "architecture": platform.machine(),
+              "runtime_asset": archive.name, "runtime_expected_sha256": os.environ["RUNTIME_DIGEST"],
+              "model_expected_sha256": model_manifest["sha256"], "command": command, "timeout_seconds": 120,
+              "exit_code": None, "assertion_exit_code": 1,
+          }
+
+          def sha256(path):
+              if not path.is_file():
+                  return None
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+
+          try:
+              assert platform.machine() == os.environ["EXPECTED_MACHINE"], "wrong native architecture"
+              with (output / "setup.log").open("wb") as log:
+                  subprocess.run(["git", "diff", "--exit-code", os.environ["RUNTIME_SOURCE"], "HEAD", "--", "sbobino_desktop/scripts/package_macos_runtime_asset.sh", "sbobino_desktop/scripts/package_windows_runtime_asset.ps1", "sbobino_desktop/scripts/patches"], check=True, stdout=log, stderr=log)
+                  subprocess.run(["gh", "release", "download", "v2.0.34", "--repo", os.environ["GITHUB_REPOSITORY"], "--pattern", archive.name, "--dir", str(root)], check=True, timeout=300, stdout=log, stderr=log)
+                  assert sha256(archive) == os.environ["RUNTIME_DIGEST"], "runtime checksum mismatch"
+                  fixture_url = "https://raw.githubusercontent.com/mudler/parakeet.cpp/9edf17c3ada66e0f881dcff155492867db7ac4cf/tests/fixtures/speech.wav"
+                  for url, target in ((fixture_url, audio), (model_manifest["url"], model)):
+                      assert "/resolve/main/" not in url, "mutable input URL"
+                      subprocess.run(["curl", "--fail", "--location", "--retry", "3", url, "--output", str(target)], check=True, timeout=300, stdout=log, stderr=log)
+                  assert sha256(audio) == "5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150", "audio checksum mismatch"
+                  assert sha256(model) == model_manifest["sha256"], "model checksum mismatch"
+                  if os.name == "nt":
+                      with zipfile.ZipFile(archive) as bundle:
+                          bundle.extractall(root)
+                  else:
+                      # ditto preserves packaged dylib symlinks on macOS.
+                      subprocess.run(["ditto", "-x", "-k", str(archive), str(root)], check=True, stdout=log, stderr=log)
+              environment = os.environ.copy()
+              environment["PATH"] = str(runtime / "bin") + os.pathsep + environment.get("PATH", "")
+              if platform.system() == "Darwin":
+                  environment["DYLD_LIBRARY_PATH"] = str(runtime / "lib")
+              started = time.monotonic()
+              try:
+                  result = subprocess.run(command, capture_output=True, timeout=120, env=environment)
+              except subprocess.TimeoutExpired as error:
+                  (output / "stdout.log").write_bytes(error.stdout or b"")
+                  (output / "stderr.log").write_bytes(error.stderr or b"")
+                  raise
+              finally:
+                  report["elapsed_seconds"] = time.monotonic() - started
+              report["exit_code"] = result.returncode
+              (output / "stdout.log").write_bytes(result.stdout)
+              (output / "stderr.log").write_bytes(result.stderr)
+              assert result.returncode == 0, f"CLI failed: {result.returncode}"
+              payload = json.loads(base.with_suffix(".json").read_text(encoding="utf-8"))
+              segments = payload["transcription"]
+              assert isinstance(segments, list) and segments, "missing speech segments"
+              previous = -1
+              for segment in segments:
+                  start, end = segment["offsets"]["from"], segment["offsets"]["to"]
+                  assert math.isfinite(start) and math.isfinite(end) and start >= previous and end > start, "invalid timestamps"
+                  assert isinstance(segment["text"], str) and segment["text"].strip(), "empty speech segment"
+                  previous = start
+              assert base.with_suffix(".txt").read_text(encoding="utf-8").strip(), "empty TXT output"
+              report.update(status="passed", assertion_exit_code=0, segment_count=len(segments))
+          except Exception as error:
+              report["error"] = f"{type(error).__name__}: {error}"
+          finally:
+              report["sha256"] = {str(p.relative_to(root)): sha256(p) for p in (archive, cli, model, audio, base.with_suffix(".json"), base.with_suffix(".txt"))}
+              (output / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          raise SystemExit(report["assertion_exit_code"])
+          PY
+      - name: Run real offline CPU diarization with the packaged Pyannote helper
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, math, os, platform, subprocess, time, zipfile
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "file-transcription"
+          output = root / "proof"
+          inputs = root / "pyannote-download"
+          inputs.mkdir()
+          stage = root / "pyannote-stage"
+          model_stage = root / "pyannote-model"
+          archive = inputs / os.environ["PYANNOTE_ASSET"]
+          model_zip = inputs / "pyannote-model-community-1.zip"
+          helper = Path("sbobino_desktop/scripts/pyannote_diarize.py").resolve()
+          report = {"status": "failed", "source_sha": os.environ["GITHUB_SHA"], "platform": platform.platform(), "architecture": platform.machine(), "scope": "real packaged CPU offline helper inference; not app rollback or DER quality", "exit_code": None, "assertion_exit_code": 1}
+
+          def sha256(path):
+              with path.open("rb") as stream:
+                  return hashlib.file_digest(stream, "sha256").hexdigest()
+
+          try:
+              with (output / "pyannote-setup.log").open("wb") as log:
+                  subprocess.run(["gh", "release", "download", "v2.0.34", "--repo", os.environ["GITHUB_REPOSITORY"], "--pattern", archive.name, "--pattern", model_zip.name, "--dir", str(inputs)], check=True, timeout=600, stdout=log, stderr=log)
+                  report["sha256"] = {archive.name: sha256(archive), model_zip.name: sha256(model_zip), "helper": sha256(helper), "audio": sha256(root / "speech.wav")}
+                  assert report["sha256"][archive.name] == os.environ["PYANNOTE_DIGEST"], "Pyannote runtime checksum mismatch"
+                  assert report["sha256"][model_zip.name] == "c2e98a01cf0bcb467a34da9b5ece993116b78b84161c191d5be0e873b76f0e34", "Pyannote model checksum mismatch"
+                  for bundle, target in ((archive, stage), (model_zip, model_stage)):
+                      if os.name == "nt":
+                          with zipfile.ZipFile(bundle) as zip_file:
+                              zip_file.extractall(target)
+                      else:
+                          target.mkdir()
+                          subprocess.run(["ditto", "-x", "-k", str(bundle), str(target)], check=True, stdout=log, stderr=log)
+              python_home = stage / "python"
+              executable = python_home / ("python.exe" if os.name == "nt" else "bin/python3")
+              env = os.environ.copy()
+              env.update(PYTHONHOME=str(python_home), PYTHONNOUSERSITE="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HOME=str(root / "isolated-hf"), TORCH_HOME=str(root / "isolated-torch"))
+              if os.name == "nt":
+                  env["PYTHONPATH"] = os.pathsep.join(map(str, (python_home / "Lib", python_home / "Lib/site-packages")))
+                  bins = (python_home, python_home / "DLLs", root / "runtime/bin", root / "runtime/lib", Path(os.environ["SystemRoot"]) / "System32")
+              else:
+                  stdlib = next(p for p in (python_home / "lib").glob("python3.*") if p.is_dir())
+                  env["PYTHONPATH"] = os.pathsep.join(map(str, (stdlib, stdlib / "lib-dynload", stdlib / "site-packages")))
+                  bins = (python_home / "bin", root / "runtime/bin", Path("/usr/bin"), Path("/bin"))
+              env["PATH"] = os.pathsep.join(map(str, bins))
+              command = [str(executable), str(helper), "--audio-path", str(root / "speech.wav"), "--model-path", str(model_stage / "model"), "--device", "cpu"]
+              report.update(command=command, python_sha256=sha256(executable), timeout_seconds=300)
+              started = time.monotonic()
+              try:
+                  result = subprocess.run(command, capture_output=True, timeout=300, env=env)
+              except subprocess.TimeoutExpired as error:
+                  (output / "pyannote.stdout").write_bytes(error.stdout or b"")
+                  (output / "pyannote.stderr").write_bytes(error.stderr or b"")
+                  raise
+              finally:
+                  report["elapsed_seconds"] = time.monotonic() - started
+              report["exit_code"] = result.returncode
+              (output / "pyannote.stdout").write_bytes(result.stdout)
+              (output / "pyannote.stderr").write_bytes(result.stderr)
+              assert result.returncode == 0, f"Pyannote helper failed: {result.returncode}"
+              turns = json.loads(result.stdout)["speakers"]
+              assert isinstance(turns, list) and turns, "no speaker turns"
+              for turn in turns:
+                  start, end = turn["start_seconds"], turn["end_seconds"]
+                  assert math.isfinite(start) and math.isfinite(end) and end > start >= 0 and turn["speaker_id"], "invalid speaker turn"
+              report.update(status="passed", assertion_exit_code=0, speaker_turn_count=len(turns))
+          except Exception as error:
+              report["error"] = f"{type(error).__name__}: {error}"
+          finally:
+              (output / "pyannote-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          raise SystemExit(report["assertion_exit_code"])
+          PY
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.95.0'
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: sbobino_desktop -> target
+      - name: Run existing real Whisper and Parakeet service smokes
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, subprocess, time
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "file-transcription"
+          output = root / "proof"
+          inputs = (
+              ("ggml-tiny.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.bin?download=true", "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21"),
+              ("tdt-0.6b-v3-q4_k.gguf", "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/bf0af9f425fa01809cadec671b3cb672709d13e9/tdt-0.6b-v3-q4_k.gguf?download=true", "993d73feb4206dadda865ab25bd64b50c48dc4d013c3bf6126a721f28b1d5ee8"),
+          )
+          with (output / "service-setup.log").open("wb") as log:
+              for filename, url, expected in inputs:
+                  target = root / filename
+                  subprocess.run(["curl", "--fail", "--location", "--retry", "3", url, "--output", str(target)], check=True, timeout=600, stdout=log, stderr=log)
+                  with target.open("rb") as stream:
+                      assert hashlib.file_digest(stream, "sha256").hexdigest() == expected, "service model checksum mismatch"
+          suffix = ".exe" if os.name == "nt" else ""
+          env = os.environ.copy()
+          env.update(
+              SBOBINO_WHISPER_CLI=str(root / "runtime/bin" / ("whisper-cli" + suffix)),
+              SBOBINO_WHISPER_FFMPEG=str(root / "runtime/bin" / ("ffmpeg" + suffix)),
+              SBOBINO_WHISPER_MODELS_DIR=str(root), SBOBINO_WHISPER_MODEL="ggml-tiny.bin", SBOBINO_WHISPER_AUDIO=str(root / "speech.wav"),
+              SBOBINO_PARAKEET_CLI=str(root / "runtime/bin" / ("parakeet-cli" + suffix)),
+              SBOBINO_PARAKEET_MODELS_DIR=str(root), SBOBINO_PARAKEET_MODEL="tdt-0.6b-v3-q4_k.gguf", SBOBINO_PARAKEET_AUDIO=str(root / "speech.wav"),
+              SBOBINO_PARAKEET_FORCE_CPU="1", SBOBINO_PARAKEET_EXPECTED_DETECTED_LANGUAGE="en", SBOBINO_PARAKEET_EXPECTED_PROCESSING_LANGUAGE="en",
+          )
+          failed = False
+          for engine, test in (("whisper", "whisper_service_real_smoke_preserves_timeline_and_plain_text"), ("parakeet", "parakeet_service_real_smoke_persists_metadata")):
+              env["SBOBINO_ASR_TIMELINE_OUTPUT"] = str(output / (engine + "-service-timeline.json"))
+              command = ["cargo", "test", "-p", "sbobino-infrastructure", "--target", os.environ["NATIVE_TARGET"], "--test", "parakeet_real_service_smoke_tests", test, "--", "--ignored", "--exact", "--nocapture"]
+              started = time.monotonic()
+              with (output / (engine + "-service.log")).open("wb") as log:
+                  result = subprocess.run(command, cwd="sbobino_desktop", env=env, stdout=log, stderr=log)
+              text = (output / (engine + "-service.log")).read_text(encoding="utf-8", errors="replace")
+              passed = result.returncode == 0 and "1 passed; 0 failed" in text and (output / (engine + "-service-timeline.json")).is_file()
+              report = {"status": "passed" if passed else "failed", "source_sha": os.environ["GITHUB_SHA"], "command": command, "exit_code": result.returncode, "elapsed_seconds_including_cargo": time.monotonic() - started, "model_sha256": inputs[0 if engine == "whisper" else 1][2], "scope": "real CPU engine through production TranscriptionService; in-memory test repository, not installed UI/export or quality benchmark"}
+              (output / (engine + "-service-report.json")).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+              failed |= not passed
+          if not failed:
+              # Discover the already-built test executable; no compilation in measured runs.
+              metadata = subprocess.run(["cargo", "test", "-p", "sbobino-infrastructure", "--target", os.environ["NATIVE_TARGET"], "--test", "parakeet_real_service_smoke_tests", "--no-run", "--message-format=json"], cwd="sbobino_desktop", capture_output=True, text=True, check=True)
+              artifacts = [json.loads(line) for line in metadata.stdout.splitlines() if line.startswith("{")]
+              binary = next(item["executable"] for item in artifacts if item.get("executable") and item.get("target", {}).get("name") == "parakeet_real_service_smoke_tests")
+              subprocess.run(["python", "-m", "unittest", "discover", "-s", "sbobino_desktop/scripts", "-p", "test_benchmark_transcription_service.py"], check=True)
+              subprocess.run(["python", "sbobino_desktop/scripts/benchmark_transcription_service.py", "--binary", binary, "--audio", str(root / "speech.wav"), "--output", str(output / "benchmark")], env=env, check=True)
+          raise SystemExit(int(failed))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: file-transcription-${{ matrix.machine }}-${{ github.sha }}
+          path: ${{ runner.temp }}/file-transcription/proof/
+          if-no-files-found: error
+          retention-days: 3

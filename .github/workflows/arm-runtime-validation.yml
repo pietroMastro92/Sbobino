@@ -3,10 +3,15 @@ name: ARM Runtime Validation
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: Optional source commit to validate without publishing a release
+        required: false
+        default: ""
+        type: string
       tag_name:
         description: Candidate tag whose packaged runtime should be validated
         required: true
-        default: v2.0.32
+        default: v2.0.34
         type: string
 
 permissions:
@@ -22,21 +27,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag_name }}
+          ref: ${{ inputs.source_ref || inputs.tag_name }}
           fetch-depth: 0
 
-      - name: Validate v2.0.32 candidate tag and versioned notes
+      - name: Record actual source and native architecture
+        run: |
+          git rev-parse HEAD | tee "$RUNNER_TEMP/runtime-validation-source.txt"
+          uname -a | tee -a "$RUNNER_TEMP/runtime-validation-source.txt"
+
+      - name: Validate v2.0.34 candidate tag and versioned notes
         working-directory: sbobino_desktop
         run: |
-          if [[ "$TAG_NAME" != "v2.0.32" ]]; then
-            echo "ARM validation is locked to the v2.0.32 candidate; got $TAG_NAME" >&2
+          if [[ "$TAG_NAME" != "v2.0.34" ]]; then
+            echo "ARM validation is locked to the v2.0.34 candidate; got $TAG_NAME" >&2
             exit 1
           fi
           VERSION="${TAG_NAME#v}"
           SBOBINO_RELEASE_PROFILE=standalone-dev ./scripts/check_release_versions.sh "$VERSION"
-          ./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md"
+          ./scripts/check_release_notes.sh "$VERSION" "docs/release-notes/v${VERSION}.md" v2.0.33
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
 
       - name: Install native build dependencies
         run: brew install ffmpeg sdl2 nasm
@@ -56,6 +68,7 @@ jobs:
       - name: Replay packaged Whisper through the production stream binary
         working-directory: sbobino_desktop
         run: |
+          TMPDIR="$RUNNER_TEMP" \
           SBOBINO_WHISPER_LIVE_ARCH=arm64 \
           SBOBINO_WHISPER_ALLOW_PREFLIGHT_REJECTION=1 \
           SBOBINO_WHISPER_LIVE_RUNTIME_ZIP="$RUNNER_TEMP/speech-runtime-macos-aarch64.zip" \
@@ -68,6 +81,14 @@ jobs:
         if: always()
         with:
           name: arm-whisper-live-replay
-          path: ${{ runner.temp }}/arm-whisper-live-smoke-proof.json
+          path: |
+            ${{ runner.temp }}/arm-whisper-live-smoke-proof.json
+            ${{ runner.temp }}/arm-whisper-live-smoke-proof.raw/
+            ${{ runner.temp }}/runtime-validation-source.txt
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.json
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.log
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.stderr
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.stdout
+            ${{ runner.temp }}/sbobino-macos-whisper-live.*/**/*.txt
           if-no-files-found: error
           retention-days: 3

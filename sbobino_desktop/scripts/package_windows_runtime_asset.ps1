@@ -24,12 +24,12 @@ $ParakeetSourceRef = "fa5aeef1e3d353679cbd374a426fee28387deb6e"
 $FfmpegUrl = if ($env:SBOBINO_FFMPEG_RUNTIME_URL) {
     $env:SBOBINO_FFMPEG_RUNTIME_URL
 } else {
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-30-13-12/ffmpeg-n8.1.2-50-g1a748fe2cd-win64-gpl-shared-8.1.zip"
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-05-13-07/ffmpeg-n8.1.3-14-g330caae0c1-win64-gpl-shared-8.1.zip"
 }
 $FfmpegSha256 = if ($env:SBOBINO_FFMPEG_RUNTIME_SHA256) {
     $env:SBOBINO_FFMPEG_RUNTIME_SHA256
 } else {
-    "d0db0a48da22815a04b5ec9e757640dc8069f9f8c37fd4e1b8753a4c0326502c"
+    "817ae73c5e6aeba48ce998be093f55db80389ffcdeb855bc712ebe54301719f2"
 }
 $TargetTriple = "x86_64-pc-windows-msvc"
 
@@ -343,10 +343,11 @@ function Assert-AppLocalDependencies {
         $packaged[$_.Name.ToLowerInvariant()] = $true
     }
     $systemDlls = @(
-        "advapi32.dll", "avicap32.dll", "avrt.dll", "bcrypt.dll", "cfgmgr32.dll",
-        "crypt32.dll", "d2d1.dll", "dwrite.dll", "gdi32.dll", "imm32.dll",
-        "iphlpapi.dll", "kernel32.dll", "msvcrt.dll", "ncrypt.dll", "ntdll.dll",
-        "ole32.dll", "oleaut32.dll", "rpcrt4.dll", "secur32.dll", "setupapi.dll",
+        "advapi32.dll", "avicap32.dll", "avrt.dll", "bcrypt.dll", "bcryptprimitives.dll",
+        "cfgmgr32.dll", "crypt32.dll", "d2d1.dll", "dnsapi.dll", "dwrite.dll",
+        "gdi32.dll", "imm32.dll", "iphlpapi.dll", "kernel32.dll", "msimg32.dll",
+        "msvcrt.dll", "ncrypt.dll", "ntdll.dll", "ole32.dll", "oleaut32.dll",
+        "rpcrt4.dll", "secur32.dll", "setupapi.dll", "userenv.dll",
         "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll", "usp10.dll", "version.dll",
         "winmm.dll", "ws2_32.dll"
     )

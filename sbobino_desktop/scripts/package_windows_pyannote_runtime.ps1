@@ -16,12 +16,12 @@ $PythonBase = (& $PythonCommand -c "import sys; print(sys.base_prefix)").Trim()
 $FfmpegUrl = if ($env:SBOBINO_FFMPEG_RUNTIME_URL) {
     $env:SBOBINO_FFMPEG_RUNTIME_URL
 } else {
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-30-13-12/ffmpeg-n8.1.2-50-g1a748fe2cd-win64-gpl-shared-8.1.zip"
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-10-05-13-07/ffmpeg-n8.1.3-14-g330caae0c1-win64-gpl-shared-8.1.zip"
 }
 $FfmpegSha256 = if ($env:SBOBINO_FFMPEG_RUNTIME_SHA256) {
     $env:SBOBINO_FFMPEG_RUNTIME_SHA256
 } else {
-    "d0db0a48da22815a04b5ec9e757640dc8069f9f8c37fd4e1b8753a4c0326502c"
+    "817ae73c5e6aeba48ce998be093f55db80389ffcdeb855bc712ebe54301719f2"
 }
 $TargetTriple = "x86_64-pc-windows-msvc"
 

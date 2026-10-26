@@ -142,7 +142,9 @@ if [[ ! -d "$APP_PATH" ]]; then
   exit 1
 fi
 
+python3 "$ROOT_DIR/scripts/prepare_macos_bundle_scripts.py" "$APP_PATH"
 codesign --force --deep --sign - "$APP_PATH"
+codesign --verify --deep --strict "$APP_PATH"
 rm -f "$UPDATER_TAR" "$UPDATER_SIG"
 COPYFILE_DISABLE=1 tar -czf "$UPDATER_TAR" -C "$APP_DIR" "Sbobino.app"
 

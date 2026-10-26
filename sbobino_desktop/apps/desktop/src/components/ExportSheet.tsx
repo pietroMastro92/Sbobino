@@ -1,5 +1,5 @@
 import { Braces, Captions, Check, Copy, Download, FileCode2, FileSpreadsheet, FileText, FileType, FileType2, List, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useTranslation } from "../i18n";
 import { copyTextToClipboard } from "../lib/clipboard";
 
@@ -100,6 +100,12 @@ type StyleItem = {
   disabled?: boolean;
 };
 
+const EXPORT_FOCUSABLE_SELECTOR = "input:not([disabled]), button:not([disabled])";
+
+function getExportFocusableElements(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(EXPORT_FOCUSABLE_SELECTOR));
+}
+
 function getStyleItems(
   t: (key: string, fallback?: string) => string,
   segmentsAlignedWithTranscript: boolean,
@@ -161,6 +167,8 @@ export function ExportSheet({
   const { t, language } = useTranslation();
   const prevStyleRef = useRef(style);
   const previewRequestIdRef = useRef(0);
+  const exportSheetRef = useRef<HTMLElement | null>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
   const exportSegments = useMemo(
     () => (segmentsAlignedWithTranscript ? segments : []),
     [segments, segmentsAlignedWithTranscript],
@@ -258,6 +266,24 @@ export function ExportSheet({
     };
   }, [exportRequest, onPreview, open]);
 
+  useEffect(() => {
+    if (!open) return;
+    openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const sheet = exportSheetRef.current;
+    if (sheet) {
+      const focusableElements = getExportFocusableElements(sheet);
+      (focusableElements[0] ?? sheet).focus();
+    }
+
+    return () => {
+      const opener = openerRef.current;
+      openerRef.current = null;
+      if (opener?.isConnected) {
+        opener.focus();
+      }
+    };
+  }, [open]);
+
   const preview = (() => {
     if (previewState.status === "loading") {
       return t("export.previewLoading", "Preparing preview...");
@@ -277,7 +303,8 @@ export function ExportSheet({
     const onKeyDown = (event: KeyboardEvent): void => {
       if (event.key === "Escape" && !isExporting) {
         event.preventDefault();
-        onClose();
+        event.stopPropagation();
+        onClose?.();
       }
     };
 
@@ -286,6 +313,13 @@ export function ExportSheet({
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [isExporting, onClose, open]);
+
+  useEffect(() => {
+    if (!open || !isExporting) return;
+    const sheet = exportSheetRef.current;
+    if (!sheet || getExportFocusableElements(sheet).length > 0) return;
+    sheet.focus();
+  }, [isExporting, open]);
 
   useEffect(() => {
     if (copyState === "idle") return;
@@ -337,6 +371,38 @@ export function ExportSheet({
         : t("export.copy", "Copy");
   const previewReady = previewState.status === "ready";
 
+  function onDialogKeyDown(event: ReactKeyboardEvent<HTMLElement>): void {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!isExporting) {
+        onClose?.();
+      }
+      return;
+    }
+    if (event.key !== "Tab") return;
+
+    const sheet = exportSheetRef.current;
+    if (!sheet) return;
+    const focusableElements = getExportFocusableElements(sheet);
+    if (focusableElements.length === 0) {
+      event.preventDefault();
+      sheet.focus();
+      return;
+    }
+
+    const currentIndex = focusableElements.indexOf(document.activeElement as HTMLElement);
+    const nextIndex =
+      currentIndex === -1
+        ? event.shiftKey
+          ? focusableElements.length - 1
+          : 0
+        : (currentIndex + (event.shiftKey ? -1 : 1) + focusableElements.length) %
+          focusableElements.length;
+    event.preventDefault();
+    focusableElements[nextIndex]?.focus();
+  }
+
   return (
     <div className="sheet-overlay" onClick={isExporting ? undefined : onClose}>
       <section
@@ -344,12 +410,19 @@ export function ExportSheet({
         role="dialog"
         aria-modal="true"
         aria-labelledby="export-sheet-title"
+        ref={exportSheetRef}
+        tabIndex={-1}
+        onKeyDown={onDialogKeyDown}
         onClick={(event) => event.stopPropagation()}
       >
         <button
           className="export-close-button"
           aria-label={t("export.closePreview", "Close export preview")}
-          onClick={onClose}
+          onClick={() => {
+            if (!isExporting) {
+              onClose?.();
+            }
+          }}
           disabled={isExporting}
         >
           <X size={14} />

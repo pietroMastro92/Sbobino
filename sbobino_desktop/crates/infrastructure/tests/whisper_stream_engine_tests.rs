@@ -876,3 +876,62 @@ exit 0
         "expected whisper-stream to receive '-l auto', got: {args:?}"
     );
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[tokio::test]
+#[ignore = "requires certified native runtime, model and isolated replay WAV"]
+async fn native_certified_replay_emits_preview_within_live_budget() {
+    assert!(std::path::Path::new(
+        &std::env::var("SBOBINO_WHISPER_REPLAY_WAV")
+            .expect("replay WAV required; never open microphone")
+    )
+    .is_file());
+    let engine = WhisperStreamEngine::new(
+        std::env::var("SBOBINO_NATIVE_WHISPER_BINARY").expect("certified binary required"),
+        std::env::var("SBOBINO_NATIVE_WHISPER_MODELS").expect("certified model directory required"),
+    );
+    let metrics = Arc::new(Mutex::new(WhisperStreamTelemetry::default()));
+    let captured_metrics = metrics.clone();
+    engine
+        .start_with_telemetry(
+            "ggml-tiny-q8_0.bin",
+            "auto",
+            Arc::new(|delta| {
+                println!("NATIVE_DELTA {:?} {}", delta.kind, delta.text);
+            }),
+            Some(Arc::new(move |metric| {
+                println!("NATIVE_METRIC {metric:?}");
+                *captured_metrics.lock().unwrap() = metric;
+            })),
+        )
+        .await
+        .expect("native capture-ready startup");
+    let completed = tokio::time::timeout(Duration::from_secs(120), async {
+        while engine.is_running().await {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let stopped = engine.stop().await;
+    println!(
+        "NATIVE_DIAGNOSTICS {:?}",
+        engine.snapshot_diagnostics().await
+    );
+    let result = stopped.expect("native replay must finish without recovery error");
+    println!("NATIVE_STOP {result:?}");
+    assert!(completed.is_ok(), "native replay exceeded time budget");
+    let metric = metrics.lock().unwrap();
+    let first_preview_ms = metric.first_preview_ms.expect("native preview required");
+    assert!(
+        first_preview_ms < 2_000.0,
+        "native producer preview exceeded live budget: {first_preview_ms}ms"
+    );
+    assert!(!result.transcript.is_empty());
+    assert!(!result.transcript.contains("audio replay:"));
+    assert!(!result.transcript.contains("SBOBINO_WHISPER_LIVE_METRICS"));
+    assert!(!result.segments.is_empty());
+    assert!(result
+        .saved_audio_path
+        .as_ref()
+        .is_some_and(|path| path.is_file()));
+}

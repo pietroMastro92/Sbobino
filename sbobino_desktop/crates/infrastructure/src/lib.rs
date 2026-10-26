@@ -369,7 +369,10 @@ impl RuntimeTranscriptionFactory {
         let settings_path = data_dir.join("settings.json");
         let artifacts_db = data_dir.join("artifacts.db");
 
-        let settings_repo = Arc::new(FsSettingsRepository::new(settings_path));
+        let settings_repo = Arc::new(
+            FsSettingsRepository::new(settings_path)
+                .map_err(|e| format!("failed to initialize settings repository: {e}"))?,
+        );
         let artifacts_repo = Arc::new(
             SqliteArtifactRepository::new(artifacts_db)
                 .map_err(|e| format!("failed to initialize artifacts repository: {e}"))?,

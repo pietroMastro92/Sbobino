@@ -46,6 +46,8 @@ need_cmd shasum
 need_cmd ditto
 need_cmd lipo
 need_cmd otool
+need_cmd tar
+need_cmd codesign
 
 RELEASE_API_URL="https://api.github.com/repos/$REPO_SLUG/releases/tags/$TAG"
 
@@ -121,6 +123,10 @@ download_asset() {
 for asset in "${ASSETS[@]}"; do
   download_asset "$asset"
 done
+
+mkdir -p "$TEMP_DIR/updater-signature"
+tar -xzf "$TEMP_DIR/Sbobino_${VERSION}_${RELEASE_ARCH}.app.tar.gz" -C "$TEMP_DIR/updater-signature"
+codesign --verify --deep --strict "$TEMP_DIR/updater-signature/Sbobino.app"
 
 python3 - "$VERSION" "$TAG" "$BASE_URL" "$TEMP_DIR" "$RELEASE_ARCH" <<'PY'
 import hashlib
