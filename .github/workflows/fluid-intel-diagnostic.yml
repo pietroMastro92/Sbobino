@@ -1,0 +1,64 @@
+name: Fluid Intel CPU diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  model-probes:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify host and pinned model files
+        run: |
+          test "$(uname -m)" = x86_64
+          xcrun swift --version
+          python3 sbobino_desktop/scripts/prepare_fluid_diarizer_models.py --output "$RUNNER_TEMP/fluid-intel-probe/models"
+      - name: Isolate each CPU prediction in a fresh process
+        env:
+          PROBE_ROOT: ${{ runner.temp }}/fluid-intel-probe
+        run: |
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, platform, subprocess, time
+          from pathlib import Path
+          root = Path(os.environ['PROBE_ROOT'])
+          script = Path('sbobino_desktop/scripts/probe_fluid_coreml.swift')
+          records = []
+          for model in ['Segmentation', 'FBank', 'Embedding', 'PldaRho']:
+              for batch in [1, 8, 32]:
+                  command = ['xcrun', 'swift', str(script), str(root/'models/speaker-diarization'), model, str(batch)]
+                  log = root/f'{model}-{batch}.log'
+                  start = time.monotonic()
+                  with log.open('wb') as output:
+                      try:
+                          code = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, timeout=90).returncode
+                      except subprocess.TimeoutExpired:
+                          code = 'TIMEOUT'
+                  records.append(dict(model=model, batch=batch, command=command, exit_code=code,
+                                      wall_seconds=time.monotonic()-start, log=log.name))
+          assert len(records) == 12
+          receipt = dict(commit=os.environ['GITHUB_SHA'], system=platform.platform(), machine=platform.machine(),
+                         scope='synthetic CPU tensor compatibility only; no app/audio/accuracy claim',
+                         script_sha256=hashlib.sha256(script.read_bytes()).hexdigest(), records=records)
+          (root/'probe-results.json').write_text(json.dumps(receipt, indent=2)+'\n')
+          print(json.dumps(receipt))
+          raise SystemExit(0 if all(row['exit_code'] == 0 for row in records) else 1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fluid-intel-cpu-probes-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/fluid-intel-probe/*.json
+            ${{ runner.temp }}/fluid-intel-probe/*.log
+          if-no-files-found: error
