@@ -14,7 +14,9 @@ export SBOBINO_TEST_TMPDIR="$TMPDIR"
 export CLANG_MODULE_CACHE_PATH="$PROOF_ROOT/module-cache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
 STATUS=0
+# All tests use XCTest; Swift 6.2 misroutes the unused Swift Testing runner to the CLI.
 xcrun swift test --disable-keychain --disable-netrc --only-use-versions-from-resolved-file \
+  --enable-xctest --disable-swift-testing \
   --package-path "$SCRIPT_DIR/fluid_diarizer" --scratch-path "$PROOF_ROOT/swift-build" \
   --cache-path "$PROOF_ROOT/swift-cache" --configuration release --jobs 2 \
   > "$PROOF_ROOT/swift-test.log" 2>&1 || STATUS=$?
