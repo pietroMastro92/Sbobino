@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     path::Path,
     path::PathBuf,
@@ -91,6 +91,8 @@ pub struct TranscriptionService {
     transcoder: Arc<dyn AudioTranscoder>,
     speech_engine: Arc<dyn SpeechToTextEngine>,
     speaker_diarizer: Option<Arc<dyn SpeakerDiarizationEngine>>,
+    /// Keep setup failures so the base transcript survives with failed speaker metadata.
+    diarization_setup_error: Option<String>,
     enhancer: Arc<dyn TranscriptEnhancer>,
     fallback_enhancers: Vec<Arc<dyn TranscriptEnhancer>>,
     artifacts: Arc<dyn ArtifactRepository>,
@@ -107,6 +109,7 @@ impl TranscriptionService {
             transcoder,
             speech_engine,
             speaker_diarizer: None,
+            diarization_setup_error: None,
             enhancer,
             fallback_enhancers: Vec::new(),
             artifacts,
@@ -118,6 +121,11 @@ impl TranscriptionService {
         speaker_diarizer: Arc<dyn SpeakerDiarizationEngine>,
     ) -> Self {
         self.speaker_diarizer = Some(speaker_diarizer);
+        self
+    }
+
+    pub fn with_diarization_setup_error(mut self, error: impl Into<String>) -> Self {
+        self.diarization_setup_error = Some(error.into());
         self
     }
 
@@ -306,7 +314,15 @@ impl TranscriptionService {
 
             let mut diarization_status: Option<String> = None;
             let mut diarization_error: Option<String> = None;
-            if let Some(speaker_diarizer) = &self.speaker_diarizer {
+            // Companion jobs carry an explicit per-job choice. `Some(false)`
+            // must not inherit the desktop global setting, while `Some(true)`
+            // records a diarization failure if setup is unavailable and keeps
+            // the completed ASR transcript. Legacy requests (`None`) retain
+            // the existing global behavior.
+            let diarization_requested = request.diarization_enabled.unwrap_or(
+                self.speaker_diarizer.is_some() || self.diarization_setup_error.is_some(),
+            );
+            if diarization_requested {
                 self.emit(
                     &emit_progress,
                     &progress_state,
@@ -318,24 +334,45 @@ impl TranscriptionService {
                     None,
                     Some(0),
                 );
-                match self
-                    .run_cancellable(&cancellation_token, speaker_diarizer.diarize(&wav_path))
-                    .await
-                {
-                    Ok(turns) => {
-                        diarization_status = Some("completed".to_string());
-                        if !turns.is_empty() && !transcription_output.segments.is_empty() {
-                            transcription_output.segments = Self::assign_speakers_to_segments(
-                                &transcription_output.segments,
-                                &turns,
-                            );
+                match self.speaker_diarizer.as_ref() {
+                    Some(speaker_diarizer) => {
+                        match self
+                            .run_cancellable(
+                                &cancellation_token,
+                                speaker_diarizer.diarize(&wav_path),
+                            )
+                            .await
+                        {
+                            Ok(turns) => {
+                                diarization_status = Some("completed".to_string());
+                                if !turns.is_empty() && !transcription_output.segments.is_empty() {
+                                    transcription_output.segments =
+                                        Self::assign_speakers_to_segments(
+                                            &transcription_output.segments,
+                                            &turns,
+                                        );
+                                }
+                            }
+                            Err(ApplicationError::Cancelled) => {
+                                return Err(ApplicationError::Cancelled)
+                            }
+                            Err(error) => {
+                                diarization_status = Some("failed".to_string());
+                                diarization_error = Some(error.to_string());
+                                warn!("speaker diarization skipped after transcription: {error}");
+                            }
                         }
                     }
-                    Err(ApplicationError::Cancelled) => return Err(ApplicationError::Cancelled),
-                    Err(error) => {
+                    None => {
                         diarization_status = Some("failed".to_string());
-                        diarization_error = Some(error.to_string());
-                        warn!("speaker diarization skipped after transcription: {error}");
+                        diarization_error =
+                            Some(self.diarization_setup_error.clone().unwrap_or_else(|| {
+                                "Speaker diarization is not available on this desktop.".to_string()
+                            }));
+                        warn!(
+                            error = ?diarization_error,
+                            "speaker diarization setup failed; keeping the ASR transcript"
+                        );
                     }
                 }
                 self.emit(
@@ -343,7 +380,11 @@ impl TranscriptionService {
                     &progress_state,
                     &request.job_id,
                     JobStage::Diarizing,
-                    "Speaker assignment complete",
+                    if diarization_status.as_deref() == Some("completed") {
+                        "Speaker assignment complete"
+                    } else {
+                        "Speaker identification unavailable; transcript saved"
+                    },
                     93,
                     None,
                     None,
@@ -1133,39 +1174,71 @@ impl TranscriptionService {
                     return segment.clone();
                 };
 
-                let midpoint = (segment_start + segment_end) / 2.0;
-                let mut best_overlap = 0.0_f32;
-                let mut best_distance = f32::MAX;
-                let mut best_turn: Option<&SpeakerTurn> = None;
-
+                let segment_duration = segment_end - segment_start;
+                let mut by_speaker = HashMap::<&str, (Option<&str>, Vec<(f32, f32)>)>::new();
                 for turn in &sanitized_turns {
-                    let overlap = (segment_end.min(turn.end_seconds)
-                        - segment_start.max(turn.start_seconds))
-                    .max(0.0);
-                    let distance = if midpoint < turn.start_seconds {
-                        turn.start_seconds - midpoint
-                    } else if midpoint > turn.end_seconds {
-                        midpoint - turn.end_seconds
-                    } else {
-                        0.0
-                    };
-
-                    if overlap > best_overlap + 0.001
-                        || ((overlap - best_overlap).abs() <= 0.001 && distance < best_distance)
-                    {
-                        best_overlap = overlap;
-                        best_distance = distance;
-                        best_turn = Some(turn);
+                    let start = segment_start.max(turn.start_seconds);
+                    let end = segment_end.min(turn.end_seconds);
+                    if end <= start {
+                        continue;
                     }
+
+                    let entry = by_speaker
+                        .entry(turn.speaker_id.as_str())
+                        .or_insert_with(|| (turn.speaker_label.as_deref(), Vec::new()));
+                    if entry.0.is_none() {
+                        entry.0 = turn.speaker_label.as_deref();
+                    }
+                    entry.1.push((start, end));
                 }
 
-                let Some(turn) = best_turn else {
+                // A duplicated or overlapping diarizer interval must count once
+                // per speaker. Otherwise repeated turns could manufacture a
+                // majority that the measured timeline does not contain.
+                let mut winners = by_speaker
+                    .into_iter()
+                    .filter_map(|(speaker_id, (speaker_label, mut intervals))| {
+                        intervals.sort_unstable_by(|left, right| {
+                            left.0
+                                .total_cmp(&right.0)
+                                .then_with(|| left.1.total_cmp(&right.1))
+                        });
+                        let mut covered = 0.0_f32;
+                        let mut current: Option<(f32, f32)> = None;
+                        for (start, end) in intervals {
+                            let Some((current_start, current_end)) = current else {
+                                current = Some((start, end));
+                                continue;
+                            };
+                            if start <= current_end {
+                                current = Some((current_start, current_end.max(end)));
+                            } else {
+                                covered += current_end - current_start;
+                                current = Some((start, end));
+                            }
+                        }
+                        if let Some((start, end)) = current {
+                            covered += end - start;
+                        }
+                        if covered > segment_duration / 2.0 {
+                            Some((speaker_id, speaker_label, covered))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                // Require one and only one speaker to own a strict majority.
+                // If multiple speakers each cover a majority because their
+                // turns overlap, the segment is ambiguous and remains raw.
+                if winners.len() != 1 {
                     return segment.clone();
-                };
+                }
+                let (speaker_id, speaker_label, _) = winners.remove(0);
 
                 let mut next = segment.clone();
-                next.speaker_id = Some(turn.speaker_id.clone());
-                next.speaker_label = turn.speaker_label.clone();
+                next.speaker_id = Some(speaker_id.to_string());
+                next.speaker_label = speaker_label.map(str::to_string);
                 next
             })
             .collect()

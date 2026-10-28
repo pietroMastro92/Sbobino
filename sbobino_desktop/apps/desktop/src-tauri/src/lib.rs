@@ -33,6 +33,10 @@ use crate::commands::automatic_import::{
     scan_automatic_import,
 };
 use crate::commands::backup::{export_app_backup, import_app_backup};
+use crate::commands::companion::{
+    companion_ai_status, companion_status, select_companion_ai_provider, start_companion,
+    stop_companion,
+};
 use crate::commands::provisioning::{
     plan_pyannote_background_action, provisioning_cancel, provisioning_download_model,
     provisioning_install_pyannote, provisioning_install_runtime, provisioning_models,
@@ -177,6 +181,7 @@ pub fn run() {
                 });
 
             app.manage(state::AppState {
+                companion: Arc::new(Mutex::new(None)),
                 artifact_service: bundle.artifact_service,
                 settings_service: bundle.settings_service,
                 runtime_factory: bundle.runtime_factory,
@@ -205,6 +210,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            start_companion,
+            stop_companion,
+            companion_status,
+            companion_ai_status,
+            select_companion_ai_provider,
             get_settings,
             list_transcription_languages,
             update_settings,

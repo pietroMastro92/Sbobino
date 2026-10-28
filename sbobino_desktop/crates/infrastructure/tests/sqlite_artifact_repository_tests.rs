@@ -3,11 +3,13 @@ use std::path::Path;
 
 use chrono::{Duration, Utc};
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 use sbobino_application::ArtifactRepository;
 use sbobino_domain::{ArtifactChatMessage, ArtifactKind, ArtifactSourceOrigin, TranscriptArtifact};
 use sbobino_infrastructure::repositories::sqlite_artifact_repository::SqliteArtifactRepository;
+use sbobino_infrastructure::secure_storage::SecureStorage;
 
 fn enable_local_secure_storage_for_tests() {
     std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
@@ -31,6 +33,110 @@ fn artifact_with_job(job_id: &str, input_path: &str, transcript: &str) -> Transc
         BTreeMap::new(),
     )
     .expect("valid artifact")
+}
+
+#[tokio::test]
+async fn owned_audio_file_import_preserves_bytes_hash_and_legacy_layout() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("owned synthetic directory");
+    let source = temp.path().join("synthetic.CAF");
+    let payload: Vec<u8> = (0..(2 * 1024 * 1024 + 31))
+        .map(|index| (index as u8).wrapping_mul(37))
+        .collect();
+    std::fs::write(&source, &payload).unwrap();
+    let db_path = temp.path().join("artifacts.db");
+    let repo = SqliteArtifactRepository::new(db_path.clone()).unwrap();
+    let mut artifact = artifact_with_job("owned-audio", source.to_str().unwrap(), "Synthetic text");
+    artifact.set_source_external_path(source.to_str().unwrap());
+    repo.save(&artifact).await.unwrap();
+    let reopened = SqliteArtifactRepository::new(db_path.clone()).unwrap();
+    let loaded = reopened.get_by_id(&artifact.id).await.unwrap().unwrap();
+    assert!(loaded.audio_available);
+    assert_eq!(
+        reopened
+            .read_audio_bytes(&artifact.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        payload
+    );
+    assert_eq!(
+        std::fs::read(&source).unwrap(),
+        payload,
+        "source must not be changed"
+    );
+    let connection = Connection::open(db_path).unwrap();
+    let (relative_path, extension, sha256, size): (String, String, String, i64) = connection.query_row(
+        "SELECT encrypted_rel_path, file_extension, sha256, byte_size FROM artifact_audio WHERE artifact_id = ?1",
+        [&artifact.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap();
+    assert_eq!(extension, "caf");
+    assert_eq!(sha256, format!("{:x}", Sha256::digest(&payload)));
+    assert_eq!(size, payload.len() as i64);
+    let encrypted = temp.path().join("vault/artifacts").join(relative_path);
+    assert_eq!(
+        std::fs::metadata(encrypted).unwrap().len(),
+        payload.len() as u64 + 28
+    );
+}
+
+#[tokio::test]
+async fn backup_audio_bytes_still_use_the_readable_vault_format() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("owned synthetic directory");
+    let repo = SqliteArtifactRepository::new(temp.path().join("artifacts.db")).unwrap();
+    let payload = b"synthetic portable backup audio";
+    let artifact = artifact_with_job("backup-audio", "synthetic.wav", "Synthetic text");
+    repo.import_backup_artifact(&artifact, Some(payload), Some("synthetic.wav"), false, None)
+        .unwrap();
+    assert_eq!(
+        repo.read_audio_bytes(&artifact.id).await.unwrap().unwrap(),
+        payload
+    );
+    assert!(
+        repo.get_by_id(&artifact.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .audio_available
+    );
+}
+
+#[tokio::test]
+async fn historical_audio_ciphertext_remains_readable_after_repository_reopen() {
+    enable_local_secure_storage_for_tests();
+    let temp = tempdir().expect("owned synthetic directory");
+    let source = temp.path().join("synthetic.wav");
+    let payload = b"synthetic historical vault audio";
+    std::fs::write(&source, payload).unwrap();
+    let db_path = temp.path().join("artifacts.db");
+    let repo = SqliteArtifactRepository::new(db_path.clone()).unwrap();
+    let mut artifact = artifact_with_job(
+        "historical-audio",
+        source.to_str().unwrap(),
+        "Synthetic text",
+    );
+    artifact.set_source_external_path(source.to_str().unwrap());
+    repo.save(&artifact).await.unwrap();
+    let storage = SecureStorage::load_or_create_with_fallback(temp.path()).unwrap();
+    let historical = storage
+        .encrypt_bytes(&format!("audio-vault:{}", artifact.id), payload)
+        .unwrap();
+    let encrypted_path = temp
+        .path()
+        .join("vault/artifacts")
+        .join(&artifact.id)
+        .join("source.enc");
+    std::fs::write(encrypted_path, historical).unwrap();
+    let reopened = SqliteArtifactRepository::new(db_path).unwrap();
+    assert_eq!(
+        reopened
+            .read_audio_bytes(&artifact.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        payload
+    );
 }
 
 #[tokio::test]

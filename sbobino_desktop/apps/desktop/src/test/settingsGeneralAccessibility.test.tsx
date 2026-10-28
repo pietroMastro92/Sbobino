@@ -1,9 +1,9 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "../App";
 import { changeLanguage } from "../i18n";
-import { fetchSettingsSnapshot } from "../lib/tauri";
+import { fetchSettingsSnapshot, saveSettings } from "../lib/tauri";
 import { useAppStore } from "../state/useAppStore";
 import type { AppSettings } from "../types";
 
@@ -57,7 +57,7 @@ vi.mock("../lib/tauri", () => {
     resumeRealtime: asyncNoop,
     restoreArtifacts: asyncNoop,
     runArtifactSpeakerDiarization: asyncNoop,
-    saveSettings: asyncNoop,
+    saveSettings: vi.fn(async (settings: AppSettings) => settings),
     saveSettingsPartial: asyncNoop,
     scanAutomaticImport: asyncNoop,
     startRealtime: asyncNoop,
@@ -89,10 +89,16 @@ vi.mock("../lib/tauri", () => {
   };
 });
 
-vi.mock("@tauri-apps/api/core", () => ({
-  convertFileSrc: vi.fn((path: string) => `asset://${path}`),
-  invoke: vi.fn(),
-}));
+vi.mock("@tauri-apps/api/core", () => {
+  const invoke = vi.fn(async (command: string): Promise<null | undefined> => {
+    if (command === "companion_status") return null;
+    return undefined;
+  });
+  return {
+    convertFileSrc: vi.fn((path: string) => `asset://${path}`),
+    invoke,
+  };
+});
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => () => undefined),
@@ -242,6 +248,7 @@ describe("General settings accessibility", () => {
   let localStorageDescriptor: PropertyDescriptor | undefined;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     changeLanguage("en");
     const settings = createSettingsFixture();
     useAppStore.setState({
@@ -303,5 +310,31 @@ describe("General settings accessibility", () => {
     expect(
       screen.getByRole("combobox", { name: "App Language" }),
     ).toHaveValue("en");
+  });
+
+  it("names the speaker engine and prevents selecting unverified native resources", () => {
+    render(<App standaloneSettingsWindow />);
+    fireEvent.click(screen.getByRole("button", { name: /^Transcription/ }));
+    expect(screen.getByRole("combobox", { name: "Speaker detection engine" })).toHaveValue("auto");
+    expect(screen.getByRole("option", { name: /^FluidAudio/ })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Speaker detection device" })).toHaveValue("cpu");
+  });
+
+  it("persists the engine choice and replaces an incompatible native device explicitly", async () => {
+    const settings = createSettingsFixture();
+    settings.transcription.speaker_diarization = {
+      enabled: true, backend: "fluid", device: "ane", speaker_colors: { s1: "#123456" },
+    };
+    useAppStore.setState({ settings });
+    vi.mocked(fetchSettingsSnapshot).mockResolvedValue(settings);
+    render(<App standaloneSettingsWindow />);
+    fireEvent.click(screen.getByRole("button", { name: /^Transcription/ }));
+    fireEvent.change(screen.getByRole("combobox", { name: "Speaker detection engine" }), {
+      target: { value: "pyannote" },
+    });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalled());
+    expect(vi.mocked(saveSettings).mock.lastCall?.[0].transcription.speaker_diarization).toEqual({
+      enabled: true, backend: "pyannote", device: "cpu", speaker_colors: { s1: "#123456" },
+    });
   });
 });

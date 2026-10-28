@@ -8,7 +8,7 @@ on:
         type: boolean
         default: false
   push:
-    branches: [codex/arm-release-readiness-20261003]
+    branches: [main]
     paths: [.github/workflows/verification-packages.yml]
 
 concurrency:
@@ -81,12 +81,14 @@ jobs:
         with:
           key: verification-${{ matrix.target }}
           workspaces: sbobino_desktop -> target
-      - name: Verify snapshot, runner and unchanged runtime sources
+      - name: Verify snapshot, runner and runtime provenance
         run: |
-          test "$GITHUB_REF" = refs/heads/codex/arm-release-readiness-20261003
+          test "$GITHUB_REF" = refs/heads/main
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(git rev-parse 'v2.0.34^{commit}')" = "$RUNTIME_SOURCE"
-          git diff --exit-code "$RUNTIME_SOURCE" HEAD -- sbobino_desktop/scripts/package_macos_runtime_asset.sh sbobino_desktop/scripts/package_windows_runtime_asset.ps1 sbobino_desktop/scripts/patches
+          git diff --exit-code "$RUNTIME_SOURCE" HEAD -- sbobino_desktop/scripts/package_macos_runtime_asset.sh sbobino_desktop/scripts/patches
+          mkdir -p "$RUNNER_TEMP/verification-output"
+          git diff "$RUNTIME_SOURCE" HEAD -- sbobino_desktop/scripts/package_windows_runtime_asset.ps1 > "$RUNNER_TEMP/verification-output/windows-runtime-builder-delta.patch"
           python -c 'import os, platform; assert platform.machine() == os.environ["EXPECTED_MACHINE"], platform.machine(); print(platform.platform())'
           rustc --version
           node --version
@@ -97,7 +99,7 @@ jobs:
           import json, os
           from pathlib import Path
           root = Path("sbobino_desktop/apps/desktop/src-tauri")
-          metadata = {"app_commit_sha": os.environ["GITHUB_SHA"], "mode": "verification-only", "runtime_verification_scope": "speech archive only; Pyannote and models not downloaded by this build", "runtime_release_tag": "v2.0.34", "runtime_commit_sha": os.environ["RUNTIME_SOURCE"], "runtime_asset": os.environ["RUNTIME_ASSET"], "runtime_sha256": os.environ["RUNTIME_DIGEST"], "updater_artifacts_enabled": False}
+          metadata = {"app_commit_sha": os.environ["GITHUB_SHA"], "mode": "verification-only", "runtime_verification_scope": "pinned speech archive; FluidAudio bundled on macOS only; Pyannote not downloaded by this build", "runtime_release_tag": "v2.0.34", "runtime_commit_sha": os.environ["RUNTIME_SOURCE"], "runtime_asset": os.environ["RUNTIME_ASSET"], "runtime_sha256": os.environ["RUNTIME_DIGEST"], "updater_artifacts_enabled": False}
           overlay = {"bundle": {"createUpdaterArtifacts": False, "resources": ["resources/licenses/NotoSans-OFL.txt", "verification-build.json"]}}
           if os.environ.get("ISOLATED_UI") == "true":
               windows = json.loads((root / "tauri.conf.json").read_text())["app"]["windows"]
@@ -108,7 +110,7 @@ jobs:
           metadata["verification_config"] = overlay
           (root / "verification-build.json").write_text(json.dumps(metadata, indent=2) + "\n")
           (root / "verification-tauri.json").write_text(json.dumps(overlay))
-          Path(os.environ["RUNNER_TEMP"], "verification-output").mkdir()
+          Path(os.environ["RUNNER_TEMP"], "verification-output").mkdir(exist_ok=True)
           PY
       - name: Verify immutable managed runtime bytes
         env:
@@ -131,12 +133,14 @@ jobs:
           npx tauri build --target "$TARGET" --bundles "$BUNDLE" --no-sign --ci --config src-tauri/verification-tauri.json 2>&1 | tee "$RUNNER_TEMP/verification-output/build.log"
       - name: Seal native macOS app and create verification DMG
         if: runner.os == 'macOS'
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
         run: |
           set -o pipefail
           APP="sbobino_desktop/target/$TARGET/release/bundle/macos/Sbobino.app"
           python sbobino_desktop/scripts/prepare_macos_bundle_scripts.py "$APP"
           lipo "$APP/Contents/MacOS/sbobino-desktop" -verify_arch "$EXPECTED_MACHINE"
-          codesign --force --deep --sign - "$APP"
+          python sbobino_desktop/scripts/package_fluid_diarizer.py --app "$APP" --build-root "$RUNNER_TEMP/fluid-diarizer-proof" --identity -
           codesign --verify --deep --strict "$APP"
           codesign -dv --verbose=4 "$APP" 2> "$RUNNER_TEMP/verification-output/signature.log"
           STAGE="$RUNNER_TEMP/dmg-stage"

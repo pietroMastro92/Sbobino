@@ -50,7 +50,10 @@ jobs:
           python3 -m unittest \
             scripts/test_release_workflow_contract.py \
             scripts/test_evaluate_live_latency.py \
-            scripts/test_run_whisper_live_replay.py
+            scripts/test_run_whisper_live_replay.py \
+            scripts/test_prepare_fluid_diarizer_models.py \
+            scripts/test_package_fluid_diarizer.py \
+            scripts/test_run_fluid_speaker_replay.py
       - name: Clippy
         run: cargo clippy -p sbobino-domain -p sbobino-application -p sbobino-infrastructure --all-targets -- -D warnings
       - name: Tests
@@ -142,6 +145,23 @@ jobs:
         run: python3 scripts/test_macos_bundle_scripts.py
       - name: Lint native workspace
         run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
+      - name: Test native FluidAudio helper
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+        run: bash scripts/test_fluid_diarizer_native.sh "$RUNNER_TEMP/fluid-diarizer-proof"
+      - name: Verify native FluidAudio offline inference on public audio
+        run: python3 scripts/smoke_fluid_diarizer_native.py --output "$RUNNER_TEMP/fluid-diarizer-proof"
+      - name: Preserve native FluidAudio test evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fluid-diarizer-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/fluid-diarizer-proof/native-tests.json
+            ${{ runner.temp }}/fluid-diarizer-proof/swift-test.log
+            ${{ runner.temp }}/fluid-diarizer-proof/offline-smoke*.json
+            ${{ runner.temp }}/fluid-diarizer-proof/offline-smoke.stderr.log
+          if-no-files-found: error
 
   native-windows:
     name: Native Rust tests (Windows x86_64)
@@ -192,6 +212,11 @@ jobs:
           cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc adapters::whisper_stream::tests::certified_live_model_context_is_scoped_to_apple_silicon_gpu -- --exact
       - name: Verify Windows credential storage
         run: cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc secure_storage::tests::windows_credential_manager_roundtrip -- --exact
+      - name: Verify Windows companion protocol and durable AI jobs
+        run: |
+          cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc companion:: -- --test-threads=1
+      - name: Verify portable FluidAudio adapter protocol
+        run: cargo test -p sbobino-infrastructure --target x86_64-pc-windows-msvc adapters::fluid_diarization::tests::protocol_preserves_overlapping_turns_and_rejects_invalid_output -- --exact
 
   published-intel-runtime:
     name: Diagnose published 2.0.34 Intel Live runtime

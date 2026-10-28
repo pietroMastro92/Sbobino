@@ -250,6 +250,10 @@ pub struct ProvisioningStatusResponse {
     pub missing_models: Vec<String>,
     pub missing_encoders: Vec<String>,
     pub pyannote: sbobino_infrastructure::PyannoteRuntimeHealth,
+    pub fluid_diarization:
+        sbobino_infrastructure::fluid_diarization_runtime::FluidDiarizationHealth,
+    pub selected_speaker_diarization:
+        sbobino_infrastructure::fluid_diarization_runtime::SelectedSpeakerDiarizationHealth,
 }
 
 #[derive(Debug, Serialize)]
@@ -948,6 +952,8 @@ pub async fn provisioning_status(
         missing_models,
         missing_encoders,
         pyannote: runtime_health.pyannote,
+        fluid_diarization: runtime_health.fluid_diarization,
+        selected_speaker_diarization: runtime_health.selected_speaker_diarization,
     })
 }
 
@@ -1096,6 +1102,28 @@ async fn plan_pyannote_background_action_inner(
             false,
             "pyannote_auto_check_disabled",
             "Pyannote is validated only during installation, repair, and app updates.",
+        ));
+    }
+
+    let settings = runtime_factory
+        .load_settings()
+        .map_err(|e| CommandError::new("settings", e))?;
+    let native_health = runtime_factory
+        .runtime_health_preflight()
+        .map_err(|e| CommandError::new("runtime_health", e))?;
+    let diarization = &settings.transcription.speaker_diarization;
+    use sbobino_domain::settings::SpeakerDiarizationBackend;
+    if diarization.backend == SpeakerDiarizationBackend::Fluid
+        || (diarization.backend == SpeakerDiarizationBackend::Auto
+            && native_health.fluid_diarization.ready
+            && matches!(diarization.device.trim(), "cpu" | "auto" | "ane"))
+    {
+        return Ok(pyannote_background_action_response(
+            "none",
+            false,
+            false,
+            "fluid_backend_selected",
+            "FluidAudio is selected; automatic Pyannote maintenance is not needed.",
         ));
     }
 
@@ -5294,6 +5322,16 @@ mod tests {
             missing_models: vec![],
             missing_encoders: vec![],
             pyannote: PyannoteRuntimeHealth::default(),
+            fluid_diarization: Default::default(),
+            selected_speaker_diarization: sbobino_infrastructure::fluid_diarization_runtime::SelectedSpeakerDiarizationHealth {
+                enabled: false,
+                requested_backend: sbobino_domain::settings::SpeakerDiarizationBackend::Auto,
+                selected_backend: None,
+                compute: None,
+                ready: true,
+                reason_code: "disabled".into(),
+                message: "disabled".into(),
+            },
             setup_complete: false,
         }
     }
@@ -5314,6 +5352,29 @@ mod tests {
             !transcription_runtime_install_complete(&health),
             "runtime repair must not skip install when Parakeet CLI is missing"
         );
+    }
+
+    #[tokio::test]
+    async fn post_update_does_not_download_pyannote_for_explicit_fluid() {
+        let (_temp, factory) = build_runtime_factory();
+        let mut settings = AppSettings::default();
+        settings.transcription.speaker_diarization.enabled = true;
+        settings.transcription.speaker_diarization.backend =
+            sbobino_domain::settings::SpeakerDiarizationBackend::Fluid;
+        std::fs::write(
+            factory.data_dir().join("settings.json"),
+            serde_json::to_vec(&settings).unwrap(),
+        )
+        .unwrap();
+        let action = plan_pyannote_background_action_inner(
+            &factory,
+            PyannoteBackgroundActionTrigger::PostUpdate,
+        )
+        .await
+        .unwrap();
+        assert!(!action.should_start);
+        assert_eq!(action.reason_code, "fluid_backend_selected");
+        assert!(!factory.managed_pyannote_runtime_dir().exists());
     }
 
     #[tokio::test]

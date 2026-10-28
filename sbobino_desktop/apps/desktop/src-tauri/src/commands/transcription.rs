@@ -119,6 +119,7 @@ pub(crate) async fn spawn_transcription_job(
             .unwrap_or(ArtifactSourceOrigin::Imported),
         metadata: payload.metadata,
         source_fingerprint_json: payload.source_fingerprint_json,
+        diarization_enabled: None,
     };
 
     let runtime_factory = state.runtime_factory.clone();

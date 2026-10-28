@@ -359,6 +359,7 @@ async fn parakeet_service_real_smoke_persists_metadata() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|progress| {
                 eprintln!(
@@ -510,6 +511,7 @@ async fn whisper_service_real_smoke_preserves_timeline_and_plain_text() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|progress| {
                 eprintln!(

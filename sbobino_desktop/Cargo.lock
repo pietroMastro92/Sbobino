@@ -1922,6 +1922,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hyper"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1934,6 +1940,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa 1.0.17",
  "pin-project-lite",
  "pin-utils",
@@ -4201,6 +4208,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "read-fonts"
 version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4696,12 +4715,17 @@ name = "sbobino-infrastructure"
 version = "2.0.36"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "futures-util",
  "hound",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "keyring",
  "libc",
  "lingua",
+ "rcgen",
  "regex",
  "reqwest 0.12.28",
  "ring",
@@ -4711,11 +4735,16 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 
@@ -7539,6 +7568,15 @@ name = "xmlwriter"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
+]
 
 [[package]]
 name = "yoke"

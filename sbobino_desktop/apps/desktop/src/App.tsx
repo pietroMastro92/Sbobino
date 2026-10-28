@@ -8,6 +8,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { CompanionPanel } from "./components/CompanionPanel";
 import {
   confirm as confirmDialog,
   message as messageDialog,
@@ -739,8 +740,8 @@ type TranscriptionStartBadge = {
   message: string;
 };
 
-function isPyannotePreflightReasonCode(reasonCode: string): boolean {
-  return reasonCode.startsWith("pyannote_");
+function isSpeakerDiarizationPreflightReasonCode(reasonCode: string): boolean {
+  return reasonCode.startsWith("pyannote_") || reasonCode.startsWith("fluid_") || reasonCode.startsWith("speaker_diarization_");
 }
 
 function getPyannoteBackgroundActionStatusMessage(
@@ -985,6 +986,7 @@ function getDefaultWhisperOptions(
 function getDefaultSpeakerDiarizationSettings(): SpeakerDiarizationSettings {
   return {
     enabled: false,
+    backend: "auto",
     device: "cpu",
     speaker_colors: {},
   };
@@ -2178,6 +2180,10 @@ function formatTranscriptionPreflightMessage(
     return preflight.message;
   }
 
+  if (preflight.reason_code.startsWith("fluid_")) {
+    return preflight.selected_speaker_diarization?.message || preflight.message;
+  }
+
   if (preflight.reason_code.startsWith("pyannote_")) {
     return (
       formatPyannoteHealthMessage(preflight.pyannote) ??
@@ -2502,12 +2508,13 @@ function sanitizeSpeakerDiarizationSettings(
   settings: SpeakerDiarizationSettings,
 ): SpeakerDiarizationSettings {
   const device =
-    settings.device === "auto" || settings.device === "mps"
+    settings.device === "auto" || settings.device === "mps" || settings.device === "ane"
       ? settings.device
       : "cpu";
 
   return {
     enabled: Boolean(settings.enabled),
+    backend: settings.backend === "fluid" || settings.backend === "pyannote" ? settings.backend : "auto",
     device,
     speaker_colors: sanitizeSpeakerColorMap(settings.speaker_colors),
   };
@@ -8372,7 +8379,8 @@ export function App({
     await onPatchSpeakerDiarizationSettings((current) => ({
       ...current,
       enabled: true,
-      device: preferredPyannoteDeviceForEnable(current),
+      backend: "pyannote",
+      device: current.device === "ane" ? "cpu" : preferredPyannoteDeviceForEnable(current),
     }));
   }
 
@@ -8623,7 +8631,7 @@ export function App({
           );
         }
         if (preflight && !preflight.allowed) {
-          if (isPyannotePreflightReasonCode(preflight.reason_code)) {
+          if (isSpeakerDiarizationPreflightReasonCode(preflight.reason_code)) {
             setTranscriptionStartBadge({
               state: "warning",
               message:
@@ -14488,6 +14496,7 @@ export function App({
 
     return (
       <div className="settings-stack">
+        <CompanionPanel />
         <section className="settings-panel">
           <header>
             <h3>{t("settings.general.title", "General")}</h3>
@@ -15656,6 +15665,9 @@ export function App({
       settings.transcription.speaker_diarization ??
       getDefaultSpeakerDiarizationSettings();
     const pyannoteHealth = runtimeHealth?.pyannote ?? null;
+    const selectedDiarization = runtimeHealth?.selected_speaker_diarization;
+    const speakerRuntimeReady = speakerDiarization.enabled && (selectedDiarization?.enabled
+      ? selectedDiarization.ready : pyannoteHealth?.ready ?? false);
     const normalizedLanguageSearch = transcriptionLanguageSearch.trim().toLowerCase();
     const searchableLanguageOptions = [
       {
@@ -15918,12 +15930,12 @@ export function App({
               <small>
                 {t(
                   "settings.transcription.speakerDiarizationDesc",
-                  "After transcription completes, the app will run its managed offline pyannote diarization runtime and assign speakers into the timeline when the pyannote assets are installed from Local Models.",
+                  "Speaker detection runs offline after transcription with the selected engine.",
                 )}
               </small>
               {pyannoteHealth ? (
                 <small className="muted">
-                  {formatPyannoteHealthMessage(pyannoteHealth)}
+                  {selectedDiarization?.message || formatPyannoteHealthMessage(pyannoteHealth)}
                 </small>
               ) : null}
             </div>
@@ -15931,10 +15943,10 @@ export function App({
               {pyannoteHealth ? (
                 <span
                   className={
-                    pyannoteHealth.ready ? "kind-chip" : "missing-chip"
+                    speakerRuntimeReady ? "kind-chip" : "missing-chip"
                   }
                 >
-                  {pyannoteHealth.ready
+                  {!speakerDiarization.enabled ? t("settings.ai.disabled", "Disabled") : speakerRuntimeReady
                     ? t("status.ready", "Ready")
                     : t("status.setupRequired", "Setup required")}
                 </span>
@@ -15985,17 +15997,37 @@ export function App({
 
           <div className="settings-row settings-row-block">
             <div>
+              <label htmlFor="speaker-engine"><strong>{t("settings.transcription.speakerEngine", "Speaker detection engine")}</strong></label>
+              <small>{t("settings.transcription.speakerEngineDesc", "Auto uses bundled FluidAudio on supported Macs; Pyannote remains available for compatibility.")}</small>
+            </div>
+            <select id="speaker-engine" value={speakerDiarization.backend ?? "auto"}
+              onChange={(event) => {
+                const backend = event.target.value as SpeakerDiarizationSettings["backend"];
+                void onPatchSpeakerDiarizationSettings((current) => ({
+                  ...current, backend,
+                  device: (backend === "fluid" && current.device === "mps") || (backend === "pyannote" && current.device === "ane") ? "cpu" : current.device,
+                }));
+              }}>
+              <option value="auto">{t("settings.transcription.computeAuto", "Auto")}</option>
+              <option value="fluid" disabled={runtimeHealth?.fluid_diarization?.supported !== true}>{t("settings.transcription.fluidEngine", "FluidAudio — macOS 15+")}</option>
+              <option value="pyannote">{t("settings.pyannote.name", "Pyannote")}</option>
+            </select>
+          </div>
+
+          <div className="settings-row settings-row-block">
+            <div>
               <strong>
-                {t("settings.transcription.pyannoteDevice", "Pyannote device")}
+                {t("settings.transcription.speakerDevice", "Speaker detection device")}
               </strong>
               <small>
                 {t(
-                  "settings.transcription.pyannoteDeviceDesc",
-                  "Auto uses Apple acceleration when available and falls back to CPU when the managed local runtime needs it.",
+                  "settings.transcription.speakerDeviceDesc",
+                  "Neural Engine requires FluidAudio on Apple Silicon. MPS uses Pyannote.",
                 )}
               </small>
             </div>
             <select
+              aria-label={t("settings.transcription.speakerDevice", "Speaker detection device")}
               value={speakerDiarization.device}
               onChange={(event) => {
                 void onPatchSpeakerDiarizationSettings((current) => ({
@@ -16008,10 +16040,11 @@ export function App({
               <option value="cpu">
                 {t("settings.transcription.deviceCpu", "CPU")}
               </option>
-              <option value="auto">{t("lang.auto", "Auto Detect")}</option>
-              <option value="mps">
-                {t("settings.transcription.deviceMps", "MPS")}
-              </option>
+              <option value="auto">{t("settings.transcription.computeAuto", "Auto")}</option>
+              {speakerDiarization.backend !== "fluid" && <option value="mps">{t("settings.transcription.speakerMps", "MPS — Pyannote")}</option>}
+              {speakerDiarization.backend !== "pyannote" && (
+                <option value="ane" disabled={!platformIsAppleSilicon || !runtimeHealth?.fluid_diarization?.ready}>{t("settings.transcription.speakerAne", "Neural Engine — FluidAudio")}</option>
+              )}
             </select>
           </div>
         </section>
@@ -16893,9 +16926,23 @@ export function App({
           ) : null}
         </section>
 
+        {runtimeHealth?.fluid_diarization?.supported && (
+          <section className="settings-panel" aria-label={t("settings.transcription.fluidName", "FluidAudio")}>
+            <div className="settings-card-head">
+              <h3>{t("settings.transcription.fluidName", "FluidAudio")}</h3>
+              <span className={runtimeHealth.fluid_diarization.ready ? "kind-chip" : "missing-chip"}>
+                {runtimeHealth.fluid_diarization.ready ? t("status.ready", "Ready") : t("status.missing", "Missing")}
+              </span>
+            </div>
+            <p className="muted">{t("settings.transcription.fluidBundled", "Included with Sbobino on macOS 15+. Detects speakers offline after transcription.")}</p>
+            <small className="muted">{runtimeHealth.fluid_diarization.message}</small>
+            {!runtimeHealth.fluid_diarization.ready && <p className="muted">{t("settings.transcription.fluidRepair", "Update or reinstall Sbobino to restore the bundled runtime. Pyannote remains available as an alternative.")}</p>}
+          </section>
+        )}
+
         <section className="settings-panel">
           <div className="settings-card-head">
-            <h3>{t("settings.pyannote.title", "Speaker Diarization")}</h3>
+            <h3>{t("settings.pyannote.name", "Pyannote")}</h3>
             <button
               className="secondary-button"
               onClick={() => void refreshRuntimeHealth()}

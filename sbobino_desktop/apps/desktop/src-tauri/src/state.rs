@@ -42,6 +42,7 @@ pub struct ProvisioningRuntime {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub companion: Arc<Mutex<Option<sbobino_infrastructure::companion::CompanionServer>>>,
     pub artifact_service: Arc<ArtifactService>,
     pub settings_service: Arc<SettingsService>,
     pub runtime_factory: Arc<RuntimeTranscriptionFactory>,

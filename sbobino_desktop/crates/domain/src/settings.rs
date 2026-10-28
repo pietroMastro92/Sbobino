@@ -502,14 +502,28 @@ impl Default for WhisperOptions {
 #[serde(default)]
 pub struct SpeakerDiarizationSettings {
     pub enabled: bool,
+    /// Selects the offline diarization implementation.  `auto` preserves the
+    /// historical settings shape while allowing a verified native backend on
+    /// supported macOS hosts.
+    pub backend: SpeakerDiarizationBackend,
     pub device: String,
     pub speaker_colors: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerDiarizationBackend {
+    #[default]
+    Auto,
+    Fluid,
+    Pyannote,
 }
 
 impl Default for SpeakerDiarizationSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: SpeakerDiarizationBackend::Auto,
             device: "cpu".to_string(),
             speaker_colors: BTreeMap::new(),
         }
@@ -1328,6 +1342,25 @@ mod language_tests {
         assert_eq!(
             settings.live_compute_device,
             TranscriptionComputeDevice::Auto
+        );
+        assert_eq!(
+            settings.speaker_diarization.backend,
+            SpeakerDiarizationBackend::Auto
+        );
+    }
+
+    #[test]
+    fn speaker_diarization_backend_is_backward_compatible_and_serializes_stably() {
+        let settings: SpeakerDiarizationSettings =
+            serde_json::from_str(r#"{"enabled":true,"device":"cpu","speaker_colors":{}}"#)
+                .expect("historical settings without a backend should deserialize");
+        assert_eq!(settings.backend, SpeakerDiarizationBackend::Auto);
+
+        let encoded = serde_json::to_string(&SpeakerDiarizationBackend::Fluid).unwrap();
+        assert_eq!(encoded, "\"fluid\"");
+        assert_eq!(
+            serde_json::from_str::<SpeakerDiarizationBackend>("\"pyannote\"").unwrap(),
+            SpeakerDiarizationBackend::Pyannote
         );
     }
 

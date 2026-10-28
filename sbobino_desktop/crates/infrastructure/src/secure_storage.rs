@@ -12,6 +12,7 @@ use ring::{
 };
 
 use sbobino_application::ApplicationError;
+use tempfile::NamedTempFile;
 
 const KEYCHAIN_SERVICE_NAME: &str = "com.sbobino.desktop";
 const MASTER_KEY_ACCOUNT: &str = "master_key_v1";
@@ -442,13 +443,77 @@ pub fn encrypt_to_file(
     path: &Path,
     plaintext: &[u8],
 ) -> Result<(), ApplicationError> {
-    let ciphertext = storage.encrypt_bytes(label, plaintext)?;
-    std::fs::write(path, ciphertext).map_err(|e| {
+    encrypt_owned_to_file(storage, label, path, plaintext.to_vec())
+}
+
+/// Encrypts an owned payload using the historical single-shot file format.
+///
+/// The payload is sealed in place and written as `[nonce][ciphertext][tag]`.
+/// Writing through a sibling temporary file keeps an existing target intact if
+/// encryption or any part of the write fails.
+pub fn encrypt_owned_to_file(
+    storage: &SecureStorage,
+    label: &str,
+    path: &Path,
+    mut plaintext: Vec<u8>,
+) -> Result<(), ApplicationError> {
+    let key_bytes = storage.derive_key(label)?;
+    let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes).map_err(|_| {
+        ApplicationError::Persistence("failed to initialize AES-256-GCM key".to_string())
+    })?;
+    let key = LessSafeKey::new(unbound);
+    let rng = SystemRandom::new();
+    let mut nonce_bytes = [0_u8; 12];
+    rng.fill(&mut nonce_bytes).map_err(|e| {
+        ApplicationError::Persistence(format!("failed to generate encryption nonce: {e}"))
+    })?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let tag = key
+        .seal_in_place_separate_tag(nonce, Aad::empty(), &mut plaintext)
+        .map_err(|_| ApplicationError::Persistence("failed to encrypt payload".to_string()))?;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|e| {
         ApplicationError::Persistence(format!(
-            "failed to write encrypted file {}: {e}",
+            "failed to create temporary encrypted file {}: {e}",
             path.display()
         ))
-    })
+    })?;
+
+    temporary
+        .as_file_mut()
+        .write_all(&nonce_bytes)
+        .and_then(|_| temporary.as_file_mut().write_all(&plaintext))
+        .and_then(|_| temporary.as_file_mut().write_all(tag.as_ref()))
+        .map_err(|e| {
+            ApplicationError::Persistence(format!(
+                "failed to write encrypted file {}: {e}",
+                path.display()
+            ))
+        })?;
+    temporary.as_file_mut().flush().map_err(|e| {
+        ApplicationError::Persistence(format!(
+            "failed to flush encrypted file {}: {e}",
+            path.display()
+        ))
+    })?;
+    temporary.as_file().sync_all().map_err(|e| {
+        ApplicationError::Persistence(format!(
+            "failed to sync encrypted file {}: {e}",
+            path.display()
+        ))
+    })?;
+    temporary.persist(path).map_err(|error| {
+        ApplicationError::Persistence(format!(
+            "failed to commit encrypted file {}: {}",
+            path.display(),
+            error.error
+        ))
+    })?;
+    Ok(())
 }
 
 pub fn decrypt_from_file(
@@ -792,8 +857,136 @@ fn read_u32_be(
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_file_with_password, encrypt_file_with_password};
+    use std::path::PathBuf;
+
+    use super::{
+        decrypt_file_with_password, decrypt_from_file, encrypt_file_with_password,
+        encrypt_owned_to_file, encrypt_to_file, SecureStorage, SecureStorageBackend,
+    };
     use tempfile::tempdir;
+
+    fn synthetic_storage() -> SecureStorage {
+        SecureStorage {
+            master_key: [0x42; 32],
+            backend: SecureStorageBackend::LocalDir(PathBuf::from("test-only")),
+        }
+    }
+
+    fn directory_entries(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let mut entries = std::fs::read_dir(path)
+            .expect("directory should be readable")
+            .map(|entry| {
+                entry
+                    .expect("directory entry should be readable")
+                    .file_name()
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn owned_writer_preserves_historical_file_format_for_all_payload_sizes() {
+        let storage = synthetic_storage();
+        let temp = tempdir().expect("tempdir");
+        let payloads = vec![
+            Vec::new(),
+            vec![0, 1, 2, 3, 127, 128, 254, 255],
+            (0..(2 * 1024 * 1024))
+                .map(|index| (index as u8).wrapping_mul(37))
+                .collect::<Vec<_>>(),
+        ];
+
+        for (index, payload) in payloads.into_iter().enumerate() {
+            let path = temp.path().join(format!("payload-{index}.enc"));
+            encrypt_owned_to_file(&storage, "test-audio", &path, payload.clone())
+                .expect("owned writer should succeed");
+
+            let encoded = std::fs::read(&path).expect("encrypted file should be readable");
+            assert_eq!(encoded.len(), 12 + payload.len() + 16);
+            assert_eq!(
+                storage.decrypt_bytes("test-audio", &encoded).unwrap(),
+                payload
+            );
+            assert_eq!(
+                decrypt_from_file(&storage, "test-audio", &path).unwrap(),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_writer_and_historical_ciphertext_remain_compatible() {
+        let storage = synthetic_storage();
+        let temp = tempdir().expect("tempdir");
+        let payload = b"historical source.enc payload";
+        let borrowed_path = temp.path().join("borrowed.enc");
+        encrypt_to_file(&storage, "test-audio", &borrowed_path, payload)
+            .expect("borrowed writer should succeed");
+        assert_eq!(
+            storage
+                .decrypt_bytes(
+                    "test-audio",
+                    &std::fs::read(&borrowed_path).expect("borrowed file should be readable")
+                )
+                .unwrap(),
+            payload
+        );
+
+        let historical_path = temp.path().join("historical.enc");
+        let historical_ciphertext = storage
+            .encrypt_bytes("test-audio", payload)
+            .expect("historical encryption should succeed");
+        std::fs::write(&historical_path, historical_ciphertext)
+            .expect("historical ciphertext should be writable");
+        assert_eq!(
+            decrypt_from_file(&storage, "test-audio", &historical_path).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn owned_file_rejects_wrong_label_tampering_and_truncation() {
+        let storage = synthetic_storage();
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("payload.enc");
+        encrypt_owned_to_file(&storage, "test-audio", &path, b"authenticated".to_vec())
+            .expect("owned writer should succeed");
+
+        assert!(decrypt_from_file(&storage, "wrong-label", &path).is_err());
+
+        let mut tampered = std::fs::read(&path).expect("encrypted file should be readable");
+        tampered[12] ^= 0x01;
+        let tampered_path = temp.path().join("tampered.enc");
+        std::fs::write(&tampered_path, tampered).expect("tampered file should be writable");
+        assert!(decrypt_from_file(&storage, "test-audio", &tampered_path).is_err());
+
+        let encrypted = std::fs::read(&path).expect("encrypted file should be readable");
+        let truncated_path = temp.path().join("truncated.enc");
+        std::fs::write(&truncated_path, &encrypted[..encrypted.len() - 1])
+            .expect("truncated file should be writable");
+        assert!(decrypt_from_file(&storage, "test-audio", &truncated_path).is_err());
+    }
+
+    #[test]
+    fn failed_commit_preserves_existing_target_and_cleans_temporary_file() {
+        let storage = synthetic_storage();
+        let temp = tempdir().expect("tempdir");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).expect("target directory should be created");
+        let marker = target.join("existing-marker");
+        std::fs::write(&marker, b"preserve me").expect("marker should be writable");
+        let before_entries = directory_entries(temp.path());
+
+        let error = encrypt_owned_to_file(&storage, "test-audio", &target, b"new payload".to_vec())
+            .expect_err("directory target should fail at commit");
+        assert!(error
+            .to_string()
+            .contains("failed to commit encrypted file"));
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"preserve me");
+        assert_eq!(directory_entries(temp.path()), before_entries);
+    }
 
     #[test]
     fn password_backup_file_roundtrip_restores_original_bytes() {

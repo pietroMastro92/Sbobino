@@ -132,7 +132,7 @@ jobs:
           mkdir -p "$STAGING_DIR"
 
           python3 ../../scripts/prepare_macos_bundle_scripts.py "$APP_PATH"
-          codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_PATH"
+          DEVELOPER_DIR=/Applications/Xcode_26.2.app/Contents/Developer python3 ../../scripts/package_fluid_diarizer.py --app "$APP_PATH" --build-root "$RUNNER_TEMP/fluid-diarizer-proof" --identity "$CODESIGN_IDENTITY"
           codesign --verify --deep --strict "$APP_PATH"
           rm -f "$UPDATER_TAR" "$UPDATER_SIG"
           COPYFILE_DISABLE=1 tar -czf "$UPDATER_TAR" -C "$APP_DIR" "Sbobino.app"

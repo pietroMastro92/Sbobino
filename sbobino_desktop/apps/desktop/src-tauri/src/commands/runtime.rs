@@ -15,7 +15,9 @@ use sbobino_domain::{
     TranscriptionComputeDevice, TranscriptionEngine, WhisperLiveModelManifest,
 };
 use sbobino_infrastructure::{
-    background_process::tokio_background_command, ManagedRuntimeHealth, PyannoteRuntimeHealth,
+    background_process::tokio_background_command,
+    fluid_diarization_runtime::{FluidDiarizationHealth, SelectedSpeakerDiarizationHealth},
+    ManagedRuntimeHealth, PyannoteRuntimeHealth,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -76,6 +78,8 @@ pub struct RuntimeHealthResponse {
     pub missing_models: Vec<String>,
     pub missing_encoders: Vec<String>,
     pub pyannote: PyannoteRuntimeHealth,
+    pub fluid_diarization: FluidDiarizationHealth,
+    pub selected_speaker_diarization: SelectedSpeakerDiarizationHealth,
     pub setup_complete: bool,
 }
 
@@ -102,6 +106,8 @@ pub struct StartPreflightResponse {
     pub whisper_stream_resolved: String,
     pub parakeet_cli_resolved: String,
     pub pyannote: PyannoteRuntimeHealth,
+    pub fluid_diarization: FluidDiarizationHealth,
+    pub selected_speaker_diarization: SelectedSpeakerDiarizationHealth,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -723,6 +729,8 @@ fn runtime_health_response(health: sbobino_infrastructure::RuntimeHealth) -> Run
         missing_models: health.missing_models,
         missing_encoders: health.missing_encoders,
         pyannote: health.pyannote,
+        fluid_diarization: health.fluid_diarization,
+        selected_speaker_diarization: health.selected_speaker_diarization,
         setup_complete: health.setup_complete,
     }
 }
@@ -1117,6 +1125,8 @@ pub async fn get_transcription_start_preflight(
             whisper_stream_resolved: health.whisper_stream_resolved,
             parakeet_cli_resolved: health.parakeet_cli_resolved,
             pyannote: health.pyannote,
+            fluid_diarization: health.fluid_diarization,
+            selected_speaker_diarization: health.selected_speaker_diarization,
         });
     }
 
@@ -1140,6 +1150,8 @@ pub async fn get_transcription_start_preflight(
             whisper_stream_resolved: health.whisper_stream_resolved,
             parakeet_cli_resolved: health.parakeet_cli_resolved,
             pyannote: health.pyannote,
+            fluid_diarization: health.fluid_diarization,
+            selected_speaker_diarization: health.selected_speaker_diarization,
         });
     }
 
@@ -1159,6 +1171,8 @@ pub async fn get_transcription_start_preflight(
             whisper_stream_resolved: health.whisper_stream_resolved,
             parakeet_cli_resolved: health.parakeet_cli_resolved,
             pyannote: health.pyannote,
+            fluid_diarization: health.fluid_diarization,
+            selected_speaker_diarization: health.selected_speaker_diarization,
         });
     }
 
@@ -1177,6 +1191,8 @@ pub async fn get_transcription_start_preflight(
             whisper_stream_resolved: health.whisper_stream_resolved,
             parakeet_cli_resolved: health.parakeet_cli_resolved,
             pyannote: health.pyannote,
+            fluid_diarization: health.fluid_diarization,
+            selected_speaker_diarization: health.selected_speaker_diarization,
         });
     }
 
@@ -1207,6 +1223,25 @@ pub async fn get_transcription_start_preflight(
             whisper_stream_resolved: health.whisper_stream_resolved,
             parakeet_cli_resolved: health.parakeet_cli_resolved,
             pyannote: health.pyannote,
+            fluid_diarization: health.fluid_diarization,
+            selected_speaker_diarization: health.selected_speaker_diarization,
+        });
+    }
+
+    if health.selected_speaker_diarization.enabled && !health.selected_speaker_diarization.ready {
+        return Ok(StartPreflightResponse {
+            allowed: false,
+            reason_code: health.selected_speaker_diarization.reason_code.clone(),
+            message: health.selected_speaker_diarization.message.clone(),
+            engine: engine_wire,
+            model_filename,
+            model_path,
+            whisper_cli_resolved: health.whisper_cli_resolved,
+            whisper_stream_resolved: health.whisper_stream_resolved,
+            parakeet_cli_resolved: health.parakeet_cli_resolved,
+            pyannote: health.pyannote,
+            fluid_diarization: health.fluid_diarization,
+            selected_speaker_diarization: health.selected_speaker_diarization,
         });
     }
 
@@ -1224,6 +1259,8 @@ pub async fn get_transcription_start_preflight(
         whisper_stream_resolved: health.whisper_stream_resolved,
         parakeet_cli_resolved: health.parakeet_cli_resolved,
         pyannote: health.pyannote,
+        fluid_diarization: health.fluid_diarization,
+        selected_speaker_diarization: health.selected_speaker_diarization,
     })
 }
 
@@ -1343,6 +1380,16 @@ mod tests {
                 message: "disabled".to_string(),
                 receipt_verified: false,
                 deep_probe_required: false,
+            },
+            fluid_diarization: FluidDiarizationHealth::default(),
+            selected_speaker_diarization: SelectedSpeakerDiarizationHealth {
+                enabled: false,
+                requested_backend: sbobino_domain::settings::SpeakerDiarizationBackend::Auto,
+                selected_backend: None,
+                compute: None,
+                ready: true,
+                reason_code: "disabled".to_string(),
+                message: "disabled".to_string(),
             },
             setup_complete: parakeet_available,
         }

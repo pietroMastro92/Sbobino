@@ -1,0 +1,22 @@
+{
+  "audio": {
+    "url": "https://huggingface.co/datasets/FluidInference/ami-corpus-mirror/resolve/722d8891643e1e4dc62cfd0d198fa05a1646c3cc/sdm/ES2004a.Mix-Headset.wav",
+    "revision": "722d8891643e1e4dc62cfd0d198fa05a1646c3cc",
+    "bytes": 33579394,
+    "sha256": "3e2560b19bee6952c7c7ce041b0f1ea8a7ea9468044c4eea79d2a2c67e24ab0f",
+    "recording": "AMI ES2004a mixed headset audio; not a physical microphone test"
+  },
+  "reference": {
+    "url": "https://raw.githubusercontent.com/pyannote/AMI-diarization-setup/67c2d539286e89f68952d5dcf83912bd9f01dfae/only_words/rttms/test/ES2004a.rttm",
+    "revision": "67c2d539286e89f68952d5dcf83912bd9f01dfae",
+    "sha256": "9869c6146c2fd9595403edb36c2caeda65c12ffa2c0af4ce48d6814b673fd5a9",
+    "type": "AMI only_words RTTM; native corpus annotations, not synthetic reference"
+  },
+  "excerpt": {
+    "offset_seconds": 210,
+    "duration_seconds": 120,
+    "sha256": "4455b16b1242d08755e5c9acef5db6a6c0ee0ad6b6c69e6d2fb707de984b9270"
+  },
+  "license": "AMI CC-BY-4.0; retain dataset attribution",
+  "scope": "One English multi-speaker meeting; no Italian/general quality certification"
+}

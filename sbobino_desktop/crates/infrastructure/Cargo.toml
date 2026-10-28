@@ -14,10 +14,19 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle = "2.6"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+base64 = "0.22"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
+url = "2"
 hound.workspace = true
 ring.workspace = true
 lingua = { version = "1.8.0", default-features = false, features = [
@@ -45,3 +54,4 @@ libc = "0.2"
 
 [dev-dependencies]
 regex = "1"
+tracing-subscriber.workspace = true

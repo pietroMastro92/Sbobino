@@ -14,7 +14,9 @@ use sbobino_domain::{
     TranscriptArtifact,
 };
 
-use crate::secure_storage::{decrypt_from_file, encrypt_to_file, SecureStorage};
+use crate::secure_storage::{
+    decrypt_from_file, encrypt_owned_to_file, encrypt_to_file, SecureStorage,
+};
 
 const HAS_OPTIMIZED_TRANSCRIPT_METADATA_KEY: &str = "has_optimized_transcript";
 const EMOTION_ANALYSIS_METADATA_KEY: &str = "emotion_analysis_v1";
@@ -617,6 +619,10 @@ impl SqliteArtifactRepository {
                 source_path.display()
             ))
         })?;
+        // Hash before moving the one audio buffer into in-place encryption.
+        // Do not keep the plaintext plus two complete ciphertext copies alive.
+        let byte_size = bytes.len() as u64;
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
 
         let extension = source_path
             .extension()
@@ -635,15 +641,12 @@ impl SqliteArtifactRepository {
             ))
         })?;
         let encrypted_path = artifact_dir.join("source.enc");
-        encrypt_to_file(
+        encrypt_owned_to_file(
             &self.secure_storage,
             &format!("audio-vault:{artifact_id}"),
             &encrypted_path,
-            &bytes,
+            bytes,
         )?;
-
-        let mut sha = Sha256::new();
-        sha.update(&bytes);
 
         Ok(AudioImportResult {
             available: true,
@@ -654,8 +657,8 @@ impl SqliteArtifactRepository {
             encrypted_rel_path: Some(format!("{artifact_id}/source.enc")),
             extension,
             mime_type: Some(mime_type),
-            sha256: Some(format!("{:x}", sha.finalize())),
-            byte_size: Some(bytes.len() as u64),
+            sha256: Some(sha256),
+            byte_size: Some(byte_size),
         })
     }
 

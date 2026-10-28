@@ -623,6 +623,7 @@ async fn run_file_transcription_without_ai_emits_expected_stages_and_persists() 
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(move |event| {
                 emitted_clone
@@ -741,6 +742,7 @@ async fn run_file_transcription_with_parakeet_uses_gguf_model_and_persists_engin
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(move |event| {
                 emitted_clone
@@ -829,6 +831,7 @@ async fn run_file_transcription_emits_final_transcript_snapshot_before_post_proc
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(move |text: String| {
@@ -888,6 +891,7 @@ async fn run_file_transcription_with_ai_runs_enhancer_steps() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(move |event| {
                 emitted_clone
@@ -973,6 +977,7 @@ async fn run_file_transcription_rejects_missing_input_path() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(|_text: String| {}),
@@ -1054,6 +1059,7 @@ async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(|_text: String| {}),
@@ -1076,6 +1082,128 @@ async fn run_file_transcription_assigns_speakers_into_timeline_metadata() {
             .map(String::as_str),
         Some("completed")
     );
+}
+
+fn timed_segment(start: f32, end: f32) -> TimedSegment {
+    TimedSegment {
+        text: "segment".to_string(),
+        start_seconds: Some(start),
+        end_seconds: Some(end),
+        ..TimedSegment::default()
+    }
+}
+
+fn speaker_turn(id: &str, start: f32, end: f32) -> SpeakerTurn {
+    SpeakerTurn {
+        speaker_id: id.to_string(),
+        speaker_label: Some(id.to_string()),
+        start_seconds: start,
+        end_seconds: end,
+    }
+}
+
+#[test]
+fn speaker_assignment_leaves_segments_without_overlap_unattributed() {
+    let segments = vec![timed_segment(0.0, 1.0)];
+    let turns = vec![speaker_turn("speaker_1", 1.0, 2.0)];
+
+    let assigned = TranscriptionService::assign_speakers_to_segments(&segments, &turns);
+
+    assert_eq!(assigned[0].speaker_id, None);
+    assert_eq!(assigned[0].speaker_label, None);
+}
+
+#[test]
+fn speaker_assignment_leaves_equal_overlap_ties_unattributed() {
+    let segments = vec![timed_segment(0.0, 1.0)];
+    let turns = vec![
+        speaker_turn("speaker_1", 0.0, 0.5),
+        speaker_turn("speaker_2", 0.5, 1.0),
+    ];
+
+    let assigned = TranscriptionService::assign_speakers_to_segments(&segments, &turns);
+
+    assert_eq!(assigned[0].speaker_id, None);
+    assert_eq!(assigned[0].speaker_label, None);
+}
+
+#[test]
+fn speaker_assignment_unions_duplicate_overlaps_before_majority_check() {
+    let segments = vec![timed_segment(0.0, 1.0)];
+    // The repeated speaker owns only 0.4 seconds after unioning the overlap;
+    // summing the duplicate intervals would incorrectly produce a majority.
+    let turns = vec![
+        speaker_turn("speaker_1", 0.0, 0.3),
+        speaker_turn("speaker_1", 0.2, 0.4),
+    ];
+
+    let assigned = TranscriptionService::assign_speakers_to_segments(&segments, &turns);
+
+    assert_eq!(assigned[0].speaker_id, None);
+    assert_eq!(assigned[0].speaker_label, None);
+}
+
+#[tokio::test]
+async fn diarization_setup_failure_persists_asr_for_default_and_explicit_requests() {
+    for diarization_enabled in [None, Some(true)] {
+        let temp = tempdir().expect("failed to create temp dir");
+        let input_path = temp.path().join("setup-failure.wav");
+        tokio::fs::write(&input_path, b"fake wav content")
+            .await
+            .expect("failed to create wav file");
+
+        let service = TranscriptionService::new(
+            Arc::new(MockTranscoder::default()),
+            Arc::new(MockSpeechEngine {
+                transcript: "base transcript survives".to_string(),
+                segments: vec![timed_segment(0.0, 1.0)],
+            }),
+            Arc::new(MockEnhancer::default()),
+            Arc::new(InMemoryArtifactRepository::default()),
+        )
+        .with_diarization_setup_error("Pyannote runtime is unavailable");
+
+        let artifact = service
+            .run_file_transcription(
+                RunTranscriptionRequest {
+                    job_id: "setup-failure".to_string(),
+                    input_path: input_path.to_string_lossy().to_string(),
+                    language: LanguageCode::En,
+                    model: SpeechModel::Base,
+                    engine: TranscriptionEngine::WhisperCpp,
+                    parakeet_model: ParakeetModel::default(),
+                    enable_ai: false,
+                    source_origin: ArtifactSourceOrigin::Imported,
+                    whisper_options: WhisperOptions::default(),
+                    title: None,
+                    parent_id: None,
+                    metadata: BTreeMap::new(),
+                    source_fingerprint_json: None,
+                    diarization_enabled,
+                },
+                Arc::new(|_| {}),
+                Arc::new(|_| {}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("ASR should persist even when diarizer setup fails");
+
+        assert_eq!(artifact.raw_transcript, "base transcript survives");
+        assert_eq!(
+            artifact
+                .metadata
+                .get("speaker_diarization_status")
+                .map(String::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            artifact
+                .metadata
+                .get("speaker_diarization_error")
+                .map(String::as_str),
+            Some("Pyannote runtime is unavailable")
+        );
+    }
 }
 
 #[tokio::test]
@@ -1122,6 +1250,7 @@ async fn run_file_transcription_persists_diarization_failure_metadata() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(|_text: String| {}),
@@ -1144,6 +1273,72 @@ async fn run_file_transcription_persists_diarization_failure_metadata() {
             .map(String::as_str),
         Some("speaker diarization failed: pyannote crashed")
     );
+}
+
+#[tokio::test]
+async fn explicit_companion_false_skips_global_diarizer() {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("no-speakers.wav");
+    tokio::fs::write(&input_path, b"fake wav content")
+        .await
+        .expect("failed to create wav file");
+
+    let diarizer = Arc::new(MockSpeakerDiarizer {
+        turns: vec![SpeakerTurn {
+            speaker_id: "speaker_1".to_string(),
+            speaker_label: Some("Speaker 1".to_string()),
+            start_seconds: 0.0,
+            end_seconds: 2.0,
+        }],
+        fail_with: None,
+    });
+    let service = TranscriptionService::new(
+        Arc::new(MockTranscoder::default()),
+        Arc::new(MockSpeechEngine {
+            transcript: "legacy global diarization".to_string(),
+            segments: vec![TimedSegment {
+                text: "legacy global diarization".to_string(),
+                start_seconds: Some(0.0),
+                end_seconds: Some(1.0),
+                ..TimedSegment::default()
+            }],
+        }),
+        Arc::new(MockEnhancer::default()),
+        Arc::new(InMemoryArtifactRepository::default()),
+    )
+    .with_speaker_diarizer(diarizer);
+
+    let artifact = service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "companion-false".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Base,
+                engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+                diarization_enabled: Some(false),
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("explicit false should not run global diarization");
+
+    assert!(!artifact.metadata.contains_key("speaker_diarization_status"));
+    assert!(!artifact
+        .metadata
+        .get("timeline_v2")
+        .unwrap()
+        .contains("speaker_id"));
 }
 
 #[tokio::test]
@@ -1198,6 +1393,7 @@ async fn automatic_ai_optimizes_contiguous_source_language_groups_separately() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(|_| {}),
@@ -1293,6 +1489,7 @@ async fn automatic_ai_falls_back_to_complete_auto_group_for_partial_segments() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(|_| {}),
@@ -1348,6 +1545,7 @@ async fn run_file_transcription_keeps_raw_transcript_when_ai_fails() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(|_text: String| {}),
@@ -1425,6 +1623,7 @@ async fn run_file_transcription_falls_back_to_secondary_ai_provider() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(|_text: String| {}),
@@ -1506,6 +1705,7 @@ async fn run_file_transcription_preserves_auto_import_metadata_and_fingerprint()
                 source_fingerprint_json: Some(
                     "{\"path\":\"/tmp/memo.wav\",\"dedupe_key\":\"123\"}".to_string(),
                 ),
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(|_text: String| {}),
@@ -1569,6 +1769,7 @@ async fn run_file_transcription_transcodes_wav_inputs_unconditionally() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(|_| {}),
             Arc::new(|_text: String| {}),
@@ -1656,6 +1857,7 @@ async fn progress_callback_keeps_visible_progress_monotonic_across_retry() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(move |event| {
                 emitted_clone
@@ -1739,6 +1941,7 @@ async fn terminal_failure_never_reports_overall_completion() {
                 parent_id: None,
                 metadata: BTreeMap::new(),
                 source_fingerprint_json: None,
+                diarization_enabled: None,
             },
             Arc::new(move |event| {
                 emitted_ref

@@ -14,6 +14,110 @@ pub struct FoundationAppleEnhancer {
 }
 
 impl FoundationAppleEnhancer {
+    /// A cancellable companion request must not share the desktop worker's stdin.
+    pub async fn ask_isolated(
+        &self,
+        prompt: &str,
+        operation: Option<&str>,
+    ) -> Result<String, ApplicationError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        static BINARY: tokio::sync::OnceCell<PathBuf> = tokio::sync::OnceCell::const_new();
+        let failure = |message: String| ApplicationError::PostProcessing(message);
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            return Err(failure(
+                "Apple Foundation requires Apple Silicon macOS".into(),
+            ));
+        }
+        let binary = BINARY
+            .get_or_try_init(|| async {
+                let script = ensure_bridge_script()?;
+                let directory = script.parent().expect("bridge script parent");
+                let target = directory.join("foundation_companion_bin");
+                let module_cache = directory.join("companion-module-cache");
+                std::fs::create_dir_all(&module_cache).map_err(|e| failure(e.to_string()))?;
+                for candidate in foundation_swiftc_candidates() {
+                    let mut command = tokio::process::Command::new(&candidate.program);
+                    if let Some(path) = candidate.developer_dir {
+                        command.env("DEVELOPER_DIR", path);
+                    }
+                    command
+                        .args(candidate.pre_args)
+                        .arg("-module-cache-path")
+                        .arg(&module_cache)
+                        .arg("-parse-as-library")
+                        .arg(&script)
+                        .arg("-o")
+                        .arg(&target)
+                        .kill_on_drop(true);
+                    let output =
+                        tokio::time::timeout(std::time::Duration::from_secs(60), command.output())
+                            .await
+                            .map_err(|_| failure("Foundation compiler timeout".into()))?
+                            .map_err(|e| failure(e.to_string()))?;
+                    if output.status.success() {
+                        return Ok::<_, ApplicationError>(target);
+                    }
+                }
+                Err(failure(
+                    "Foundation bridge could not compile with the installed toolchain".into(),
+                ))
+            })
+            .await?;
+        let mut child = tokio::process::Command::new(binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| failure(e.to_string()))?;
+        let input = serde_json::to_vec(&FoundationBridgeInput {
+            prompt: prompt.into(),
+            instructions: None,
+            operation: operation.map(String::from),
+        })
+        .map_err(|e| failure(e.to_string()))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| failure("Foundation stdin unavailable".into()))?;
+        stdin
+            .write_all(&input)
+            .await
+            .map_err(|e| failure(e.to_string()))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| failure(e.to_string()))?;
+        drop(stdin);
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| failure("Foundation stdout unavailable".into()))?;
+        let mut bytes = Vec::new();
+        stdout
+            .take(131073)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| failure(e.to_string()))?;
+        if bytes.len() > 131072 {
+            return Err(failure("Foundation response too large".into()));
+        }
+        let status = child.wait().await.map_err(|e| failure(e.to_string()))?;
+        let result: FoundationBridgeOutput = serde_json::from_slice(&bytes)
+            .map_err(|_| failure("Invalid Foundation response".into()))?;
+        if !status.success() || !result.ok {
+            return Err(failure(
+                result
+                    .error
+                    .unwrap_or_else(|| "Foundation unavailable".into()),
+            ));
+        }
+        result
+            .content
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| failure("Empty Foundation response".into()))
+    }
+
     pub fn new(
         optimize_prompt_override: Option<String>,
         summary_prompt_override: Option<String>,
@@ -34,6 +138,7 @@ impl FoundationAppleEnhancer {
         let input = FoundationBridgeInput {
             prompt: prompt.to_string(),
             instructions: None,
+            operation: None,
         };
         let output = run_foundation_bridge(&input)?;
         if output.ok {
@@ -163,6 +268,8 @@ impl TranscriptEnhancer for FoundationAppleEnhancer {
 struct FoundationBridgeInput {
     prompt: String,
     instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -742,7 +849,29 @@ import FoundationModels
 struct BridgeInput: Decodable {
     let prompt: String
     let instructions: String?
+    let operation: String?
 }
+
+#if canImport(FoundationModels)
+@Generable
+struct CompanionCitation: Encodable {
+    var recording_id: String
+    var segment_id: String
+}
+
+@Generable
+struct CompanionText: Encodable {
+    var text: String
+    var citations: [CompanionCitation]
+}
+
+@Generable
+struct CompanionPoints: Encodable {
+    @Guide(description: "Distinct plain single-line key points without bullet prefixes")
+    var points: [String]
+    var citations: [CompanionCitation]
+}
+#endif
 
 struct BridgeOutput: Encodable {
     let ok: Bool
@@ -798,11 +927,20 @@ struct FoundationBridge {
                     mergedPrompt = input.prompt
                 }
 
-                let response = try await session.respond(to: mergedPrompt)
+                let content: String
+                if input.operation == "key_points" {
+                    let response = try await session.respond(to: mergedPrompt, generating: CompanionPoints.self)
+                    content = String(decoding: try JSONEncoder().encode(response.content), as: UTF8.self)
+                } else if input.operation != nil {
+                    let response = try await session.respond(to: mergedPrompt, generating: CompanionText.self)
+                    content = String(decoding: try JSONEncoder().encode(response.content), as: UTF8.self)
+                } else {
+                    content = try await session.respond(to: mergedPrompt).content
+                }
                 writeLine(
                     BridgeOutput(
                         ok: true,
-                        content: response.content,
+                        content: content,
                         error: nil,
                         availability: "available"
                     )

@@ -22,6 +22,10 @@ pub struct RunTranscriptionRequest {
     pub source_origin: ArtifactSourceOrigin,
     pub metadata: BTreeMap<String, String>,
     pub source_fingerprint_json: Option<String>,
+    /// Per-job override for speaker diarization. `None` preserves the
+    /// desktop's existing global setting for non-companion callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diarization_enabled: Option<bool>,
 }
 
 impl RunTranscriptionRequest {

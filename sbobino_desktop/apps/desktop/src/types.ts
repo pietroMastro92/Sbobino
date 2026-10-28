@@ -104,7 +104,8 @@ export type WhisperOptions = {
 
 export type SpeakerDiarizationSettings = {
   enabled: boolean;
-  device: "auto" | "cpu" | "mps";
+  backend?: "auto" | "fluid" | "pyannote";
+  device: "auto" | "cpu" | "mps" | "ane";
   speaker_colors: Record<string, string>;
 };
 
@@ -585,6 +586,8 @@ export type ProvisioningStatus = {
   missing_models: string[];
   missing_encoders: string[];
   pyannote: PyannoteRuntimeHealth;
+  fluid_diarization?: FluidDiarizationHealth;
+  selected_speaker_diarization?: SelectedSpeakerDiarizationHealth;
 };
 
 export type ProvisioningProgressEvent = {
@@ -647,6 +650,8 @@ export type RuntimeHealth = {
   missing_models: string[];
   missing_encoders: string[];
   pyannote: PyannoteRuntimeHealth;
+  fluid_diarization?: FluidDiarizationHealth;
+  selected_speaker_diarization?: SelectedSpeakerDiarizationHealth;
   setup_complete: boolean;
 };
 
@@ -679,6 +684,8 @@ export type TranscriptionStartPreflight = {
   whisper_stream_resolved: string;
   parakeet_cli_resolved: string;
   pyannote: PyannoteRuntimeHealth;
+  fluid_diarization?: FluidDiarizationHealth;
+  selected_speaker_diarization?: SelectedSpeakerDiarizationHealth;
 };
 
 export type RealtimeStartReadiness = {
@@ -692,6 +699,35 @@ export type RealtimeStartReadiness = {
   whisper_stream_resolved: string;
   parakeet_cli_resolved: string;
   input_device_name: string | null;
+};
+
+export type FluidDiarizationHealth = {
+  supported: boolean;
+  ready: boolean;
+  manifest_version: number;
+  minimum_macos_major: number;
+  helper_installed: boolean;
+  models_installed: boolean;
+  manifest_verified: boolean;
+  helper_path: string;
+  models_dir: string;
+  manifest_path: string;
+  architecture: string;
+  sdk_revision: string;
+  model_revision: string;
+  missing_artifacts: string[];
+  reason_code: string;
+  message: string;
+};
+
+export type SelectedSpeakerDiarizationHealth = {
+  enabled: boolean;
+  requested_backend: "auto" | "fluid" | "pyannote";
+  selected_backend: "fluid" | "pyannote" | null;
+  compute: string | null;
+  ready: boolean;
+  reason_code: string;
+  message: string;
 };
 
 export type PyannoteRuntimeHealth = {

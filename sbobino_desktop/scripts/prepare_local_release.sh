@@ -39,6 +39,12 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+MACOS_MAJOR=$(sw_vers -productVersion)
+if (( ${MACOS_MAJOR%%.*} < 15 )); then
+  echo "Building the bundled FluidAudio runtime requires macOS 15+; the app still supports macOS 13+ with Pyannote." >&2
+  exit 1
+fi
+
 case "$(uname -m)" in
   arm64)
     TARGET_TRIPLE=aarch64-apple-darwin
@@ -76,7 +82,7 @@ for command in cargo codesign hdiutil npm python3 tar xcrun; do
 done
 
 STAGING_DIR="$OUTPUT_DIR/staging/$RELEASE_ARCH"
-TARGET_DIR="$ROOT_DIR/target/$TARGET_TRIPLE/release/bundle"
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/$TARGET_TRIPLE/release/bundle"
 APP_DIR="$TARGET_DIR/macos"
 APP_PATH="$APP_DIR/Sbobino.app"
 UPDATER_TAR="$APP_DIR/Sbobino.app.tar.gz"
@@ -143,7 +149,8 @@ if [[ ! -d "$APP_PATH" ]]; then
 fi
 
 python3 "$ROOT_DIR/scripts/prepare_macos_bundle_scripts.py" "$APP_PATH"
-codesign --force --deep --sign - "$APP_PATH"
+python3 "$ROOT_DIR/scripts/package_fluid_diarizer.py" --app "$APP_PATH" \
+  --build-root "${SBOBINO_FLUID_BUILD_ROOT:-${CARGO_TARGET_DIR:-$ROOT_DIR/target}/fluid-diarizer}" --identity -
 codesign --verify --deep --strict "$APP_PATH"
 rm -f "$UPDATER_TAR" "$UPDATER_SIG"
 COPYFILE_DISABLE=1 tar -czf "$UPDATER_TAR" -C "$APP_DIR" "Sbobino.app"

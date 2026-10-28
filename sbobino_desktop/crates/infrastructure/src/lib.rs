@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod background_process;
+pub mod fluid_diarization_runtime;
 pub mod repositories;
 pub mod secure_storage;
 
@@ -31,6 +32,7 @@ use sbobino_domain::{
 
 use adapters::{
     ffmpeg::FfmpegAdapter,
+    fluid_diarization::FluidDiarizationEngine,
     foundation_apple::FoundationAppleEnhancer,
     gemini::GeminiEnhancer,
     noop_enhancer::NoopEnhancer,
@@ -43,6 +45,10 @@ use adapters::{
     whisper_stream::WhisperStreamEngine,
 };
 use background_process::std_background_command;
+use fluid_diarization_runtime::{
+    choose_backend, fluid_bundle_health, selected_backend_health, verified_fluid_bundle,
+    BackendSelection, FluidDiarizationHealth, HostPlatform, SelectedSpeakerDiarizationHealth,
+};
 use repositories::{
     fs_settings_repository::FsSettingsRepository,
     sqlite_artifact_repository::SqliteArtifactRepository,
@@ -238,6 +244,14 @@ pub struct RuntimeHealth {
     pub missing_models: Vec<String>,
     pub missing_encoders: Vec<String>,
     pub pyannote: PyannoteRuntimeHealth,
+    /// Native FluidAudio resource health is kept separate from the legacy
+    /// Pyannote health contract so a missing native bundle never masquerades
+    /// as a Python receipt or installation state.
+    pub fluid_diarization: FluidDiarizationHealth,
+    /// Health of the backend effectively selected for the current settings.
+    /// This can be Pyannote when `backend=auto` intentionally preserves a
+    /// Pyannote device preference or when native resources are unavailable.
+    pub selected_speaker_diarization: SelectedSpeakerDiarizationHealth,
     pub setup_complete: bool,
 }
 
@@ -431,6 +445,16 @@ impl RuntimeTranscriptionFactory {
     }
 
     pub fn build_service(&self) -> Result<Arc<TranscriptionService>, String> {
+        self.build_service_with_diarization_override(None)
+    }
+
+    /// Builds a transcription service with an optional per-job diarization
+    /// override. The override is applied to the in-memory settings snapshot
+    /// only; the user's desktop defaults are never changed by a companion job.
+    pub fn build_service_with_diarization_override(
+        &self,
+        diarization_enabled: Option<bool>,
+    ) -> Result<Arc<TranscriptionService>, String> {
         let mut settings = self.load_settings()?;
         let mut platform_settings_changed = false;
 
@@ -575,16 +599,19 @@ impl RuntimeTranscriptionFactory {
                         .with_compute_device(settings.transcription.compute_device),
                 ),
             };
-        let speaker_diarizer = match self.build_speaker_diarizer(&settings) {
-            Ok(diarizer) => diarizer,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "speaker diarization is unavailable; continuing with transcription only"
-                );
-                None
-            }
-        };
+        let mut diarization_setup_error = None;
+        let speaker_diarizer =
+            match self.build_speaker_diarizer_for_job(&settings, diarization_enabled) {
+                Ok(diarizer) => diarizer,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "speaker diarization is unavailable; continuing with transcription only"
+                    );
+                    diarization_setup_error = Some(error);
+                    None
+                }
+            };
 
         let enhancer_candidates = self
             .build_enhancer_candidates()
@@ -609,8 +636,23 @@ impl RuntimeTranscriptionFactory {
         if let Some(diarizer) = speaker_diarizer {
             service = service.with_speaker_diarizer(diarizer);
         }
+        if let Some(error) = diarization_setup_error {
+            service = service.with_diarization_setup_error(error);
+        }
 
         Ok(Arc::new(service))
+    }
+
+    /// Checks whether the selected offline diarization backend can satisfy an
+    /// explicit companion diarization request without mutating settings.
+    pub fn companion_diarization_available(&self) -> bool {
+        let Ok(settings) = self.load_settings() else {
+            return false;
+        };
+        self.build_speaker_diarizer_for_job(&settings, Some(true))
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     pub fn build_speaker_diarization_runtime(
@@ -1212,6 +1254,37 @@ impl RuntimeTranscriptionFactory {
             return Ok(None);
         }
 
+        let host = HostPlatform::current();
+        let fluid_health = fluid_bundle_health(self.bundle_resources_dir.as_deref(), &host);
+        let pyannote_health = self.pyannote_health(settings, RuntimeHealthMode::Preflight);
+        match choose_backend(
+            diarization.enabled,
+            diarization.backend,
+            &diarization.device,
+            &fluid_health,
+            pyannote_health.ready,
+            &pyannote_health.message,
+            &host,
+        )? {
+            BackendSelection::Fluid(compute) => {
+                let bundle = verified_fluid_bundle(self.bundle_resources_dir.as_deref(), &host)
+                    .map_err(|error| format!("FluidAudio diarization is not ready: {error}"))?;
+                Ok(Some(Arc::new(FluidDiarizationEngine::new(
+                    bundle.helper_path,
+                    bundle.models_dir,
+                    matches!(compute, fluid_diarization_runtime::FluidCompute::Ane),
+                ))))
+            }
+            BackendSelection::Pyannote => self.build_pyannote_speaker_diarizer(settings),
+        }
+    }
+
+    fn build_pyannote_speaker_diarizer(
+        &self,
+        settings: &AppSettings,
+    ) -> Result<Option<Arc<dyn sbobino_application::SpeakerDiarizationEngine>>, String> {
+        let diarization = &settings.transcription.speaker_diarization;
+
         let pyannote_health = self.pyannote_health(settings, RuntimeHealthMode::Preflight);
         if !pyannote_health.ready {
             return Err(pyannote_health.message);
@@ -1271,6 +1344,22 @@ impl RuntimeTranscriptionFactory {
             diarization.device.trim().to_string(),
             runtime_path_prepend,
         ))))
+    }
+
+    fn build_speaker_diarizer_for_job(
+        &self,
+        settings: &AppSettings,
+        diarization_enabled: Option<bool>,
+    ) -> Result<Option<Arc<dyn sbobino_application::SpeakerDiarizationEngine>>, String> {
+        let Some(enabled) = diarization_enabled else {
+            return self.build_speaker_diarizer(settings);
+        };
+        if !enabled {
+            return Ok(None);
+        }
+        let mut effective = settings.clone();
+        effective.transcription.speaker_diarization.enabled = true;
+        self.build_speaker_diarizer(&effective)
     }
 
     pub fn load_settings(&self) -> Result<AppSettings, String> {
@@ -1445,6 +1534,19 @@ impl RuntimeTranscriptionFactory {
             models_dir.join(coreml_encoder).is_dir()
         };
         let pyannote = self.pyannote_health(&settings, mode);
+        let fluid_host = HostPlatform::current();
+        let fluid_diarization =
+            fluid_bundle_health(self.bundle_resources_dir.as_deref(), &fluid_host);
+        let diarization = &settings.transcription.speaker_diarization;
+        let selected_speaker_diarization = selected_backend_health(
+            diarization.enabled,
+            diarization.backend,
+            &diarization.device,
+            &fluid_diarization,
+            pyannote.ready,
+            &pyannote.message,
+            &fluid_host,
+        );
         let required_models_ready = required_initial_setup_models()
             .iter()
             .all(|model_file| models_dir.join(model_file).exists());
@@ -1526,6 +1628,8 @@ impl RuntimeTranscriptionFactory {
             missing_models: missing_models(&models_dir),
             missing_encoders: missing_encoders(&models_dir),
             pyannote,
+            fluid_diarization,
+            selected_speaker_diarization,
             setup_complete,
         })
     }
@@ -6026,6 +6130,9 @@ mod tests {
         factory
             .build_service()
             .expect("missing optional pyannote must not block transcription");
+        factory
+            .build_service_with_diarization_override(Some(true))
+            .expect("explicit diarization failure must not block ASR construction");
         let settings = factory.load_settings().expect("settings should load");
         let error = match factory.build_speaker_diarizer(&settings) {
             Ok(_) => panic!("direct diarization construction should still report setup failure"),
@@ -6694,3 +6801,4 @@ Load command 14
         assert!(script.ends_with("    raise\n"));
     }
 }
+pub mod companion;

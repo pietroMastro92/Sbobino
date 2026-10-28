@@ -921,7 +921,7 @@ async fn run_artifact_speaker_diarization_from_source(
             app,
             artifact_id,
             "running",
-            "Assigning speakers with pyannote",
+            "Assigning speakers with the selected offline engine",
             35,
         );
         let turns =

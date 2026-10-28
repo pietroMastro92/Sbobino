@@ -1,4 +1,5 @@
 pub mod ffmpeg;
+pub mod fluid_diarization;
 pub mod foundation_apple;
 pub mod gemini;
 pub mod noop_enhancer;
