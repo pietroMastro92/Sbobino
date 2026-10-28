@@ -1476,9 +1476,9 @@ mod tests {
     async fn failed_durable_write_does_not_admit_job_or_ack() {
         let (service, _temp) = fixture("http://127.0.0.1:9/v1");
         enable_fixture(&service);
-        let hidden = service.store().unwrap().root.with_extension("offline");
-        std::fs::rename(&service.store().unwrap().root, &hidden).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
+        let blocked = service.store().unwrap().root.join(format!("{id}.enc"));
+        std::fs::create_dir(&blocked).unwrap();
         assert_eq!(
             service.submit(id.clone(), request()).status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -1517,11 +1517,14 @@ mod tests {
             .unwrap()
             .records
             .insert(id.clone(), record);
-        let hidden = service.store().unwrap().root.with_extension("offline");
-        std::fs::rename(&service.store().unwrap().root, &hidden).unwrap();
+        let target = service.store().unwrap().root.join(format!("{id}.enc"));
+        let hidden = target.with_extension("offline");
+        std::fs::rename(&target, &hidden).unwrap();
+        std::fs::create_dir(&target).unwrap();
         assert_eq!(service.ack(&id).status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(service.state.lock().unwrap().records[&id].request.is_some());
-        std::fs::rename(&hidden, &service.store().unwrap().root).unwrap();
+        std::fs::remove_dir(&target).unwrap();
+        std::fs::rename(&hidden, &target).unwrap();
         assert_eq!(service.ack(&id).status(), StatusCode::OK);
     }
 
