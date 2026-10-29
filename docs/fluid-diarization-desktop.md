@@ -138,3 +138,49 @@ sheet, coherent commit and hosted native CI, Intel/Windows/old-OS native proofs,
 multilingual reference corpus and a Live
 candidate that passes quality. The connected iPhone is reserved by the iOS agent
 for the real ASR-to-speaker background regression; progress alone is not PASS.
+
+## Native Intel finding — 2026-10-29
+
+CI `2ec1bdb` passed on ARM, Windows, Linux and frontend. Intel compiled the helper
+and passed all 11 XCTest cases, but real CPU inference failed inside Core ML.
+The separate standard-runner diagnostic at
+https://github.com/pietroMastro92/Sbobino/actions/runs/40786181200 isolates it:
+Segmentation, FBank and PLDA pass batches 1, 8 and 32; Embedding fails all three
+with the same BNNS error, in separate processes. All 12 probes pass on local ARM.
+Therefore neither smaller batches nor SDK concurrency explains this failure.
+
+The pinned Community-1 model has no verified drop-in FP32 Intel alternative.
+Legacy WeSpeaker uses a different input interface; substituting it or exporting
+new weights would require new validation. This does not establish that every
+FluidAudio model or physical Intel GPU is unsupported.
+
+The app consequently keeps **Pyannote on Intel**; Auto must not select the
+installed but failing native embedding. Explicit Fluid is unavailable there with
+a diagnostic. Native model/helper resources are bundled only on Apple Silicon
+with macOS 15+. The desired Fluid-on-Intel integration remains **BLOCKED**, not
+PASS. The failing diagnostic artifacts remain preserved. CI validates the actual
+supported Intel path with existing Parakeet/Pyannote scripts, adding real
+Pyannote CPU inference rather than counting model loading alone as inference.
+No acceptance threshold or failed result is changed to obtain green status.
+
+All three verification installers for `2ec1bdb` built successfully in run
+40756823514, but that result is **build/signature scope only**; its Intel Fluid
+inference failure is separate. They are verification packages, not a new release.
+
+## Current acceptance status — 2026-10-29
+
+The historical checkpoints above identify their own snapshots. Current native
+CI at `2ec1bdb` (`40724562341`) passed ARM offline inference, Windows and portable
+checks; Intel inference failed. All three verification installers built in
+`40756823514`, but packaging does not override the Intel inference failure.
+The isolated Intel component probe `40786181200` at `5007720` failed only the
+Community-1 Embedding network at batches 1, 8 and 32. Product Auto routing and
+packaging now retain Pyannote on Intel. The requested native Fluid Intel path
+is BLOCKED for this pinned model; no unverified GPU or smaller-batch claim.
+
+The production factory `RuntimeTranscriptionFactory::build_speaker_diarizer`
+loads the bundled helper/models through `FluidDiarizationEngine`, not an
+experimental-only harness. The helper uses `OfflineDiarizerManager` at SDK pin
+`793a2c5a0e99705a55fefbad00e65ca684329349`, matching the iOS SDK pin, and the
+verified Community-1 model. New packages still require their own hash and
+product UI/QR acceptance. No stable release or promotion was performed here.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Embed the verified native diarizer after Tauri builds and seals its existing sidecars."""
+"""Seal macOS apps; include the native diarizer only on verified Apple Silicon targets."""
 import argparse
 import hashlib
 import json
@@ -67,11 +67,13 @@ def seal_app(app, bundle, identity, temporary):
         verify_bundle(destination)
         shutil.rmtree(destination)
     subprocess.run(['codesign', '--force', '--deep', '--sign', identity, str(candidate)], check=True)
-    shutil.move(str(bundle), destination)
-    # Deep signing here would change the helper bytes covered by the manifest.
-    subprocess.run(['codesign', '--force', '--sign', identity, str(candidate)], check=True)
+    if bundle is not None:
+        shutil.move(str(bundle), destination)
+        # Deep signing here would change the helper bytes covered by the manifest.
+        subprocess.run(['codesign', '--force', '--sign', identity, str(candidate)], check=True)
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(candidate)], check=True)
-    verify_bundle(destination)
+    if bundle is not None:
+        verify_bundle(destination)
     previous = temporary/'previous.app'
     app.rename(previous)
     try:
@@ -89,10 +91,20 @@ def main():
     args = parser.parse_args()
     if sys.platform != 'darwin' or not (args.app/'Contents/MacOS/sbobino-desktop').is_file():
         parser.error('requires a built native Sbobino.app on macOS')
-    if int(platform.mac_ver()[0].split('.')[0]) < 15:
+    if platform.machine() not in ('arm64', 'x86_64'):
+        parser.error('unsupported macOS build architecture')
+    native = platform.machine() == 'arm64'
+    if native and int(platform.mac_ver()[0].split('.')[0]) < 15:
         parser.error('building the bundled FluidAudio runtime requires macOS 15+')
     if not args.build_root.is_absolute():
         parser.error('--build-root must be absolute')
+    args.build_root.mkdir(parents=True, exist_ok=True)
+    if not native:
+        # The pinned embedding fails Intel CPU prediction even in an isolated batch-1 process.
+        with tempfile.TemporaryDirectory(dir=args.build_root, prefix='pyannote-app-') as temporary:
+            seal_app(args.app, None, args.identity, Path(temporary))
+        print(json.dumps(dict(bundle=None, backend='pyannote', reason='fluid_intel_cpu_unavailable')))
+        return
     scripts = Path(__file__).resolve().parent
     subprocess.run(['bash', str(scripts/'test_fluid_diarizer_native.sh'), str(args.build_root)], check=True)
     model_manifest = json.loads(MANIFEST.read_text())

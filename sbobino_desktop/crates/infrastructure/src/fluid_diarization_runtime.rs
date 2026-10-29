@@ -59,10 +59,7 @@ impl HostPlatform {
     pub fn supports_fluid(&self) -> bool {
         self.os.eq_ignore_ascii_case("macos")
             && self.os_major.is_some_and(|major| major >= 15)
-            && matches!(
-                canonical_architecture(&self.arch).as_str(),
-                "aarch64" | "x86_64"
-            )
+            && self.is_apple_silicon()
     }
 
     pub fn is_apple_silicon(&self) -> bool {
@@ -179,9 +176,14 @@ pub fn fluid_bundle_health(
     };
 
     if !health.supported {
+        if host.os == "macos" && host.canonical_arch() == "x86_64" {
+            health.reason_code = "fluid_intel_cpu_unavailable".to_string();
+            health.message = "The bundled FluidAudio embedding model failed native Intel CPU validation. Use Pyannote on this Mac.".to_string();
+            return health;
+        }
         health.reason_code = "fluid_unsupported_platform".to_string();
         health.message = format!(
-            "FluidAudio requires macOS 15+; current host is {} {} ({}).",
+            "FluidAudio requires Apple Silicon and macOS 15+; current host is {} {} ({}).",
             host.os,
             host.os_major
                 .map(|major| major.to_string())
@@ -236,7 +238,7 @@ pub fn verified_fluid_bundle(
 ) -> Result<VerifiedFluidBundle, String> {
     if !host.supports_fluid() {
         return Err(format!(
-            "FluidAudio is unavailable on {} {} (requires macOS 15+).",
+            "FluidAudio is unavailable on {} {} (requires Apple Silicon and macOS 15+).",
             host.os,
             host.os_major
                 .map(|major| major.to_string())
@@ -972,7 +974,7 @@ mod tests {
         for major in [13, 14] {
             let health = fluid_bundle_health(
                 Some(temporary.path()),
-                &host("macos", Some(major), "x86_64"),
+                &host("macos", Some(major), "aarch64"),
             );
             assert!(!health.ready);
             assert_eq!(health.reason_code, "fluid_unsupported_platform");
@@ -983,14 +985,14 @@ mod tests {
     fn missing_or_corrupt_cache_is_never_reported_ready() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join(FLUID_RESOURCE_DIR_NAME);
-        make_bundle(&root, "x86_64");
+        make_bundle(&root, "aarch64");
         fs::remove_file(
             root.join(FLUID_SPEAKER_MODEL_RELATIVE_PATH)
                 .join("FBank.mlmodelc/coremldata.bin"),
         )
         .unwrap();
         let health =
-            fluid_bundle_health(Some(temporary.path()), &host("macos", Some(15), "x86_64"));
+            fluid_bundle_health(Some(temporary.path()), &host("macos", Some(15), "aarch64"));
         assert!(!health.ready);
         assert!(matches!(
             health.reason_code.as_str(),
@@ -1009,6 +1011,39 @@ mod tests {
             fluid_bundle_health(Some(temporary.path()), &host("macos", Some(15), "aarch64"));
         assert_eq!(health.reason_code, "fluid_arch_mismatch");
         assert!(!health.ready);
+    }
+
+    #[test]
+    fn intel_auto_preserves_pyannote_despite_an_installed_fluid_bundle() {
+        let temporary = tempfile::tempdir().unwrap();
+        make_bundle(&temporary.path().join(FLUID_RESOURCE_DIR_NAME), "x86_64");
+        let host = host("macos", Some(15), "x86_64");
+        let fluid = fluid_bundle_health(Some(temporary.path()), &host);
+        assert!(!fluid.supported && !fluid.ready);
+        assert_eq!(fluid.reason_code, "fluid_intel_cpu_unavailable");
+        assert_eq!(
+            choose_backend(
+                true,
+                SpeakerDiarizationBackend::Auto,
+                "cpu",
+                &fluid,
+                true,
+                "Pyannote ready",
+                &host
+            ),
+            Ok(BackendSelection::Pyannote)
+        );
+        assert!(choose_backend(
+            true,
+            SpeakerDiarizationBackend::Fluid,
+            "cpu",
+            &fluid,
+            true,
+            "Pyannote ready",
+            &host
+        )
+        .is_err());
+        assert!(temporary.path().join(FLUID_RESOURCE_DIR_NAME).is_dir());
     }
 
     #[test]
@@ -1086,7 +1121,7 @@ mod tests {
 
     #[test]
     fn selected_health_exposes_requested_and_effective_backend() {
-        let host = host("macos", Some(15), "x86_64");
+        let host = host("macos", Some(15), "aarch64");
         let fluid = FluidDiarizationHealth {
             ready: true,
             ..Default::default()

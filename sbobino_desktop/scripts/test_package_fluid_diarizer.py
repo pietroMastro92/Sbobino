@@ -1,4 +1,6 @@
 import hashlib
+import contextlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -8,10 +10,33 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from package_fluid_diarizer import stage_bundle, verify_bundle, seal_app, inventory
+from package_fluid_diarizer import stage_bundle, verify_bundle, seal_app, inventory, main
 
 
 class NativeBundleTests(unittest.TestCase):
+    def test_intel_seals_pyannote_app_without_downloading_native_models(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root/'Sbobino.app'
+            binary = app/'Contents/MacOS/sbobino-desktop'
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b'fixture executable')
+            native = app/'Contents/Resources/fluid-diarizer'
+            native.mkdir(parents=True)
+            (native/'old-native').write_bytes(b'verified previous generated resource')
+            (native/'manifest.json').write_text(json.dumps(dict(version=1, files=inventory(native))))
+            output = io.StringIO()
+            with patch('sys.argv', ['package', '--app', str(app), '--build-root', str(root/'build')]), \
+                 patch('package_fluid_diarizer.sys.platform', 'darwin'), \
+                 patch('platform.machine', return_value='x86_64'), \
+                 patch('package_fluid_diarizer.install', side_effect=AssertionError('unexpected download')), \
+                 patch('subprocess.run') as run, contextlib.redirect_stdout(output):
+                main()
+            self.assertEqual(json.loads(output.getvalue())['backend'], 'pyannote')
+            self.assertTrue(all(call.args[0][0] == 'codesign' for call in run.call_args_list))
+            self.assertEqual(binary.read_bytes(), b'fixture executable')
+            self.assertFalse(native.exists())
+
     def test_signing_failures_preserve_the_entire_original_app(self):
         for fail_at in [1, 2, 3]:
             with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as temporary:

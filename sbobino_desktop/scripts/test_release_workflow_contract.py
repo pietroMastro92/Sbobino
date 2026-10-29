@@ -31,6 +31,33 @@ DISPATCHER = ROOT / "scripts" / "dispatch_release_candidate.sh"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_intel_cleanup_preserves_diagnostics_and_original_failure(self):
+        cleanup = INTEL_SMOKE.read_text().split("cleanup() {", 1)[1].split("\ntrap cleanup EXIT", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            run = root / "run"
+            (run / "recovery").mkdir(parents=True)
+            (run / "assets").mkdir()
+            (run / "assets/model.json").write_text('{"generated asset": true}')
+            (run / "recovery/result.json").write_text('{"diagnostic": true}')
+            (run / "model.bin").write_bytes(b"reproducible")
+            code = "set -euo pipefail\nRUN_DIR=$1\nLOG_DIR=$2\ncleanup() {" + cleanup + "\ntrap cleanup EXIT\nexit 7\n"
+            logs = root / "proof"
+            result = subprocess.run(["bash", "-c", code, "cleanup-test", str(run), str(logs)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 7, result.stderr)
+            self.assertEqual((logs / "exit-code.txt").read_text(), "7\n")
+            self.assertEqual(json.loads((logs / "recovery/result.json").read_text()), {"diagnostic": True})
+            self.assertFalse((logs / "assets").exists())
+            self.assertFalse((logs / "model.bin").exists())
+            self.assertFalse(run.exists())
+            run.mkdir()
+            (run / "failed.json").write_text('{}')
+            blocked = root / "blocked"
+            blocked.write_text("not a directory")
+            failed = subprocess.run(["bash", "-c", code, "cleanup-test", str(run), str(blocked / "proof")], capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 7)
+            self.assertTrue((run / "failed.json").exists())
+
     @unittest.skipUnless(shutil.which("pwsh"), "requires native PowerShell")
     def test_windows_cleanup_preserves_nested_diagnostics_and_original_failure(self):
         cleanup = WINDOWS_LIVE_SMOKE.read_text().rsplit("finally {", 1)[1]

@@ -40,7 +40,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 MACOS_MAJOR=$(sw_vers -productVersion)
-if (( ${MACOS_MAJOR%%.*} < 15 )); then
+if [[ "$(uname -m)" == arm64 ]] && (( ${MACOS_MAJOR%%.*} < 15 )); then
   echo "Building the bundled FluidAudio runtime requires macOS 15+; the app still supports macOS 13+ with Pyannote." >&2
   exit 1
 fi

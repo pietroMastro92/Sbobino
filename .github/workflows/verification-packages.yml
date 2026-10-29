@@ -99,7 +99,7 @@ jobs:
           import json, os
           from pathlib import Path
           root = Path("sbobino_desktop/apps/desktop/src-tauri")
-          metadata = {"app_commit_sha": os.environ["GITHUB_SHA"], "mode": "verification-only", "runtime_verification_scope": "pinned speech archive; FluidAudio bundled on macOS only; Pyannote not downloaded by this build", "runtime_release_tag": "v2.0.34", "runtime_commit_sha": os.environ["RUNTIME_SOURCE"], "runtime_asset": os.environ["RUNTIME_ASSET"], "runtime_sha256": os.environ["RUNTIME_DIGEST"], "updater_artifacts_enabled": False}
+          metadata = {"app_commit_sha": os.environ["GITHUB_SHA"], "mode": "verification-only", "runtime_verification_scope": "pinned speech archive; FluidAudio bundled on Apple Silicon only; Intel retains Pyannote (not downloaded by this build)", "runtime_release_tag": "v2.0.34", "runtime_commit_sha": os.environ["RUNTIME_SOURCE"], "runtime_asset": os.environ["RUNTIME_ASSET"], "runtime_sha256": os.environ["RUNTIME_DIGEST"], "updater_artifacts_enabled": False}
           overlay = {"bundle": {"createUpdaterArtifacts": False, "resources": ["resources/licenses/NotoSans-OFL.txt", "verification-build.json"]}}
           if os.environ.get("ISOLATED_UI") == "true":
               windows = json.loads((root / "tauri.conf.json").read_text())["app"]["windows"]

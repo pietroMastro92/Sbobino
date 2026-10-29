@@ -150,7 +150,13 @@ jobs:
           DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
         run: bash scripts/test_fluid_diarizer_native.sh "$RUNNER_TEMP/fluid-diarizer-proof"
       - name: Verify native FluidAudio offline inference on public audio
+        if: matrix.arch == 'arm64'
         run: python3 scripts/smoke_fluid_diarizer_native.py --output "$RUNNER_TEMP/fluid-diarizer-proof"
+      - name: Verify supported Intel CPU Pyannote and Parakeet inference
+        if: matrix.arch == 'x86_64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: TMPDIR="$RUNNER_TEMP" bash scripts/release_intel_pyannote_parakeet_smoke.sh 2.0.36 "$GITHUB_REPOSITORY" "$RUNNER_TEMP/intel-supported-smoke/proof.json"
       - name: Preserve native FluidAudio test evidence
         uses: actions/upload-artifact@v4
         if: always()
@@ -161,6 +167,13 @@ jobs:
             ${{ runner.temp }}/fluid-diarizer-proof/swift-test.log
             ${{ runner.temp }}/fluid-diarizer-proof/offline-smoke*.json
             ${{ runner.temp }}/fluid-diarizer-proof/offline-smoke.stderr.log
+          if-no-files-found: error
+      - name: Preserve supported Intel inference evidence
+        if: always() && matrix.arch == 'x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: intel-supported-inference-${{ github.sha }}
+          path: ${{ runner.temp }}/intel-supported-smoke/
           if-no-files-found: error
 
   native-windows:
