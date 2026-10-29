@@ -252,6 +252,7 @@ import type {
   ArtifactKind,
   ArtifactSourceOrigin,
   EmotionAnalysisResult,
+  FluidDiarizationHealth,
   JobProgress,
   LanguageCode,
   OrganizationSettings,
@@ -269,6 +270,7 @@ import type {
   RemoteServiceConfig,
   RemoteServiceKind,
   RuntimeHealth,
+  SelectedSpeakerDiarizationHealth,
   SpeakerDiarizationSettings,
   SpeechModel,
   TimelineV2,
@@ -2518,6 +2520,35 @@ function sanitizeSpeakerDiarizationSettings(
     device,
     speaker_colors: sanitizeSpeakerColorMap(settings.speaker_colors),
   };
+}
+
+function speakerDiarizationUsesPyannote(
+  settings: SpeakerDiarizationSettings,
+  selected: SelectedSpeakerDiarizationHealth | undefined,
+  fluid: FluidDiarizationHealth | undefined,
+): boolean {
+  if (selected?.selected_backend === "fluid") {
+    return false;
+  }
+  if (selected?.selected_backend === "pyannote") {
+    return true;
+  }
+  if (settings.backend === "pyannote") {
+    return true;
+  }
+  if (settings.backend !== "auto") {
+    return false;
+  }
+  // Match the native chooser: an explicit ANE request is a hard FluidAudio
+  // requirement, while MPS/CUDA-style preferences and a non-ready Fluid
+  // bundle may fall back to Pyannote.
+  if (settings.device === "ane") {
+    return false;
+  }
+  if (settings.device === "mps") {
+    return true;
+  }
+  return fluid?.ready !== true;
 }
 
 function sanitizeWhisperOptions(options: WhisperOptions): WhisperOptions {
@@ -13909,7 +13940,7 @@ export function App({
     const speakerDetectionDescription = speakerDiarizationEnabled
       ? t(
           "detail.speakerDetectionEnabledHelp",
-          "Runs speaker detection with the configured pyannote runtime and assigns speaker labels to this transcript.",
+          "Runs speaker detection with the configured engine and assigns speaker labels to this transcript.",
         )
       : t(
           "detail.speakerDetectionDisabledHelp",
@@ -14245,7 +14276,7 @@ export function App({
       realtimeSpeakerDiarizationEnabled
         ? t(
             "realtime.speakerDetectionEnabledHelp",
-            "Runs speaker detection with the configured pyannote runtime after this live recording is saved.",
+            "Runs speaker detection with the configured engine after this live recording is saved.",
           )
         : t(
             "detail.speakerDetectionDisabledHelp",
@@ -15666,8 +15697,28 @@ export function App({
       getDefaultSpeakerDiarizationSettings();
     const pyannoteHealth = runtimeHealth?.pyannote ?? null;
     const selectedDiarization = runtimeHealth?.selected_speaker_diarization;
-    const speakerRuntimeReady = speakerDiarization.enabled && (selectedDiarization?.enabled
-      ? selectedDiarization.ready : pyannoteHealth?.ready ?? false);
+    const pyannoteIsEffective = speakerDiarizationUsesPyannote(
+      speakerDiarization,
+      selectedDiarization,
+      runtimeHealth?.fluid_diarization,
+    );
+    const configuredSpeakerHealth =
+      pyannoteIsEffective
+        ? pyannoteHealth
+        : runtimeHealth?.fluid_diarization ?? null;
+    const speakerHealthAvailable = Boolean(
+      selectedDiarization || configuredSpeakerHealth,
+    );
+    const speakerHealthMessage =
+      selectedDiarization?.message ||
+      (pyannoteIsEffective
+        ? formatPyannoteHealthMessage(pyannoteHealth)
+        : runtimeHealth?.fluid_diarization?.message || null);
+    const configuredSpeakerReady = selectedDiarization?.enabled
+      ? selectedDiarization.ready
+      : configuredSpeakerHealth?.ready ?? false;
+    const speakerRuntimeReady = speakerDiarization.enabled && configuredSpeakerReady;
+    const shouldProvisionPyannote = pyannoteIsEffective;
     const normalizedLanguageSearch = transcriptionLanguageSearch.trim().toLowerCase();
     const searchableLanguageOptions = [
       {
@@ -15933,14 +15984,14 @@ export function App({
                   "Speaker detection runs offline after transcription with the selected engine.",
                 )}
               </small>
-              {pyannoteHealth ? (
+              {speakerHealthAvailable ? (
                 <small className="muted">
-                  {selectedDiarization?.message || formatPyannoteHealthMessage(pyannoteHealth)}
+                  {speakerHealthMessage}
                 </small>
               ) : null}
             </div>
             <div className="settings-toggle-stack">
-              {pyannoteHealth ? (
+              {speakerHealthAvailable ? (
                 <span
                   className={
                     speakerRuntimeReady ? "kind-chip" : "missing-chip"
@@ -15971,7 +16022,11 @@ export function App({
                 )}
                 disabled={provisioning.running}
                 onClick={() => {
-                  if (!speakerDiarization.enabled && !pyannoteHealth?.ready) {
+                  if (
+                    !speakerDiarization.enabled &&
+                    !configuredSpeakerReady &&
+                    shouldProvisionPyannote
+                  ) {
                     // Enabling the switch must be a plug-and-play action. If
                     // the optional runtime is missing or stale, provision it
                     // first and enable diarization only after the native
@@ -16009,7 +16064,7 @@ export function App({
                 }));
               }}>
               <option value="auto">{t("settings.transcription.computeAuto", "Auto")}</option>
-              <option value="fluid" disabled={runtimeHealth?.fluid_diarization?.supported !== true}>{t("settings.transcription.fluidEngine", "FluidAudio — macOS 15+")}</option>
+              <option value="fluid" disabled={runtimeHealth?.fluid_diarization?.supported !== true}>{t("settings.transcription.fluidEngine", "FluidAudio — Apple Silicon, macOS 15+")}</option>
               <option value="pyannote">{t("settings.pyannote.name", "Pyannote")}</option>
             </select>
           </div>
@@ -16536,6 +16591,11 @@ export function App({
       settings.transcription.speaker_diarization ??
         getDefaultSpeakerDiarizationSettings(),
     );
+    const pyannoteIsEffective = speakerDiarizationUsesPyannote(
+      speakerDiarization,
+      runtimeHealth?.selected_speaker_diarization,
+      runtimeHealth?.fluid_diarization,
+    );
     const pyannoteBusy =
       provisioning.running && provisioning.operationScope === "pyannote";
     const pyannoteAction =
@@ -17034,10 +17094,12 @@ export function App({
                   </span>
                   <span
                     className={
-                      speakerDiarization.enabled ? "kind-chip" : "missing-chip"
+                      pyannoteIsEffective && speakerDiarization.enabled
+                        ? "kind-chip"
+                        : "missing-chip"
                     }
                   >
-                    {speakerDiarization.enabled
+                    {pyannoteIsEffective && speakerDiarization.enabled
                       ? t(
                           "settings.pyannote.enabledForTranscriptions",
                           "Enabled",
@@ -17063,7 +17125,7 @@ export function App({
             >
               {pyannoteAction.label}
             </button>
-            {pyannoteHealth?.ready && !speakerDiarization.enabled ? (
+            {pyannoteHealth?.ready && pyannoteIsEffective && !speakerDiarization.enabled ? (
               <button
                 className="primary-button"
                 onClick={() => void enablePyannoteForTranscriptions()}

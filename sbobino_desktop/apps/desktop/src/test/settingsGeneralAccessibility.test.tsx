@@ -3,9 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "../App";
 import { changeLanguage } from "../i18n";
-import { fetchSettingsSnapshot, saveSettings } from "../lib/tauri";
+import {
+  fetchRuntimeHealth,
+  fetchRuntimeStatus,
+  fetchSettingsSnapshot,
+  provisioningModels,
+  provisioningInstallPyannote,
+  saveSettings,
+} from "../lib/tauri";
 import { useAppStore } from "../state/useAppStore";
-import type { AppSettings } from "../types";
+import type { AppSettings, RuntimeHealth } from "../types";
 
 vi.mock("../lib/tauri", () => {
   const asyncNoop = vi.fn(async (..._args: unknown[]) => undefined);
@@ -25,8 +32,8 @@ vi.mock("../lib/tauri", () => {
     fetchAiCapabilityStatus: asyncNoop,
     fetchRealtimeStartReadiness: asyncNoop,
     fetchTranscriptionStartPreflight: asyncNoop,
-    fetchRuntimeHealth: asyncNoop,
-    fetchRuntimeStatus: asyncNoop,
+    fetchRuntimeHealth: vi.fn(async (..._args: unknown[]) => undefined),
+    fetchRuntimeStatus: vi.fn(async (..._args: unknown[]) => undefined),
     fetchSettingsSnapshot: vi.fn(),
     listTranscriptionLanguages: asyncNoop,
     generateArtifactPack: asyncNoop,
@@ -44,9 +51,9 @@ vi.mock("../lib/tauri", () => {
     previewArtifactExport: asyncNoop,
     provisioningCancel: asyncNoop,
     provisioningDownloadModel: asyncNoop,
-    provisioningInstallPyannote: asyncNoop,
+    provisioningInstallPyannote: vi.fn(async (..._args: unknown[]) => undefined),
     provisioningInstallRuntime: asyncNoop,
-    provisioningModels: asyncNoop,
+    provisioningModels: vi.fn(async (..._args: unknown[]) => undefined),
     provisioningStart: asyncNoop,
     provisioningStatus: asyncNoop,
     readArtifactAudio: asyncNoop,
@@ -249,6 +256,10 @@ describe("General settings accessibility", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(fetchRuntimeHealth).mockReset().mockResolvedValue(undefined as never);
+    vi.mocked(fetchRuntimeStatus).mockReset().mockResolvedValue(undefined as never);
+    vi.mocked(provisioningModels).mockReset().mockResolvedValue([]);
+    vi.mocked(provisioningInstallPyannote).mockReset().mockResolvedValue({ started: false });
     changeLanguage("en");
     const settings = createSettingsFixture();
     useAppStore.setState({
@@ -336,5 +347,78 @@ describe("General settings accessibility", () => {
     expect(vi.mocked(saveSettings).mock.lastCall?.[0].transcription.speaker_diarization).toEqual({
       enabled: true, backend: "pyannote", device: "cpu", speaker_colors: { s1: "#123456" },
     });
+  });
+
+  it("shows the configured FluidAudio health in the speaker toggle status", async () => {
+    const settings = createSettingsFixture();
+    settings.transcription.speaker_diarization = {
+      enabled: true,
+      backend: "fluid",
+      device: "ane",
+      speaker_colors: {},
+    };
+    const runtimeHealth = {
+      app_version: "test",
+      missing_models: [],
+      missing_encoders: [],
+      models_dir_resolved: "/tmp/models",
+      pyannote: {
+        enabled: false,
+        ready: false,
+        runtime_installed: false,
+        model_installed: false,
+        runtime_dir: "",
+        arch: "arm64",
+        device: "cpu",
+        source: "test",
+        reason_code: "disabled",
+        message: "Pyannote disabled",
+      },
+      fluid_diarization: {
+        supported: true,
+        ready: true,
+        manifest_version: 1,
+        minimum_macos_major: 15,
+        helper_installed: true,
+        models_installed: true,
+        manifest_verified: true,
+        helper_path: "/tmp/helper",
+        models_dir: "/tmp/fluid",
+        manifest_path: "/tmp/fluid/manifest.json",
+        architecture: "arm64",
+        sdk_revision: "test",
+        model_revision: "test",
+        missing_artifacts: [],
+        reason_code: "ready",
+        message: "FluidAudio ready",
+      },
+    } as unknown as RuntimeHealth;
+    useAppStore.setState({ settings });
+    vi.mocked(fetchSettingsSnapshot).mockResolvedValue(settings);
+    vi.mocked(fetchRuntimeHealth).mockResolvedValue(runtimeHealth);
+    vi.mocked(fetchRuntimeStatus).mockResolvedValue(runtimeHealth);
+    vi.mocked(provisioningModels).mockResolvedValue([]);
+    vi.mocked(provisioningInstallPyannote).mockClear();
+
+    render(<App standaloneSettingsWindow />);
+    fireEvent.click(screen.getByRole("button", { name: /^Transcription/ }));
+    await waitFor(() => expect(screen.getByText("Ready")).toBeVisible());
+    expect(screen.getByText("FluidAudio ready")).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: /Local Models/ }));
+    await waitFor(() => expect(screen.getByText("FluidAudio ready")).toBeVisible());
+    expect(screen.getByText("Disabled")).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "Enable for Transcriptions" }),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /^Transcription/ }));
+    const speakerSwitch = screen.getByRole("switch", {
+      name: "Enable speaker diarization",
+    });
+    fireEvent.click(speakerSwitch);
+    fireEvent.click(speakerSwitch);
+    await waitFor(() => expect(saveSettings).toHaveBeenCalled());
+    expect(provisioningInstallPyannote).not.toHaveBeenCalled();
   });
 });

@@ -46,20 +46,22 @@ impl Engine {
 struct Options {
     data_dir: PathBuf,
     support_dir: PathBuf,
+    bundle_resources: Option<PathBuf>,
     engine: Engine,
     lan: bool,
 }
 
 fn usage() -> &'static str {
-    "Uso: companion_smoke --data-dir DIR [--engine whisper|parakeet] [--support-dir DIR] [--lan]"
+    "Uso: companion_smoke --data-dir DIR [--engine whisper|parakeet] [--support-dir DIR] [--bundle-resources DIR] [--lan]"
 }
 
-fn parse_options() -> Result<Option<Options>, String> {
+fn parse_options(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
     let mut data_dir = None;
     let mut support_dir = None;
+    let mut bundle_resources = None;
     let mut engine = Engine::Whisper;
     let mut lan = false;
-    let mut args = env::args().skip(1);
+    let mut args = args;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -75,6 +77,12 @@ fn parse_options() -> Result<Option<Options>, String> {
                 support_dir =
                     Some(PathBuf::from(args.next().ok_or_else(|| {
                         "manca il valore di --support-dir".to_string()
+                    })?));
+            }
+            "--bundle-resources" => {
+                bundle_resources =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        "manca il valore di --bundle-resources".to_string()
                     })?));
             }
             "--engine" => {
@@ -101,6 +109,7 @@ fn parse_options() -> Result<Option<Options>, String> {
     Ok(Some(Options {
         data_dir,
         support_dir,
+        bundle_resources,
         engine,
         lan,
     }))
@@ -199,13 +208,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .with_writer(std::io::stderr)
         .init();
-    let Some(options) = parse_options()? else {
+    let Some(options) = parse_options(env::args().skip(1))? else {
         eprintln!("{}", usage());
         return Ok(());
     };
     write_isolated_settings(&options)?;
 
-    let factory = Arc::new(RuntimeTranscriptionFactory::new(&options.data_dir, None)?);
+    let factory = Arc::new(RuntimeTranscriptionFactory::new(
+        &options.data_dir,
+        options.bundle_resources.clone(),
+    )?);
     factory
         .build_service()
         .map_err(|error| format!("runtime {0} non pronto: {error}", options.engine.name()))?;
@@ -248,4 +260,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::future::pending::<()>().await;
     #[allow(unreachable_code)]
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_options;
+
+    fn parse(args: &[&str]) -> super::Options {
+        parse_options(args.iter().map(|arg| (*arg).to_string()))
+            .expect("parser should accept test arguments")
+            .expect("test arguments should not request help")
+    }
+
+    #[test]
+    fn bundle_resources_defaults_to_none() {
+        let options = parse(&[
+            "--data-dir",
+            "/tmp/companion-data",
+            "--support-dir",
+            "/tmp/companion-support",
+        ]);
+
+        assert!(options.bundle_resources.is_none());
+    }
+
+    #[test]
+    fn bundle_resources_accepts_explicit_directory() {
+        let options = parse(&[
+            "--data-dir",
+            "/tmp/companion-data",
+            "--support-dir",
+            "/tmp/companion-support",
+            "--bundle-resources",
+            "/tmp/Sbobino.app/Contents/Resources",
+        ]);
+
+        assert_eq!(
+            options.bundle_resources.as_deref(),
+            Some(std::path::Path::new("/tmp/Sbobino.app/Contents/Resources"))
+        );
+    }
 }

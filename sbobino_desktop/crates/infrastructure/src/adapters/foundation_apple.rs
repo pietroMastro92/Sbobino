@@ -861,6 +861,7 @@ struct CompanionCitation: Encodable {
 
 @Generable
 struct CompanionText: Encodable {
+    @Guide(description: "The human-readable answer following the operation language instructions. Editorial revisions retain the source language. Do not include JSON, source IDs, or citation markup in this text.")
     var text: String
     var citations: [CompanionCitation]
 }
