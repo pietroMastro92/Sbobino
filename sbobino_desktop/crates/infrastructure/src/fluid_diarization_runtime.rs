@@ -431,6 +431,150 @@ fn selection_failure_reason(
     }
 }
 
+/// Closed set of readiness reason codes exposed by the companion wire
+/// contract. Both `/v1/health` (`readiness.diarization.reason_code`) and the
+/// `409` admission guard (`readiness.diarization.reason_code`) use only these
+/// values, so a client never has to interpret free-form diagnostics.
+pub const DIARIZATION_READINESS_REASON_CODES: [&str; 8] = [
+    "ok",
+    "no_backend",
+    "fluid_missing",
+    "pyannote_missing",
+    "pyannote_repair_required",
+    "pyannote_receipt_required",
+    "pyannote_arch_mismatch",
+    "device_unsupported",
+];
+
+/// Per-job diarization readiness advertised to the paired iPhone.
+///
+/// `message` is always a static human sentence chosen from the closed code
+/// table. The internal `FluidDiarizationHealth::message` and
+/// `PyannoteRuntimeHealth::message` are deliberately never forwarded: they
+/// embed absolute paths and probe output that must not leave the desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DiarizationReadiness {
+    pub ready: bool,
+    pub reason_code: &'static str,
+    pub message: &'static str,
+}
+
+/// Readiness for a companion job that explicitly asks for speaker
+/// diarization.
+///
+/// The companion contract treats `diarization=true` as an explicit per-job
+/// request that overrides the persisted global toggle. Readiness therefore
+/// always evaluates the selection with `enabled = true`; passing the global
+/// setting here would report `ready: true` with `reason_code: "disabled"`
+/// while no backend is installed.
+///
+/// This function is pure: it reuses `selected_backend_health`, which neither
+/// spawns processes nor writes helper scripts. Callers pass health that was
+/// already produced by the preflight runtime probe, so the health route adds
+/// no Python import, `otool`, download or network work.
+pub fn companion_diarization_readiness(
+    requested: SpeakerDiarizationBackend,
+    device: &str,
+    fluid: &FluidDiarizationHealth,
+    pyannote_ready: bool,
+    pyannote_reason_code: &str,
+    host: &HostPlatform,
+) -> DiarizationReadiness {
+    let selected = selected_backend_health(
+        true,
+        requested,
+        device,
+        fluid,
+        pyannote_ready,
+        // The internal selection message may contain host paths; readiness
+        // never forwards it, so it is not even passed in.
+        "",
+        host,
+    );
+    if selected.ready {
+        return DiarizationReadiness {
+            ready: true,
+            reason_code: "ok",
+            message: "La diarizzazione è disponibile su questo Desktop.",
+        };
+    }
+
+    let reason_code = if !diarization_device_is_supported(requested, device, host) {
+        "device_unsupported"
+    } else {
+        match selected.reason_code.as_str() {
+            code if code.starts_with("fluid_") => "fluid_missing",
+            "pyannote_not_ready" => pyannote_readiness_reason(pyannote_reason_code),
+            _ => "no_backend",
+        }
+    };
+    DiarizationReadiness {
+        ready: false,
+        reason_code,
+        message: readiness_message(reason_code),
+    }
+}
+
+fn diarization_device_is_supported(
+    requested: SpeakerDiarizationBackend,
+    device: &str,
+    host: &HostPlatform,
+) -> bool {
+    match requested {
+        // Pyannote is a CPU/GPU (MPS/CUDA) backend and never drives the ANE.
+        SpeakerDiarizationBackend::Pyannote => !device.trim().eq_ignore_ascii_case("ane"),
+        SpeakerDiarizationBackend::Fluid => {
+            matches!(native_compute_for_device(device, host), Ok(Some(_)))
+        }
+        // `auto` keeps an explicit-incompatible device diagnostic distinct from
+        // a missing backend, but still allows Pyannote fallback for MPS/CUDA.
+        SpeakerDiarizationBackend::Auto => {
+            !matches!(native_compute_for_device(device, host), Err(_))
+        }
+    }
+}
+
+/// Maps the internal Pyannote diagnostic code onto the closed readiness set.
+/// Unknown repair states stay `pyannote_repair_required`: not ready, and the
+/// only actionable path is the existing repair flow.
+fn pyannote_readiness_reason(reason_code: &str) -> &'static str {
+    match reason_code.trim() {
+        "pyannote_arch_mismatch" => "pyannote_arch_mismatch",
+        "pyannote_receipt_required" | "pyannote_receipt_invalid" => "pyannote_receipt_required",
+        "pyannote_runtime_missing" | "pyannote_model_missing" => "pyannote_missing",
+        _ => "pyannote_repair_required",
+    }
+}
+
+fn readiness_message(reason_code: &str) -> &'static str {
+    match reason_code {
+        "ok" => "La diarizzazione è disponibile su questo Desktop.",
+        "fluid_missing" => {
+            "Il motore di diarizzazione FluidAudio non è pronto su questo Desktop. Configuralo da Impostazioni > Modelli locali."
+        }
+        "pyannote_missing" => {
+            "La diarizzazione Pyannote non è installata su questo Desktop. Installala da Impostazioni > Modelli locali."
+        }
+        "pyannote_repair_required" => {
+            "L’installazione Pyannote su questo Desktop è incompleta. Riparala da Impostazioni > Modelli locali."
+        }
+        "pyannote_receipt_required" => {
+            "La diarizzazione Pyannote su questo Desktop deve essere verificata. Esegui la riparazione da Impostazioni > Modelli locali."
+        }
+        "pyannote_arch_mismatch" => {
+            "La diarizzazione Pyannote installata non è compatibile con questo Mac. Riparala da Impostazioni > Modelli locali."
+        }
+        "device_unsupported" => {
+            "Il dispositivo scelto per la diarizzazione non è supportato su questo Desktop. Scegli cpu o auto."
+        }
+        // `no_backend` and any unexpected internal state share the honest
+        // answer: nothing on this desktop can diarize the job right now.
+        _ => {
+            "La diarizzazione non è disponibile su questo Desktop. Installa un motore da Impostazioni > Modelli locali."
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ValidationError {
     reason_code: String,
@@ -1141,5 +1285,224 @@ mod tests {
         );
         assert_eq!(health.compute.as_deref(), Some("cpu"));
         assert!(health.ready);
+    }
+
+    #[test]
+    fn readiness_follows_the_explicit_per_job_request_not_the_global_toggle() {
+        let host = host("macos", Some(15), "aarch64");
+        // The trap this test pins: the global toggle is off and no backend is
+        // installed, so `selected_backend_health(false, ..)` reports
+        // ready/disabled. A companion job that asks for `diarization=true`
+        // would still be accepted under that false positive.
+        let global_toggle = selected_backend_health(
+            false,
+            SpeakerDiarizationBackend::Auto,
+            "cpu",
+            &FluidDiarizationHealth::default(),
+            false,
+            "unavailable",
+            &host,
+        );
+        assert!(global_toggle.ready);
+        assert_eq!(global_toggle.reason_code, "disabled");
+
+        let readiness = companion_diarization_readiness(
+            SpeakerDiarizationBackend::Auto,
+            "cpu",
+            &FluidDiarizationHealth::default(),
+            false,
+            "pyannote_runtime_missing",
+            &host,
+        );
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason_code, "no_backend");
+        assert_ne!(readiness.reason_code, "disabled");
+    }
+
+    #[test]
+    fn readiness_is_ok_when_pyannote_is_ready_even_if_fluid_is_missing() {
+        let host = host("macos", Some(15), "aarch64");
+        let readiness = companion_diarization_readiness(
+            SpeakerDiarizationBackend::Auto,
+            "cpu",
+            &FluidDiarizationHealth::default(),
+            true,
+            "ok",
+            &host,
+        );
+        assert!(readiness.ready);
+        assert_eq!(readiness.reason_code, "ok");
+        assert!(!readiness.message.is_empty());
+    }
+
+    #[test]
+    fn readiness_portable_diagnostic_codes_and_messages_stay_inside_the_closed_set() {
+        let host = host("macos", Some(15), "aarch64");
+        // Real internal diagnostics embed absolute paths and probe output.
+        // Readiness must never forward them.
+        let fluid_with_path = FluidDiarizationHealth {
+            ready: false,
+            reason_code: "fluid_helper_missing".to_string(),
+            message: "FluidAudio helper is missing or not executable at '/Users/example/Application Support/com.sbobino/runtime/fluid-diarizer/bin/sbobino-diarizer'."
+                .to_string(),
+            ..Default::default()
+        };
+        let pyannote_message = "Pyannote runtime still exposes host LC_RPATH '/opt/homebrew/lib' in '/Users/example/Library/Application Support/com.sbobino/runtime/pyannote/python/lib/libpython3.11.dylib'.";
+
+        let cases = [
+            (
+                companion_diarization_readiness(
+                    SpeakerDiarizationBackend::Auto,
+                    "cpu",
+                    &fluid_with_path,
+                    true,
+                    "ok",
+                    &host,
+                ),
+                "ok",
+            ),
+            (
+                companion_diarization_readiness(
+                    SpeakerDiarizationBackend::Auto,
+                    "cpu",
+                    &fluid_with_path,
+                    false,
+                    "pyannote_runtime_missing",
+                    &host,
+                ),
+                "no_backend",
+            ),
+            (
+                companion_diarization_readiness(
+                    SpeakerDiarizationBackend::Fluid,
+                    "cpu",
+                    &fluid_with_path,
+                    false,
+                    "",
+                    &host,
+                ),
+                "fluid_missing",
+            ),
+            (
+                companion_diarization_readiness(
+                    SpeakerDiarizationBackend::Pyannote,
+                    "cpu",
+                    &FluidDiarizationHealth::default(),
+                    false,
+                    "pyannote_runtime_missing",
+                    &host,
+                ),
+                "pyannote_missing",
+            ),
+            (
+                companion_diarization_readiness(
+                    SpeakerDiarizationBackend::Pyannote,
+                    "cpu",
+                    &FluidDiarizationHealth::default(),
+                    false,
+                    "pyannote_repair_required",
+                    &host,
+                ),
+                "pyannote_repair_required",
+            ),
+            (
+                companion_diarization_readiness(
+                    SpeakerDiarizationBackend::Pyannote,
+                    "cpu",
+                    &FluidDiarizationHealth::default(),
+                    false,
+                    "pyannote_receipt_invalid",
+                    &host,
+                ),
+                "pyannote_receipt_required",
+            ),
+            (
+                companion_diarization_readiness(
+                    SpeakerDiarizationBackend::Pyannote,
+                    "cpu",
+                    &FluidDiarizationHealth::default(),
+                    false,
+                    "pyannote_arch_mismatch",
+                    &host,
+                ),
+                "pyannote_arch_mismatch",
+            ),
+            (
+                companion_diarization_readiness(
+                    SpeakerDiarizationBackend::Fluid,
+                    "mps",
+                    &fluid_with_path,
+                    false,
+                    "",
+                    &host,
+                ),
+                "device_unsupported",
+            ),
+        ];
+
+        let mut produced = std::collections::BTreeSet::new();
+        for (readiness, expected) in cases {
+            assert_eq!(readiness.reason_code, expected, "{readiness:?}");
+            assert_eq!(readiness.ready, expected == "ok");
+            assert!(
+                DIARIZATION_READINESS_REASON_CODES.contains(&readiness.reason_code),
+                "unexpected code {}",
+                readiness.reason_code
+            );
+            assert!(!readiness.message.is_empty());
+            for forbidden in [
+                "/",
+                "\\",
+                "Application Support",
+                "libpython",
+                ".dylib",
+                ".so",
+                "opt/homebrew",
+                pyannote_message,
+            ] {
+                assert!(
+                    !readiness.message.contains(forbidden),
+                    "message for {} leaks {forbidden}: {}",
+                    readiness.reason_code,
+                    readiness.message
+                );
+            }
+            produced.insert(readiness.reason_code);
+        }
+        assert_eq!(
+            produced.len(),
+            DIARIZATION_READINESS_REASON_CODES.len(),
+            "every closed code should be reachable: {produced:?}"
+        );
+    }
+
+    #[test]
+    fn readiness_requires_a_supported_device_before_claiming_a_missing_backend() {
+        let host = host("macos", Some(15), "aarch64");
+        let fluid = FluidDiarizationHealth {
+            ready: true,
+            ..Default::default()
+        };
+        let readiness = companion_diarization_readiness(
+            SpeakerDiarizationBackend::Fluid,
+            "mps",
+            &fluid,
+            true,
+            "ok",
+            &host,
+        );
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason_code, "device_unsupported");
+
+        let readiness = companion_diarization_readiness(
+            SpeakerDiarizationBackend::Pyannote,
+            "ane",
+            &fluid,
+            true,
+            "ok",
+            &host,
+        );
+        assert!(!readiness.ready);
+        assert_eq!(readiness.reason_code, "device_unsupported");
     }
 }

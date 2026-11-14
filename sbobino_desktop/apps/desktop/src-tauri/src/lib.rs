@@ -34,8 +34,8 @@ use crate::commands::automatic_import::{
 };
 use crate::commands::backup::{export_app_backup, import_app_backup};
 use crate::commands::companion::{
-    companion_ai_status, companion_status, select_companion_ai_provider, start_companion,
-    stop_companion,
+    companion_ai_status, companion_pairing_state, companion_status, revoke_companion_pairing,
+    select_companion_ai_provider, start_companion, stop_companion,
 };
 use crate::commands::provisioning::{
     plan_pyannote_background_action, provisioning_cancel, provisioning_download_model,
@@ -143,6 +143,29 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // Identity guard: fail closed before menu work, app data
+            // initialisation, RuntimeFactory bootstrap, artifact storage and
+            // secure storage (Keychain or local file backend).
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| PathBuf::from("."));
+            let bootstrap_profile =
+                bootstrap_isolation::authorize_bootstrap(&bootstrap_isolation::BootstrapRequest {
+                    identifier: &app.config().identifier,
+                    data_dir: &data_dir,
+                    support_dir: std::env::var_os(bootstrap_isolation::APP_SUPPORT_ENV)
+                        .map(PathBuf::from),
+                    local_secrets_opt_in: bootstrap_isolation::local_secrets_opt_in(
+                        std::env::var_os(bootstrap_isolation::LOCAL_SECRETS_ENV).as_deref(),
+                    ),
+                    home: std::env::var_os("HOME").map(PathBuf::from),
+                })
+                .map_err(|error| {
+                    tracing::error!("{error}");
+                    std::io::Error::other(error)
+                })?;
+
             #[cfg(target_os = "macos")]
             setup_macos_app_menu(app.handle())
                 .map_err(|error| std::io::Error::other(format!("menu setup failure: {error}")))?;
@@ -160,14 +183,19 @@ pub fn run() {
                 );
             }
 
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .unwrap_or_else(|_| PathBuf::from("."));
             let resources_dir = app.path().resource_dir().ok();
 
             let bundle = sbobino_infrastructure::bootstrap(&data_dir, resources_dir)
                 .map_err(|e| std::io::Error::other(format!("bootstrap failure: {e}")))?;
+
+            // The local secrets backend must have produced its master key file
+            // during the bootstrap; a candidate without it is not isolated.
+            bootstrap_profile
+                .verify_local_secrets_marker()
+                .map_err(|error| {
+                    tracing::error!("{error}");
+                    std::io::Error::other(error)
+                })?;
 
             let realtime_engine = bundle
                 .runtime_factory
@@ -213,6 +241,8 @@ pub fn run() {
             start_companion,
             stop_companion,
             companion_status,
+            companion_pairing_state,
+            revoke_companion_pairing,
             companion_ai_status,
             select_companion_ai_provider,
             get_settings,
@@ -300,4 +330,647 @@ pub fn run() {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+}
+
+mod bootstrap_isolation {
+    use std::ffi::{OsStr, OsString};
+    use std::path::{Component, Path, PathBuf};
+
+    /// Compiled product identifier. Only this identity keeps the historical
+    /// behaviour (product data dir, Keychain, managed runtime).
+    pub const OFFICIAL_IDENTIFIER: &str = "com.sbobino.desktop";
+    /// Existing opt-in that switches secure storage to the local file backend.
+    /// Candidates require the explicit value `1`; the official backend's
+    /// historical parser is intentionally unchanged.
+    pub const LOCAL_SECRETS_ENV: &str = "SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS";
+    /// Existing isolated runtime support directory for verification launchers.
+    pub const APP_SUPPORT_ENV: &str = "SBOBINO_APP_SUPPORT_DIR";
+    /// Stable marker so a launcher can prove a bundle contains this guard.
+    pub const GUARD_MARKER: &str = "bootstrap isolation guard";
+
+    const SECURE_STORAGE_MARKER: &str = ".sbobino-secure-storage/master_key_v1";
+    const PERSONAL_PROFILE_NAMES: [&str; 2] = ["com.sbobino.desktop", "sbobino"];
+
+    pub fn local_secrets_opt_in(value: Option<&OsStr>) -> bool {
+        value == Some(OsStr::new("1"))
+    }
+
+    pub struct BootstrapRequest<'a> {
+        pub identifier: &'a str,
+        pub data_dir: &'a Path,
+        pub support_dir: Option<PathBuf>,
+        pub local_secrets_opt_in: bool,
+        pub home: Option<PathBuf>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum BootstrapProfile {
+        Official,
+        IsolatedCandidate {
+            data_dir: PathBuf,
+            support_dir: PathBuf,
+        },
+    }
+
+    impl BootstrapProfile {
+        pub fn verify_local_secrets_marker(&self) -> Result<(), String> {
+            let Self::IsolatedCandidate { data_dir, .. } = self else {
+                return Ok(());
+            };
+            let marker = data_dir.join(SECURE_STORAGE_MARKER);
+            if marker.is_file() {
+                Ok(())
+            } else {
+                Err(refusal(format!(
+                    "the local secrets backend did not create '{}'; refusing to run a \
+                     non-official identity without verifiable isolated secure storage",
+                    marker.display()
+                )))
+            }
+        }
+    }
+
+    pub fn authorize_bootstrap(request: &BootstrapRequest<'_>) -> Result<BootstrapProfile, String> {
+        let identifier = request.identifier.trim();
+        if identifier.is_empty() {
+            return Err(refusal(
+                "the compiled application identifier is empty; refusing to bootstrap",
+            ));
+        }
+
+        // The official product identity keeps the historical behaviour: product
+        // data dir, Keychain, managed runtime and no new requirement.
+        if identifier == OFFICIAL_IDENTIFIER {
+            return Ok(BootstrapProfile::Official);
+        }
+
+        // Every other identity is a verification/candidate build. It may only
+        // start with an explicit opt-in to the existing local secrets backend,
+        // and never falls back to the product profile.
+        if !request.local_secrets_opt_in {
+            return Err(refusal(format!(
+                "identifier '{identifier}' is not the official product identity \
+                 '{OFFICIAL_IDENTIFIER}'; it requires an explicit local secrets opt-in \
+                 ({LOCAL_SECRETS_ENV}=1) together with an isolated runtime support path \
+                 ({APP_SUPPORT_ENV}=<isolated dir>). Refusing to bootstrap before settings, \
+                 artifacts or Keychain access, and refusing to fall back to the product \
+                 profile"
+            )));
+        }
+
+        let home = request.home.as_deref().filter(|path| path.is_absolute()).ok_or_else(|| {
+            refusal("a non-official identity requires an absolute home directory to exclude personal profiles")
+        })?;
+        let data_dir = require_absolute("candidate data dir", request.data_dir)?;
+        reject_personal_profile_path(identifier, "candidate data dir", &data_dir, Some(home))?;
+
+        // The bundled parakeet-cli wrapper falls back to the product application
+        // support directory when this variable is absent, so an isolated
+        // candidate has to declare it.
+        let support_dir = match &request.support_dir {
+            Some(path) if !path.as_os_str().is_empty() => require_absolute(APP_SUPPORT_ENV, path)?,
+            _ => {
+                return Err(refusal(format!(
+                    "identifier '{identifier}' must declare {APP_SUPPORT_ENV}=<isolated dir>; \
+                     the runtime wrapper would otherwise resolve the '{OFFICIAL_IDENTIFIER}' \
+                     application support directory"
+                )));
+            }
+        };
+        reject_personal_profile_path(identifier, APP_SUPPORT_ENV, &support_dir, Some(home))?;
+
+        // Only after every refusal path has passed do we create or restrict the
+        // candidate profile, so a refused launch leaves the filesystem untouched.
+        ensure_private_directory("candidate data dir", &data_dir)?;
+        ensure_private_directory(APP_SUPPORT_ENV, &support_dir)?;
+
+        Ok(BootstrapProfile::IsolatedCandidate {
+            data_dir,
+            support_dir,
+        })
+    }
+
+    fn refusal(message: impl AsRef<str>) -> String {
+        format!("{}: {}", GUARD_MARKER, message.as_ref())
+    }
+
+    fn resolve_existing_ancestors(path: &Path) -> PathBuf {
+        let mut candidate = path.to_path_buf();
+        let mut suffix: Vec<OsString> = Vec::new();
+        loop {
+            if let Ok(resolved) = std::fs::canonicalize(&candidate) {
+                let mut output = resolved;
+                for part in suffix.iter().rev() {
+                    output.push(part);
+                }
+                return output;
+            }
+            let Some(name) = candidate.file_name().map(|name| name.to_os_string()) else {
+                return path.to_path_buf();
+            };
+            let Some(parent) = candidate.parent() else {
+                return path.to_path_buf();
+            };
+            if parent.as_os_str().is_empty() {
+                return path.to_path_buf();
+            }
+            suffix.push(name);
+            candidate = parent.to_path_buf();
+        }
+    }
+
+    fn require_absolute(label: &str, path: &Path) -> Result<PathBuf, String> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(refusal(format!(
+                "{label} '{}' must be an absolute path without parent traversal; refusing \
+                 a non-official identity with an unresolved path",
+                path.display()
+            )));
+        }
+        Ok(path.to_path_buf())
+    }
+
+    fn reject_personal_profile_path(
+        identifier: &str,
+        label: &str,
+        path: &Path,
+        home: Option<&Path>,
+    ) -> Result<(), String> {
+        let resolved = resolve_existing_ancestors(path);
+        if let Some(name) = resolved.file_name().and_then(|name| name.to_str()) {
+            if PERSONAL_PROFILE_NAMES
+                .iter()
+                .any(|personal| personal.eq_ignore_ascii_case(name))
+            {
+                return Err(refusal(format!(
+                    "{label} '{}' resolves to the personal profile '{}'; refusing to touch \
+                     product data from identifier '{identifier}'",
+                    path.display(),
+                    resolved.display()
+                )));
+            }
+        }
+        if let Some(home) = home {
+            for personal in PERSONAL_PROFILE_NAMES {
+                let personal_dir = resolve_existing_ancestors(
+                    &home
+                        .join("Library")
+                        .join("Application Support")
+                        .join(personal),
+                );
+                if resolved == personal_dir
+                    || resolved.starts_with(&personal_dir)
+                    || personal_dir.starts_with(&resolved)
+                {
+                    return Err(refusal(format!(
+                        "{label} '{}' resolves inside the personal profile '{}'; refusing to \
+                         touch product data from identifier '{identifier}'",
+                        path.display(),
+                        personal_dir.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_private_directory(label: &str, path: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(path).map_err(|error| {
+            refusal(format!(
+                "cannot create {label} '{}': {error}",
+                path.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    refusal(format!(
+                        "{label} '{}' cannot be restricted to mode 0700: {error}",
+                        path.display()
+                    ))
+                },
+            )?;
+            let mode = std::fs::metadata(path)
+                .map_err(|error| {
+                    refusal(format!(
+                        "cannot inspect {label} '{}': {error}",
+                        path.display()
+                    ))
+                })?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode != 0o700 {
+                return Err(refusal(format!(
+                    "{label} '{}' is mode {mode:04o} instead of 0700",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bootstrap_isolation_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
+
+    use super::bootstrap_isolation::{
+        authorize_bootstrap, BootstrapProfile, BootstrapRequest, APP_SUPPORT_ENV, GUARD_MARKER,
+        LOCAL_SECRETS_ENV, OFFICIAL_IDENTIFIER,
+    };
+
+    const CANDIDATE_IDENTIFIER: &str = "com.sbobino.companion.baseline.isolated2";
+
+    struct Fixture {
+        temp: TempDir,
+        home: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = TempDir::new().expect("temp dir");
+            let home = temp.path().join("home");
+            fs::create_dir_all(home.join("Library").join("Application Support"))
+                .expect("fixture home");
+            let fixture = Self { temp, home };
+            for profile in [OFFICIAL_IDENTIFIER, "sbobino"] {
+                let dir = fixture.application_support().join(profile);
+                fs::create_dir_all(&dir).expect("personal profile");
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))
+                    .expect("personal profile mode");
+            }
+            fixture
+        }
+
+        fn application_support(&self) -> PathBuf {
+            self.home.join("Library").join("Application Support")
+        }
+
+        fn product_profile(&self) -> PathBuf {
+            self.application_support().join(OFFICIAL_IDENTIFIER)
+        }
+
+        fn legacy_profile(&self) -> PathBuf {
+            self.application_support().join("sbobino")
+        }
+
+        /// Candidate-owned directory outside the synthetic home.
+        fn isolated_root(&self) -> PathBuf {
+            self.temp.path().join("candidate-root")
+        }
+
+        fn request<'a>(
+            &'a self,
+            identifier: &'a str,
+            data_dir: &'a Path,
+            support_dir: Option<PathBuf>,
+            local_secrets_opt_in: bool,
+        ) -> BootstrapRequest<'a> {
+            BootstrapRequest {
+                identifier,
+                data_dir,
+                support_dir,
+                local_secrets_opt_in,
+                home: Some(self.home.clone()),
+            }
+        }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn non_canonical_identifier_without_local_secrets_opt_in_is_refused() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.application_support().join(CANDIDATE_IDENTIFIER);
+        let support_dir = fixture.isolated_root().join("app-support");
+
+        let error = authorize_bootstrap(&fixture.request(
+            CANDIDATE_IDENTIFIER,
+            &data_dir,
+            Some(support_dir.clone()),
+            false,
+        ))
+        .expect_err("non-official identifier without opt-in must be refused");
+
+        assert!(error.contains(GUARD_MARKER), "unexpected error: {error}");
+        assert!(
+            error.contains(LOCAL_SECRETS_ENV),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains(CANDIDATE_IDENTIFIER),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !data_dir.exists(),
+            "the guard must refuse before creating or touching the candidate data dir"
+        );
+        assert!(
+            !support_dir.exists(),
+            "the guard must refuse before creating the candidate support dir"
+        );
+        assert_eq!(
+            mode_of(&fixture.product_profile()),
+            0o755,
+            "the product profile must stay untouched by the refusal path"
+        );
+    }
+
+    #[test]
+    fn non_canonical_identifier_with_opt_in_and_separated_paths_is_allowed() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.application_support().join(CANDIDATE_IDENTIFIER);
+        fs::create_dir_all(&data_dir).expect("pre-existing candidate data dir");
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o755)).expect("loose mode");
+        let support_dir = fixture.isolated_root().join("app-support");
+
+        let profile = authorize_bootstrap(&fixture.request(
+            CANDIDATE_IDENTIFIER,
+            &data_dir,
+            Some(support_dir.clone()),
+            true,
+        ))
+        .expect("explicit opt-in with separated paths is allowed");
+
+        assert_eq!(
+            profile,
+            BootstrapProfile::IsolatedCandidate {
+                data_dir: data_dir.clone(),
+                support_dir: support_dir.clone(),
+            }
+        );
+        assert_eq!(mode_of(&data_dir), 0o700, "candidate data dir must be 0700");
+        assert_eq!(
+            mode_of(&support_dir),
+            0o700,
+            "candidate support dir must be 0700"
+        );
+        assert_eq!(mode_of(&fixture.product_profile()), 0o755);
+        assert_eq!(mode_of(&fixture.legacy_profile()), 0o755);
+    }
+
+    #[test]
+    fn official_identifier_keeps_the_existing_behaviour() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.product_profile();
+
+        let profile =
+            authorize_bootstrap(&fixture.request(OFFICIAL_IDENTIFIER, &data_dir, None, false))
+                .expect("the official product identifier must always bootstrap");
+
+        assert_eq!(profile, BootstrapProfile::Official);
+        assert_eq!(
+            mode_of(&fixture.product_profile()),
+            0o755,
+            "the official profile mode must not be rewritten"
+        );
+        assert!(
+            !fixture
+                .product_profile()
+                .join(".sbobino-secure-storage")
+                .exists(),
+            "the official flow must not create a local secret backend"
+        );
+    }
+
+    #[test]
+    fn non_canonical_identifier_pointing_at_the_product_profile_is_refused() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.product_profile();
+        let support_dir = fixture.isolated_root().join("app-support");
+
+        let error = authorize_bootstrap(&fixture.request(
+            CANDIDATE_IDENTIFIER,
+            &data_dir,
+            Some(support_dir),
+            true,
+        ))
+        .expect_err("a candidate identity may not use the product profile");
+
+        assert!(error.contains(GUARD_MARKER), "unexpected error: {error}");
+        assert_eq!(mode_of(&fixture.product_profile()), 0o755);
+    }
+
+    #[test]
+    fn non_canonical_identifier_with_symlinked_product_profile_alias_is_refused() {
+        let fixture = Fixture::new();
+        let alias = fixture.application_support().join(CANDIDATE_IDENTIFIER);
+        std::os::unix::fs::symlink(fixture.product_profile(), &alias).expect("symlink alias");
+        let support_dir = fixture.isolated_root().join("app-support");
+
+        let error = authorize_bootstrap(&fixture.request(
+            CANDIDATE_IDENTIFIER,
+            &alias,
+            Some(support_dir),
+            true,
+        ))
+        .expect_err("a symlink alias of the product profile must be refused");
+
+        assert!(error.contains(GUARD_MARKER), "unexpected error: {error}");
+        assert_eq!(
+            mode_of(&fixture.product_profile()),
+            0o755,
+            "a symlink alias must be refused before any chmod reaches the product profile"
+        );
+    }
+
+    #[test]
+    fn non_canonical_identifier_with_support_dir_alias_of_legacy_profile_is_refused() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.isolated_root().join("data");
+        let support_alias = fixture.isolated_root().join("app-support");
+        fs::create_dir_all(fixture.isolated_root()).expect("isolated root");
+        std::os::unix::fs::symlink(fixture.legacy_profile(), &support_alias)
+            .expect("symlink support alias");
+
+        let error = authorize_bootstrap(&fixture.request(
+            CANDIDATE_IDENTIFIER,
+            &data_dir,
+            Some(support_alias),
+            true,
+        ))
+        .expect_err("a support dir aliased to the legacy profile must be refused");
+
+        assert!(error.contains(GUARD_MARKER), "unexpected error: {error}");
+        assert_eq!(mode_of(&fixture.legacy_profile()), 0o755);
+    }
+
+    #[test]
+    fn non_canonical_identifier_with_support_dir_inside_product_profile_is_refused() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.isolated_root().join("data");
+        let support_dir = fixture.product_profile().join("verification-support");
+
+        let error = authorize_bootstrap(&fixture.request(
+            CANDIDATE_IDENTIFIER,
+            &data_dir,
+            Some(support_dir),
+            true,
+        ))
+        .expect_err("a support dir inside the product profile must be refused");
+
+        assert!(error.contains(GUARD_MARKER), "unexpected error: {error}");
+        assert!(!fixture.isolated_root().join("data").exists());
+    }
+
+    #[test]
+    fn non_canonical_identifier_without_support_dir_is_refused() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.isolated_root().join("data");
+
+        let error =
+            authorize_bootstrap(&fixture.request(CANDIDATE_IDENTIFIER, &data_dir, None, true))
+                .expect_err("a candidate identity must declare an isolated runtime support dir");
+
+        assert!(error.contains(APP_SUPPORT_ENV), "unexpected error: {error}");
+        assert!(!data_dir.exists());
+    }
+
+    #[test]
+    fn non_canonical_identifier_with_relative_data_dir_is_refused() {
+        let fixture = Fixture::new();
+        let data_dir = PathBuf::from("relative-data");
+        let support_dir = fixture.isolated_root().join("app-support");
+
+        let error = authorize_bootstrap(&fixture.request(
+            CANDIDATE_IDENTIFIER,
+            &data_dir,
+            Some(support_dir),
+            true,
+        ))
+        .expect_err("an unresolved relative data dir must be refused");
+
+        assert!(error.contains(GUARD_MARKER), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn isolated_candidate_must_prove_the_local_secrets_backend_after_bootstrap() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.isolated_root().join("data");
+        let support_dir = fixture.isolated_root().join("app-support");
+        let profile = authorize_bootstrap(&fixture.request(
+            CANDIDATE_IDENTIFIER,
+            &data_dir,
+            Some(support_dir),
+            true,
+        ))
+        .expect("isolated candidate plan");
+
+        let error = profile
+            .verify_local_secrets_marker()
+            .expect_err("a candidate without a local master key must fail closed");
+        assert!(error.contains(GUARD_MARKER), "unexpected error: {error}");
+
+        let marker = data_dir
+            .join(".sbobino-secure-storage")
+            .join("master_key_v1");
+        fs::create_dir_all(marker.parent().expect("marker parent")).expect("secure storage dir");
+        fs::write(&marker, b"00").expect("marker placeholder");
+        profile
+            .verify_local_secrets_marker()
+            .expect("an existing local master key marker certifies the isolated backend");
+
+        let official = authorize_bootstrap(&fixture.request(
+            OFFICIAL_IDENTIFIER,
+            &fixture.product_profile(),
+            None,
+            false,
+        ))
+        .expect("official plan");
+        official
+            .verify_local_secrets_marker()
+            .expect("the official Keychain flow has no local marker to prove");
+    }
+
+    #[test]
+    fn candidate_local_secrets_opt_in_requires_the_explicit_value_one() {
+        use std::ffi::OsStr;
+        assert!(!super::bootstrap_isolation::local_secrets_opt_in(None));
+        for value in ["", "0", "false", "true", "yes"] {
+            assert!(!super::bootstrap_isolation::local_secrets_opt_in(Some(
+                OsStr::new(value)
+            )));
+        }
+        assert!(super::bootstrap_isolation::local_secrets_opt_in(Some(
+            OsStr::new("1")
+        )));
+    }
+
+    #[test]
+    fn candidate_without_known_home_is_refused_before_creating_data() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.isolated_root().join("data");
+        let support_dir = fixture.isolated_root().join("support");
+        let mut request = fixture.request(
+            CANDIDATE_IDENTIFIER,
+            &data_dir,
+            Some(support_dir.clone()),
+            true,
+        );
+        request.home = None;
+        assert!(authorize_bootstrap(&request).is_err());
+        assert!(!data_dir.exists());
+        assert!(!support_dir.exists());
+    }
+
+    #[test]
+    fn candidate_parent_traversal_and_personal_profile_ancestors_are_refused() {
+        let fixture = Fixture::new();
+        let data_dir = fixture.isolated_root().join("data");
+        for support_dir in [
+            fixture.isolated_root().join("missing/../support"),
+            fixture.application_support(),
+        ] {
+            let request = fixture.request(CANDIDATE_IDENTIFIER, &data_dir, Some(support_dir), true);
+            assert!(authorize_bootstrap(&request).is_err());
+            assert!(!data_dir.exists());
+            assert_eq!(mode_of(&fixture.product_profile()), 0o755);
+        }
+    }
+
+    #[test]
+    fn setup_authorises_the_profile_before_infrastructure_bootstrap() {
+        let source = include_str!("lib.rs");
+
+        let setup = source.find(".setup(|app|").expect("tauri setup closure");
+        let guard = source
+            .find("bootstrap_isolation::authorize_bootstrap")
+            .expect("setup must call the isolation guard");
+        let bootstrap = source
+            .find("sbobino_infrastructure::bootstrap(")
+            .expect("setup must call the infrastructure bootstrap");
+        let marker = source
+            .find(".verify_local_secrets_marker()")
+            .expect("setup must verify the local secrets marker");
+
+        assert!(
+            setup < guard && guard < bootstrap,
+            "the isolation guard must run inside setup before the infrastructure bootstrap"
+        );
+        assert!(
+            bootstrap < marker,
+            "the local secrets marker can only be verified after the bootstrap"
+        );
+
+        let data_dir = source
+            .find("app_data_dir()")
+            .expect("app data dir resolution");
+        assert!(
+            setup < data_dir && data_dir < guard,
+            "the guard must consume the resolved app data dir before any bootstrap step"
+        );
+    }
 }

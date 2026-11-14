@@ -3233,7 +3233,7 @@ impl RuntimeTranscriptionFactory {
     fn migrate_models_dir_if_needed(&self, settings: &mut AppSettings) -> Result<(), String> {
         let current_models_dir =
             PathBuf::from(self.resolve_models_dir(&settings.transcription.models_dir));
-        let Some(legacy_models_dir) = legacy_models_dir() else {
+        let Some(legacy_models_dir) = legacy_models_dir(&self.data_dir) else {
             return Ok(());
         };
 
@@ -3615,48 +3615,43 @@ fn encoder_for_model(model_filename: &str) -> Option<&'static str> {
         .map(|(_model, encoder)| *encoder)
 }
 
-fn legacy_models_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("sbobino")
-            .join("models")
-    })
+fn legacy_models_dir(current_data_dir: &Path) -> Option<PathBuf> {
+    let parent = current_data_dir.parent()?;
+    canonical_app_identifier(current_data_dir)?;
+    Some(parent.join("sbobino").join("models"))
 }
 
 fn legacy_pyannote_runtime_dirs(current_data_dir: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
     let Some(parent) = current_data_dir.parent() else {
-        return candidates;
+        return Vec::new();
+    };
+    let Some(current_name) = canonical_app_identifier(current_data_dir) else {
+        return Vec::new();
     };
 
-    let current_name = current_data_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    if current_name == "com.sbobino.desktop" {
-        candidates.push(parent.join("sbobino").join("runtime").join("pyannote"));
-    } else if current_name == "sbobino" {
-        candidates.push(
-            parent
-                .join("com.sbobino.desktop")
-                .join("runtime")
-                .join("pyannote"),
-        );
+    // Only the two canonical product identities may adopt runtime assets from
+    // a sibling profile. Custom/verification identifiers (for example
+    // `com.sbobino.companion.baseline`) must stay isolated and never read a
+    // canonical profile's runtime directory.
+    let legacy_name = if current_name == "com.sbobino.desktop" {
+        "sbobino"
     } else {
-        candidates.push(parent.join("sbobino").join("runtime").join("pyannote"));
-        candidates.push(
-            parent
-                .join("com.sbobino.desktop")
-                .join("runtime")
-                .join("pyannote"),
-        );
-    }
+        "com.sbobino.desktop"
+    };
 
-    candidates
+    vec![parent.join(legacy_name).join("runtime").join("pyannote")]
+}
+
+fn canonical_app_identifier(data_dir: &Path) -> Option<String> {
+    ["com.sbobino.desktop", "sbobino"]
+        .into_iter()
+        .find(|canonical| {
+            data_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(canonical))
+        })
+        .map(str::to_string)
 }
 
 fn pyannote_runtime_layout_is_usable(runtime_dir: &Path) -> bool {
@@ -4651,6 +4646,19 @@ mod tests {
         (temp, factory)
     }
 
+    /// Builds a factory whose data directory has an explicit application
+    /// identity (the last path component), so legacy-migration boundaries can
+    /// be exercised without touching any real profile directory.
+    fn build_factory_with_data_dir_name(
+        name: &str,
+    ) -> (tempfile::TempDir, RuntimeTranscriptionFactory) {
+        let temp = tempdir().expect("failed to create tempdir");
+        let data_dir = temp.path().join(name);
+        let factory = RuntimeTranscriptionFactory::new_for_tests(&data_dir, None)
+            .expect("factory should build");
+        (temp, factory)
+    }
+
     #[test]
     fn live_start_health_uses_the_pinned_quantized_tiny_model() {
         let (_temp, factory) = build_factory();
@@ -4841,6 +4849,32 @@ mod tests {
         .expect("collections __init__ should write");
         std::fs::write(stdlib_dir.join("collections").join("abc.py"), "# test\n")
             .expect("collections abc should write");
+    }
+
+    fn write_fake_pyannote_runtime(runtime_dir: &std::path::Path, python_marker: &str) {
+        write_executable_file(
+            &runtime_dir.join("python").join("bin").join("python3"),
+            &format!("#!/bin/sh\n# {python_marker}\nexit 0\n"),
+        );
+        std::fs::create_dir_all(runtime_dir.join("model"))
+            .expect("pyannote model dir should exist");
+        std::fs::write(
+            runtime_dir.join("model").join("config.yaml"),
+            "name: test\n",
+        )
+        .expect("pyannote model marker should write");
+    }
+
+    fn write_complete_models_dir(models_dir: &std::path::Path) {
+        std::fs::create_dir_all(models_dir).expect("models dir should exist");
+        for filename in super::REQUIRED_MODEL_FILES {
+            std::fs::write(models_dir.join(filename), b"fixture")
+                .expect("model fixture should write");
+        }
+        for (_model, encoder_dir) in super::REQUIRED_COREML_ENCODERS {
+            std::fs::create_dir_all(models_dir.join(encoder_dir))
+                .expect("encoder fixture dir should exist");
+        }
     }
 
     fn write_test_pyannote_receipt_with_app_version(
@@ -5525,30 +5559,17 @@ mod tests {
 
     #[test]
     fn load_settings_migrates_legacy_pyannote_runtime_directory_when_current_is_missing() {
-        let (_temp, factory) = build_factory();
+        let (_temp, factory) = build_factory_with_data_dir_name("com.sbobino.desktop");
         persist_enabled_diarization(&factory);
 
         let legacy_runtime_dir = factory
             .data_dir()
             .parent()
             .expect("data dir should have parent")
-            .join("com.sbobino.desktop")
+            .join("sbobino")
             .join("runtime")
             .join("pyannote");
-        write_executable_file(
-            &legacy_runtime_dir
-                .join("python")
-                .join("bin")
-                .join("python3"),
-            "#!/bin/sh\nexit 0\n",
-        );
-        std::fs::create_dir_all(legacy_runtime_dir.join("model"))
-            .expect("legacy model dir should exist");
-        std::fs::write(
-            legacy_runtime_dir.join("model").join("config.yaml"),
-            "name: test\n",
-        )
-        .expect("legacy model marker should write");
+        write_fake_pyannote_runtime(&legacy_runtime_dir, "legacy-sbobino");
 
         factory.load_settings().expect("settings should load");
 
@@ -5566,6 +5587,194 @@ mod tests {
                 .join("config.yaml")
                 .is_file(),
             "managed pyannote model should be migrated into current data dir"
+        );
+    }
+
+    #[test]
+    fn load_settings_custom_identity_does_not_copy_canonical_sibling_pyannote_runtime() {
+        let temp = tempdir().expect("failed to create tempdir");
+        let support_dir = temp.path().join("Application Support");
+        let custom_data_dir = support_dir.join("com.sbobino.companion.baseline");
+        let factory = RuntimeTranscriptionFactory::new_for_tests(&custom_data_dir, None)
+            .expect("factory should build");
+
+        // A complete absolute models directory keeps the legacy models probe
+        // out of this red/green check, so it never inspects a real HOME.
+        let mut settings = AppSettings::default();
+        settings.transcription.speaker_diarization.enabled = true;
+        let complete_models_dir = custom_data_dir.join("models");
+        write_complete_models_dir(&complete_models_dir);
+        settings.transcription.models_dir = complete_models_dir.to_string_lossy().to_string();
+        persist_settings(&factory, &settings);
+
+        let sbobino_runtime = support_dir.join("sbobino").join("runtime").join("pyannote");
+        let desktop_runtime = support_dir
+            .join("com.sbobino.desktop")
+            .join("runtime")
+            .join("pyannote");
+        write_fake_pyannote_runtime(&sbobino_runtime, "canonical-sbobino");
+        write_fake_pyannote_runtime(&desktop_runtime, "canonical-desktop");
+
+        let loaded = factory.load_settings().expect("settings should load");
+
+        assert!(
+            !factory
+                .managed_pyannote_python_dir()
+                .join("bin")
+                .join("python3")
+                .exists(),
+            "a custom identity must not copy a canonical profile's pyannote runtime"
+        );
+        assert!(
+            sbobino_runtime
+                .join("python")
+                .join("bin")
+                .join("python3")
+                .is_file(),
+            "the sbobino profile runtime must stay untouched"
+        );
+        assert!(
+            desktop_runtime
+                .join("python")
+                .join("bin")
+                .join("python3")
+                .is_file(),
+            "the com.sbobino.desktop runtime must stay untouched"
+        );
+        assert_eq!(
+            loaded.transcription.models_dir,
+            complete_models_dir.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn legacy_pyannote_runtime_dirs_ignore_canonical_siblings_for_non_canonical_data_dirs() {
+        let parent = PathBuf::from("Application Support");
+        for data_dir in [
+            parent.join("com.sbobino.companion.baseline"),
+            parent.join("com.sbobino.companion.baseline.isolated2"),
+            parent.join("app-support"),
+            PathBuf::from("/"),
+            PathBuf::new(),
+        ] {
+            assert!(
+                super::legacy_pyannote_runtime_dirs(&data_dir).is_empty(),
+                "non-canonical data dir '{}' must not search canonical legacy runtimes",
+                data_dir.display()
+            );
+            assert_eq!(
+                super::legacy_models_dir(&data_dir),
+                None,
+                "non-canonical data dir '{}' must not search canonical legacy models",
+                data_dir.display()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_candidates_exist_only_for_the_canonical_product_identities() {
+        let parent = PathBuf::from("Application Support");
+        assert_eq!(
+            super::legacy_pyannote_runtime_dirs(&parent.join("com.sbobino.desktop")),
+            vec![parent.join("sbobino").join("runtime").join("pyannote")]
+        );
+        assert_eq!(
+            super::legacy_pyannote_runtime_dirs(&parent.join("SBOBINO")),
+            vec![parent
+                .join("com.sbobino.desktop")
+                .join("runtime")
+                .join("pyannote")]
+        );
+        assert_eq!(
+            super::legacy_models_dir(&parent.join("com.sbobino.desktop")),
+            Some(parent.join("sbobino").join("models"))
+        );
+        assert_eq!(
+            super::legacy_models_dir(&parent.join("sbobino")),
+            Some(parent.join("sbobino").join("models"))
+        );
+    }
+
+    #[test]
+    fn load_settings_migrates_legacy_models_directory_for_canonical_identity() {
+        let (_temp, factory) = build_factory_with_data_dir_name("com.sbobino.desktop");
+        let legacy_models_dir = factory
+            .data_dir()
+            .parent()
+            .expect("data dir should have parent")
+            .join("sbobino")
+            .join("models");
+        write_complete_models_dir(&legacy_models_dir);
+
+        let settings = factory.load_settings().expect("settings should load");
+
+        let expected = legacy_models_dir.to_string_lossy().to_string();
+        assert_eq!(settings.transcription.models_dir, expected);
+        assert_eq!(settings.models_dir, expected);
+        assert_eq!(
+            factory
+                .load_settings()
+                .expect("migrated settings should reload")
+                .transcription
+                .models_dir,
+            expected,
+            "the migrated models path must be persisted"
+        );
+    }
+
+    #[test]
+    fn load_settings_custom_identity_does_not_adopt_canonical_sibling_models() {
+        let (_temp, factory) =
+            build_factory_with_data_dir_name("com.sbobino.companion.baseline.isolated2");
+        let legacy_models_dir = factory
+            .data_dir()
+            .parent()
+            .expect("data dir should have parent")
+            .join("sbobino")
+            .join("models");
+        write_complete_models_dir(&legacy_models_dir);
+
+        let settings = factory.load_settings().expect("settings should load");
+
+        assert_eq!(settings.transcription.models_dir, "models");
+        assert_eq!(settings.models_dir, "models");
+        assert!(
+            legacy_models_dir.join("ggml-tiny.bin").is_file(),
+            "the canonical profile models must stay untouched"
+        );
+    }
+
+    #[test]
+    fn load_settings_does_not_overwrite_usable_current_pyannote_runtime() {
+        let (_temp, factory) = build_factory_with_data_dir_name("com.sbobino.desktop");
+        persist_enabled_diarization(&factory);
+
+        let current_runtime_dir = factory.managed_pyannote_runtime_dir();
+        write_fake_pyannote_runtime(&current_runtime_dir, "current-runtime");
+        let current_marker = current_runtime_dir.join("current.marker");
+        std::fs::write(&current_marker, b"keep").expect("current marker should write");
+
+        let legacy_runtime_dir = factory
+            .data_dir()
+            .parent()
+            .expect("data dir should have parent")
+            .join("sbobino")
+            .join("runtime")
+            .join("pyannote");
+        write_fake_pyannote_runtime(&legacy_runtime_dir, "legacy-runtime");
+        let legacy_marker = legacy_runtime_dir.join("legacy.marker");
+        std::fs::write(&legacy_marker, b"legacy").expect("legacy marker should write");
+
+        factory.load_settings().expect("settings should load");
+
+        assert!(current_marker.is_file(), "the current runtime must be kept");
+        assert!(
+            !current_runtime_dir.join("legacy.marker").exists(),
+            "a usable current runtime must never be overwritten by a legacy copy"
+        );
+        assert!(
+            legacy_marker.is_file(),
+            "the legacy runtime must stay untouched"
         );
     }
 

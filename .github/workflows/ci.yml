@@ -53,6 +53,7 @@ jobs:
             scripts/test_run_whisper_live_replay.py \
             scripts/test_prepare_fluid_diarizer_models.py \
             scripts/test_package_fluid_diarizer.py \
+            scripts/test_pyannote_portable_runtime.py \
             scripts/test_run_fluid_speaker_replay.py
       - name: Clippy
         run: cargo clippy -p sbobino-domain -p sbobino-application -p sbobino-infrastructure --all-targets -- -D warnings
@@ -143,6 +144,8 @@ jobs:
         run: cargo test --workspace --target "${{ matrix.target }}"
       - name: Verify macOS updater signature roundtrip
         run: python3 scripts/test_macos_bundle_scripts.py
+      - name: Verify native Pyannote portability tooling
+        run: python3 scripts/test_pyannote_portable_runtime.py
       - name: Lint native workspace
         run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
       - name: Test native FluidAudio helper

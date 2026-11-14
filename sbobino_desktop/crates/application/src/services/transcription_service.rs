@@ -13,9 +13,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{instrument, warn};
 
 use sbobino_domain::{
-    constrain_transcript_edit, minimize_transcript_repetitions, ArtifactKind, JobProgress,
-    JobStage, LanguageCode, SpeakerTurn, TimedSegment, TranscriptArtifact, TranscriptionEngine,
-    TranscriptionOutput,
+    artifact::speaker_turns_json, constrain_transcript_edit, minimize_transcript_repetitions,
+    ArtifactKind, JobProgress, JobStage, LanguageCode, SpeakerTurn, TimedSegment,
+    TranscriptArtifact, TranscriptionEngine, TranscriptionOutput,
 };
 
 use crate::{
@@ -34,6 +34,9 @@ const AUTO_IMPORT_GENERATE_PRESET_OUTPUT_METADATA_KEY: &str = "auto_import_gener
 const AUTO_POST_SUMMARY_STATUS_METADATA_KEY: &str = "auto_post_summary_status";
 const AUTO_POST_FAQS_STATUS_METADATA_KEY: &str = "auto_post_faqs_status";
 const AUTO_POST_PRESET_OUTPUT_STATUS_METADATA_KEY: &str = "auto_post_preset_output_status";
+/// Reserved metadata key owned exclusively by a diarization run of the current
+/// job. Caller-supplied values are always discarded.
+const SPEAKER_TURNS_METADATA_KEY: &str = "speaker_turns_v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceLanguageOptimizationGroup {
@@ -314,6 +317,10 @@ impl TranscriptionService {
 
             let mut diarization_status: Option<String> = None;
             let mut diarization_error: Option<String> = None;
+            // Measured turns captured directly from this run's diarizer output.
+            // They are intentionally independent from the ASR segments: no
+            // merge, ordering or interpolation happens here.
+            let mut measured_turns: Option<Vec<SpeakerTurn>> = None;
             // Companion jobs carry an explicit per-job choice. `Some(false)`
             // must not inherit the desktop global setting, while `Some(true)`
             // records a diarization failure if setup is unavailable and keeps
@@ -352,6 +359,10 @@ impl TranscriptionService {
                                             &turns,
                                         );
                                 }
+                                // Keep every measured turn of this run, even
+                                // when the ASR assigned only one speaker to a
+                                // segment or skipped it entirely.
+                                measured_turns = Some(turns);
                             }
                             Err(ApplicationError::Cancelled) => {
                                 return Err(ApplicationError::Cancelled)
@@ -499,6 +510,10 @@ impl TranscriptionService {
             );
 
             let mut metadata = request.metadata.clone();
+            // The reserved key is written only from this run's diarizer output.
+            // A stale or injected request value must never look like a
+            // measurement, even when this job never completes diarization.
+            metadata.remove(SPEAKER_TURNS_METADATA_KEY);
             let processing_language = transcription_output.processing_language_code();
             metadata.insert(
                 "model".to_string(),
@@ -518,6 +533,17 @@ impl TranscriptionService {
                 "timeline_v2".to_string(),
                 transcription_output.timeline_v2_metadata_json(),
             );
+            // Only a completed diarization with at least one structurally valid
+            // measured turn promotes the turns to the artifact. Failure,
+            // cancellation, skip and an empty result keep the key absent.
+            if diarization_status.as_deref() == Some("completed") {
+                if let Some(turns) = measured_turns.as_deref() {
+                    let turns_json = speaker_turns_json(turns);
+                    if turns_json != "[]" {
+                        metadata.insert(SPEAKER_TURNS_METADATA_KEY.to_string(), turns_json);
+                    }
+                }
+            }
             if let Some(status) = diarization_status {
                 metadata.insert("speaker_diarization_status".to_string(), status);
             }
@@ -1144,6 +1170,7 @@ impl TranscriptionService {
             .filter_map(|turn| {
                 if !turn.start_seconds.is_finite()
                     || !turn.end_seconds.is_finite()
+                    || turn.start_seconds < 0.0
                     || turn.end_seconds <= turn.start_seconds
                     || turn.speaker_id.trim().is_empty()
                 {
@@ -1157,8 +1184,8 @@ impl TranscriptionService {
                         .as_ref()
                         .map(|value| value.trim().to_string())
                         .filter(|value| !value.is_empty()),
-                    start_seconds: turn.start_seconds.max(0.0),
-                    end_seconds: turn.end_seconds.max(0.0),
+                    start_seconds: turn.start_seconds,
+                    end_seconds: turn.end_seconds,
                 })
             })
             .collect::<Vec<_>>();
@@ -1190,6 +1217,20 @@ impl TranscriptionService {
                         entry.0 = turn.speaker_label.as_deref();
                     }
                     entry.1.push((start, end));
+                }
+
+                // Any strictly positive overlap with more than one distinct
+                // speaker makes the segment ambiguous: a single label would
+                // attribute the other voices' words to the wrong person. The
+                // segment stays raw even when one voice covers most of it.
+                // Repeated turns of the same speaker are one voice and remain
+                // eligible; a turn that only touches the boundary does not
+                // overlap and is not counted here.
+                if by_speaker.len() > 1 {
+                    let mut unattributed = segment.clone();
+                    unattributed.speaker_id = None;
+                    unattributed.speaker_label = None;
+                    return unattributed;
                 }
 
                 // A duplicated or overlapping diarizer interval must count once
@@ -1228,9 +1269,9 @@ impl TranscriptionService {
                     })
                     .collect::<Vec<_>>();
 
-                // Require one and only one speaker to own a strict majority.
-                // If multiple speakers each cover a majority because their
-                // turns overlap, the segment is ambiguous and remains raw.
+                // Ambiguity was already ruled out above, so the only remaining
+                // decision is coverage: require one and only one speaker to own
+                // a strict majority of the segment.
                 if winners.len() != 1 {
                     return segment.clone();
                 }

@@ -260,6 +260,65 @@ impl TranscriptionOutput {
     }
 }
 
+/// Serializes the diarizer's measured turns for artifact metadata.
+///
+/// This is a pure, additive encoder: it never merges, sorts, clamps or
+/// interpolates measured intervals, and it never derives a turn from ASR
+/// segments. Only individually invalid records are dropped (empty speaker id,
+/// non-finite or inverted bounds, negative start), so a malformed entry cannot
+/// erase the valid turns around it or invent a replacement.
+pub fn speaker_turns_json(turns: &[SpeakerTurn]) -> String {
+    let mut output = String::from("[");
+    let mut written = 0;
+
+    for turn in turns {
+        let speaker_id = turn.speaker_id.trim();
+        if speaker_id.is_empty()
+            || !turn.start_seconds.is_finite()
+            || !turn.end_seconds.is_finite()
+            || turn.start_seconds < 0.0
+            || turn.end_seconds <= turn.start_seconds
+        {
+            continue;
+        }
+
+        if written > 0 {
+            output.push(',');
+        }
+        written += 1;
+
+        output.push_str("{\"speaker_id\":");
+        push_json_string(&mut output, speaker_id);
+        if let Some(speaker_label) = turn
+            .speaker_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+        {
+            output.push_str(",\"speaker_label\":");
+            push_json_string(&mut output, speaker_label);
+        }
+        output.push_str(",\"start_seconds\":");
+        output.push_str(&format_measured_json_number(turn.start_seconds));
+        output.push_str(",\"end_seconds\":");
+        output.push_str(&format_measured_json_number(turn.end_seconds));
+        output.push('}');
+    }
+
+    output.push(']');
+    output
+}
+
+/// Shortest round-trip representation at the diarizer's f32 precision. The
+/// timeline encoder's six-decimal display precision can collapse valid turns.
+fn format_measured_json_number(value: f32) -> String {
+    let mut rendered = value.to_string();
+    if !rendered.contains('.') && !rendered.contains('e') && !rendered.contains('E') {
+        rendered.push_str(".0");
+    }
+    rendered
+}
+
 fn timeline_v2_json_from_segments(segments: &[TimedSegment]) -> String {
     let mut output = String::from("{\"version\":2,\"segments\":[");
 
@@ -418,6 +477,115 @@ mod language_tests {
         };
         assert_eq!(output.processing_language_code(), "it");
         assert!(output.detected_languages_json().contains("\"code\":\"it\""));
+    }
+}
+
+#[cfg(test)]
+mod speaker_turn_tests {
+    use super::{speaker_turns_json, SpeakerTurn};
+    use serde_json::Value;
+
+    fn turn(id: &str, label: Option<&str>, start: f32, end: f32) -> SpeakerTurn {
+        SpeakerTurn {
+            speaker_id: id.to_string(),
+            speaker_label: label.map(str::to_string),
+            start_seconds: start,
+            end_seconds: end,
+        }
+    }
+
+    fn parsed(json: &str) -> Value {
+        serde_json::from_str(json).expect("speaker turns JSON must parse")
+    }
+
+    #[test]
+    fn preserves_measured_order_and_overlap() {
+        let turns = [
+            turn("speaker_2", Some("Speaker 2"), 5.0, 9.0),
+            turn("speaker_1", Some("Speaker 1"), 7.5, 12.0),
+            turn("speaker_2", Some("Speaker 2"), 2.0, 4.0),
+        ];
+
+        assert_eq!(
+            parsed(&speaker_turns_json(&turns)),
+            serde_json::json!([
+                {"speaker_id": "speaker_2", "speaker_label": "Speaker 2", "start_seconds": 5.0, "end_seconds": 9.0},
+                {"speaker_id": "speaker_1", "speaker_label": "Speaker 1", "start_seconds": 7.5, "end_seconds": 12.0},
+                {"speaker_id": "speaker_2", "speaker_label": "Speaker 2", "start_seconds": 2.0, "end_seconds": 4.0}
+            ])
+        );
+    }
+
+    #[test]
+    fn drops_invalid_records_without_padding() {
+        let turns = [
+            turn("speaker_1", Some("Speaker 1"), 0.0, 1.0),
+            turn("   ", None, 1.0, 2.0),
+            turn("nan", None, f32::NAN, 2.0),
+            turn("inf", None, 0.0, f32::INFINITY),
+            turn("negative", None, -0.5, 1.0),
+            turn("inverted", None, 3.0, 2.0),
+            turn("  speaker_2  ", Some("  Speaker 2  "), 2.5, 4.0),
+        ];
+
+        let json = speaker_turns_json(&turns);
+        assert_eq!(
+            parsed(&json),
+            serde_json::json!([
+                {"speaker_id": "speaker_1", "speaker_label": "Speaker 1", "start_seconds": 0.0, "end_seconds": 1.0},
+                {"speaker_id": "speaker_2", "speaker_label": "Speaker 2", "start_seconds": 2.5, "end_seconds": 4.0}
+            ])
+        );
+        assert!(!json.contains("NaN"));
+        assert!(!json.to_ascii_lowercase().contains("inf"));
+    }
+
+    #[test]
+    fn escapes_strings_and_keeps_optional_labels_absent() {
+        let turns = [turn("speaker\"1\\", Some("Voce \"uno\"\n\ttab"), 0.0, 1.5)];
+
+        let json = speaker_turns_json(&turns);
+        assert_eq!(
+            parsed(&json),
+            serde_json::json!([
+                {
+                    "speaker_id": "speaker\"1\\",
+                    "speaker_label": "Voce \"uno\"\n\ttab",
+                    "start_seconds": 0.0,
+                    "end_seconds": 1.5
+                }
+            ])
+        );
+
+        let unlabeled = speaker_turns_json(&[turn("speaker_1", Some("   "), 0.0, 1.0)]);
+        assert_eq!(
+            parsed(&unlabeled),
+            serde_json::json!([{"speaker_id": "speaker_1", "start_seconds": 0.0, "end_seconds": 1.0}])
+        );
+    }
+
+    #[test]
+    fn empty_or_fully_invalid_input_is_an_empty_array() {
+        assert_eq!(speaker_turns_json(&[]), "[]");
+        assert_eq!(
+            speaker_turns_json(&[turn("nan", None, f32::NAN, 1.0)]),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn preserves_distinct_measured_bounds_at_f32_precision() {
+        let start = 0.1234567_f32;
+        let end = 0.1234568_f32;
+        let json = parsed(&speaker_turns_json(&[turn("speaker_1", None, start, end)]));
+        let encoded_start = json[0]["start_seconds"].as_f64().unwrap();
+        let encoded_end = json[0]["end_seconds"].as_f64().unwrap();
+        assert!(
+            encoded_end > encoded_start,
+            "valid measured bounds must not collapse"
+        );
+        assert_eq!(encoded_start as f32, start);
+        assert_eq!(encoded_end as f32, end);
     }
 }
 

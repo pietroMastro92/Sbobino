@@ -252,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         options.data_dir.display(),
         server.pairing.endpoint
     );
-    eprintln!("arresta il processo per revocare token, certificato e job attivi");
+    eprintln!("arresta il processo per interrompere i lavori attivi; l'abbinamento salvato resta valido fino alla revoca esplicita");
 
     // CompanionServer owns the listener and cancels all jobs when dropped.
     // Keeping the example alive makes its stdout a simple pairing pipe for the

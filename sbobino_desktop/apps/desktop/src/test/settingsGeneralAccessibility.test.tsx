@@ -374,6 +374,15 @@ describe("General settings accessibility", () => {
         reason_code: "disabled",
         message: "Pyannote disabled",
       },
+      // A settings edit can arrive before the matching runtime refresh.
+      selected_speaker_diarization: {
+        enabled: true,
+        requested_backend: "pyannote",
+        selected_backend: "pyannote",
+        ready: false,
+        reason_code: "pyannote_not_ready",
+        message: "Stale Pyannote health",
+      },
       fluid_diarization: {
         supported: true,
         ready: true,

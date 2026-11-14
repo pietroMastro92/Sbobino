@@ -12,6 +12,15 @@ type Pairing = {
   desktop_version: string;
 };
 
+type PairingStateName = "active" | "inactive_paired" | "inactive_unpaired" | "unknown";
+
+type PairingState = {
+  state: PairingStateName;
+  pairing: Pairing | null;
+};
+
+type ConfirmAction = "stop" | "revoke";
+
 type CompanionAiProvider = "foundation_apple" | "ollama";
 
 type CompanionAiOption = {
@@ -45,6 +54,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isCompanionAiProvider(value: unknown): value is CompanionAiProvider {
   return value === "foundation_apple" || value === "ollama";
+}
+
+function normalizePairing(value: unknown): Pairing | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.version !== "number" ||
+    typeof value.endpoint !== "string" ||
+    typeof value.token !== "string" ||
+    typeof value.certificate !== "string" ||
+    typeof value.desktop_name !== "string" ||
+    typeof value.desktop_version !== "string"
+  ) {
+    return null;
+  }
+  return {
+    version: value.version,
+    endpoint: value.endpoint,
+    token: value.token,
+    certificate: value.certificate,
+    desktop_name: value.desktop_name,
+    desktop_version: value.desktop_version,
+  };
+}
+
+function normalizePairingState(value: unknown): PairingState | null {
+  if (!isRecord(value)) return null;
+  if (value.state === "active") {
+    const pairing = normalizePairing(value.pairing);
+    // An active state without a complete pairing payload cannot be rendered
+    // safely; the panel reports an unknown state instead of guessing.
+    return pairing ? { state: "active", pairing } : null;
+  }
+  if (value.state === "inactive_paired" || value.state === "inactive_unpaired" || value.state === "unknown") {
+    // Inactive states never expose certificate, token or key material.
+    return { state: value.state, pairing: null };
+  }
+  return null;
 }
 
 function normalizeCompanionAiStatus(value: unknown): CompanionAiStatus | null {
@@ -84,10 +130,11 @@ function normalizeCompanionAiStatus(value: unknown): CompanionAiStatus | null {
 
 export function CompanionPanel(): JSX.Element {
   const { t } = useTranslation();
+  const [pairingState, setPairingState] = useState<PairingStateName>("inactive_unpaired");
   const [pairing, setPairing] = useState<Pairing | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [confirmStop, setConfirmStop] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
   const [copyFeedback, setCopyFeedback] = useState("");
   const [qrDataUrl, setQrDataUrl] = useState("");
   const [qrError, setQrError] = useState("");
@@ -103,22 +150,51 @@ export function CompanionPanel(): JSX.Element {
     return mountedRef.current && sessionRef.current === session;
   }, []);
 
-  useEffect(() => {
-    const requestSession = sessionRef.current;
-    let active = true;
-    void invoke<Pairing | null>("companion_status")
-      .then(value => {
-        if (active && isCurrentSession(requestSession)) setPairing(value);
-      })
-      .catch(() => {
-        // The panel keeps its explicit activation flow available when status is unavailable.
-      });
-    return () => {
-      active = false;
-    };
-  }, [isCurrentSession]);
+  const clearSessionUi = useCallback((): void => {
+    setCopyFeedback("");
+    setAiStatus(null);
+    setAiError("");
+    setAiAction(null);
+  }, []);
+
+  const applyPairingState = useCallback(
+    (next: PairingState, requestSession: number): void => {
+      if (!isCurrentSession(requestSession)) return;
+      setPairing(next.pairing);
+      setPairingState(next.state);
+      setConfirmAction(null);
+      if (!next.pairing) clearSessionUi();
+    },
+    [clearSessionUi, isCurrentSession],
+  );
+
+  const loadPairingState = useCallback(
+    async (requestSession: number): Promise<void> => {
+      try {
+        const rawState = await invoke<unknown>("companion_pairing_state");
+        const nextState = normalizePairingState(rawState);
+        if (!nextState) throw new Error("invalid companion pairing state");
+        applyPairingState(nextState, requestSession);
+      } catch {
+        // A read failure is reported as unknown: paired and unpaired are
+        // opposite claims and neither may be guessed. Nothing is started.
+        if (isCurrentSession(requestSession)) {
+          setPairing(null);
+          setPairingState("unknown");
+          setConfirmAction(null);
+          clearSessionUi();
+        }
+      }
+    },
+    [applyPairingState, clearSessionUi, isCurrentSession],
+  );
 
   useEffect(() => {
+    void loadPairingState(sessionRef.current);
+  }, [loadPairingState]);
+
+  useEffect(() => {
+    mountedRef.current = true;
     return () => {
       mountedRef.current = false;
       sessionRef.current += 1;
@@ -189,44 +265,101 @@ export function CompanionPanel(): JSX.Element {
     void loadAiStatus(sessionRef.current);
   }, [loadAiStatus, pairingPayload]);
 
-  async function toggle(): Promise<void> {
+  function beginAction(): number {
+    // Every new user action invalidates the responses still in flight, so a
+    // late status, QR, AI, start, stop or revoke reply can never overwrite the
+    // state produced by the latest action.
     const requestSession = sessionRef.current + 1;
     sessionRef.current = requestSession;
     setBusy(true);
     setError("");
+    setConfirmAction(null);
+    return requestSession;
+  }
+
+  async function startConnection(): Promise<void> {
+    const requestSession = beginAction();
     try {
-      if (pairing) {
-        await invoke("stop_companion");
-        if (isCurrentSession(requestSession)) {
-          setPairing(null);
-          setConfirmStop(false);
-          setCopyFeedback("");
-        }
-      } else {
-        const nextPairing = await invoke<Pairing>("start_companion", { lan: true });
-        if (isCurrentSession(requestSession)) setPairing(nextPairing);
+      const rawPairing = await invoke<unknown>("start_companion", { lan: true });
+      const nextPairing = normalizePairing(rawPairing);
+      if (!nextPairing) throw new Error("invalid companion pairing");
+      if (isCurrentSession(requestSession)) {
+        setPairing(nextPairing);
+        setPairingState("active");
       }
     } catch {
       if (isCurrentSession(requestSession)) {
         setError(t("companion.error.connection", "Connection unavailable. Check the local network and try again."));
+        // Reload the authoritative state instead of leaving the panel on a
+        // guess about what the failed command actually did.
+        await loadPairingState(requestSession);
       }
     } finally {
       if (isCurrentSession(requestSession)) setBusy(false);
     }
   }
 
+  async function stopConnection(): Promise<void> {
+    const requestSession = beginAction();
+    try {
+      await invoke("stop_companion");
+      if (isCurrentSession(requestSession)) {
+        // The listener is closed but the saved pairing stays; the reload below
+        // confirms it from metadata instead of assuming it.
+        setPairing(null);
+        setPairingState("inactive_paired");
+        clearSessionUi();
+      }
+      await loadPairingState(requestSession);
+    } catch {
+      if (isCurrentSession(requestSession)) {
+        setError(t("companion.error.connection", "Connection unavailable. Check the local network and try again."));
+        await loadPairingState(requestSession);
+      }
+    } finally {
+      if (isCurrentSession(requestSession)) setBusy(false);
+    }
+  }
+
+  async function revokePairing(): Promise<void> {
+    const requestSession = beginAction();
+    try {
+      const rawState = await invoke<unknown>("revoke_companion_pairing");
+      const nextState = normalizePairingState(rawState);
+      if (!nextState) throw new Error("invalid companion pairing state");
+      applyPairingState(nextState, requestSession);
+    } catch {
+      if (isCurrentSession(requestSession)) {
+        // Never claim a successful revocation: report the unconfirmed outcome
+        // and reload the real state (which may still be stopped-with-pairing).
+        setError(t("companion.error.revoke", "Revocation not confirmed. Check the connection state and try again."));
+        await loadPairingState(requestSession);
+      }
+    } finally {
+      if (isCurrentSession(requestSession)) setBusy(false);
+    }
+  }
+
+  function checkAgain(): void {
+    const requestSession = sessionRef.current + 1;
+    sessionRef.current = requestSession;
+    setError("");
+    void loadPairingState(requestSession);
+  }
+
   async function copyPairing(): Promise<void> {
     if (!pairing) return;
+    const requestSession = sessionRef.current;
     try {
       await navigator.clipboard.writeText(pairingPayload);
-      if (mountedRef.current) {
+      if (isCurrentSession(requestSession)) {
         setCopyFeedback(t("companion.copy.success", "Code copied. Paste it into the iOS app settings."));
       }
     } catch {
       const field = document.getElementById("companion-pairing") as HTMLTextAreaElement | null;
       field?.focus();
       field?.select();
-      if (mountedRef.current) {
+      if (isCurrentSession(requestSession)) {
         setCopyFeedback(t("companion.copy.fallback", "Code selected: use the computer's Copy command."));
       }
     }
@@ -254,11 +387,45 @@ export function CompanionPanel(): JSX.Element {
     }
   }
 
+  const isActive = pairingState === "active" && pairing !== null;
+  const canRevoke = isActive || pairingState === "inactive_paired";
+  const primaryLabel = busy
+    ? t("companion.busy", "Please wait…")
+    : isActive
+      ? t("companion.stop", "Stop connection")
+      : pairingState === "inactive_paired"
+        ? t("companion.resume", "Resume connection")
+        : pairingState === "unknown"
+          ? t("companion.retry", "Check again")
+          : t("companion.enable", "Enable connection");
+
+  const statusTitle = isActive
+    ? t("companion.active", "Connection active")
+    : pairingState === "inactive_paired"
+      ? t("companion.stopped", "Connection stopped")
+      : pairingState === "unknown"
+        ? t("companion.state.unknownTitle", "Connection state unavailable")
+        : t("companion.inactive", "Connect Sbobbino iOS");
+  const statusDetail = isActive
+    ? pairing.endpoint
+    : pairingState === "inactive_paired"
+      ? t("companion.state.paired", "The pairing is saved. Resume the connection to receive new recordings; nothing was started automatically.")
+      : pairingState === "unknown"
+        ? t("companion.state.unknown", "The saved pairing could not be read. Nothing was started. Check again before enabling the connection.")
+        : t("companion.networkDescription", "Devices must be on the same network. The connection uses an encrypted session.");
+
   const selectedAiProvider =
     aiStatus?.options.some(option => option.id === aiStatus.selection) ? aiStatus.selection ?? "" : "";
   const aiBusyLabel = aiAction === "select"
     ? t("companion.ai.saving", "Saving…")
     : t("companion.ai.probing", "Checking availability…");
+
+  function primaryAction(): void {
+    if (busy) return;
+    if (isActive) setConfirmAction("stop");
+    else if (pairingState === "unknown") checkAgain();
+    else void startConnection();
+  }
 
   return (
     <section className="settings-panel">
@@ -268,25 +435,25 @@ export function CompanionPanel(): JSX.Element {
       </header>
       <div className="settings-row">
         <div>
-          <strong>{pairing ? t("companion.active", "Connection active") : t("companion.inactive", "Connect Sbobbino iOS")}</strong>
-          <small>{pairing ? pairing.endpoint : t("companion.networkDescription", "Devices must be on the same network. The connection uses an encrypted session.")}</small>
+          <strong>{statusTitle}</strong>
+          <small>{statusDetail}</small>
         </div>
-        <button
-          type="button"
-          onClick={() => {
-            if (pairing) setConfirmStop(true);
-            else void toggle();
-          }}
-          disabled={busy}
-        >
-          {busy
-            ? t("companion.busy", "Please wait…")
-            : pairing
-              ? t("companion.revoke", "Disable")
-              : t("companion.enable", "Enable connection")}
-        </button>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          <button type="button" onClick={primaryAction} disabled={busy}>
+            {primaryLabel}
+          </button>
+          {canRevoke && (
+            <button
+              type="button"
+              onClick={() => setConfirmAction("revoke")}
+              disabled={busy || confirmAction !== null}
+            >
+              {t("companion.revokePairing", "Revoke pairing")}
+            </button>
+          )}
+        </div>
       </div>
-      {pairing && (
+      {isActive && pairing && (
         <div className="settings-row settings-row-block">
           <label htmlFor="companion-pairing">{t("companion.pairing.label", "Pairing code")}</label>
           <textarea
@@ -323,7 +490,7 @@ export function CompanionPanel(): JSX.Element {
           <p role="status">{copyFeedback}</p>
         </div>
       )}
-      {pairing && (
+      {isActive && (
         <div className="settings-row settings-row-block">
           <div>
             <strong>{t("companion.ai.title", "Local AI for remote transcriptions")}</strong>
@@ -369,14 +536,24 @@ export function CompanionPanel(): JSX.Element {
           {aiError && <p role="alert">{aiError}</p>}
         </div>
       )}
-      {confirmStop && (
+      {confirmAction && (
         <div role="alert" className="settings-row settings-row-block">
-          <p>{t("companion.confirm.revoke", "Disable the connection? The code will be revoked and remote transcriptions still in progress will be cancelled.")}</p>
-          <button type="button" disabled={busy} onClick={() => void toggle()}>
-            {t("companion.confirm.revokeButton", "Disable and cancel remote jobs")}
+          <p>
+            {confirmAction === "stop"
+              ? t("companion.confirm.stop", "Stop the connection? Remote transcriptions in progress are interrupted and their result cannot be recovered afterwards. The saved pairing and the local archive stay intact.")
+              : t("companion.confirm.revoke", "Revoke the pairing? Remote transcriptions in progress are interrupted and the iOS app must be paired again with a new code. The local archive stays intact.")}
+          </p>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void (confirmAction === "stop" ? stopConnection() : revokePairing())}
+          >
+            {confirmAction === "stop"
+              ? t("companion.confirm.stopButton", "Stop and interrupt jobs")
+              : t("companion.confirm.revokeButton", "Revoke and require new pairing")}
           </button>
-          <button type="button" disabled={busy} onClick={() => setConfirmStop(false)}>
-            {t("companion.confirm.keep", "Keep connection")}
+          <button type="button" disabled={busy} onClick={() => setConfirmAction(null)}>
+            {t("companion.confirm.cancel", "Cancel")}
           </button>
         </div>
       )}

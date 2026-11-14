@@ -15,7 +15,7 @@ use sbobino_application::{
 };
 use sbobino_domain::{
     ArtifactKind, ArtifactSourceOrigin, JobProgress, JobStage, LanguageCode, ParakeetModel,
-    SpeakerTurn, SpeechModel, TimedSegment, TranscriptArtifact, TranscriptionEngine,
+    SpeakerTurn, SpeechModel, TimedSegment, TimedWord, TranscriptArtifact, TranscriptionEngine,
     TranscriptionLanguagePolicy, TranscriptionOutput, WhisperOptions,
 };
 
@@ -1103,6 +1103,33 @@ fn speaker_turn(id: &str, start: f32, end: f32) -> SpeakerTurn {
 }
 
 #[test]
+fn ambiguous_segment_removes_an_existing_speaker_label() {
+    let mut segment = timed_segment(0.0, 10.0);
+    segment.speaker_id = Some("old_speaker".to_string());
+    segment.speaker_label = Some("Old label".to_string());
+    let mut expected = segment.clone();
+    expected.speaker_id = None;
+    expected.speaker_label = None;
+    let result = TranscriptionService::assign_speakers_to_segments(
+        &[segment],
+        &[speaker_turn("A", 0.0, 6.0), speaker_turn("B", 6.0, 10.0)],
+    );
+    assert_eq!(result, vec![expected]);
+}
+
+#[test]
+fn negative_turn_does_not_manufacture_segment_ambiguity() {
+    let result = TranscriptionService::assign_speakers_to_segments(
+        &[timed_segment(0.0, 10.0)],
+        &[
+            speaker_turn("A", 0.0, 10.0),
+            speaker_turn("invalid", -1.0, 2.0),
+        ],
+    );
+    assert_eq!(result[0].speaker_id.as_deref(), Some("A"));
+}
+
+#[test]
 fn speaker_assignment_leaves_segments_without_overlap_unattributed() {
     let segments = vec![timed_segment(0.0, 1.0)];
     let turns = vec![speaker_turn("speaker_1", 1.0, 2.0)];
@@ -1141,6 +1168,107 @@ fn speaker_assignment_unions_duplicate_overlaps_before_majority_check() {
 
     assert_eq!(assigned[0].speaker_id, None);
     assert_eq!(assigned[0].speaker_label, None);
+}
+
+#[test]
+fn speaker_assignment_leaves_segment_unattributed_when_two_speakers_overlap() {
+    // Intentional policy change (D1): a segment that crosses two measured
+    // voices must not receive the majority label, even when that voice covers
+    // more than half of the segment. Otherwise the minority voice's words are
+    // shown under the wrong speaker.
+    let segments = vec![timed_segment(0.0, 10.0)];
+    let turns = vec![
+        speaker_turn("speaker_1", 0.0, 6.0),
+        speaker_turn("speaker_2", 6.0, 10.0),
+    ];
+
+    let assigned = TranscriptionService::assign_speakers_to_segments(&segments, &turns);
+
+    assert_eq!(assigned[0].speaker_id, None);
+    assert_eq!(assigned[0].speaker_label, None);
+}
+
+#[test]
+fn speaker_assignment_keeps_single_speaker_across_multiple_turns() {
+    // Two measured turns of the same voice are not an ambiguity.
+    let segments = vec![timed_segment(0.0, 10.0)];
+    let turns = vec![
+        speaker_turn("speaker_1", 0.0, 4.0),
+        speaker_turn("speaker_1", 6.0, 10.0),
+    ];
+
+    let assigned = TranscriptionService::assign_speakers_to_segments(&segments, &turns);
+
+    assert_eq!(assigned[0].speaker_id.as_deref(), Some("speaker_1"));
+    assert_eq!(assigned[0].speaker_label.as_deref(), Some("speaker_1"));
+}
+
+#[test]
+fn speaker_assignment_ignores_adjacent_turn_without_overlap() {
+    // The second turn only touches the segment boundary: no overlap, no
+    // ambiguity, so the voice that fully covers the segment keeps the label.
+    let segments = vec![timed_segment(0.0, 6.0)];
+    let turns = vec![
+        speaker_turn("speaker_1", 0.0, 6.0),
+        speaker_turn("speaker_2", 6.0, 10.0),
+    ];
+
+    let assigned = TranscriptionService::assign_speakers_to_segments(&segments, &turns);
+
+    assert_eq!(assigned[0].speaker_id.as_deref(), Some("speaker_1"));
+}
+
+#[test]
+fn speaker_assignment_leaves_segment_unattributed_on_simultaneous_overlap() {
+    // Both voices are measured inside the segment at the same time. The first
+    // one alone would win the old strict-majority check (60%), which is
+    // exactly the false attribution this policy refuses.
+    let segments = vec![timed_segment(0.0, 10.0)];
+    let turns = vec![
+        speaker_turn("speaker_1", 0.0, 6.0),
+        speaker_turn("speaker_2", 5.0, 10.0),
+    ];
+
+    let assigned = TranscriptionService::assign_speakers_to_segments(&segments, &turns);
+
+    assert_eq!(assigned[0].speaker_id, None);
+    assert_eq!(assigned[0].speaker_label, None);
+}
+
+#[test]
+fn speaker_assignment_ignores_invalid_turns_when_detecting_ambiguity() {
+    // Invalid records are dropped before the decision, so they can neither
+    // create ambiguity nor steal the label from the only valid voice.
+    let mut nan_turn = speaker_turn("speaker_2", 6.0, 10.0);
+    nan_turn.start_seconds = f32::NAN;
+    let mut blank_turn = speaker_turn("   ", 6.0, 10.0);
+    blank_turn.speaker_label = None;
+    let segments = vec![timed_segment(0.0, 10.0)];
+    let turns = vec![
+        speaker_turn("speaker_1", 0.0, 6.0),
+        nan_turn,
+        blank_turn,
+        speaker_turn("speaker_3", 8.0, 7.0),
+    ];
+
+    let assigned = TranscriptionService::assign_speakers_to_segments(&segments, &turns);
+
+    assert_eq!(assigned[0].speaker_id.as_deref(), Some("speaker_1"));
+}
+
+#[test]
+fn speaker_assignment_keeps_strict_majority_requirement_for_single_voice() {
+    // Single voice: the existing coverage guard is unchanged. 40% is not
+    // enough, 60% is.
+    let turns = vec![speaker_turn("speaker_1", 0.0, 4.0)];
+    let assigned =
+        TranscriptionService::assign_speakers_to_segments(&[timed_segment(0.0, 10.0)], &turns);
+    assert_eq!(assigned[0].speaker_id, None);
+
+    let turns = vec![speaker_turn("speaker_1", 0.0, 6.0)];
+    let assigned =
+        TranscriptionService::assign_speakers_to_segments(&[timed_segment(0.0, 10.0)], &turns);
+    assert_eq!(assigned[0].speaker_id.as_deref(), Some("speaker_1"));
 }
 
 #[tokio::test]
@@ -1964,4 +2092,413 @@ async fn terminal_failure_never_reports_overall_completion() {
     assert!(events
         .windows(2)
         .all(|pair| pair[1].overall_percentage >= pair[0].overall_percentage));
+}
+
+// --- S1: measured diarizer turns survive into the artifact metadata ---
+
+const SPEAKER_TURNS_METADATA_KEY: &str = "speaker_turns_v1";
+
+fn speaker_turns_metadata(artifact: &TranscriptArtifact) -> Option<serde_json::Value> {
+    artifact
+        .metadata
+        .get(SPEAKER_TURNS_METADATA_KEY)
+        .map(|raw| serde_json::from_str(raw).expect("speaker_turns_v1 must be valid JSON"))
+}
+
+async fn run_speaker_metadata_transcription(
+    diarizer: MockSpeakerDiarizer,
+    metadata: BTreeMap<String, String>,
+    diarization_enabled: Option<bool>,
+) -> TranscriptArtifact {
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("interview.wav");
+    tokio::fs::write(&input_path, b"fake wav content")
+        .await
+        .expect("failed to create wav file");
+
+    let speech = Arc::new(MockSpeechEngine {
+        transcript: "Hello there.".to_string(),
+        segments: vec![TimedSegment {
+            text: "Hello there.".to_string(),
+            start_seconds: Some(0.0),
+            end_seconds: Some(2.0),
+            ..TimedSegment::default()
+        }],
+    });
+
+    let service = TranscriptionService::new(
+        Arc::new(MockTranscoder::default()),
+        speech,
+        Arc::new(MockEnhancer::default()),
+        Arc::new(InMemoryArtifactRepository::default()),
+    )
+    .with_speaker_diarizer(Arc::new(diarizer));
+
+    service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-speaker-turns".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::En,
+                model: SpeechModel::Base,
+                engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata,
+                source_fingerprint_json: None,
+                diarization_enabled,
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_text: String| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("transcription with measured turns should succeed")
+}
+
+#[tokio::test]
+async fn speaker_turns_metadata_matches_diarizer_output() {
+    // Intentional policy change (D1): the segment crosses two measured voices,
+    // so it now stays unattributed instead of keeping the strict-majority
+    // label. The measured turns are still persisted verbatim and the completed
+    // diarization remains a success: a nil label is not an error.
+    let artifact = run_speaker_metadata_transcription(
+        MockSpeakerDiarizer {
+            turns: vec![
+                SpeakerTurn {
+                    speaker_id: "speaker_1".to_string(),
+                    speaker_label: Some("Speaker 1".to_string()),
+                    start_seconds: 0.0,
+                    end_seconds: 1.4,
+                },
+                SpeakerTurn {
+                    speaker_id: "speaker_2".to_string(),
+                    speaker_label: Some("Speaker 2".to_string()),
+                    start_seconds: 1.2,
+                    end_seconds: 2.0,
+                },
+            ],
+            fail_with: None,
+        },
+        BTreeMap::new(),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        artifact
+            .metadata
+            .get("speaker_diarization_status")
+            .map(String::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        speaker_turns_metadata(&artifact),
+        Some(serde_json::json!([
+            {
+                "speaker_id": "speaker_1",
+                "speaker_label": "Speaker 1",
+                "start_seconds": 0.0,
+                "end_seconds": 1.4
+            },
+            {
+                "speaker_id": "speaker_2",
+                "speaker_label": "Speaker 2",
+                "start_seconds": 1.2,
+                "end_seconds": 2.0
+            }
+        ]))
+    );
+
+    let timeline = artifact
+        .metadata
+        .get("timeline_v2")
+        .expect("timeline metadata should be present");
+    assert!(!timeline.contains("\"speaker_id\""));
+    assert!(!timeline.contains("\"speaker_label\""));
+    // Text and timing of the segment are untouched by the decision.
+    assert!(timeline.contains("\"text\":\"Hello there.\""));
+    assert!(timeline.contains("\"start_seconds\":0.0"));
+    assert!(timeline.contains("\"end_seconds\":2.0"));
+}
+
+#[tokio::test]
+async fn ambiguous_segment_keeps_text_words_language_and_measured_turns() {
+    // The tradeoff of the ambiguous-segment policy, observed on the artifact:
+    // the segment loses its single speaker label, while text, timing, words,
+    // language, confidence and the measured turns stay byte-for-byte intact.
+    let temp = tempdir().expect("failed to create temp dir");
+    let input_path = temp.path().join("ambiguous.wav");
+    tokio::fs::write(&input_path, b"fake wav content")
+        .await
+        .expect("failed to create wav file");
+
+    let speech = Arc::new(MockSpeechEngine {
+        transcript: "Ok, rispettare. grazie".to_string(),
+        segments: vec![TimedSegment {
+            text: "Ok, rispettare. grazie".to_string(),
+            start_seconds: Some(0.0),
+            end_seconds: Some(10.0),
+            language_code: Some("it".to_string()),
+            language_confidence: Some(0.87),
+            words: vec![
+                TimedWord {
+                    text: "rispettare.".to_string(),
+                    start_seconds: Some(5.5),
+                    end_seconds: Some(6.0),
+                    confidence: Some(0.9),
+                },
+                TimedWord {
+                    text: "grazie".to_string(),
+                    start_seconds: Some(6.2),
+                    end_seconds: Some(6.8),
+                    confidence: Some(0.8),
+                },
+            ],
+            ..TimedSegment::default()
+        }],
+    });
+
+    let service = TranscriptionService::new(
+        Arc::new(MockTranscoder::default()),
+        speech,
+        Arc::new(MockEnhancer::default()),
+        Arc::new(InMemoryArtifactRepository::default()),
+    )
+    .with_speaker_diarizer(Arc::new(MockSpeakerDiarizer {
+        turns: vec![
+            speaker_turn("speaker_1", 0.0, 6.0),
+            speaker_turn("speaker_2", 6.0, 10.0),
+        ],
+        fail_with: None,
+    }));
+
+    let artifact = service
+        .run_file_transcription(
+            RunTranscriptionRequest {
+                job_id: "job-ambiguous".to_string(),
+                input_path: input_path.to_string_lossy().to_string(),
+                language: LanguageCode::It,
+                model: SpeechModel::Base,
+                engine: TranscriptionEngine::WhisperCpp,
+                parakeet_model: ParakeetModel::default(),
+                enable_ai: false,
+                source_origin: ArtifactSourceOrigin::Imported,
+                whisper_options: WhisperOptions::default(),
+                title: None,
+                parent_id: None,
+                metadata: BTreeMap::new(),
+                source_fingerprint_json: None,
+                diarization_enabled: None,
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_text: String| {}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("ambiguous segment must still complete the transcription");
+
+    assert_eq!(artifact.job_id, "job-ambiguous");
+    assert_eq!(artifact.raw_transcript, "Ok, rispettare. grazie");
+    assert_eq!(
+        artifact
+            .metadata
+            .get("speaker_diarization_status")
+            .map(String::as_str),
+        Some("completed")
+    );
+    assert_eq!(
+        speaker_turns_metadata(&artifact),
+        Some(serde_json::json!([
+            {
+                "speaker_id": "speaker_1",
+                "speaker_label": "speaker_1",
+                "start_seconds": 0.0,
+                "end_seconds": 6.0
+            },
+            {
+                "speaker_id": "speaker_2",
+                "speaker_label": "speaker_2",
+                "start_seconds": 6.0,
+                "end_seconds": 10.0
+            }
+        ]))
+    );
+
+    let timeline: serde_json::Value = serde_json::from_str(
+        artifact
+            .metadata
+            .get("timeline_v2")
+            .expect("timeline metadata should be present"),
+    )
+    .expect("timeline_v2 must be valid JSON");
+    assert_eq!(timeline["version"], 2);
+    let segment = &timeline["segments"][0];
+    assert_eq!(segment["text"], "Ok, rispettare. grazie");
+    assert_eq!(segment["start_seconds"], serde_json::json!(0.0));
+    assert_eq!(segment["end_seconds"], serde_json::json!(10.0));
+    assert_eq!(segment["language_code"], "it");
+    assert_eq!(segment["language_confidence"], serde_json::json!(0.87));
+    assert!(segment.get("speaker_id").is_none());
+    assert!(segment.get("speaker_label").is_none());
+    assert_eq!(segment["words"][0]["text"], "rispettare.");
+    assert_eq!(segment["words"][0]["start_seconds"], serde_json::json!(5.5));
+    assert_eq!(segment["words"][0]["end_seconds"], serde_json::json!(6.0));
+    assert_eq!(segment["words"][0]["confidence"], serde_json::json!(0.9));
+    assert_eq!(segment["words"][1]["text"], "grazie");
+    assert_eq!(segment["words"][1]["start_seconds"], serde_json::json!(6.2));
+    assert_eq!(segment["words"][1]["end_seconds"], serde_json::json!(6.8));
+    assert_eq!(segment["words"][1]["confidence"], serde_json::json!(0.8));
+}
+
+#[tokio::test]
+async fn speaker_turns_metadata_absent_on_failure_or_skip() {
+    let failed = run_speaker_metadata_transcription(
+        MockSpeakerDiarizer {
+            turns: Vec::new(),
+            fail_with: Some("diarizer exploded".to_string()),
+        },
+        BTreeMap::new(),
+        Some(true),
+    )
+    .await;
+    assert_eq!(
+        failed
+            .metadata
+            .get("speaker_diarization_status")
+            .map(String::as_str),
+        Some("failed")
+    );
+    assert!(!failed.metadata.contains_key(SPEAKER_TURNS_METADATA_KEY));
+
+    let skipped = run_speaker_metadata_transcription(
+        MockSpeakerDiarizer {
+            turns: vec![speaker_turn("speaker_1", 0.0, 2.0)],
+            fail_with: None,
+        },
+        BTreeMap::new(),
+        Some(false),
+    )
+    .await;
+    assert!(!skipped.metadata.contains_key("speaker_diarization_status"));
+    assert!(!skipped.metadata.contains_key(SPEAKER_TURNS_METADATA_KEY));
+
+    let empty = run_speaker_metadata_transcription(
+        MockSpeakerDiarizer {
+            turns: Vec::new(),
+            fail_with: None,
+        },
+        BTreeMap::new(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        empty
+            .metadata
+            .get("speaker_diarization_status")
+            .map(String::as_str),
+        Some("completed")
+    );
+    assert!(!empty.metadata.contains_key(SPEAKER_TURNS_METADATA_KEY));
+}
+
+#[tokio::test]
+async fn speaker_turns_metadata_discards_stale_request_key() {
+    let mut stale_metadata = BTreeMap::new();
+    stale_metadata.insert(
+        SPEAKER_TURNS_METADATA_KEY.to_string(),
+        r#"[{"speaker_id":"injected","start_seconds":0.0,"end_seconds":9.0}]"#.to_string(),
+    );
+
+    let failed = run_speaker_metadata_transcription(
+        MockSpeakerDiarizer {
+            turns: Vec::new(),
+            fail_with: Some("diarizer exploded".to_string()),
+        },
+        stale_metadata.clone(),
+        Some(true),
+    )
+    .await;
+    assert!(!failed.metadata.contains_key(SPEAKER_TURNS_METADATA_KEY));
+
+    let replaced = run_speaker_metadata_transcription(
+        MockSpeakerDiarizer {
+            turns: vec![speaker_turn("speaker_1", 0.0, 2.0)],
+            fail_with: None,
+        },
+        stale_metadata,
+        None,
+    )
+    .await;
+    assert_eq!(
+        speaker_turns_metadata(&replaced),
+        Some(serde_json::json!([{
+            "speaker_id": "speaker_1",
+            "speaker_label": "speaker_1",
+            "start_seconds": 0.0,
+            "end_seconds": 2.0
+        }]))
+    );
+}
+
+#[tokio::test]
+async fn speaker_turns_sanitizes_without_padding() {
+    let artifact = run_speaker_metadata_transcription(
+        MockSpeakerDiarizer {
+            turns: vec![
+                speaker_turn("speaker_1", 0.0, 1.0),
+                SpeakerTurn {
+                    speaker_id: "   ".to_string(),
+                    speaker_label: Some("Ghost".to_string()),
+                    start_seconds: 1.0,
+                    end_seconds: 2.0,
+                },
+                SpeakerTurn {
+                    speaker_id: "speaker_nan".to_string(),
+                    speaker_label: None,
+                    start_seconds: f32::NAN,
+                    end_seconds: 2.0,
+                },
+                SpeakerTurn {
+                    speaker_id: "speaker_inf".to_string(),
+                    speaker_label: None,
+                    start_seconds: 0.0,
+                    end_seconds: f32::INFINITY,
+                },
+                speaker_turn("speaker_inverted", 3.0, 2.0),
+                SpeakerTurn {
+                    speaker_id: "  speaker_2  ".to_string(),
+                    speaker_label: Some("  Speaker 2  ".to_string()),
+                    start_seconds: 2.5,
+                    end_seconds: 4.0,
+                },
+            ],
+            fail_with: None,
+        },
+        BTreeMap::new(),
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        speaker_turns_metadata(&artifact),
+        Some(serde_json::json!([
+            {
+                "speaker_id": "speaker_1",
+                "speaker_label": "speaker_1",
+                "start_seconds": 0.0,
+                "end_seconds": 1.0
+            },
+            {
+                "speaker_id": "speaker_2",
+                "speaker_label": "Speaker 2",
+                "start_seconds": 2.5,
+                "end_seconds": 4.0
+            }
+        ]))
+    );
 }

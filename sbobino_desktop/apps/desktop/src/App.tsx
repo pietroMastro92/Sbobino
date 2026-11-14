@@ -2527,10 +2527,15 @@ function speakerDiarizationUsesPyannote(
   selected: SelectedSpeakerDiarizationHealth | undefined,
   fluid: FluidDiarizationHealth | undefined,
 ): boolean {
-  if (selected?.selected_backend === "fluid") {
+  const currentSelection =
+    selected && selected.requested_backend === settings.backend &&
+    selected.enabled === settings.enabled
+      ? selected
+      : undefined;
+  if (currentSelection?.selected_backend === "fluid") {
     return false;
   }
-  if (selected?.selected_backend === "pyannote") {
+  if (currentSelection?.selected_backend === "pyannote") {
     return true;
   }
   if (settings.backend === "pyannote") {
@@ -3574,6 +3579,13 @@ export function App({
       initialBootstrap?.setupReport?.runtime_health ??
       null,
   );
+  // The setup report carries a persisted runtime snapshot. Local Models must
+  // read the live health before presenting diagnostics or offering repairs, so
+  // the snapshot stays hidden until this pane has verified its own context.
+  const [localModelsDiagnostics, setLocalModelsDiagnostics] = useState<{
+    status: "unverified" | "checking" | "verified" | "error";
+    errorMessage: string | null;
+  }>({ status: "unverified", errorMessage: null });
   const [isWindowFullscreen, setIsWindowFullscreen] = useState(false);
   const currentBuildVersion =
     runtimeHealth?.app_version ?? initialBootstrap?.setupReport?.build_version ?? null;
@@ -3801,6 +3813,12 @@ export function App({
   >(null);
   const pyannoteProvisioningActiveRef = useRef(false);
   const provisioningOperationIdRef = useRef(0);
+  const runtimeHealthReadSeqRef = useRef(0);
+  const runtimeHealthAppliedSeqRef = useRef(0);
+  const modelCatalogReadSeqRef = useRef(0);
+  const modelCatalogAppliedSeqRef = useRef(0);
+  const localModelsDiagnosticsContextRef = useRef(0);
+  const appMountedRef = useRef(true);
   const initialSetupReportRef = useRef<InitialSetupReport>(
     initialBootstrap?.setupReport ?? createInitialSetupReport(),
   );
@@ -4387,14 +4405,31 @@ export function App({
   }, [activeSidebarResize, clampLeftSidebarWidth, clampRightSidebarWidth]);
 
   useEffect(() => {
+    appMountedRef.current = true;
+    return () => {
+      appMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!standaloneSettingsWindow) {
       return;
     }
 
     if (settingsPane === "local_models") {
-      void refreshProvisioningModels();
+      localModelsDiagnosticsContextRef.current += 1;
+      void verifyLocalModelsDiagnostics();
       return;
     }
+
+    // Leaving the pane invalidates any read that is still in flight, so an old
+    // context cannot mark the diagnostics as verified after the user moved on.
+    localModelsDiagnosticsContextRef.current += 1;
+    setLocalModelsDiagnostics((current) =>
+      current.status === "unverified"
+        ? current
+        : { status: "unverified", errorMessage: null },
+    );
 
     if (settingsPane === "transcription") {
       void refreshRuntimeStatus();
@@ -4437,6 +4472,8 @@ export function App({
           ? initialStandaloneSettingsPane === "local_models"
           : !warmStartEligible;
         const previousSeenVersion = readLastSeenAppVersion();
+        const initialHealthReadId = beginRuntimeHealthRead();
+        const initialCatalogReadId = beginModelCatalogRead();
         const initialSettingsPromise = fetchSettingsSnapshot();
         const initialRuntimeHealthPromise = shouldPrimeSettingsDiagnostics
           ? fetchRuntimeStatus()
@@ -4463,15 +4500,19 @@ export function App({
           initialRuntimeHealthResult.status === "fulfilled" &&
           initialRuntimeHealthResult.value
         ) {
-          setRuntimeHealth(initialRuntimeHealthResult.value);
-          writeLastSeenAppVersion(initialRuntimeHealthResult.value.app_version);
-          syncProvisioningFromRuntimeHealth(initialRuntimeHealthResult.value);
+          commitRuntimeHealth(
+            initialRuntimeHealthResult.value,
+            initialHealthReadId,
+          );
         }
         if (
           initialModelCatalogResult.status === "fulfilled" &&
           initialModelCatalogResult.value
         ) {
-          setModelCatalog(initialModelCatalogResult.value);
+          commitModelCatalog(
+            initialModelCatalogResult.value,
+            initialCatalogReadId,
+          );
         }
         if (warmStartEligible) {
           setStartupRequirementsLoaded(true);
@@ -6848,6 +6889,42 @@ export function App({
     }));
   }
 
+  // Health reads are ordered by the moment they started. A slow bootstrap,
+  // catalog or status response therefore cannot overwrite a newer verified
+  // read, even when it resolves last.
+  function beginRuntimeHealthRead(): number {
+    runtimeHealthReadSeqRef.current += 1;
+    return runtimeHealthReadSeqRef.current;
+  }
+
+  function commitRuntimeHealth(health: RuntimeHealth, readId: number): boolean {
+    if (!appMountedRef.current || readId < runtimeHealthAppliedSeqRef.current) {
+      return false;
+    }
+    runtimeHealthAppliedSeqRef.current = readId;
+    setRuntimeHealth(health);
+    writeLastSeenAppVersion(health.app_version);
+    syncProvisioningFromRuntimeHealth(health);
+    return true;
+  }
+
+  function beginModelCatalogRead(): number {
+    modelCatalogReadSeqRef.current += 1;
+    return modelCatalogReadSeqRef.current;
+  }
+
+  function commitModelCatalog(
+    models: ProvisioningModelCatalogEntry[],
+    readId: number,
+  ): boolean {
+    if (!appMountedRef.current || readId < modelCatalogAppliedSeqRef.current) {
+      return false;
+    }
+    modelCatalogAppliedSeqRef.current = readId;
+    setModelCatalog(models);
+    return true;
+  }
+
   function syncArtifactDraftState(
     artifact: TranscriptArtifact,
     options?: {
@@ -7588,13 +7665,59 @@ export function App({
     }
   }
 
+  async function verifyLocalModelsDiagnostics(): Promise<void> {
+    const context = localModelsDiagnosticsContextRef.current;
+    const healthReadId = beginRuntimeHealthRead();
+    const catalogReadId = beginModelCatalogRead();
+    setLocalModelsDiagnostics({ status: "checking", errorMessage: null });
+    try {
+      const [health, models] = await Promise.all([
+        fetchRuntimeHealth(),
+        provisioningModels(),
+      ]);
+      if (
+        !appMountedRef.current ||
+        localModelsDiagnosticsContextRef.current !== context
+      ) {
+        return;
+      }
+      commitRuntimeHealth(health, healthReadId);
+      commitModelCatalog(models, catalogReadId);
+      setLocalModelsDiagnostics({ status: "verified", errorMessage: null });
+    } catch (healthError) {
+      if (
+        !appMountedRef.current ||
+        localModelsDiagnosticsContextRef.current !== context
+      ) {
+        return;
+      }
+      // A newer read that already succeeded owns the diagnostics. Without this
+      // check an older failure would replace a fresh verified context.
+      if (!appMountedRef.current || healthReadId < runtimeHealthAppliedSeqRef.current) {
+        setLocalModelsDiagnostics({ status: "verified", errorMessage: null });
+        return;
+      }
+      setLocalModelsDiagnostics({
+        status: "error",
+        errorMessage: formatUiError(
+          "error.readRuntimeHealth",
+          "Could not read transcription runtime health",
+          healthError,
+        ),
+      });
+    }
+  }
+
   async function refreshRuntimeHealth(): Promise<void> {
+    const healthReadId = beginRuntimeHealthRead();
     try {
       const health = await fetchRuntimeHealth();
-      setRuntimeHealth(health);
-      writeLastSeenAppVersion(health.app_version);
-      syncProvisioningFromRuntimeHealth(health);
+      commitRuntimeHealth(health, healthReadId);
     } catch (healthError) {
+      // A slower failure must not hide a newer read that already succeeded.
+      if (!appMountedRef.current || healthReadId < runtimeHealthAppliedSeqRef.current) {
+        return;
+      }
       setError(
         formatUiError(
           "error.readRuntimeHealth",
@@ -7606,12 +7729,14 @@ export function App({
   }
 
   async function refreshRuntimeStatus(): Promise<void> {
+    const healthReadId = beginRuntimeHealthRead();
     try {
       const health = await fetchRuntimeStatus();
-      setRuntimeHealth(health);
-      writeLastSeenAppVersion(health.app_version);
-      syncProvisioningFromRuntimeHealth(health);
+      commitRuntimeHealth(health, healthReadId);
     } catch (healthError) {
+      if (!appMountedRef.current || healthReadId < runtimeHealthAppliedSeqRef.current) {
+        return;
+      }
       setError(
         formatUiError(
           "error.readRuntimeHealth",
@@ -7623,16 +7748,19 @@ export function App({
   }
 
   async function refreshProvisioningModels(): Promise<void> {
+    const healthReadId = beginRuntimeHealthRead();
+    const catalogReadId = beginModelCatalogRead();
     try {
       const [models, health] = await Promise.all([
         provisioningModels(),
-        fetchRuntimeStatus(),
+        fetchRuntimeHealth(),
       ]);
-      setModelCatalog(models);
-      setRuntimeHealth(health);
-      writeLastSeenAppVersion(health.app_version);
-      syncProvisioningFromRuntimeHealth(health);
+      commitModelCatalog(models, catalogReadId);
+      commitRuntimeHealth(health, healthReadId);
     } catch (modelsError) {
+      if (!appMountedRef.current || healthReadId < runtimeHealthAppliedSeqRef.current) {
+        return;
+      }
       setError(
         formatUiError(
           "error.readModelsCatalog",
@@ -7644,15 +7772,15 @@ export function App({
   }
 
   async function loadStartupRequirements(): Promise<StartupRequirementsSnapshot> {
+    const healthReadId = beginRuntimeHealthRead();
+    const catalogReadId = beginModelCatalogRead();
     const [models, health] = await Promise.all([
       provisioningModels(),
       fetchRuntimeStatus(),
     ]);
 
-    syncProvisioningFromRuntimeHealth(health);
-    setModelCatalog(models);
-    setRuntimeHealth(health);
-    writeLastSeenAppVersion(health.app_version);
+    commitRuntimeHealth(health, healthReadId);
+    commitModelCatalog(models, catalogReadId);
     setStartupRequirementsLoaded(true);
     setStartupRequirementsError(null);
 
@@ -15696,7 +15824,12 @@ export function App({
       settings.transcription.speaker_diarization ??
       getDefaultSpeakerDiarizationSettings();
     const pyannoteHealth = runtimeHealth?.pyannote ?? null;
-    const selectedDiarization = runtimeHealth?.selected_speaker_diarization;
+    const reportedDiarization = runtimeHealth?.selected_speaker_diarization;
+    const selectedDiarization =
+      reportedDiarization && reportedDiarization.requested_backend === speakerDiarization.backend &&
+      reportedDiarization.enabled === speakerDiarization.enabled
+        ? reportedDiarization
+        : undefined;
     const pyannoteIsEffective = speakerDiarizationUsesPyannote(
       speakerDiarization,
       selectedDiarization,
@@ -16598,6 +16731,18 @@ export function App({
     );
     const pyannoteBusy =
       provisioning.running && provisioning.operationScope === "pyannote";
+    const diagnosticsVerified = localModelsDiagnostics.status === "verified";
+    const diagnosticsBusy =
+      localModelsDiagnostics.status === "checking" ||
+      localModelsDiagnostics.status === "unverified";
+    const diagnosticsError =
+      localModelsDiagnostics.status === "error"
+        ? localModelsDiagnostics.errorMessage ||
+          t(
+            "error.readRuntimeHealth",
+            "Could not read transcription runtime health",
+          )
+        : null;
     const pyannoteAction =
       !pyannoteHealth?.runtime_installed || !pyannoteHealth?.model_installed
         ? {
@@ -16621,7 +16766,8 @@ export function App({
             <h3>{t("settings.localModels.title")}</h3>
             <button
               className="secondary-button"
-              onClick={() => void refreshProvisioningModels()}
+              disabled={diagnosticsBusy}
+              onClick={() => void verifyLocalModelsDiagnostics()}
             >
               {t("action.refresh", "Refresh")}
             </button>
@@ -16642,12 +16788,24 @@ export function App({
           <p className="muted">
             {t("settings.localModels.parakeetDirectory", "Parakeet directory:")}{" "}
             <code>
-              {runtimeHealth?.parakeet_models_dir_resolved ||
-                settings.transcription.parakeet_models_dir}
+              {(diagnosticsVerified
+                ? runtimeHealth?.parakeet_models_dir_resolved
+                : null) || settings.transcription.parakeet_models_dir}
             </code>
           </p>
 
-          {runtimeHealth ? (
+          {!diagnosticsVerified ? (
+            <div
+              className="settings-health-block"
+              role={diagnosticsError ? "alert" : "status"}
+            >
+              <h4>{t("settings.localModels.runtimeHealth")}</h4>
+              <p className="muted">
+                {diagnosticsError ??
+                  t("settings.general.checking", "Checking...")}
+              </p>
+            </div>
+          ) : runtimeHealth ? (
             <div className="settings-health-block">
               <h4>{t("settings.localModels.runtimeHealth")}</h4>
               <div className="settings-health-rows">
@@ -16916,6 +17074,7 @@ export function App({
                     className="secondary-button"
                     disabled={
                       provisioning.running ||
+                      !diagnosticsVerified ||
                       (model.installed &&
                         (model.engine !== "whisper_cpp" ||
                           !platformIsAppleSilicon ||
@@ -16939,7 +17098,11 @@ export function App({
             <button
               className="secondary-button"
               onClick={() => void onInstallRuntime(false)}
-              disabled={provisioning.running || runtimeToolchainReady}
+              disabled={
+                provisioning.running ||
+                runtimeToolchainReady ||
+                !diagnosticsVerified
+              }
             >
               {t(
                 "settings.localModels.installRuntime",
@@ -16949,14 +17112,14 @@ export function App({
             <button
               className="secondary-button"
               onClick={() => void onInstallRuntime(true)}
-              disabled={provisioning.running}
+              disabled={provisioning.running || !diagnosticsVerified}
             >
               {t("settings.localModels.repairRuntime", "Repair Runtime")}
             </button>
             <button
               className="primary-button"
               onClick={() => void onProvisionModels()}
-              disabled={provisioning.running}
+              disabled={provisioning.running || !diagnosticsVerified}
             >
               {t(
                 "settings.localModels.downloadMissing",
@@ -16986,7 +17149,7 @@ export function App({
           ) : null}
         </section>
 
-        {runtimeHealth?.fluid_diarization?.supported && (
+        {diagnosticsVerified && runtimeHealth?.fluid_diarization?.supported && (
           <section className="settings-panel" aria-label={t("settings.transcription.fluidName", "FluidAudio")}>
             <div className="settings-card-head">
               <h3>{t("settings.transcription.fluidName", "FluidAudio")}</h3>
@@ -17005,7 +17168,8 @@ export function App({
             <h3>{t("settings.pyannote.name", "Pyannote")}</h3>
             <button
               className="secondary-button"
-              onClick={() => void refreshRuntimeHealth()}
+              disabled={diagnosticsBusy}
+              onClick={() => void verifyLocalModelsDiagnostics()}
             >
               {t("action.refresh", "Refresh")}
             </button>
@@ -17020,11 +17184,12 @@ export function App({
           <p className="muted">
             {t("settings.localModels.directory", "Directory:")}{" "}
             <code>
-              {pyannoteHealth?.runtime_dir || "runtime/pyannote"}
+              {(diagnosticsVerified ? pyannoteHealth?.runtime_dir : null) ||
+                "runtime/pyannote"}
             </code>
           </p>
 
-          {pyannoteHealth ? (
+          {diagnosticsVerified && pyannoteHealth ? (
             <div className="settings-health-block">
               <div className="settings-health-rows">
                 <div className="settings-health-row">
@@ -17121,11 +17286,14 @@ export function App({
             <button
               className="primary-button"
               onClick={() => void onInstallPyannote(pyannoteAction.force)}
-              disabled={provisioning.running}
+              disabled={provisioning.running || !diagnosticsVerified}
             >
               {pyannoteAction.label}
             </button>
-            {pyannoteHealth?.ready && pyannoteIsEffective && !speakerDiarization.enabled ? (
+            {diagnosticsVerified &&
+            pyannoteHealth?.ready &&
+            pyannoteIsEffective &&
+            !speakerDiarization.enabled ? (
               <button
                 className="primary-button"
                 onClick={() => void enablePyannoteForTranscriptions()}
