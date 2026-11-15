@@ -225,8 +225,13 @@ impl PairingStore {
             .map_err(|_| STORAGE_UNAVAILABLE.to_string())?;
         restrict_file(&lease).map_err(|_| STORAGE_UNAVAILABLE.to_string())?;
         lease.try_lock().map_err(|_| LEASE_BUSY.to_string())?;
-        let storage = SecureStorage::load_or_create_with_fallback(data_dir)
-            .map_err(|_| STORAGE_UNAVAILABLE.to_string())?;
+        let storage = match SecureStorage::load_or_create_with_fallback(data_dir) {
+            Ok(storage) => storage,
+            Err(_) => {
+                Self::unlock_lease(&lease);
+                return Err(STORAGE_UNAVAILABLE.to_string());
+            }
+        };
         Ok(Self {
             root,
             storage,
@@ -311,8 +316,50 @@ impl PairingStore {
     /// Releases the profile lease before dropping the store, so a restart after
     /// an awaited shutdown does not need an out-of-process delay.
     pub(super) fn release_lease(&self) {
-        if let Ok(mut lease) = self.lease.lock() {
-            let _ = lease.take();
+        let mut lease = match self.lease.lock() {
+            Ok(lease) => lease,
+            // No code panics while holding this mutex, so a poisoned lock still
+            // holds the real lease: releasing it is the whole point of this
+            // call. Taking the guard keeps the release exactly as fail-closed as
+            // the normal path.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(file) = lease.as_ref() {
+            Self::unlock_lease(file);
+        }
+        let _ = lease.take();
+    }
+
+    /// Releases the OS lease explicitly instead of relying on the implicit
+    /// release performed when the descriptor is closed.
+    ///
+    /// An explicit unlock ends ownership independently of when the last
+    /// descriptor for this open file description closes. It also makes the
+    /// shutdown/restart boundary explicit. A failure is logged; dropping the
+    /// descriptor still provides the OS close-time release as a fallback.
+    fn unlock_lease(file: &File) {
+        if let Err(error) = file.unlock() {
+            tracing::error!(%error, "companion pairing lease release failed");
+        }
+    }
+}
+
+impl Drop for PairingStore {
+    fn drop(&mut self) {
+        // The store owns the lease for the whole time it exists, so a store that
+        // is dropped without an explicit `release_lease` (the owner went away
+        // while the accept task drained) must release it the same way here.
+        match self.lease.get_mut() {
+            Ok(lease) => {
+                if let Some(file) = lease.as_ref() {
+                    Self::unlock_lease(file);
+                }
+            }
+            Err(poisoned) => {
+                if let Some(file) = poisoned.into_inner().as_ref() {
+                    Self::unlock_lease(file);
+                }
+            }
         }
     }
 }
@@ -360,4 +407,58 @@ fn sync_directory(_root: &Path) -> std::io::Result<()> {
     // Windows cannot open a directory as a file; the AI recovery store keeps
     // the same platform behaviour.
     Ok(())
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_release_and_drop_unlock_even_with_a_duplicated_descriptor() {
+        std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
+        for explicit_release in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = PairingStore::open(temp.path()).unwrap();
+            let descriptor = store
+                .lease
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap();
+            assert!(PairingStore::open(temp.path()).is_err());
+            if explicit_release {
+                store.release_lease();
+                // The store itself is still alive, as after shutdown().await.
+                let replacement = PairingStore::open(temp.path()).unwrap();
+                drop(replacement);
+                drop(store);
+            } else {
+                drop(store);
+                let replacement = PairingStore::open(temp.path()).unwrap();
+                drop(replacement);
+            }
+            drop(descriptor);
+        }
+    }
+
+    #[test]
+    fn storage_open_failure_releases_the_pairing_lease_for_a_retry() {
+        std::env::set_var("SBOBINO_ALLOW_INSECURE_LOCAL_SECRETS", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let blocker = temp.path().join(".sbobino-secure-storage");
+        std::fs::write(&blocker, b"synthetic storage blocker").unwrap();
+        for _ in 0..2 {
+            let error = PairingStore::open(temp.path())
+                .err()
+                .expect("blocked storage");
+            assert_eq!(error, STORAGE_UNAVAILABLE);
+        }
+        std::fs::remove_file(blocker).unwrap();
+        let reopened = PairingStore::open(temp.path())
+            .expect("the storage failure must not leave a busy lease");
+        drop(reopened);
+    }
 }

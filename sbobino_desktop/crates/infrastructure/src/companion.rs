@@ -332,10 +332,12 @@ impl CompanionServer {
             for task in tasks {
                 let _ = task.await;
             }
-            // The last reference to the profile lease once the owner has been
-            // dropped. It is released only after the drain, and explicitly
-            // before the drain is reported complete, so a revoke or a restart
-            // can never overlap a running job task.
+            // This task holds its own reference to the store for the whole
+            // drain, so the OS lease cannot be handed to a revoke or to a second
+            // start while a connection or job task is still running. The lease
+            // itself is released by an awaited `shutdown` (explicit `LOCK_UN`)
+            // or, if the owner went away, by the store's `Drop` once this last
+            // reference is dropped here.
             drop(accept_store);
             #[cfg(test)]
             signal_drain(&accept_state.drain.finished);
@@ -1513,7 +1515,12 @@ mod tests {
     }
     #[tokio::test]
     async fn shutdown_drains_session_and_restart_reuses_the_persisted_pairing() {
-        let (server, _client, temporary) = test_server().await;
+        // The profile is created through the persisting entry point so the
+        // restart below rebinds a port the OS will not hand to another socket.
+        let temporary = tempfile::tempdir().expect("temporary data directory");
+        let server = start_persisting_server(temporary.path())
+            .await
+            .expect("companion server should start");
         let pairing = server.pairing.clone();
         let token = server.pairing.token.clone();
         // A Tauri command awaits this future, so it must stay `Send` even
@@ -1522,17 +1529,9 @@ mod tests {
         require_send(server.shutdown());
         server.shutdown().await;
         drop(server);
-        let factory =
-            Arc::new(RuntimeTranscriptionFactory::new_for_tests(temporary.path(), None).unwrap());
-        let next = CompanionServer::start(
-            factory,
-            Arc::new(Semaphore::new(1)),
-            false,
-            "test".into(),
-            Arc::new(|_| {}),
-        )
-        .await
-        .unwrap();
+        let next = start_persisting_server(temporary.path())
+            .await
+            .expect("the persisted pairing should restart");
         let client = trusted_client(&next.pairing).await;
         let response = client
             .get(format!("{}/v1/health", next.pairing.endpoint))
@@ -1754,17 +1753,53 @@ mod tests {
         data_dir.join("companion-pairing").join("pairing.enc")
     }
 
-    fn pairing_port(endpoint: &str) -> u16 {
-        endpoint
-            .rsplit(':')
-            .next()
-            .and_then(|port| port.parse().ok())
-            .expect("pairing endpoint should carry a port")
+    /// Persists a loopback pairing on a free port below the default ephemeral
+    /// ranges on macOS, Linux and Windows, and returns it.
+    ///
+    /// A restart test must be about the persisted identity, not about the OS
+    /// keeping a freed ephemeral port free: a client socket can be handed a port
+    /// the companion just released, and a plain bind then legitimately fails.
+    /// The atomic sequence assigns distinct candidates within this test binary,
+    /// including when a candidate is already occupied. An unrelated process can
+    /// still occupy a port between the probe and the server's bind.
+    fn persist_stable_loopback_pairing(data_dir: &std::path::Path) -> u16 {
+        const FIRST: u16 = 20_000;
+        const SPAN: u16 = 800;
+        static NEXT_CANDIDATE: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        for _ in 0..SPAN {
+            let sequence = NEXT_CANDIDATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let offset = (std::process::id() % SPAN as u32) as u16;
+            let candidate = FIRST + (sequence.wrapping_add(offset) % SPAN);
+            let Ok(probe) = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, candidate)) else {
+                continue;
+            };
+            drop(probe);
+            let store = identity::PairingStore::open(data_dir).expect("pairing store");
+            store
+                .persist(
+                    &identity::PairingIdentity::generate(
+                        identity::PairingMode::Loopback,
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        candidate,
+                    )
+                    .expect("synthetic identity"),
+                )
+                .expect("synthetic pairing record");
+            store.release_lease();
+            drop(store);
+            return candidate;
+        }
+        panic!("no free non-ephemeral loopback port in the reserved test range");
     }
 
     async fn start_persisting_server(
         data_dir: &std::path::Path,
     ) -> Result<CompanionServer, String> {
+        // A fresh profile in these tests starts from a port the OS will not hand
+        // to an unrelated socket, so restarts do not race ephemeral reassignment.
+        if !pairing_record(data_dir).exists() {
+            persist_stable_loopback_pairing(data_dir);
+        }
         CompanionServer::start(
             Arc::new(
                 RuntimeTranscriptionFactory::new_for_tests(data_dir, None)
@@ -1872,18 +1907,31 @@ mod tests {
     #[tokio::test]
     async fn occupied_persisted_port_fails_without_rotating_identity() {
         let temporary = tempfile::tempdir().expect("temporary data directory");
-        let first = start_persisting_server(temporary.path())
-            .await
-            .expect("companion server should start");
-        let endpoint = first.pairing.endpoint.clone();
-        first.shutdown().await;
-        drop(first);
+        // The persisted port is owned for the whole test instead of re-binding
+        // the ephemeral port that a previous listener happened to use: a freed
+        // ephemeral port can be handed to any other socket in this process, and
+        // binding it again is then a race against unrelated traffic rather than
+        // a statement about the companion. Holding the listener makes the
+        // conflict itself deterministic.
+        let occupier =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a port to occupy");
+        let port = occupier.local_addr().expect("occupier address").port();
+        let store = identity::PairingStore::open(temporary.path()).expect("pairing store");
+        store
+            .persist(
+                &identity::PairingIdentity::generate(
+                    identity::PairingMode::Loopback,
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    port,
+                )
+                .expect("synthetic identity"),
+            )
+            .expect("synthetic pairing record");
+        store.release_lease();
+        drop(store);
 
-        let port = pairing_port(&endpoint);
-        let occupier = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-            .expect("port should be free right after shutdown");
         let record = pairing_record(temporary.path());
-        let before = std::fs::read(&record).unwrap();
+        let before = std::fs::read(&record).expect("pairing record should exist");
 
         let error = start_persisting_server(temporary.path())
             .await

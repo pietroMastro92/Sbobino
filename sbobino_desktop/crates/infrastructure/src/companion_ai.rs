@@ -207,7 +207,22 @@ struct Store {
     _lease: std::fs::File,
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // The final owner releases only after its workers have drained. Order
+        // the unlock before a replacement opens the store; closing alone can
+        // leave an immediate restart observing the old lease as busy.
+        Self::unlock_lease(&self._lease);
+    }
+}
+
 impl Store {
+    fn unlock_lease(lease: &std::fs::File) {
+        if let Err(error) = lease.unlock() {
+            tracing::error!(%error, "companion AI lease release failed");
+        }
+    }
+
     fn save(&self, record: &Record) -> Result<(), String> {
         let id = &record.snapshot.id;
         let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
@@ -333,8 +348,13 @@ impl AiService {
         lease.try_lock().map_err(|_| {
             "La sessione AI precedente si sta ancora chiudendo. Riprova.".to_string()
         })?;
-        let storage = SecureStorage::load_or_create_with_fallback(factory.data_dir())
-            .map_err(|_| "Archivio AI cifrato non disponibile.")?;
+        let storage = match SecureStorage::load_or_create_with_fallback(factory.data_dir()) {
+            Ok(storage) => storage,
+            Err(_) => {
+                Store::unlock_lease(&lease);
+                return Err("Archivio AI cifrato non disponibile.".into());
+            }
+        };
         let store = Store {
             root,
             storage,
@@ -1731,6 +1751,62 @@ mod tests {
         );
         assert!(service.state.lock().unwrap().records.is_empty());
         assert_eq!(service.get(&id).status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn store_drop_unlocks_lease_after_the_last_owner_even_with_a_duplicated_descriptor() {
+        let (service, _temp) = fixture("http://127.0.0.1:9/v1");
+        let factory = service.factory.clone();
+        let remaining_owner = service.clone();
+        // flock follows the open file description. Keeping a duplicate makes
+        // close-only release deterministically insufficient, without sleeping
+        // or depending on when the kernel completes a last-descriptor close.
+        let descriptor = service.store().unwrap()._lease.try_clone().unwrap();
+        let reopen = || {
+            AiService::new(
+                factory.clone(),
+                Arc::new(Semaphore::new(1)),
+                CancellationToken::new(),
+            )
+        };
+        service.shutdown().await;
+        assert!(reopen().is_err(), "a live store must keep its lease");
+        drop(service);
+        assert!(reopen().is_err(), "the remaining owner must keep its lease");
+        drop(remaining_owner);
+        let restarted = reopen().expect("dropping the last store owner must unlock synchronously");
+        // The duplicate still exists when the replacement owns the lease.
+        drop(descriptor);
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn storage_open_failure_releases_the_ai_lease_for_a_retry() {
+        let (service, temp) = fixture("http://127.0.0.1:9/v1");
+        let factory = service.factory.clone();
+        service.shutdown().await;
+        drop(service);
+        let key = temp.path().join(".sbobino-secure-storage/master_key_v1");
+        std::fs::write(&key, "invalid synthetic key").unwrap();
+        for _ in 0..2 {
+            let error = AiService::new(
+                factory.clone(),
+                Arc::new(Semaphore::new(1)),
+                CancellationToken::new(),
+            )
+            .err()
+            .expect("invalid synthetic storage must fail");
+            assert_eq!(error, "Archivio AI cifrato non disponibile.");
+        }
+        std::fs::remove_file(key).unwrap();
+        let restarted = AiService::new(
+            factory,
+            Arc::new(Semaphore::new(1)),
+            CancellationToken::new(),
+        )
+        .expect("the storage failure must not leave a busy lease");
+        restarted.shutdown().await;
     }
 
     #[tokio::test]

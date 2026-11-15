@@ -230,6 +230,36 @@ impl WhisperStreamEngine {
         candidates.pop()
     }
 
+    /// True when `status` is what an intentional stop looks like: a clean
+    /// worker exit, or termination by the interrupt this stop sends.
+    ///
+    /// Everything else — a non-zero exit code of its own, or a signal this
+    /// stop never sent — is the worker dying while the caller stops it, and it
+    /// must be reported instead of being collected as a successful session.
+    fn status_ends_an_intentional_stop(status: &ExitStatus) -> bool {
+        match status.code() {
+            Some(code) => code == 0,
+            // No exit code means the worker was killed by a signal.
+            None => Self::status_signal_is_our_interrupt(status),
+        }
+    }
+
+    #[cfg(unix)]
+    fn status_signal_is_our_interrupt(status: &ExitStatus) -> bool {
+        use std::os::unix::process::ExitStatusExt;
+        // `stop` interrupts the worker with SIGINT, so exactly that signal is
+        // its own doing; any other terminating signal is a crash. These values
+        // are fixed by POSIX/macOS/Linux ABI.
+        const SIGINT: i32 = 2;
+        status.signal() == Some(SIGINT)
+    }
+
+    #[cfg(not(unix))]
+    fn status_signal_is_our_interrupt(_status: &ExitStatus) -> bool {
+        // Every non-Unix platform reports an exit code instead of a signal.
+        false
+    }
+
     async fn await_saved_audio_path(session_dir: Option<&Path>) -> Option<PathBuf> {
         let session_dir = session_dir?;
 
@@ -982,28 +1012,45 @@ impl WhisperStreamEngine {
                     .status();
             }
 
-            if timeout(Duration::from_millis(900), child.wait())
-                .await
-                .is_err()
-            {
-                if let Some(pid) = child.id() {
-                    #[cfg(unix)]
-                    let _ = std::process::Command::new("kill")
-                        .arg("-TERM")
-                        .arg(pid.to_string())
-                        .status();
-                    #[cfg(target_os = "windows")]
-                    let _ = std_background_command("taskkill")
-                        .args(["/F", "/PID", &pid.to_string()])
-                        .status();
+            // The interrupt is only a request. A worker that leaves on its own
+            // while this stop waits — with a failure status — crashed during the
+            // stop, so its exit status must be classified here. Once this stop
+            // has to escalate to SIGTERM/SIGKILL the status belongs to that
+            // escalation and says nothing about the worker's own health.
+            let mut crash_while_stopping = None;
+            match timeout(Duration::from_millis(900), child.wait()).await {
+                Ok(Ok(status)) => {
+                    if !Self::status_ends_an_intentional_stop(&status) {
+                        crash_while_stopping = Some(status);
+                    }
                 }
-                if timeout(Duration::from_millis(500), child.wait())
-                    .await
-                    .is_err()
-                {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                // Waiting failed; there is no status to classify and nothing to
+                // escalate, exactly as before.
+                Ok(Err(_)) => {}
+                Err(_) => {
+                    if let Some(pid) = child.id() {
+                        #[cfg(unix)]
+                        let _ = std::process::Command::new("kill")
+                            .arg("-TERM")
+                            .arg(pid.to_string())
+                            .status();
+                        #[cfg(target_os = "windows")]
+                        let _ = std_background_command("taskkill")
+                            .args(["/F", "/PID", &pid.to_string()])
+                            .status();
+                    }
+                    if timeout(Duration::from_millis(500), child.wait())
+                        .await
+                        .is_err()
+                    {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                    }
                 }
+            }
+            if let Some(status) = crash_while_stopping {
+                let mut state = self.state.lock().await;
+                Self::mark_terminal_child_failure(&mut state, Some(&status));
             }
         }
 
@@ -1134,7 +1181,7 @@ mod tests {
     use super::{StreamState, WhisperLiveProfile, WhisperStreamEngine};
     use sbobino_application::{RealtimeDelta, RealtimeDeltaKind};
     use sbobino_domain::TranscriptionComputeDevice;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt};
     use tokio::sync::{oneshot, Mutex};
 
     #[test]
@@ -1510,26 +1557,52 @@ mod tests {
         assert!(state.preview.is_empty());
     }
 
-    #[tokio::test]
-    async fn stop_after_child_exit_returns_recovery_error_and_keeps_audio_path() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let audio_path = temp.path().join("whisper-live.wav");
+    /// Awaits the OS-observable exit of a fixture child.
+    ///
+    /// A fixed sleep only *usually* runs ahead of the child; polling `try_wait`
+    /// is the same primitive `stop` uses, so the test cannot start from a state
+    /// the production code would classify differently than the test assumes.
+    /// The deadline only guards against a fixture that never exits.
+    async fn await_child_exit(child: &mut tokio::process::Child) -> std::process::ExitStatus {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("fixture child must be waitable") {
+                return status;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fixture child never exited"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn write_recovery_wav(path: &std::path::Path) {
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 16_000,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
-        let mut writer = hound::WavWriter::create(&audio_path, spec).expect("create wav");
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
         writer.write_sample(0_i16).expect("write wav");
         writer.finalize().expect("finalize wav");
+    }
+
+    #[tokio::test]
+    async fn stop_after_child_exit_returns_recovery_error_and_keeps_audio_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let audio_path = temp.path().join("whisper-live.wav");
+        write_recovery_wav(&audio_path);
 
         let engine = WhisperStreamEngine::new("whisper-stream".to_string(), "models".to_string());
-        let child = tokio::process::Command::new("sh")
+        let mut child = tokio::process::Command::new("sh")
             .args(["-c", "exit 7"])
             .spawn()
             .expect("fake whisper child should spawn");
-        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+        // The precondition of this test is a child that has *already* exited, so
+        // it is awaited instead of assumed from elapsed time.
+        assert_eq!(await_child_exit(&mut child).await.code(), Some(7));
         {
             let mut state = engine.state.lock().await;
             state.child = Some(child);
@@ -1559,5 +1632,100 @@ mod tests {
             message.contains("no partial live transcript was saved"),
             "{message}"
         );
+    }
+
+    /// The same recovery contract for the race the hosted runner exposed: the
+    /// child was still running when `stop` looked at it, and it failed while
+    /// `stop` was already waiting. Its exit status is the only evidence of the
+    /// crash, so ignoring it would save a partial preview as a successful
+    /// transcript.
+    #[tokio::test]
+    async fn child_that_fails_while_stopping_is_not_saved_as_success() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let audio_path = temp.path().join("whisper-live.wav");
+        write_recovery_wav(&audio_path);
+
+        let engine = WhisperStreamEngine::new("whisper-stream".to_string(), "models".to_string());
+        // The fixture ignores the stop interrupt and fails with status 7 as soon
+        // as its stdin pipe is closed. `stop` closes the worker's stdin when it
+        // waits, so the failure provably happens while this stop is already
+        // waiting: no elapsed-time assumption and no signal handler involved.
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' INT; echo armed; read -r line; exit 7"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            // A test that panics must not leave the fixture running.
+            .kill_on_drop(true)
+            .spawn()
+            .expect("fake whisper child should spawn");
+        let stdout = child.stdout.take().expect("fixture stdout");
+        let mut armed = String::new();
+        tokio::io::BufReader::new(stdout)
+            .read_line(&mut armed)
+            .await
+            .expect("fixture readiness line");
+        assert_eq!(armed.trim(), "armed");
+        assert!(
+            child.try_wait().expect("fixture child").is_none(),
+            "the fixture must still be running when stop starts"
+        );
+        {
+            let mut state = engine.state.lock().await;
+            state.child = Some(child);
+            state.running = true;
+            state.active_readers = 0;
+            state.session_dir = Some(temp.path().to_path_buf());
+            state
+                .lines
+                .push("partial preview must not be saved".to_string());
+        }
+
+        let error = engine
+            .stop()
+            .await
+            .expect_err("a child that fails while stopping must fail stop");
+        let message = error.to_string();
+        assert!(message.contains("status 7"), "{message}");
+        assert!(
+            message.contains(audio_path.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(
+            message.contains("no partial live transcript was saved"),
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn intentional_sigint_stop_keeps_the_successful_transcript_and_audio() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let audio_path = temp.path().join("whisper-live.wav");
+        write_recovery_wav(&audio_path);
+        let engine = WhisperStreamEngine::new("whisper-stream".into(), "models".into());
+        // No signal handler: the same SIGINT as the shipped worker terminates
+        // this child by signal, rather than with a normal exit code.
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("fixture child");
+        assert!(child.try_wait().unwrap().is_none());
+        {
+            let mut state = engine.state.lock().await;
+            state.child = Some(child);
+            state.running = true;
+            state.active_readers = 0;
+            state.session_dir = Some(temp.path().to_path_buf());
+            state
+                .lines
+                .push("A completed synthetic live session.".into());
+        }
+        let result = engine
+            .stop()
+            .await
+            .expect("our SIGINT is an intentional stop");
+        assert_eq!(result.transcript, "A completed synthetic live session.");
+        assert_eq!(result.saved_audio_path, Some(audio_path));
     }
 }
