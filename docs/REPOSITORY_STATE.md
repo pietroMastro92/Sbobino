@@ -1,4 +1,4 @@
-# Repository state — 2026-11-14
+# Repository state — 2026-11-15
 
 `main` is the canonical development branch of https://github.com/pietroMastro92/Sbobino. The canonical local checkout is `/Users/pietromastro/Documents/sbobino_tauri`.
 
@@ -8,7 +8,9 @@ The stable baseline remains v2.0.36. Candidate tags v2.0.37 and v2.0.38 are reta
 
 The next product version is **2.0.39**, prepared locally after reproducing the failure through the complete hydration path. DeepSeek's changes plus root review corrections cover universal LLVM bitcode, explicit per-architecture Mach-O queries, embedded-library sanitization, path/collision guards, Rust lint and Windows pairing-state error classification. See `docs/reviews/companion-local-release-integration-20261115.md`.
 
-Local evidence includes a complete public ARM build/readiness pass, 217 frontend tests, 566 Rust tests (5 declared real-runtime smokes ignored), and 87 packaging/staging/loader tests on native ARM and in an x86_64 process through Rosetta. Native Intel and Windows distribution proofs remain mandatory, not inferred from Rosetta. Final 2.0.39 source-bound full hydration, native public app build, pinned Clippy and full frontend/Rust gates pass locally. The reviewed product commit is `73749147c9f58009bb14e6db3fb23e347778a929`; the v2.0.39 release workflow is pinned to that exact product tree.
+The single main CI at `1188c64` (43709717704) passed ARM, Windows and Linux but failed four Intel lifecycle assertions; verification installers 43709717718 passed all three platforms. Those failures were reproduced and repaired locally before another push. The reviewed product commit is now `153a86c194ca43b1172d570743e0adc0297980f0`; the v2.0.39 workflow is pinned to that exact product tree. See `docs/reviews/companion-lifecycle-final-integration-20261115.md`.
+
+Final local evidence for that product: 572 workspace tests passed on native ARM and in an x86_64 process through Rosetta (5/4 declared real-runtime smokes ignored), all-targets Clippy clean on both, and 20/20 complete infrastructure stress runs of 229 tests per architecture. The public ARM app was rebuilt and its ad-hoc deep/strict signature verified. The nine packaging sources are byte-identical to the prior complete hydration/packaging gate, so those source-bound proofs and the unchanged 217-test frontend evidence are carried forward. Native Intel/Windows distribution proofs remain mandatory; Rosetta is not Intel hardware certification. At this local checkpoint no v2.0.39 tag, candidate or promotion exists. One new main push is allowed only for the unchanged official CI/verification-installer matrix; no Release Candidate dispatch until that exact head is green.
 
 The official runner matrix and promotion contract are unchanged. Main CI must finish green before a Release Candidate dispatch; candidate publication, all same-tag/SHA proofs/manifests, updater signature verification and the promotion gate precede any stable update. No test profile pairing is copied into the official identity.
 

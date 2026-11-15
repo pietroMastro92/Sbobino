@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAG_NAME: ${{ inputs.tag_name }}
-      REVIEWED_PRODUCT_SHA: 73749147c9f58009bb14e6db3fb23e347778a929
+      REVIEWED_PRODUCT_SHA: 153a86c194ca43b1172d570743e0adc0297980f0
     steps:
       - name: Require the reviewed candidate tag
         run: |
