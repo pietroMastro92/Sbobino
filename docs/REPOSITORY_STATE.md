@@ -2,6 +2,12 @@
 
 `main` is the canonical development branch of https://github.com/pietroMastro92/Sbobino. The canonical local checkout is `/Users/pietromastro/Documents/sbobino_tauri`.
 
+## Current release preparation — 2026-11-15
+
+The latest stable public release remains v2.0.36. Both v2.0.37 candidate runs failed before publishing; its annotated tag is retained unchanged for provenance. The replacement product version is 2.0.38, with packaging fixes and native loader/staging regressions reviewed in companion-2038-root-review-fixes-20261115.md. The reviewed product commit is 60addb167fdb28748053207e77aa8d3dd518fb1b. Candidate and promotion workflows lock to v2.0.38 and compare the tagged product tree against that commit. Native validation remains on the official hosted Apple Silicon, Intel and Windows runners. A public candidate, its signed updater assets and all distribution/portability proofs are required before stable promotion.
+
+The dated preparation notes below retain earlier snapshots and are historical where they mention 2.0.37 as the current candidate.
+
 ## Release baseline
 
 `v2.0.36` is the published stable release, commit `aa171fa31ebc77e00a49b8530a3053cdfc1ae079`. Main now contains that entire history plus the later main studies/benchmarks; the integration merge is `3d5d744f824d0e34e4c0a2b4d89a8d7e34541c9c`. The product version on main is 2.0.37 since commit `f9055b289ede447a265e1cb51a177b304dbcf3bd`; that commit is unreleased preparation plus the Companion implementation, not a release. Local `main` is that commit, two commits ahead of `origin/main` (`692cdb58a5853ea0d9d5ea910da1c0365b11f0e0`) and not pushed; `v2.0.36` is still the newest tag locally and remotely, so it remains the latest stable release and the only version the updater endpoint serves.
