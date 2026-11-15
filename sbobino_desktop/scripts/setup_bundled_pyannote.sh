@@ -4,10 +4,16 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage: setup_bundled_pyannote.sh [--force] [--python-version VERSION] [--model-repo URL]
+                                 [--stage-dir-probe]
 
 Downloads a local offline pyannote model and creates a bundled Python runtime
 under apps/desktop/src-tauri/resources/pyannote so Tauri builds can ship a
 standalone diarization-capable app without post-install provisioning.
+
+The staging tree lives in $TMPDIR (absolute path required) and is created with
+an explicit `mktemp` template: macOS BSD mktemp ignores TMPDIR when no template
+is given, which on a hosted runner silently staged the runtime under
+/private/var/folders and tripped the personal-path guard.
 
 Options:
   --force                 Rebuild runtime and re-download the model.
@@ -15,12 +21,16 @@ Options:
   --model-repo URL        Git/LFS repository containing an offline pyannote
                           pipeline. Default:
                           https://huggingface.co/pyannote-community/speaker-diarization-community-1
+  --stage-dir-probe       Resolve, create and remove the staging directory, print
+                          `stage_parent=` and `stage_dir=` lines, then exit. Used
+                          by the staging contract test; touches no other path.
 EOF
 }
 
 FORCE=0
 PYTHON_VERSION=3.11
 MODEL_REPO="https://huggingface.co/pyannote-community/speaker-diarization-community-1"
+STAGE_DIR_PROBE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,6 +45,10 @@ while [[ $# -gt 0 ]]; do
     --model-repo)
       MODEL_REPO=${2:-}
       shift 2
+      ;;
+    --stage-dir-probe)
+      STAGE_DIR_PROBE=1
+      shift
       ;;
     -h|--help)
       usage
@@ -67,6 +81,92 @@ need_cmd python3
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PYANNOTE_PORTABLE_RUNTIME_LIB="$SCRIPT_DIR/lib/pyannote_portable_runtime.py"
+
+# ---------------------------------------------------------------------------
+# Staging directory
+# ---------------------------------------------------------------------------
+# macOS BSD mktemp ignores TMPDIR unless a template is passed: `mktemp -d`
+# behaves as `-t tmp` and builds its template from _CS_DARWIN_USER_TEMP_DIR.
+# The 2.0.37 hosted candidates therefore staged the runtime under
+# /var/folders/... even though the workflow exported TMPDIR=$RUNNER_TEMP, and
+# sanitize_runtime then refused the resolved /private/... path.  Every staging
+# directory is now created from an explicit template under the resolved TMPDIR.
+# Only the documented `mktemp -d <template>` form is used (no GNU-only flags),
+# and the template is quoted so a parent with spaces keeps working.
+STAGE_PARENT=""
+
+tmp_parent_dir() {
+  local requested=${TMPDIR:-/tmp}
+  if [[ -z "$requested" ]]; then
+    requested=/tmp
+  fi
+  if [[ "$requested" != /* ]]; then
+    echo "TMPDIR must be an absolute path, got '$requested'" >&2
+    return 1
+  fi
+  if [[ ! -d "$requested" ]]; then
+    mkdir -p "$requested" || {
+      echo "cannot create temporary parent '$requested'" >&2
+      return 1
+    }
+  fi
+  # Canonical absolute path (symlinks resolved, spaces preserved).
+  (cd "$requested" && pwd -P)
+}
+
+stage_parent_dir() {
+  local requested=${TMPDIR:-/tmp}
+  if [[ -z "$requested" ]]; then
+    requested=/tmp
+  fi
+  if [[ "$requested" != /* ]]; then
+    echo "TMPDIR must be an absolute path, got '$requested'" >&2
+    return 1
+  fi
+  # Vet the requested root before creating anything, and again after resolving
+  # symlinks (/var -> /private/var), so a personal profile or lockbox path is
+  # never created and is refused before the model download instead of after the
+  # build.  sanitize_runtime applies the same guard to the staging tree.
+  if ! python3 "$PYANNOTE_PORTABLE_RUNTIME_LIB" guard-root "$requested" >/dev/null; then
+    echo "staging parent '$requested' is a personal/lockbox path; set TMPDIR to a" >&2
+    echo "build directory outside the user profile before running this script" >&2
+    return 1
+  fi
+  local parent
+  parent=$(tmp_parent_dir) || return 1
+  if ! python3 "$PYANNOTE_PORTABLE_RUNTIME_LIB" guard-root "$parent" >/dev/null; then
+    echo "staging parent '$parent' resolves to a personal/lockbox path; set TMPDIR" >&2
+    echo "to a build directory outside the user profile before running this script" >&2
+    return 1
+  fi
+  printf '%s\n' "$parent"
+}
+
+create_stage_dir() {
+  local parent
+  parent=$(stage_parent_dir) || return 1
+  STAGE_PARENT=$parent
+  # Assign in the caller's shell so cleanup_stage_dir can vet the parent.
+  STAGE_DIR=$(mktemp -d "$parent/tmp.XXXXXXXXXX") || {
+    echo "cannot create a staging directory under '$parent'" >&2
+    return 1
+  }
+  return 0
+}
+
+cleanup_stage_dir() {
+  local dir=${1:-$STAGE_DIR}
+  # Fail closed: never run rm -rf on an empty, relative, root or unexpected path.
+  if [[ -z "$dir" || "$dir" != /* || "$dir" == "/" ]]; then
+    echo "refusing to remove unsafe stage directory '${dir}'" >&2
+    return 0
+  fi
+  if [[ -z "${STAGE_PARENT:-}" || "$dir" != "$STAGE_PARENT"/tmp.* ]]; then
+    echo "refusing to remove stage directory '${dir}' outside '${STAGE_PARENT:-}'" >&2
+    return 0
+  fi
+  rm -rf "$dir"
+}
 
 TORCHCODEC_FFMPEG_BASE_URL="https://pytorch.s3.amazonaws.com/torchcodec/ffmpeg/2025-03-14/macos_arm64"
 TORCHCODEC_FFMPEG_VERSION="8.0"
@@ -115,7 +215,9 @@ PY
 python_supports_venv_creation() {
   local python_bin=$1
   local probe_dir
-  probe_dir=$(mktemp -d)
+  local probe_parent
+  probe_parent=$(tmp_parent_dir) || return 1
+  probe_dir=$(mktemp -d "$probe_parent/tmp.XXXXXXXXXX") || return 1
   if "$python_bin" -m venv --copies "$probe_dir/venv" >/dev/null 2>&1; then
     rm -rf "$probe_dir"
     return 0
@@ -562,6 +664,18 @@ esac
 
 RUNTIME_DIR="$PYTHON_ROOT/$TARGET_TRIPLE"
 
+if [[ $STAGE_DIR_PROBE -eq 1 ]]; then
+  create_stage_dir || exit 1
+  echo "stage_parent=$STAGE_PARENT"
+  echo "stage_dir=$STAGE_DIR"
+  cleanup_stage_dir "$STAGE_DIR"
+  if [[ -e "$STAGE_DIR" ]]; then
+    echo "stage directory '$STAGE_DIR' was not removed by cleanup" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
 if [[ $FORCE -eq 0 && -f "$MODEL_DIR/config.yaml" && -x "$RUNTIME_DIR/bin/python3" ]]; then
   echo "Bundled pyannote assets already present in $RESOURCE_ROOT"
   exit 0
@@ -570,8 +684,9 @@ fi
 mkdir -p "$RESOURCE_ROOT" "$PYTHON_ROOT"
 git lfs install >/dev/null
 
-STAGE_DIR=$(mktemp -d)
-trap 'rm -rf "$STAGE_DIR"' EXIT
+create_stage_dir || exit 1
+trap 'cleanup_stage_dir "$STAGE_DIR"' EXIT
+echo "Staging runtime in $STAGE_DIR"
 
 STAGE_MODEL_DIR="$STAGE_DIR/model"
 STAGE_RUNTIME_DIR="$STAGE_DIR/python/$TARGET_TRIPLE"

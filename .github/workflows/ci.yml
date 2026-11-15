@@ -146,6 +146,10 @@ jobs:
         run: python3 scripts/test_macos_bundle_scripts.py
       - name: Verify native Pyannote portability tooling
         run: python3 scripts/test_pyannote_portable_runtime.py
+      - name: Verify native Pyannote staging contract
+        run: python3 scripts/test_setup_pyannote_staging.py
+      - name: Verify native Pyannote loader review regressions
+        run: python3 scripts/test_pyannote_review_regressions.py
       - name: Lint native workspace
         run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
       - name: Test native FluidAudio helper
