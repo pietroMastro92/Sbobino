@@ -43,7 +43,18 @@ esac
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DESKTOP_DIR="$ROOT_DIR/apps/desktop"
 SCRIPTS_DIR="$ROOT_DIR/scripts"
-TEMP_DIR=$(mktemp -d)
+# The default remains the app input used by hosted release builds. Local gates
+# may hydrate into a separate resource root without overwriting that snapshot.
+PYANNOTE_RESOURCE_ROOT=${SBOBINO_PYANNOTE_RESOURCE_ROOT:-"$DESKTOP_DIR/src-tauri/resources/pyannote"}
+# BSD mktemp ignores TMPDIR without an explicit template. Keep the archives and
+# extraction probes on the caller's build volume as well as the hydration tree.
+TEMP_PARENT=${TMPDIR:-/tmp}
+if [[ "$TEMP_PARENT" != /* || ! -d "$TEMP_PARENT" ]]; then
+  echo "TMPDIR must name an absolute existing directory." >&2
+  exit 1
+fi
+TEMP_PARENT=$(cd "$TEMP_PARENT" && pwd -P)
+TEMP_DIR=$(mktemp -d "$TEMP_PARENT/sbobino-readiness.XXXXXXXXXX")
 ASSET_DIR="$TEMP_DIR/release-assets"
 PYANNOTE_RUNTIME_ZIP="$ASSET_DIR/pyannote-runtime-macos-$RELEASE_ARCH.zip"
 PYANNOTE_MODEL_ZIP="$ASSET_DIR/pyannote-model-community-1.zip"
@@ -160,7 +171,7 @@ assert_bundle_contains_no_local_user_data() {
 smoke_test_runtime_asset() {
   local runtime_zip=$1
   local runtime_stage
-  runtime_stage=$(mktemp -d)
+  runtime_stage=$(mktemp -d "$TEMP_DIR/speech-smoke.XXXXXXXXXX")
   trap 'rm -rf "$runtime_stage"' RETURN
 
   unzip -q "$runtime_zip" -d "$runtime_stage"
@@ -288,7 +299,7 @@ PY
 smoke_test_pyannote_runtime_asset() {
   local pyannote_runtime_zip=$1
   local pyannote_stage
-  pyannote_stage=$(mktemp -d)
+  pyannote_stage=$(mktemp -d "$TEMP_DIR/pyannote-smoke.XXXXXXXXXX")
   trap 'rm -rf "$pyannote_stage"' RETURN
 
   /usr/bin/ditto -x -k "$pyannote_runtime_zip" "$pyannote_stage"
@@ -513,7 +524,7 @@ PY
 assert_runtime_asset_portability() {
   local runtime_zip=$1
   local runtime_stage
-  runtime_stage=$(mktemp -d)
+  runtime_stage=$(mktemp -d "$TEMP_DIR/speech-portability.XXXXXXXXXX")
   trap 'rm -rf "$runtime_stage"' RETURN
 
   unzip -q "$runtime_zip" -d "$runtime_stage"
@@ -580,15 +591,15 @@ mkdir -p "$ASSET_DIR"
 
 "$SCRIPTS_DIR/check_release_versions.sh" "$VERSION"
 "$SCRIPTS_DIR/check_no_skipped_tests.sh"
-"$SCRIPTS_DIR/setup_bundled_pyannote.sh" --force
+"$SCRIPTS_DIR/setup_bundled_pyannote.sh" --force --resource-root "$PYANNOTE_RESOURCE_ROOT"
 
 "$SCRIPTS_DIR/package_macos_runtime_asset.sh" "$RUNTIME_ZIP"
 "$SCRIPTS_DIR/package_pyannote_asset.sh" \
-  "$DESKTOP_DIR/src-tauri/resources/pyannote/python/$TARGET_TRIPLE" \
+  "$PYANNOTE_RESOURCE_ROOT/python/$TARGET_TRIPLE" \
   python \
   "$PYANNOTE_RUNTIME_ZIP"
 "$SCRIPTS_DIR/package_pyannote_asset.sh" \
-  "$DESKTOP_DIR/src-tauri/resources/pyannote/model" \
+  "$PYANNOTE_RESOURCE_ROOT/model" \
   model \
   "$PYANNOTE_MODEL_ZIP"
 assert_runtime_asset_portability "$RUNTIME_ZIP"

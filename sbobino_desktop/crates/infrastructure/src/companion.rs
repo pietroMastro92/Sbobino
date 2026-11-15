@@ -384,19 +384,86 @@ pub enum PersistedPairingState {
     Absent,
     /// A regular `companion-pairing/pairing.enc` entry exists. Not a validity check.
     Present,
-    /// The entry could not be inspected, or it is not a regular file. The UI must
-    /// not guess between paired and unpaired in this case.
+    /// The entry could not be inspected, or the profile layout is not the one
+    /// this helper describes (for example `companion-pairing` is not a
+    /// directory). The UI must not guess between paired and unpaired here.
     Unknown,
 }
 
-pub fn persisted_pairing_state(data_dir: &std::path::Path) -> PersistedPairingState {
-    let path = data_dir.join(identity::DIRECTORY).join("pairing.enc");
-    match std::fs::metadata(&path) {
-        Ok(metadata) if metadata.is_file() => PersistedPairingState::Present,
-        Ok(_) => PersistedPairingState::Unknown,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedPairingState::Absent,
-        Err(_) => PersistedPairingState::Unknown,
+/// What one `metadata` observation conclusively says about a single path.
+///
+/// The four cases exist because "the path is missing" and "the path cannot be
+/// inspected" are different answers for the status UI, and the platforms report
+/// them differently: a child lookup below a non-directory component is
+/// `ENOTDIR`/`NotADirectory` on Unix but `ERROR_PATH_NOT_FOUND`/`NotFound` on
+/// Windows (see rust-lang/rust `library/std/src/sys/io/error/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingEntryKind {
+    Directory,
+    RegularFile,
+    /// Conclusively not there.
+    Missing,
+    /// Not a directory, not a regular file, unreadable or otherwise inconclusive.
+    Uninspectable,
+}
+
+fn pairing_entry_kind(path: &std::path::Path) -> PairingEntryKind {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => PairingEntryKind::Directory,
+        Ok(metadata) if metadata.is_file() => PairingEntryKind::RegularFile,
+        Ok(_) => PairingEntryKind::Uninspectable,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PairingEntryKind::Missing,
+        Err(_) => PairingEntryKind::Uninspectable,
     }
+}
+
+/// Pure decision table for the status answer, kept separate from the I/O so the
+/// cross-platform cases can be exercised without a Windows runtime.
+///
+/// `record` is only meaningful when `profile_directory` is a `Directory`: a
+/// missing profile directory cannot hold a saved pairing at all.
+fn classify_persisted_pairing_state(
+    profile_directory: PairingEntryKind,
+    record: PairingEntryKind,
+) -> PersistedPairingState {
+    match profile_directory {
+        PairingEntryKind::Directory => match record {
+            PairingEntryKind::RegularFile => PersistedPairingState::Present,
+            // A confirmed profile directory with no record has nothing saved.
+            PairingEntryKind::Missing => PersistedPairingState::Absent,
+            // Neither a regular file nor conclusive: never guess.
+            PairingEntryKind::Directory | PairingEntryKind::Uninspectable => {
+                PersistedPairingState::Unknown
+            }
+        },
+        // The profile store was never created: the normal first start.
+        PairingEntryKind::Missing => PersistedPairingState::Absent,
+        // `companion-pairing` is not a directory, or cannot be inspected, so the
+        // presence of a record cannot be established. This is the case Windows
+        // reports as `NotFound` for the child lookup, which must not be read as
+        // "unpaired".
+        PairingEntryKind::RegularFile | PairingEntryKind::Uninspectable => {
+            PersistedPairingState::Unknown
+        }
+    }
+}
+
+pub fn persisted_pairing_state(data_dir: &std::path::Path) -> PersistedPairingState {
+    // A `data_dir` that exists but is not a directory makes every observation
+    // below unreliable (on Windows the child lookup degrades to `NotFound`).
+    if matches!(
+        pairing_entry_kind(data_dir),
+        PairingEntryKind::RegularFile | PairingEntryKind::Uninspectable
+    ) {
+        return PersistedPairingState::Unknown;
+    }
+    let profile_directory = data_dir.join(identity::DIRECTORY);
+    classify_persisted_pairing_state(
+        pairing_entry_kind(&profile_directory),
+        // Probing the record below a non-directory is a harmless failed stat; the
+        // profile directory already decides the answer in that case.
+        pairing_entry_kind(&profile_directory.join("pairing.enc")),
+    )
 }
 
 fn local_ip() -> IpAddr {
@@ -2094,8 +2161,7 @@ mod tests {
         }
         assert_eq!(
             revoke_persisted_pairing(temporary.path())
-                .err()
-                .expect("revocation must stay refused while the accept task drains"),
+                .expect_err("revocation must stay refused while the accept task drains"),
             identity::LEASE_BUSY
         );
         assert_eq!(
@@ -2132,8 +2198,7 @@ mod tests {
 
         let error = store
             .revoke()
-            .err()
-            .expect("an unconfirmed directory sync must be reported");
+            .expect_err("an unconfirmed directory sync must be reported");
         assert!(error.contains("non posso confermare"), "{error}");
         // The unlink already happened before the sync failed: the message
         // describes exactly that partial outcome instead of claiming success.
@@ -2169,9 +2234,7 @@ mod tests {
             eprintln!("mode bits are not enforced here: directory sync was not exercised");
             return;
         }
-        let error = result
-            .err()
-            .expect("an unconfirmed directory sync must be reported");
+        let error = result.expect_err("an unconfirmed directory sync must be reported");
         assert!(error.contains("non posso confermare"), "{error}");
         // The rename already happened, so the record exists even though its
         // durability could not be confirmed.
@@ -2223,5 +2286,76 @@ mod tests {
             persisted_pairing_state(unreadable.path()),
             PersistedPairingState::Unknown
         );
+
+        // A `data_dir` that exists but is not a directory cannot hold a profile.
+        // Reading that as "unpaired" would be a guess, not an observation.
+        let replaced_data_dir = tempfile::tempdir().expect("temporary data directory");
+        let data_dir_file = replaced_data_dir.path().join("profile-dir-is-a-file");
+        std::fs::write(&data_dir_file, b"not-a-directory").expect("blocking file");
+        assert_eq!(
+            persisted_pairing_state(&data_dir_file),
+            PersistedPairingState::Unknown
+        );
+    }
+
+    /// The layout evidence the status path can collect, regardless of platform.
+    ///
+    /// `RegularFile` profile directory + `Missing` record is exactly what the
+    /// Windows runner observed before the fix: `metadata` on the child of a
+    /// regular file returns `ERROR_PATH_NOT_FOUND`, which Rust maps to
+    /// `NotFound`, so the old `NotFound => Absent` rule answered "unpaired" for
+    /// a profile that cannot be inspected at all. Unix reports the same layout as
+    /// `ENOTDIR` (`NotADirectory`), which is why only the Windows runner failed.
+    #[test]
+    fn persisted_pairing_classification_never_reads_an_uninspectable_profile_as_absent() {
+        let cases = [
+            (
+                PairingEntryKind::Missing,
+                PairingEntryKind::Missing,
+                PersistedPairingState::Absent,
+            ),
+            (
+                PairingEntryKind::Directory,
+                PairingEntryKind::Missing,
+                PersistedPairingState::Absent,
+            ),
+            (
+                PairingEntryKind::Directory,
+                PairingEntryKind::RegularFile,
+                PersistedPairingState::Present,
+            ),
+            (
+                PairingEntryKind::Directory,
+                PairingEntryKind::Directory,
+                PersistedPairingState::Unknown,
+            ),
+            (
+                PairingEntryKind::Directory,
+                PairingEntryKind::Uninspectable,
+                PersistedPairingState::Unknown,
+            ),
+            (
+                PairingEntryKind::RegularFile,
+                PairingEntryKind::Missing,
+                PersistedPairingState::Unknown,
+            ),
+            (
+                PairingEntryKind::RegularFile,
+                PairingEntryKind::RegularFile,
+                PersistedPairingState::Unknown,
+            ),
+            (
+                PairingEntryKind::Uninspectable,
+                PairingEntryKind::Missing,
+                PersistedPairingState::Unknown,
+            ),
+        ];
+        for (profile_directory, record, expected) in cases {
+            assert_eq!(
+                classify_persisted_pairing_state(profile_directory, record),
+                expected,
+                "profile directory {profile_directory:?} with record {record:?}"
+            );
+        }
     }
 }

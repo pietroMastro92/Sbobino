@@ -528,9 +528,9 @@ fn diarization_device_is_supported(
         }
         // `auto` keeps an explicit-incompatible device diagnostic distinct from
         // a missing backend, but still allows Pyannote fallback for MPS/CUDA.
-        SpeakerDiarizationBackend::Auto => {
-            !matches!(native_compute_for_device(device, host), Err(_))
-        }
+        // Only a rejected device is unsupported: `Ok(None)` (a Pyannote-only
+        // preference such as mps/cuda) stays supported for the `auto` path.
+        SpeakerDiarizationBackend::Auto => native_compute_for_device(device, host).is_ok(),
     }
 }
 

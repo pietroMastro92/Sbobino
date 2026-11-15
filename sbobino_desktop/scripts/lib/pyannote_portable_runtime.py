@@ -45,6 +45,18 @@ CLI
     seals and personal-path substrings in load commands.  Exit status 1 on
     violations.
 
+    Mach-O membership is decided from the real per-slice headers, never from
+    the container magic alone: python.org's universal2 3.11 runtime ships
+    ``lib/python3.11/config-3.11-darwin/python.o`` as a fat container whose two
+    slices are LLVM bitcode wrappers.  Containers with no Mach-O slice are
+    reported as ``non_macho_container`` warnings (inert data, no load
+    commands), a container that mixes Mach-O and non-Mach-O slices is a
+    ``mixed_slice_macho`` violation, and a truncated/broken container is a
+    ``malformed_macho_container`` violation.  Every Mach-O slice is queried
+    explicitly with ``otool -arch <arch>``, so a tool that reports only the
+    host architecture in a multi-architecture dump cannot hide half of the
+    load commands.
+
     Absolute non-system *install names* and *dependencies* are violations.  An
     absolute reference that resolves to a file inside the audited tree is
     reported as ``absolute_runtime_reference`` regardless of the root prefix:
@@ -63,7 +75,11 @@ CLI
 
 ``pyannote_portable_runtime.py inventory <root> <output.json>``
     Deterministic inventory (path, type, sha256, size, symlink target) plus a
-    rolled-up tree hash, used for the payload manifest.
+    rolled-up tree hash, used for the payload manifest.  Files that carry a
+    Mach-O container magic also record their ``macho`` metadata (container
+    format, per-slice architecture and Mach-O file type), so an object file is
+    distinguishable from a dylib and an executable, and a universal container
+    whose slices are LLVM bitcode is visible instead of implied.
 
 ``pyannote_portable_runtime.py guard-paths <input> <output>``
     Path guard for the repair tool: rejects personal profile paths, an output
@@ -113,21 +129,308 @@ INSTALL_NAME_TOOL = "/usr/bin/install_name_tool"
 CODESIGN = "/usr/bin/codesign"
 LIPO = "/usr/bin/lipo"
 
-# Thin and fat Mach-O magics, both endiannesses.
-MACHO_MAGICS = {
+# Thin Mach-O magics and universal ("fat") container magics, both endiannesses.
+THIN_MACHO_MAGICS = {
     b"\xcf\xfa\xed\xfe",
     b"\xce\xfa\xed\xfe",
-    b"\xca\xfe\xba\xbe",
-    b"\xbe\xba\xfe\xca",
     b"\xfe\xed\xfa\xcf",
     b"\xfe\xed\xfa\xce",
 }
+FAT_MACHO_MAGICS = {
+    b"\xca\xfe\xba\xbe",  # fat32, big endian
+    b"\xbe\xba\xfe\xca",  # fat32, little endian
+}
+FAT64_MACHO_MAGICS = {
+    b"\xca\xfe\xba\xbf",  # fat64, big endian (64-bit slice offsets)
+    b"\xbf\xba\xfe\xca",  # fat64, little endian
+}
+MACHO_MAGICS = THIN_MACHO_MAGICS | FAT_MACHO_MAGICS | FAT64_MACHO_MAGICS
+
+# A container magic is *not* evidence that the slices are Mach-O.  python.org's
+# universal2 3.11 installer ships
+# ``lib/python3.11/config-3.11-darwin/python.o`` as a fat container
+# (0xcafebabe) whose two slices are LLVM bitcode wrappers (0x0b17c0de):
+#
+#   $ otool -D .../python.o
+#   .../python.o (architecture x86_64): is an LLVM bit-code file
+#   .../python.o (architecture arm64): is an LLVM bit-code file
+#   $ install_name_tool -id @rpath/python.o .../python.o
+#   .../python.o is not a Mach-O file
+#
+# `otool` exits 0 and prints a diagnostic where load commands would be, so a
+# parser that skips only section headers mistakes the diagnostic for an
+# LC_ID_DYLIB and the sanitizer "plans" a rewrite for a file that has none.
+# Release candidate 2.0.38 died exactly there (release run 2038, ARM64 job,
+# 2026-11-15T08:15:22Z).  Every consumer therefore parses the container itself,
+# bounds-checks it, classifies each slice from its own header and queries
+# `otool -arch <arch>` only for slices that really are Mach-O.
+LLVM_BITCODE_MAGICS = {
+    b"\xde\xc0\x17\x0b",  # wrapper, little endian (measured on python.org 3.11.9)
+    b"\x0b\x17\xc0\xde",  # wrapper, big endian
+    b"BC\xc0\xde",  # raw bitcode stream
+}
+
+MH_MAGIC = 0xFEEDFACE
+MH_MAGIC_64 = 0xFEEDFACF
+MH_FILE_TYPES = {
+    1: "object",
+    2: "execute",
+    3: "fvmlib",
+    4: "core",
+    5: "preload",
+    6: "dylib",
+    7: "dylinker",
+    8: "bundle",
+    9: "dylib_stub",
+    10: "dsym",
+    11: "kext_bundle",
+}
+MH_DYLIB = 6
+CPU_ARCH_ABI64 = 0x01000000
+CPU_TYPE_X86 = 7
+CPU_TYPE_X86_64 = CPU_TYPE_X86 | CPU_ARCH_ABI64
+CPU_TYPE_ARM = 12
+CPU_TYPE_ARM64 = CPU_TYPE_ARM | CPU_ARCH_ABI64
+CPU_SUBTYPE_LOW_MASK = 0x00FFFFFF
+# A universal container larger than this is not a real macOS payload and would
+# only make the parser allocate on attacker-controlled input.
+MAX_FAT_ARCHITECTURES = 64
 
 ARCH_FOR_TRIPLE = {
     "aarch64-apple-darwin": "arm64",
     "x86_64-apple-darwin": "x86_64",
 }
 TRIPLE_FOR_ARCH = {value: key for key, value in ARCH_FOR_TRIPLE.items()}
+
+
+def arch_name(cputype, cpusubtype):
+    """Return the architecture name for a ``cputype``/``cpusubtype`` pair."""
+    if cputype is None or cpusubtype is None:
+        return None
+    subtype = cpusubtype & CPU_SUBTYPE_LOW_MASK
+    if cputype == CPU_TYPE_ARM64:
+        # arm64e (pointer authentication ABI) only exists as a stdlib value on
+        # macOS; nothing in the Pyannote payload ships it today.
+        return "arm64e" if subtype == 2 else "arm64"
+    if cputype == CPU_TYPE_X86_64:
+        return "x86_64h" if subtype == 8 else "x86_64"
+    if cputype == CPU_TYPE_ARM:
+        return "arm"
+    if cputype == CPU_TYPE_X86:
+        return "i386"
+    return None
+
+
+def _read_at(handle, offset, size):
+    """Read ``size`` bytes at ``offset``, or ``None`` when the file is short."""
+    handle.seek(offset)
+    data = handle.read(size)
+    if len(data) != size:
+        return None
+    return data
+
+
+def _thin_macho_header(handle, offset, limit):
+    """Parse a thin Mach-O header at ``offset`` (bounded by ``limit``)."""
+    magic = _read_at(handle, offset, 4)
+    if magic is None or magic not in THIN_MACHO_MAGICS:
+        return None
+    big_endian = magic in (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf")
+    is_64 = magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf")
+    header_size = 32 if is_64 else 28
+    raw = _read_at(handle, offset, header_size)
+    if raw is None or offset + header_size > limit:
+        return None
+    order = "big" if big_endian else "little"
+    cputype = int.from_bytes(raw[4:8], order, signed=False)
+    cpusubtype = int.from_bytes(raw[8:12], order, signed=False)
+    filetype = int.from_bytes(raw[12:16], order, signed=False)
+    ncmds = int.from_bytes(raw[16:20], order, signed=False)
+    sizeofcmds = int.from_bytes(raw[20:24], order, signed=False)
+    start = offset + header_size
+    if start + sizeofcmds > limit:
+        return {"error": "load commands exceed the file bounds"}
+    if ncmds > 100000:
+        return {"error": "implausible load-command count {}".format(ncmds)}
+    return {
+        "cputype": cputype,
+        "cpusubtype": cpusubtype,
+        "filetype": filetype,
+        "filetype_name": MH_FILE_TYPES.get(filetype, "unknown-{}".format(filetype)),
+        "ncmds": ncmds,
+        "sizeofcmds": sizeofcmds,
+        "bits": 64 if is_64 else 32,
+        "error": None,
+    }
+
+
+def read_macho_container(path):
+    """Classify a file as thin/fat Mach-O and inspect every slice header.
+
+    Returns ``{"format": ..., "slices": [...], "error": ...}`` where ``format``
+    is ``thin``, ``fat32``, ``fat64`` or ``invalid`` and every slice carries
+    ``kind`` (``macho``, ``llvm_bitcode`` or ``unknown``).  A container that
+    only has a Mach-O-looking magic but whose slices are not Mach-O is not a
+    Mach-O file for the purposes of the sanitizer and the audit.
+
+    The parse is entirely local and bounds checked: offsets, sizes, slice count
+    and load-command tables are validated against the real file length, so a
+    truncated or hostile container is reported instead of trusted.
+    """
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        return {"format": "invalid", "slices": [], "error": "stat failed: {}".format(error)}
+
+    try:
+        handle = open(path, "rb")
+    except OSError as error:
+        return {"format": "invalid", "slices": [], "error": "open failed: {}".format(error)}
+
+    with handle:
+        magic = _read_at(handle, 0, 4)
+        if magic is None:
+            return {"format": "invalid", "slices": [], "error": "file is shorter than a magic"}
+
+        if magic in THIN_MACHO_MAGICS:
+            header = _thin_macho_header(handle, 0, size)
+            if header is None or header.get("error"):
+                return {
+                    "format": "invalid",
+                    "slices": [],
+                    "error": (header or {}).get("error", "unreadable thin Mach-O header"),
+                }
+            slice_entry = {
+                "index": 0,
+                "offset": 0,
+                "size": size,
+                "arch": arch_name(header["cputype"], header["cpusubtype"]),
+                "kind": "macho",
+                "magic": magic.hex(),
+                "cputype": header["cputype"],
+                "cpusubtype": header["cpusubtype"],
+                "filetype": header["filetype"],
+                "filetype_name": header["filetype_name"],
+            }
+            return {"format": "thin", "slices": [slice_entry], "error": None}
+
+        if magic not in FAT_MACHO_MAGICS and magic not in FAT64_MACHO_MAGICS:
+            return {"format": "invalid", "slices": [], "error": "not a Mach-O container"}
+
+        big_endian = magic in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")
+        is_fat64 = magic in FAT64_MACHO_MAGICS
+        order = "big" if big_endian else "little"
+        header = _read_at(handle, 0, 8)
+        if header is None:
+            return {"format": "invalid", "slices": [], "error": "truncated fat header"}
+        nfat_arch = int.from_bytes(header[4:8], order, signed=False)
+        if nfat_arch == 0 or nfat_arch > MAX_FAT_ARCHITECTURES:
+            return {
+                "format": "invalid",
+                "slices": [],
+                "error": "implausible universal binary architecture count {}".format(nfat_arch),
+            }
+
+        entry_size = 32 if is_fat64 else 20
+        table_size = 8 + nfat_arch * entry_size
+        if table_size > size:
+            return {
+                "format": "invalid",
+                "slices": [],
+                "error": "universal binary header table exceeds the file",
+            }
+        table = _read_at(handle, 8, nfat_arch * entry_size)
+        if table is None:
+            return {"format": "invalid", "slices": [], "error": "truncated universal binary table"}
+
+        slices = []
+        ranges = []
+        for index in range(nfat_arch):
+            entry = table[index * entry_size : (index + 1) * entry_size]
+            if entry_size == 32:
+                cputype = int.from_bytes(entry[0:4], order, signed=False)
+                cpusubtype = int.from_bytes(entry[4:8], order, signed=False)
+                offset = int.from_bytes(entry[8:16], order, signed=False)
+                slice_size = int.from_bytes(entry[16:24], order, signed=False)
+            else:
+                cputype = int.from_bytes(entry[0:4], order, signed=False)
+                cpusubtype = int.from_bytes(entry[4:8], order, signed=False)
+                offset = int.from_bytes(entry[8:12], order, signed=False)
+                slice_size = int.from_bytes(entry[12:16], order, signed=False)
+            if slice_size == 0 or offset < table_size or offset + slice_size > size:
+                return {
+                    "format": "invalid",
+                    "slices": [],
+                    "error": "universal slice {} lies outside the file".format(index),
+                }
+            for start, end in ranges:
+                if offset < end and start < offset + slice_size:
+                    return {
+                        "format": "invalid",
+                        "slices": [],
+                        "error": "universal slices overlap at index {}".format(index),
+                    }
+            ranges.append((offset, offset + slice_size))
+
+            slice_magic = _read_at(handle, offset, 4)
+            kind = "unknown"
+            header_info = None
+            if slice_magic in THIN_MACHO_MAGICS:
+                parsed = _thin_macho_header(handle, offset, offset + slice_size)
+                if parsed is None or parsed.get("error"):
+                    return {
+                        "format": "invalid",
+                        "slices": [],
+                        "error": "slice {}: {}".format(
+                            index, (parsed or {}).get("error", "unreadable Mach-O header")
+                        ),
+                    }
+                header_info = parsed
+                kind = "macho"
+            elif slice_magic in LLVM_BITCODE_MAGICS:
+                kind = "llvm_bitcode"
+            slices.append(
+                {
+                    "index": index,
+                    "offset": offset,
+                    "size": slice_size,
+                    "arch": arch_name(
+                        cputype, cpusubtype
+                    )
+                    or (arch_name(header_info["cputype"], header_info["cpusubtype"]) if header_info else None),
+                    "kind": kind,
+                    "magic": slice_magic.hex() if slice_magic else None,
+                    "cputype": header_info["cputype"] if header_info else cputype,
+                    "cpusubtype": header_info["cpusubtype"] if header_info else cpusubtype,
+                    "filetype": header_info["filetype"] if header_info else None,
+                    "filetype_name": header_info["filetype_name"] if header_info else None,
+                }
+            )
+        return {
+            "format": "fat64" if is_fat64 else "fat32",
+            "slices": slices,
+            "error": None,
+        }
+
+
+def container_macho_slices(container):
+    return [entry for entry in container["slices"] if entry["kind"] == "macho"]
+
+
+def container_non_macho_slices(container):
+    return [entry for entry in container["slices"] if entry["kind"] != "macho"]
+
+
+def describe_slice_kinds(container):
+    kinds = []
+    for entry in container["slices"]:
+        kind = entry["kind"]
+        if kind == "llvm_bitcode":
+            kind = "LLVM bit-code"
+        label = "{}:{}".format(entry["arch"] or "unknown", kind)
+        kinds.append(label)
+    return ", ".join(kinds)
 
 
 # ---------------------------------------------------------------------------
@@ -145,14 +448,50 @@ _OTOOL_SECTION_HEADER = re.compile(
     r"^(?P<path>.*?)(?: \(architecture [A-Za-z0-9_]+\))?:$"
 )
 
+# ``otool`` exits 0 and prints a *diagnostic* where load commands would be when
+# a slice is not Mach-O, for example::
+#
+#   /payload/python.o (architecture arm64): is an LLVM bit-code file
+#   /payload/thing.dylib: is not a Mach-O file
+#
+# Such a line is not a section header (it does not end with ``:``) and must
+# never be mistaken for an install name or a dependency.
+_OTOOL_FILE_DIAGNOSTIC = re.compile(
+    r"^(?P<path>.+?)(?: \(architecture [A-Za-z0-9_]+\))?: is (?:an? )?"
+    r"(?P<kind>LLVM bit-code|not a Mach-O|not an object) file\.?$"
+)
+
+
+def otool_diagnostics(output: str) -> list[str]:
+    """Return the ``is not a Mach-O file`` style diagnostics of an otool dump."""
+    found = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped and _OTOOL_FILE_DIAGNOSTIC.match(stripped):
+            found.append(stripped)
+    return found
+
 
 def _otool_section_lines(output: str):
-    """Yield load-command lines, skipping per-file and per-arch headers."""
+    """Yield load-command lines, skipping per-file/per-arch headers."""
     for line in output.splitlines():
         stripped = line.strip()
         if not stripped or _OTOOL_SECTION_HEADER.match(stripped):
             continue
+        if _OTOOL_FILE_DIAGNOSTIC.match(stripped):
+            # Never let a tool diagnostic masquerade as a load command.
+            continue
         yield stripped
+
+
+def parse_install_names(output: str) -> list[str]:
+    """Return the distinct LC_ID_DYLIB values of an ``otool -D`` dump."""
+    refs = []
+    for stripped in _otool_section_lines(output):
+        ref = stripped.split(" (", 1)[0].strip()
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
 
 
 def parse_otool_dependencies(output: str) -> list[str]:
@@ -226,12 +565,116 @@ def run_command(args, *, check=True):
     return completed
 
 
+def _container_arch_names(binary: Path, container) -> list[str]:
+    """Return one ``otool -arch`` name per slice, cross-checked with ``lipo``.
+
+    ``-arch`` is an arch-selection flag, independent of the host architecture,
+    so a universal binary is inspected slice by slice instead of relying on the
+    multi-architecture dump of a single ``otool`` call.  The dumped form is not
+    portable across tool versions/hosts: on the hosted Intel runners
+    (macos-15-intel, Xcode 16.x) a bare ``otool -D <fat>`` reported only the
+    x86_64 LC_ID_DYLIB, which failed ``test_install_names_are_reported_per_
+    architecture`` and the repaired-install-name receipt (CI run 43692823687).
+    """
+    names = lipo_archs(binary)
+    slices = container["slices"]
+    if not names or len(names) != len(slices):
+        raise SystemExit(
+            "cannot pair the universal slices of '{}' with 'lipo -archs' "
+            "(lipo: {}; container: {}); refusing to query the wrong slice".format(
+                binary, names, len(slices)
+            )
+        )
+    for entry, name in zip(slices, names):
+        mapped = entry["arch"]
+        if mapped and mapped != name:
+            raise SystemExit(
+                "slice {} of '{}' has cputype {} ({}), but lipo reports '{}'; "
+                "refusing to query the wrong architecture".format(
+                    entry["index"], binary, entry["cputype"], mapped, name
+                )
+            )
+    return names
+
+
+def _macho_slice_queries(binary: Path, container):
+    """Return ``[(arch_name_or_None, slice)]`` for the slices we may query."""
+    if container["format"] == "invalid":
+        raise SystemExit(
+            "cannot read Mach-O container '{}': {}".format(binary, container["error"])
+        )
+    macho_slices = container_macho_slices(container)
+    others = container_non_macho_slices(container)
+    if others and macho_slices:
+        raise SystemExit(
+            "'{}' mixes Mach-O and non-Mach-O slices ({}); load commands cannot "
+            "be read per slice, refusing a partial rewrite".format(
+                binary, describe_slice_kinds(container)
+            )
+        )
+    if container["format"] == "thin":
+        return [(None, entry) for entry in macho_slices]
+    names = _container_arch_names(binary, container)
+    return [
+        (names[index], entry)
+        for index, entry in enumerate(container["slices"])
+        if entry["kind"] == "macho"
+    ]
+
+
+def _read_slice_load_commands(binary: Path, container, flag: str, selector=None) -> str:
+    """Run ``otool <flag>`` per Mach-O slice and return the merged raw output.
+
+    An empty stdout from a slice we already know is Mach-O means the tool
+    ignored the request (``otool -arch`` prints nothing and exits 0 for a
+    non-matching arch); that is a hard failure, never an empty load-command
+    list.
+    """
+    queries = _macho_slice_queries(binary, container)
+    if selector is not None:
+        queries = [(name, entry) for name, entry in queries if selector(entry)]
+    outputs = []
+    for name, entry in queries:
+        if name is None:
+            completed = run_command([OTOOL, flag, binary])
+        else:
+            completed = run_command([OTOOL, "-arch", name, flag, binary])
+        if not completed.stdout.strip():
+            raise SystemExit(
+                "otool {}{} produced no output for slice '{}' of '{}'; refusing "
+                "to treat a missing load-command dump as an empty one".format(
+                    "" if name is None else "-arch {} ".format(name),
+                    flag,
+                    entry["arch"] or entry["index"],
+                    binary,
+                )
+            )
+        diagnostics = otool_diagnostics(completed.stdout)
+        if diagnostics:
+            raise SystemExit(
+                "otool reported '{}' for a slice the container declares as "
+                "Mach-O: {}".format(diagnostics[0], binary)
+            )
+        outputs.append(completed.stdout)
+    return "\n".join(outputs)
+
+
 def read_otool_dependencies(binary: Path) -> list[str]:
-    return parse_otool_dependencies(run_command([OTOOL, "-L", binary]).stdout)
+    container = read_macho_container(binary)
+    if container["format"] == "invalid":
+        raise SystemExit(
+            "cannot read Mach-O container '{}': {}".format(binary, container["error"])
+        )
+    return parse_otool_dependencies(_read_slice_load_commands(binary, container, "-L"))
 
 
 def read_otool_rpaths(binary: Path) -> list[str]:
-    return parse_otool_rpaths(run_command([OTOOL, "-l", binary]).stdout)
+    container = read_macho_container(binary)
+    if container["format"] == "invalid":
+        raise SystemExit(
+            "cannot read Mach-O container '{}': {}".format(binary, container["error"])
+        )
+    return parse_otool_rpaths(_read_slice_load_commands(binary, container, "-l"))
 
 
 def read_install_names(binary: Path) -> list[str]:
@@ -240,17 +683,30 @@ def read_install_names(binary: Path) -> list[str]:
     ``otool -D`` prints one section per architecture, so a universal binary can
     legitimately carry two different install names (measured: the
     ``google/_upb`` wheels embed a per-arch ``bazel-out/...`` id).  Reporting
-    only the first slice hides half of the defects.
+    only the first slice hides half of the defects, so every Mach-O slice is
+    queried explicitly.
+
+    Only ``MH_DYLIB`` slices can carry an LC_ID_DYLIB; object files (``.o``)
+    and executables report none by definition, which is decided from the slice
+    header instead of from an empty tool answer.
     """
-    completed = run_command([OTOOL, "-D", binary], check=False)
-    if completed.returncode != 0:
+    container = read_macho_container(binary)
+    if container["format"] == "invalid":
+        return parse_install_names(run_command([OTOOL, "-D", binary]).stdout)
+    dylib_slices = [
+        entry
+        for entry in container_macho_slices(container)
+        if entry["filetype"] == MH_DYLIB
+    ]
+    if not dylib_slices:
+        # Still prove the container is queryable/consistent (raises on mixed
+        # containers) without inventing an install name for a non-dylib.
+        _macho_slice_queries(binary, container)
         return []
-    refs = []
-    for stripped in _otool_section_lines(completed.stdout):
-        ref = stripped.split(" (", 1)[0].strip()
-        if ref and ref not in refs:
-            refs.append(ref)
-    return refs
+    output = _read_slice_load_commands(
+        binary, container, "-D", selector=lambda entry: entry["filetype"] == MH_DYLIB
+    )
+    return parse_install_names(output)
 
 
 def read_install_name(binary: Path):
@@ -297,12 +753,67 @@ def codesign_verify(path: Path):
 
 
 def is_macho(path: Path) -> bool:
-    try:
-        with open(path, "rb") as handle:
-            header = handle.read(4)
-    except OSError:
-        return False
-    return header in MACHO_MAGICS
+    """True only when the file really contains at least one Mach-O slice.
+
+    A universal container whose slices are LLVM bitcode (python.org's bundled
+    ``python.o``) has a Mach-O *container* magic but no load commands at all;
+    treating it as Mach-O is what made the 2.0.38 ARM64 release run call
+    ``install_name_tool -id`` on it.
+    """
+    container = read_macho_container(path)
+    return container["format"] != "invalid" and bool(container_macho_slices(container))
+
+
+def scan_macho_payload(root: Path):
+    """Classify every file below ``root`` that carries a Mach-O container magic.
+
+    Returns a dict with four lists of ``(relative_path, real_path, ...)``:
+
+    ``macho``      every slice is Mach-O: readable and rewritable load commands
+    ``non_macho``  no slice is Mach-O (LLVM bitcode objects): no load commands
+    ``mixed``      some slices are Mach-O and some are not: fail closed
+    ``invalid``    container magic with a broken/truncated header
+
+    Symlinked payload files are visited once, through their real target, so a
+    payload that ships the same binary twice is not rewritten twice.
+    """
+    root = Path(root).resolve()
+    result = {"macho": [], "non_macho": [], "mixed": [], "invalid": []}
+    seen = set()
+    for path in sorted(root.rglob("*")):
+        if path.is_dir() and not path.is_symlink():
+            continue
+        try:
+            real = path.resolve(strict=True)
+        except OSError:
+            continue
+        if not real.is_file():
+            continue
+        key = str(real)
+        if key in seen:
+            continue
+        try:
+            with open(real, "rb") as handle:
+                magic = handle.read(4)
+        except OSError:
+            continue
+        if magic not in MACHO_MAGICS:
+            continue
+        seen.add(key)
+        relative = path.relative_to(root).as_posix()
+        container = read_macho_container(real)
+        if container["format"] == "invalid":
+            result["invalid"].append((relative, real, container))
+            continue
+        macho_slices = container_macho_slices(container)
+        other_slices = container_non_macho_slices(container)
+        if macho_slices and other_slices:
+            result["mixed"].append((relative, real, container))
+        elif macho_slices:
+            result["macho"].append((relative, real, container))
+        else:
+            result["non_macho"].append((relative, real, container))
+    return result
 
 
 def iter_macho(root: Path):
@@ -312,25 +823,11 @@ def iter_macho(root: Path):
     ``lib/Resources/Python.app/Contents/MacOS/Python`` launcher and the
     ``bin/python3`` executable carry their own LC_RPATH list, and a stale
     host rpath there is just as non-portable as one inside a dylib.
+
+    LLVM-bitcode objects and mixed containers are excluded: they have no
+    verifiable load commands for the slice we could not parse.
     """
-    root = Path(root).resolve()
-    seen = set()
-    results = []
-    for path in sorted(root.rglob("*")):
-        if path.is_dir() and not path.is_symlink():
-            continue
-        try:
-            real = path.resolve(strict=True)
-        except OSError:
-            continue
-        if not real.is_file() or not is_macho(real):
-            continue
-        key = str(real)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append((path.relative_to(root).as_posix(), real))
-    return results
+    return [(relative, real) for relative, real, _ in scan_macho_payload(root)["macho"]]
 
 
 def is_inside(path: Path, root: Path) -> bool:
@@ -480,11 +977,42 @@ def audit_runtime(root, expect_arch=None, strict_closure=False):
     if not root.is_dir():
         raise SystemExit("audit root is not a directory: {}".format(root))
 
-    binaries = iter_macho(root)
+    scan = scan_macho_payload(root)
+    binaries = [(relative, real) for relative, real, _ in scan["macho"]]
     file_index = payload_file_index(root)
     violations = []
     warnings = []
     signed_checked = 0
+
+    for relative, _, container in scan["invalid"]:
+        violations.append(
+            {
+                "kind": "malformed_macho_container",
+                "path": relative,
+                "detail": container["error"],
+            }
+        )
+    for relative, _, container in scan["mixed"]:
+        violations.append(
+            {
+                "kind": "mixed_slice_macho",
+                "path": relative,
+                "detail": "slices are {}; load commands cannot be verified for "
+                "the non-Mach-O slice".format(describe_slice_kinds(container)),
+            }
+        )
+    for relative, _, container in scan["non_macho"]:
+        # python.org's universal2 ``python.o`` is a fat container of LLVM
+        # bitcode: an inert data object with no load commands and no install
+        # name.  It must not be audited as code, but it must not be hidden
+        # either, so it is disclosed as a warning.
+        warnings.append(
+            {
+                "kind": "non_macho_container",
+                "path": relative,
+                "detail": "{}; no load commands".format(describe_slice_kinds(container)),
+            }
+        )
 
     def violation(kind, path, detail):
         violations.append(
@@ -791,6 +1319,14 @@ def resolve_internal_dependency(root: Path, binary: Path, dependency: str, index
     return target_real
 
 
+# A payload that embeds a host-managed dylib pulls in that dylib's own host
+# references, so one planning pass is not enough: the copy only becomes visible
+# to the scanner on the next pass.  Four passes cover the measured
+# ``_ssl -> libssl -> libcrypto`` chain with headroom; not converging is a hard
+# failure, never a partially repaired payload.
+MAX_SANITIZE_PASSES = 4
+
+
 def sanitize_runtime(root):
     """Make an existing runtime tree position independent, in place.
 
@@ -798,17 +1334,110 @@ def sanitize_runtime(root):
     the tree itself, and it refuses a root that looks like a personal profile.
 
     Rewrites absolute LC_ID_DYLIB values (build root or delocated prefix) to
-    ``@rpath/<name>`` (layout-scoped for duplicate basenames) and absolute dependencies that point into the tree to
-    ``@loader_path/<relative>``; host-managed dylibs are still embedded under
-    ``lib/embedded-dylibs`` and absolute/host LC_RPATH entries are removed.
-    System libraries and ``@loader_path``/``@executable_path``/``@rpath``
-    references are preserved.
+    ``@rpath/<name>`` (layout-scoped for duplicate basenames) and absolute
+    dependencies that point into the tree to ``@loader_path/<relative>``;
+    host-managed dylibs are embedded under ``lib/embedded-dylibs`` and
+    absolute/host LC_RPATH entries are removed.  System libraries and
+    ``@loader_path``/``@executable_path``/``@rpath`` references are preserved.
+
+    An embedded copy is itself a payload binary with its own load commands
+    (measured: python.org's ``libssl.3.dylib`` links
+    ``/Library/Frameworks/Python.framework/.../libcrypto.3.dylib`` and carries a
+    host LC_RPATH).  Repairing only the client would ship a runtime that still
+    fails ``validate_portable_pyannote_native_dependencies`` in the companion
+    installer, so the pass is repeated until it reaches a fixpoint.  That also
+    keeps a second ``sanitize`` call a byte-level no-op.
+    """
+    root = Path(root).resolve()
+    refuse_personal_root(root)
+
+    aggregate = {
+        "root": str(root),
+        "modified": [],
+        "removed_rpaths": [],
+        "repaired_install_names": [],
+        "repaired_dependencies": [],
+        "embedded_copies": [],
+        "signed": [],
+        "signed_bundles": [],
+        "skipped_non_macho": [],
+        "passes": 0,
+    }
+    seen_modified = set()
+    seen_skipped = set()
+    embedded_sources = {}
+    for pass_index in range(1, MAX_SANITIZE_PASSES + 1):
+        receipt = _sanitize_pass(root, embedded_sources)
+        for entry in receipt["modified"]:
+            if entry not in seen_modified:
+                seen_modified.add(entry)
+                aggregate["modified"].append(entry)
+        for key in (
+            "removed_rpaths",
+            "repaired_install_names",
+            "repaired_dependencies",
+            "embedded_copies",
+            "signed",
+            "signed_bundles",
+        ):
+            aggregate[key].extend(receipt[key])
+        for entry in receipt["skipped_non_macho"]:
+            if entry["path"] not in seen_skipped:
+                seen_skipped.add(entry["path"])
+                aggregate["skipped_non_macho"].append(entry)
+        if receipt["modified"]:
+            aggregate["passes"] = pass_index
+        if not receipt["modified"]:
+            return aggregate
+
+    raise SystemExit(
+        "the sanitizer did not converge after {} passes; the payload keeps "
+        "gaining host-managed references (last pass embedded {}). Refusing to "
+        "ship a partially repaired runtime.".format(
+            MAX_SANITIZE_PASSES, ", ".join(aggregate["embedded_copies"][-5:]) or "none"
+        )
+    )
+
+
+def _sanitize_pass(root, embedded_sources):
+    """One plan-then-mutate pass over the current payload tree.
+
+    ``embedded_sources`` maps an embedded target path to the realpath of the
+    host dylib it was copied from, and is shared across passes so a basename
+    collision is detected even when the two clients are seen in different
+    passes.
     """
     root = Path(root).resolve()
     refuse_personal_root(root)
     embedded_dir = root / "lib" / "embedded-dylibs"
 
-    binaries = iter_macho(root)
+    scan = scan_macho_payload(root)
+    # Fail closed before planning a single rewrite: a container we cannot
+    # classify slice by slice must never be half-repaired.
+    if scan["invalid"]:
+        relative, _, container = scan["invalid"][0]
+        raise SystemExit(
+            "'{}' has a Mach-O container magic but an unreadable header ({}); "
+            "refusing to sanitize a payload this tool cannot verify".format(
+                relative, container["error"]
+            )
+        )
+    if scan["mixed"]:
+        relative, _, container = scan["mixed"][0]
+        raise SystemExit(
+            "'{}' mixes Mach-O and non-Mach-O slices ({}); install_name_tool "
+            "would act on a container this tool cannot fully verify, refusing "
+            "the rewrite".format(relative, describe_slice_kinds(container))
+        )
+    binaries = [(relative, real) for relative, real, _ in scan["macho"]]
+    skipped_non_macho = [
+        {
+            "path": relative,
+            "format": container["format"],
+            "slices": describe_slice_kinds(container),
+        }
+        for relative, _, container in scan["non_macho"]
+    ]
     file_index = payload_file_index(root)
     # Snapshot every install name before touching anything: a dependency is
     # verified against the *original* ids of its target, not against a value
@@ -831,6 +1460,7 @@ def sanitize_runtime(root):
     # the run before a single load command is rewritten, so a failed repair
     # can never leave a half-sanitized, half-signed tree behind.
     plans = []
+    planned_embedded_sources = dict(embedded_sources)
     for relative, binary in binaries:
         plan = {
             "relative": relative,
@@ -857,6 +1487,17 @@ def sanitize_runtime(root):
                         "host-managed dylib '{}' required by '{}' is missing on this "
                         "machine; cannot repair the runtime offline".format(dependency, binary)
                     )
+                target_key = str(embedded_dir / source.name)
+                source_real = os.path.realpath(source)
+                previous = planned_embedded_sources.get(target_key)
+                if previous is not None and previous != source_real:
+                    raise SystemExit(
+                        "cannot embed '{}': '{}' was already planned from '{}' "
+                        "and they are different files with the same basename".format(
+                            source, target_key, previous
+                        )
+                    )
+                planned_embedded_sources[target_key] = source_real
                 plan["embed"].append((dependency, source))
                 continue
             if not dependency.startswith("/") or is_system_reference(dependency):
@@ -900,6 +1541,7 @@ def sanitize_runtime(root):
     embedded_planned = set()
     embedded_targets = []
 
+    embedded_sources.update(planned_embedded_sources)
     for plan in plans:
         binary = plan["binary"]
         relative = plan["relative"]
@@ -1017,6 +1659,10 @@ def sanitize_runtime(root):
         "embedded_copies": embedded_copies,
         "signed": signed,
         "signed_bundles": [str(bundle.relative_to(root)) for bundle in bundles],
+        # Containers with no Mach-O slice at all (python.org's universal2
+        # ``python.o`` is fat LLVM bitcode).  They are data, never rewritten;
+        # the receipt keeps them visible instead of silently skipping a file.
+        "skipped_non_macho": skipped_non_macho,
     }
 
 
@@ -1066,6 +1712,53 @@ def guard_paths(input_path, output_path):
 # ---------------------------------------------------------------------------
 
 
+def inventory_macho_metadata(path: Path):
+    """Return Mach-O type metadata for an inventory entry, or ``None``.
+
+    The manifest has to distinguish an object file from a dylib and from an
+    executable, and it has to stay honest about containers whose slices are not
+    Mach-O at all (python.org's universal2 ``python.o`` is fat LLVM bitcode).
+    ``kind`` is ``macho``, ``llvm_bitcode``, ``mixed``, ``unknown`` or
+    ``invalid``; each slice records its own architecture and Mach-O file type,
+    taken from the real Mach-O header of that slice.
+    """
+    try:
+        with open(path, "rb") as handle:
+            magic = handle.read(4)
+    except OSError:
+        return None
+    if magic not in MACHO_MAGICS:
+        return None
+    container = read_macho_container(path)
+    if container["format"] == "invalid":
+        return {"format": "invalid", "kind": "invalid", "error": container["error"], "slices": []}
+    macho_slices = container_macho_slices(container)
+    other_slices = container_non_macho_slices(container)
+    if macho_slices and other_slices:
+        kind = "mixed"
+    elif macho_slices:
+        kind = "macho"
+    elif other_slices:
+        kind = "llvm_bitcode" if all(
+            entry["kind"] == "llvm_bitcode" for entry in other_slices
+        ) else "unknown"
+    else:
+        kind = "unknown"
+    return {
+        "format": container["format"],
+        "kind": kind,
+        "archs": [entry["arch"] for entry in container["slices"]],
+        "slices": [
+            {
+                "arch": entry["arch"],
+                "kind": entry["kind"],
+                "filetype": entry["filetype_name"],
+            }
+            for entry in container["slices"]
+        ],
+    }
+
+
 def build_inventory(root):
     root = Path(root).resolve()
     entries = []
@@ -1088,14 +1781,16 @@ def build_inventory(root):
                 digest.update(chunk)
         size = path.stat().st_size
         total_bytes += size
-        entries.append(
-            {
-                "path": relative,
-                "type": "file",
-                "sha256": digest.hexdigest(),
-                "size": size,
-            }
-        )
+        entry = {
+            "path": relative,
+            "type": "file",
+            "sha256": digest.hexdigest(),
+            "size": size,
+        }
+        macho = inventory_macho_metadata(path)
+        if macho is not None:
+            entry["macho"] = macho
+        entries.append(entry)
 
     rolled = hashlib.sha256()
     for entry in entries:
@@ -1174,7 +1869,8 @@ def main(argv=None):
         print(
             "sanitized {} Mach-O, removed {} rpath(s), repaired {} install "
             "name(s) and {} dependency reference(s), copied {} dylib(s), signed "
-            "{} binary/binaries and {} bundle(s)".format(
+            "{} binary/binaries and {} bundle(s), skipped {} non-Mach-O "
+            "container(s)".format(
                 len(receipt["modified"]),
                 len(receipt["removed_rpaths"]),
                 len(receipt["repaired_install_names"]),
@@ -1182,6 +1878,7 @@ def main(argv=None):
                 len(receipt["embedded_copies"]),
                 len(receipt["signed"]),
                 len(receipt["signed_bundles"]),
+                len(receipt["skipped_non_macho"]),
             )
         )
         return 0

@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage: setup_bundled_pyannote.sh [--force] [--python-version VERSION] [--model-repo URL]
-                                 [--stage-dir-probe]
+                                 [--resource-root DIR] [--stage-dir-probe]
 
 Downloads a local offline pyannote model and creates a bundled Python runtime
 under apps/desktop/src-tauri/resources/pyannote so Tauri builds can ship a
@@ -21,9 +21,17 @@ Options:
   --model-repo URL        Git/LFS repository containing an offline pyannote
                           pipeline. Default:
                           https://huggingface.co/pyannote-community/speaker-diarization-community-1
+  --resource-root DIR     Absolute path of the assembled `pyannote` resource
+                          root (python/ + model/). Default:
+                          apps/desktop/src-tauri/resources/pyannote
+                          Needed to build and verify the real hydration outside
+                          the checkout (the default root is tracked app input).
+                          The path is vetted by the shared personal-path guard
+                          before anything is created.
   --stage-dir-probe       Resolve, create and remove the staging directory, print
-                          `stage_parent=` and `stage_dir=` lines, then exit. Used
-                          by the staging contract test; touches no other path.
+                          `stage_parent=`, `stage_dir=` and `resource_root=`
+                          lines, then exit. Used by the staging contract test;
+                          touches no other path.
 EOF
 }
 
@@ -31,6 +39,7 @@ FORCE=0
 PYTHON_VERSION=3.11
 MODEL_REPO="https://huggingface.co/pyannote-community/speaker-diarization-community-1"
 STAGE_DIR_PROBE=0
+RESOURCE_ROOT_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,6 +53,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --model-repo)
       MODEL_REPO=${2:-}
+      shift 2
+      ;;
+    --resource-root)
+      RESOURCE_ROOT_OVERRIDE=${2:-}
       shift 2
       ;;
     --stage-dir-probe)
@@ -166,6 +179,36 @@ cleanup_stage_dir() {
     return 0
   fi
   rm -rf "$dir"
+}
+
+replace_runtime_dir() {
+  local target=$1
+  local root=$2
+  local canonical_target
+  # The assembled runtime is rewritten from scratch, so the target must be a
+  # non-empty absolute path strictly inside the resource root. A mistyped
+  # --resource-root must never turn this into `rm -rf /` or into a removal of
+  # the resource root itself.
+  if [[ -z "$target" || "$target" != /* || "$target" == "/" ]]; then
+    echo "refusing to remove unsafe runtime directory '${target}'" >&2
+    return 1
+  fi
+  if [[ -z "$root" || "$root" != /* || "$target" != "$root"/* ]]; then
+    echo "refusing to remove runtime directory '${target}' outside '${root:-}'" >&2
+    return 1
+  fi
+  canonical_target=$(python3 - "$target" "$root" <<'PY'
+import sys
+from pathlib import Path
+
+target, root = (Path(value).resolve() for value in sys.argv[1:])
+if root == Path(root.anchor) or target == root or root not in target.parents:
+    raise SystemExit("refusing to remove runtime directory outside its canonical resource root")
+print(target)
+PY
+  ) || return 1
+  python3 "$PYANNOTE_PORTABLE_RUNTIME_LIB" guard-root "$canonical_target" >/dev/null || return 1
+  rm -rf "$canonical_target"
 }
 
 TORCHCODEC_FFMPEG_BASE_URL="https://pytorch.s3.amazonaws.com/torchcodec/ffmpeg/2025-03-14/macos_arm64"
@@ -644,7 +687,59 @@ PY
 }
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+resolve_resource_root() {
+  local requested=$1
+  local resolved
+  if [[ -z "$requested" ]]; then
+    echo "--resource-root requires a value" >&2
+    return 1
+  fi
+  if [[ "$requested" != /* ]]; then
+    echo "resource root must be an absolute path, got '$requested'" >&2
+    return 1
+  fi
+  if [[ "$requested" == "/" ]]; then
+    echo "refusing the filesystem root as a resource root" >&2
+    return 1
+  fi
+  if [[ -e "$requested" && ! -d "$requested" ]]; then
+    echo "resource root '$requested' exists and is not a directory" >&2
+    return 1
+  fi
+  # Vet the requested path and its symlink-resolved form before creating
+  # anything, exactly like the staging parent: the resource root receives the
+  # assembled runtime and is emptied/rewritten, so it must never be a personal
+  # profile, a lockbox path or pairing material.
+  if ! python3 "$PYANNOTE_PORTABLE_RUNTIME_LIB" guard-root "$requested" >/dev/null; then
+    echo "resource root '$requested' is a personal/lockbox path; choose a build" >&2
+    echo "directory outside the user profile" >&2
+    return 1
+  fi
+  # Canonicalise the deepest existing ancestor without creating anything yet.
+  resolved=$(python3 - "$requested" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+existing = path
+while not existing.exists() and existing != existing.parent:
+    existing = existing.parent
+print(str(existing.resolve() / path.relative_to(existing)))
+PY
+)
+  if ! python3 "$PYANNOTE_PORTABLE_RUNTIME_LIB" guard-root "$resolved" >/dev/null; then
+    echo "resource root '$requested' resolves to personal/lockbox path '$resolved'" >&2
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
 RESOURCE_ROOT="$ROOT_DIR/apps/desktop/src-tauri/resources/pyannote"
+if [[ -n "$RESOURCE_ROOT_OVERRIDE" ]]; then
+  RESOURCE_ROOT=$(resolve_resource_root "$RESOURCE_ROOT_OVERRIDE") || exit 1
+fi
 MODEL_DIR="$RESOURCE_ROOT/model"
 PYTHON_ROOT="$RESOURCE_ROOT/python"
 
@@ -668,6 +763,7 @@ if [[ $STAGE_DIR_PROBE -eq 1 ]]; then
   create_stage_dir || exit 1
   echo "stage_parent=$STAGE_PARENT"
   echo "stage_dir=$STAGE_DIR"
+  echo "resource_root=$RESOURCE_ROOT"
   cleanup_stage_dir "$STAGE_DIR"
   if [[ -e "$STAGE_DIR" ]]; then
     echo "stage directory '$STAGE_DIR' was not removed by cleanup" >&2
@@ -867,7 +963,7 @@ Pipeline.from_pretrained(r"$STAGE_MODEL_DIR")
 print("pyannote pipeline loaded successfully")
 PY
 
-rm -rf "$RUNTIME_DIR"
+replace_runtime_dir "$RUNTIME_DIR" "$RESOURCE_ROOT"
 mkdir -p "$(dirname "$RUNTIME_DIR")" "$MODEL_DIR"
 rsync -a "$STAGE_RUNTIME_DIR/" "$RUNTIME_DIR/"
 rsync -a --delete --exclude '.gitkeep' --exclude 'README.md' "$STAGE_MODEL_DIR/" "$MODEL_DIR/"

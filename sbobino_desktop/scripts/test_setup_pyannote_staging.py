@@ -64,7 +64,7 @@ def random_letters(count=10):
     return "".join(secrets.choice(alphabet) for _ in range(count))
 
 
-def run_probe(tmpdir, **environment_overrides):
+def run_probe(tmpdir, args=(), **environment_overrides):
     environment = dict(os.environ)
     for name, value in environment_overrides.items():
         if value is None:
@@ -73,7 +73,7 @@ def run_probe(tmpdir, **environment_overrides):
             environment[name] = value
     environment["TMPDIR"] = str(tmpdir)
     completed = subprocess.run(
-        ["bash", str(SETUP), "--stage-dir-probe"],
+        ["bash", str(SETUP), "--stage-dir-probe", *args],
         capture_output=True,
         text=True,
         env=environment,
@@ -167,6 +167,71 @@ class StagingDirectoryTests(unittest.TestCase):
         completed, _ = run_probe("relative-tmp")
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("absolute path", completed.stderr)
+
+
+class ResourceRootContractTests(unittest.TestCase):
+    """The assembled resource root can be redirected for local verification.
+
+    The default stays ``apps/desktop/src-tauri/resources/pyannote`` (tracked app
+    input); a local full hydration must be able to assemble and verify the real
+    payload somewhere else without touching it.  The redirect is vetted with the
+    same personal-path guard as the staging parent, before anything is created.
+    """
+
+    def setUp(self):
+        base = non_personal_staging_base()
+        directory = tempfile.mkdtemp(dir=str(base), prefix="resource root test ")
+        self.addCleanup(shutil.rmtree, directory, True)
+        self.parent = pathlib.Path(directory)
+        self.tmpdir = self.parent / "tmp"
+        self.tmpdir.mkdir()
+
+    def test_default_resource_root_is_the_tracked_app_input(self):
+        completed, values = run_probe(self.tmpdir)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            pathlib.Path(values["resource_root"]).parts[-6:],
+            (
+                "sbobino_desktop",
+                "apps",
+                "desktop",
+                "src-tauri",
+                "resources",
+                "pyannote",
+            ),
+        )
+
+    def test_explicit_resource_root_is_used_and_not_created_by_the_probe(self):
+        requested = self.parent / "hydrated output with space" / "pyannote"
+        completed, values = run_probe(self.tmpdir, ["--resource-root", str(requested)])
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(values["resource_root"], str(requested))
+        self.assertFalse(
+            requested.exists(), "the stage probe must not create the resource root"
+        )
+
+    def test_relative_resource_root_is_refused(self):
+        completed, values = run_probe(self.tmpdir, ["--resource-root", "relative/root"])
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("absolute path", completed.stderr)
+        self.assertNotIn("resource_root", values)
+
+    def test_personal_resource_root_is_refused(self):
+        requested = pathlib.Path.home() / "Library" / "Application Support" / (
+            "sbobino-resource-root-" + random_letters()
+        )
+        self.addCleanup(shutil.rmtree, requested, True)
+        completed, values = run_probe(self.tmpdir, ["--resource-root", str(requested)])
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("personal/lockbox", completed.stderr)
+        self.assertFalse(requested.exists())
+
+    def test_runtime_directory_removal_is_guarded(self):
+        source = SETUP.read_text(encoding="utf-8")
+        self.assertIn("refusing to remove runtime directory", source)
+        # The destructive step must go through the guard, never straight rm -rf.
+        self.assertNotIn('rm -rf "$RUNTIME_DIR"', source)
+        self.assertIn('replace_runtime_dir "$RUNTIME_DIR" "$RESOURCE_ROOT"', source)
 
 
 class StagingScriptContractTests(unittest.TestCase):
