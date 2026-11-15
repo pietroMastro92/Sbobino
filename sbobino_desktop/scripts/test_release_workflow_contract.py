@@ -31,6 +31,17 @@ DISPATCHER = ROOT / "scripts" / "dispatch_release_candidate.sh"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_candidate_and_promotion_locks_match_product_version(self):
+        version = json.loads((ROOT / "apps/desktop/package.json").read_text())["version"]
+        tag = "v" + version
+        for path in (WORKFLOW, ROOT.parent / ".github/workflows/promote-release.yml"):
+            workflow = path.read_text()
+            self.assertIn("default: " + tag, workflow)
+            locks = re.findall(r'if \[\[ "\$TAG_NAME" != "(v[0-9.]+)" \]\]', workflow)
+            self.assertEqual(locks, [tag], str(path))
+        verification = (ROOT.parent / ".github/workflows/verification-packages.yml").read_text()
+        self.assertIn("check_release_versions.sh " + version, verification)
+
     def test_intel_cleanup_preserves_diagnostics_and_original_failure(self):
         cleanup = INTEL_SMOKE.read_text().split("cleanup() {", 1)[1].split("\ntrap cleanup EXIT", 1)[0]
         with tempfile.TemporaryDirectory() as temporary:
