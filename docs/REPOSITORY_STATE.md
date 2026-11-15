@@ -4,9 +4,15 @@
 
 ## Current release preparation — 2026-11-15
 
-The latest stable public release remains v2.0.36. Both v2.0.37 candidate runs failed before publishing; its annotated tag is retained unchanged for provenance. The replacement product version is 2.0.38, with packaging fixes and native loader/staging regressions reviewed in companion-2038-root-review-fixes-20261115.md. The reviewed product commit is 60addb167fdb28748053207e77aa8d3dd518fb1b. Candidate and promotion workflows lock to v2.0.38 and compare the tagged product tree against that commit. Native validation remains on the official hosted Apple Silicon, Intel and Windows runners. A public candidate, its signed updater assets and all distribution/portability proofs are required before stable promotion.
+The stable baseline remains v2.0.36. Candidate tags v2.0.37 and v2.0.38 are retained unchanged; neither produced a publishable candidate. Run 43692826685 was cancelled after its ARM hydration failure.
 
-The dated preparation notes below retain earlier snapshots and are historical where they mention 2.0.37 as the current candidate.
+The next product version is **2.0.39**, prepared locally after reproducing the failure through the complete hydration path. DeepSeek's changes plus root review corrections cover universal LLVM bitcode, explicit per-architecture Mach-O queries, embedded-library sanitization, path/collision guards, Rust lint and Windows pairing-state error classification. See `docs/reviews/companion-local-release-integration-20261115.md`.
+
+Local evidence includes a complete public ARM build/readiness pass, 217 frontend tests, 566 Rust tests (5 declared real-runtime smokes ignored), and 87 packaging/staging/loader tests on native ARM and in an x86_64 process through Rosetta. Native Intel and Windows distribution proofs remain mandatory, not inferred from Rosetta. Final 2.0.39 source-bound full hydration, native public app build, pinned Clippy and full frontend/Rust gates pass locally. The reviewed product commit is `73749147c9f58009bb14e6db3fb23e347778a929`; the v2.0.39 release workflow is pinned to that exact product tree.
+
+The official runner matrix and promotion contract are unchanged. Main CI must finish green before a Release Candidate dispatch; candidate publication, all same-tag/SHA proofs/manifests, updater signature verification and the promotion gate precede any stable update. No test profile pairing is copied into the official identity.
+
+The dated notes below are historical snapshots wherever they describe 2.0.37 or 2.0.38 as current, or describe old local/remote branch state.
 
 ## Release baseline
 

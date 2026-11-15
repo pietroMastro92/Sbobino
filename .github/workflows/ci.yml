@@ -140,8 +140,6 @@ jobs:
           echo "runner=$(uname -srm), target=${{ matrix.target }}" | tee -a "$GITHUB_STEP_SUMMARY"
           rustc --version | tee -a "$GITHUB_STEP_SUMMARY"
           test "$(uname -m)" = "${{ matrix.arch }}"
-      - name: Test native workspace
-        run: cargo test --workspace --target "${{ matrix.target }}"
       - name: Verify macOS updater signature roundtrip
         run: python3 scripts/test_macos_bundle_scripts.py
       - name: Verify native Pyannote portability tooling
@@ -152,6 +150,8 @@ jobs:
         run: python3 scripts/test_pyannote_review_regressions.py
       - name: Lint native workspace
         run: cargo clippy --workspace --all-targets --target "${{ matrix.target }}" -- -D warnings
+      - name: Test native workspace
+        run: cargo test --workspace --target "${{ matrix.target }}"
       - name: Test native FluidAudio helper
         env:
           DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
