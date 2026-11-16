@@ -1,20 +1,18 @@
-# Repository state — 2026-11-15
+# Repository state — 2026-11-16
 
 `main` is the canonical development branch of https://github.com/pietroMastro92/Sbobino. The canonical local checkout is `/Users/pietromastro/Documents/sbobino_tauri`.
 
-## Current release preparation — 2026-11-15
+## Current release preparation — 2026-11-16
 
-The stable baseline remains v2.0.36. Candidate tags v2.0.37 and v2.0.38 are retained unchanged; neither produced a publishable candidate. Run 43692826685 was cancelled after its ARM hydration failure.
+Stable remains **v2.0.36**. Immutable candidate tags2.0.37/38/39 are preserved; none published a candidate. The full same-head CI43724115449 at67b83f9 passed nativeARM/Intel/Windows/Linux/frontend. Candidate43728198825 then builtARM/Windows but failed Intel Conda hydration at the exact contained ncurses→tinfo dependency with a portable dylib ID; publication and public validation never ran.
 
-The next product version is **2.0.39**, prepared locally after reproducing the failure through the complete hydration path. DeepSeek's changes plus root review corrections cover universal LLVM bitcode, explicit per-architecture Mach-O queries, embedded-library sanitization, path/collision guards, Rust lint and Windows pairing-state error classification. See `docs/reviews/companion-local-release-integration-20261115.md`.
+The next product is **2.0.40**, reviewed product commit `7d09a4ced1739bc41dae28998cd2cbb21931a001`. It fixes canonical-contained dependency provenance, Conda-invalidated ad-hoc signatures with refusal before mutation, and native-library stdout contamination of diarization JSON. See `docs/reviews/companion-intel-conda-root-integration-20261116.md`. Release defaults/locks and verification-version coherence are40, with the candidate workflow pinned to that exact product tree.
 
-The single main CI at `1188c64` (43709717704) passed ARM, Windows and Linux but failed four Intel lifecycle assertions; verification installers 43709717718 passed all three platforms. Those failures were reproduced and repaired locally before another push. The reviewed product commit is now `153a86c194ca43b1172d570743e0adc0297980f0`; the v2.0.39 workflow is pinned to that exact product tree. See `docs/reviews/companion-lifecycle-final-integration-20261115.md`.
+Final local evidence:99 packaging/staging/output contracts pass per architecture; actual final-source raw Conda Intel hydration passes, followed by0-violation audit and real strict-JSON speaker inference. Complete original/relocated Intel and ARM payload gates pass with unchanged final source hashes. Cargo workspace572passes per target (ARM5/Intel4 declared ignored), all-targets Clippy clean, and publicARM app40 rebuilt with its exact final helper bytes and ad-hoc deep/strict signature verified. Local x86_64 is Rosetta, not physical Intel certification. Unsigned Conda core and non-strict-closure warnings remain explicit.
 
-Final local evidence for that product: 572 workspace tests passed on native ARM and in an x86_64 process through Rosetta (5/4 declared real-runtime smokes ignored), all-targets Clippy clean on both, and 20/20 complete infrastructure stress runs of 229 tests per architecture. The public ARM app was rebuilt and its ad-hoc deep/strict signature verified. The nine packaging sources are byte-identical to the prior complete hydration/packaging gate, so those source-bound proofs and the unchanged 217-test frontend evidence are carried forward. Native Intel/Windows distribution proofs remain mandatory; Rosetta is not Intel hardware certification. At this local checkpoint no v2.0.39 tag, candidate or promotion exists. One new main push is allowed only for the unchanged official CI/verification-installer matrix; no Release Candidate dispatch until that exact head is green.
+At this local checkpoint no40tag or GitHub run exists. One main push is allowed only after CI-pin review; it will run the normal CI plus the automatic verification-installers matrix because that workflow's version check changed. A bound job-level monitor must cancel the owned run(s) on a required failure rather than letting independent builds continue. The optional installer artifacts are verification-only, not public release proofs.
 
-The official runner matrix and promotion contract are unchanged. Main CI must finish green before a Release Candidate dispatch; candidate publication, all same-tag/SHA proofs/manifests, updater signature verification and the promotion gate precede any stable update. No test profile pairing is copied into the official identity.
-
-The dated notes below are historical snapshots wherever they describe 2.0.37 or 2.0.38 as current, or describe old local/remote branch state.
+The official native runner matrix and promotion contract are unchanged: complete same-head CI first, then one candidate dispatch, all3native public installers,7same-tag/SHA proofs,4operational manifests+notes, updater signatures and promotion dry-run before stable. No test-profile pairing is copied into the canonical identity. No AS-THIRD/VM gate exists in the current tracked contract. The notes below are historical snapshots where they describe an older version as current.
 
 ## Release baseline
 
