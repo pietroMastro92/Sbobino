@@ -33,11 +33,27 @@ CLI
       ``lib/embedded-dylibs``;
     * LC_RPATH entries that are host managed or absolute are removed.
 
+    Files whose existing *adhoc* signature no longer matches their content are
+    re-signed adhoc: another build tool (conda's prefix rewrite) can change
+    string data without touching a load command, and no identity exists to
+    protect in that case. An invalid non-adhoc signature, and any verification
+    failure that is not a known "modified content" or "unsigned" outcome,
+    aborts the run instead of being masked.
+
     Everything else (system libraries, ``@loader_path``/``@executable_path``/
     ``@rpath`` references) is preserved.  A non-system absolute dependency
     whose target cannot be located *and verified* inside the tree aborts the
     run instead of being rewritten: guessing a target by basename is what
     silently produces a payload that only loads on the build machine.
+
+    "Verified" is provenance-sensitive.  An absolute path that exists inside
+    the payload at exactly that path is the file dyld would open, so it is
+    accepted when the target is a real ``MH_DYLIB`` with a loader-relative (or
+    scheduled-for-repair) identity — conda's ``@rpath`` id with an absolute
+    client path is the measured osx-64 layout.  A path that does *not* exist on
+    the build machine can only be matched by reconstructing its tail, which is
+    weaker provenance, so that case still requires the target to declare the
+    recorded reference as one of its install names.
 
 ``pyannote_portable_runtime.py audit <runtime-root> [--expect-arch ARCH] [--json PATH] [--strict-closure]``
     Strict audit: architecture, host-managed dependency/rpath/install-name
@@ -747,6 +763,51 @@ def codesign_verify(path: Path):
     return completed.returncode == 0, message
 
 
+def codesign_signature_kind(path: Path):
+    """Return the signature kind recorded by ``codesign -dvvv`` (``adhoc`` etc.).
+
+    An ``adhoc`` signature is the linker's identity-less signature: it is
+    invalidated by *any* byte change, including a relocation or prefix rewrite
+    performed by a different tool. A real identity ("Developer ID
+    Application" and friends) must never be replaced silently, so the sanitizer
+    consults this value before re-signing a binary it did not modify itself.
+    """
+    completed = run_command([CODESIGN, "-dvvv", path], check=False)
+    text = "{}\n{}".format(completed.stdout or "", completed.stderr or "")
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("Signature="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def _plan_signature_repairs(binaries):
+    """Classify pre-existing signature damage before any payload mutation."""
+    repairs = []
+    for relative, binary in binaries:
+        ok, message = codesign_verify(binary)
+        if ok:
+            continue
+        if "not signed at all" in message or "code object is not signed" in message:
+            # Preserve unsigned code as a visible audit warning.
+            continue
+        if "invalid signature" not in message and "code or signature have been modified" not in message:
+            raise SystemExit(
+                "'{}' could not be verified ({}); refusing to guess whether the "
+                "payload is intact".format(relative, message.replace("\n", " | ")[:200])
+            )
+        kind = codesign_signature_kind(binary)
+        if kind != "adhoc":
+            raise SystemExit(
+                "'{}' carries a '{}' signature that no longer matches its content "
+                "({}); refusing to replace a real identity".format(
+                    relative, kind or "unknown", message.replace("\n", " | ")[:160]
+                )
+            )
+        repairs.append((relative, binary))
+    return repairs
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -1265,13 +1326,91 @@ def is_portable_install_name(value: str) -> bool:
     )
 
 
-def resolve_internal_dependency(root: Path, binary: Path, dependency: str, index, ids_by_binary):
+def _contained_dylib_identity(target: Path, binary: Path, dependency: str, ids_by_binary):
+    """Verify a contained rewrite target is a real dylib; return its identities.
+
+    dyld can only satisfy an ``LC_LOAD_DYLIB`` with an ``MH_DYLIB``.  An object
+    file, an LLVM bit-code wrapper, a bundle (``.so`` extension module) or an
+    executable has no loadable dylib identity, so a reference that resolves to
+    one of them proves the planned rewrite is wrong even though the path
+    exists.  The declared install names are read from the *pre-sanitize*
+    snapshot so a pass never validates a value it has already rewritten.
+    """
+    container = read_macho_container(target)
+    if container["error"]:
+        raise SystemExit(
+            "dependency '{}' of '{}' resolves to '{}', whose Mach-O container is "
+            "unreadable ({}); refusing an unverifiable rewrite".format(
+                dependency, binary, target, container["error"]
+            )
+        )
+    macho_slices = container_macho_slices(container)
+    if not macho_slices:
+        raise SystemExit(
+            "dependency '{}' of '{}' resolves to '{}', which carries no Mach-O "
+            "slice ({}); dyld cannot load it".format(
+                dependency, binary, target, describe_slice_kinds(container)
+            )
+        )
+    if container_non_macho_slices(container):
+        raise SystemExit(
+            "dependency '{}' of '{}' resolves to '{}', which mixes Mach-O and "
+            "non-Mach-O slices ({}); refusing an unverifiable rewrite".format(
+                dependency, binary, target, describe_slice_kinds(container)
+            )
+        )
+    identities = list(ids_by_binary.get(str(target), []))
+    not_a_dylib = [
+        slice_entry for slice_entry in macho_slices if slice_entry["filetype"] != MH_DYLIB
+    ]
+    if not_a_dylib:
+        raise SystemExit(
+            "dependency '{}' of '{}' resolves to '{}', which is a {} slice, not an "
+            "MH_DYLIB (declared: {}); dyld cannot satisfy a load command with it".format(
+                dependency,
+                binary,
+                target,
+                ", ".join(sorted({entry["filetype_name"] for entry in not_a_dylib})),
+                ", ".join(identities) or "none",
+            )
+        )
+    if not identities:
+        raise SystemExit(
+            "dependency '{}' of '{}' resolves to '{}', which declares no install "
+            "name; refusing an unverifiable rewrite".format(dependency, binary, target)
+        )
+    return identities
+
+
+def resolve_internal_dependency(
+    root: Path, binary: Path, dependency: str, index, ids_by_binary, planned_ids=None
+):
     """Map an absolute non-system dependency to a verified file in ``root``.
 
-    Fails closed instead of guessing.  A reference is accepted only when the
-    resolved target is inside the payload *and* the target either is ``binary``
-    itself or carries the same absolute path as one of its install names, so a
-    coincidental basename match can never silently repoint a dependency.
+    Fails closed instead of guessing.  Two provenances are accepted, and they
+    are deliberately *not* equivalent:
+
+    ``inside``
+        The recorded absolute path exists inside the payload at exactly that
+        path, so what is verified here is the file dyld would open: no name
+        reconstruction is involved.  The target must still be a genuine
+        ``MH_DYLIB`` whose declared identities are already portable or are
+        scheduled for a portable rewrite in this pass.  Demanding that its
+        ``LC_ID_DYLIB`` repeat the absolute path is *not* a dyld requirement
+        (an absolute ``LC_LOAD_DYLIB`` is opened directly) and it rejects the
+        conda layout measured on conda-forge osx-64
+        ``ncurses 6.6 hcc0dc9a_1``: ``libncurses.6.dylib`` records
+        ``<prefix>/lib/libtinfo.6.dylib`` while ``libtinfo.6.dylib`` declares
+        ``@rpath/libtinfo.6.dylib``.  conda documents loader-relative links as
+        the relocatable form (``@rpath``/``@loader_path``), so a portable
+        identity and an absolute client path are a normal combination.
+
+    ``suffix``
+        The recorded path does not exist on this machine and the tail was
+        reconstructed against the payload index.  That provenance is weaker,
+        so the original rule stays: the target must declare the recorded
+        reference as one of its install names.  A basename guess can never be
+        validated by an identity it does not carry.
     """
     classified = classify_absolute_reference(dependency, root, index)
     if classified["kind"] == "ambiguous":
@@ -1305,7 +1444,26 @@ def resolve_internal_dependency(root: Path, binary: Path, dependency: str, index
         )
     if target_real != binary.resolve():
         target_ids = ids_by_binary.get(str(target_real), [])
-        if dependency not in target_ids:
+        if classified["kind"] == "inside":
+            target_ids = _contained_dylib_identity(
+                target_real, binary, dependency, ids_by_binary
+            )
+            # A non-portable identity is repaired by this same pass (see
+            # ``planned_ids``), so it is acceptable only when that rewrite is
+            # actually scheduled; anything else would keep a build-machine
+            # path in the shipped payload.
+            unportable = [
+                value for value in target_ids if not is_portable_install_name(value)
+            ]
+            if unportable and str(target_real) not in (planned_ids or {}):
+                raise SystemExit(
+                    "dependency '{}' of '{}' resolves to '{}', which declares the "
+                    "non-portable install name(s) {} that no rewrite in this pass "
+                    "would repair; refusing an unverifiable rewrite".format(
+                        dependency, binary, target_real, ", ".join(unportable)
+                    )
+                )
+        elif dependency not in target_ids:
             raise SystemExit(
                 "dependency '{}' of '{}' resolves to '{}' but that file does not "
                 "declare the reference as an install name (declared: {}); refusing "
@@ -1360,6 +1518,7 @@ def sanitize_runtime(root):
         "embedded_copies": [],
         "signed": [],
         "signed_bundles": [],
+        "repaired_signatures": [],
         "skipped_non_macho": [],
         "passes": 0,
     }
@@ -1379,6 +1538,7 @@ def sanitize_runtime(root):
             "embedded_copies",
             "signed",
             "signed_bundles",
+            "repaired_signatures",
         ):
             aggregate[key].extend(receipt[key])
         for entry in receipt["skipped_non_macho"]:
@@ -1503,7 +1663,7 @@ def _sanitize_pass(root, embedded_sources):
             if not dependency.startswith("/") or is_system_reference(dependency):
                 continue
             target = resolve_internal_dependency(
-                root, binary, dependency, file_index, ids_by_binary
+                root, binary, dependency, file_index, ids_by_binary, planned_ids
             )
             replacement = "@loader_path/{}".format(
                 Path(os.path.relpath(target, start=binary.parent)).as_posix()
@@ -1533,6 +1693,9 @@ def _sanitize_pass(root, embedded_sources):
 
         plans.append(plan)
 
+    # Signature refusals belong to the read-only plan too. In particular, an
+    # invalid real identity must not be discovered after other files changed.
+    signature_repairs = _plan_signature_repairs(binaries)
     modified = []
     removed_rpaths = []
     embedded_copies = []
@@ -1650,6 +1813,39 @@ def _sanitize_pass(root, embedded_sources):
                 "re-signed bundle failed verification: {}: {}".format(bundle, message)
             )
 
+    # A relocation performed by another tool breaks an adhoc signature without
+    # touching a single load command: conda's own prefix rewrite replaces the
+    # build prefix inside string data, so 15 conda-forge osx-64 binaries arrive
+    # with a signature that no longer matches their content (measured on the
+    # 2.0.39 Intel stack).  Such a signature carries no identity to protect, and
+    # the payload cannot be shipped with `codesign --verify` failing on files
+    # nobody here modified, so it is re-signed adhoc.  Anything else is refused:
+    # an unknown failure or a *real* identity that no longer matches must never
+    # be silently replaced.
+    resigned = []
+    for relative, binary in signature_repairs:
+        if binary in modified:
+            continue
+        ensure_owner_writable(binary)
+        run_command([CODESIGN, "--force", "--sign", "-", binary])
+        ok, message = codesign_verify(binary)
+        if not ok:
+            raise SystemExit(
+                "re-signed '{}' still fails verification: {}".format(relative, message)
+            )
+        resigned.append(relative)
+        modified.append(binary)
+        signed.append(relative)
+        for bundle in _enclosing_app_bundles(binary, root):
+            if bundle not in bundles:
+                bundles.append(bundle)
+                run_command([CODESIGN, "--force", "--sign", "-", bundle])
+                ok, message = codesign_verify(bundle)
+                if not ok:
+                    raise SystemExit(
+                        "re-signed bundle '{}' failed verification: {}".format(bundle, message)
+                    )
+
     return {
         "root": str(root),
         "modified": [path.relative_to(root).as_posix() for path in modified],
@@ -1659,6 +1855,9 @@ def _sanitize_pass(root, embedded_sources):
         "embedded_copies": embedded_copies,
         "signed": signed,
         "signed_bundles": [str(bundle.relative_to(root)) for bundle in bundles],
+        # Files that arrived with an adhoc signature invalidated by another
+        # tool (conda's prefix rewrite) and were re-signed here.
+        "repaired_signatures": resigned,
         # Containers with no Mach-O slice at all (python.org's universal2
         # ``python.o`` is fat LLVM bitcode).  They are data, never rewritten;
         # the receipt keeps them visible instead of silently skipping a file.
@@ -1869,8 +2068,8 @@ def main(argv=None):
         print(
             "sanitized {} Mach-O, removed {} rpath(s), repaired {} install "
             "name(s) and {} dependency reference(s), copied {} dylib(s), signed "
-            "{} binary/binaries and {} bundle(s), skipped {} non-Mach-O "
-            "container(s)".format(
+            "{} binary/binaries and {} bundle(s), re-signed {} adhoc signature(s) "
+            "invalidated by another tool, skipped {} non-Mach-O container(s)".format(
                 len(receipt["modified"]),
                 len(receipt["removed_rpaths"]),
                 len(receipt["repaired_install_names"]),
@@ -1878,6 +2077,7 @@ def main(argv=None):
                 len(receipt["embedded_copies"]),
                 len(receipt["signed"]),
                 len(receipt["signed_bundles"]),
+                len(receipt["repaired_signatures"]),
                 len(receipt["skipped_non_macho"]),
             )
         )

@@ -93,12 +93,32 @@ def load_wav_input(audio_path: str):
     return {"waveform": waveform, "sample_rate": sample_rate}
 
 
+def claim_stdout_for_json():
+    """Reserve the result channel for this one-shot CLI, including at exit.
+
+    Native libraries bypass Python's stream redirection. Keep descriptor 1 on
+    stderr through their finalizers and write JSON to its original duplicate.
+    """
+    if os.name != "posix":
+        return sys.stdout
+    sys.stdout.flush()
+    result = os.fdopen(os.dup(1), "w", encoding="utf-8")
+    try:
+        os.dup2(2, 1)
+    except OSError:
+        result.close()
+        raise
+    sys.stdout = sys.stderr
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run speaker diarization with pyannote.audio")
     parser.add_argument("--audio-path", required=True)
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
+    json_stdout = claim_stdout_for_json()
 
     try:
         import torch  # noqa: F401 - explicit dependency preflight check
@@ -158,7 +178,8 @@ def main() -> int:
         )
 
     turns.sort(key=lambda item: (item["start_seconds"], item["end_seconds"]))
-    sys.stdout.write(json.dumps({"speakers": turns}))
+    json_stdout.write(json.dumps({"speakers": turns}))
+    json_stdout.flush()
     return 0
 
 

@@ -143,6 +143,35 @@ class NativeReviewRegressions(unittest.TestCase):
         report = portable.audit_runtime(payload, strict_closure=True)
         self.assertIn('unresolved_rpath_dependency', [item['kind'] for item in report['violations']])
 
+    def test_conda_dylib_identity_is_trusted_in_place_but_not_after_a_copy(self):
+        # conda-forge osx-64 ncurses 6.6 hcc0dc9a_1 records an absolute prefix
+        # path in libncurses while libtinfo declares @rpath/libtinfo.6.dylib.
+        # In place that exact path is the file dyld opens, so the rewrite is
+        # verifiable.  A copied tree only has a reconstructed suffix, which must
+        # stay strict.
+        payload = self.root / 'payload'
+        target = self.build(payload / 'lib' / 'libidentity.dylib', 'int fixture_value(void){return 11;}', '-Wl,-install_name,@rpath/libidentity.dylib')
+        client = self.build(payload / 'lib' / 'libconsumer.dylib', 'extern int fixture_value(void); int value(void){return fixture_value();}', target, '-Wl,-install_name,@rpath/libconsumer.dylib')
+        subprocess.run(['install_name_tool', '-change', '@rpath/libidentity.dylib', str(target), str(client)], check=True, capture_output=True)
+        subprocess.run(['codesign', '--force', '--sign', '-', str(client)], check=True, capture_output=True)
+        self.assertIn(str(target), portable.read_linked_dependencies(client))
+        copied = self.root / 'copied payload'
+        shutil.copytree(payload, copied, symlinks=True)
+
+        with self.assertRaisesRegex(SystemExit, 'does not declare the reference as an install name'):
+            portable.sanitize_runtime(copied)
+        self.assertIn(str(target), portable.read_linked_dependencies(copied / 'lib' / 'libconsumer.dylib'))
+
+        portable.sanitize_runtime(payload)
+        self.assertEqual(portable.read_linked_dependencies(client), ['@loader_path/libidentity.dylib', '/usr/lib/libSystem.B.dylib'])
+        self.assertEqual(portable.audit_runtime(payload)['violations'], [])
+        moved = self.root / 'moved identity payload'
+        payload.rename(moved)
+        code = 'import ctypes,sys;print(ctypes.CDLL(sys.argv[1]).value())'
+        result = subprocess.run(['/usr/bin/arch', '-' + os.uname().machine, sys.executable, '-B', '-c', code, str(moved / 'lib' / 'libconsumer.dylib')], capture_output=True, text=True, env={k: v for k, v in os.environ.items() if not k.startswith('DYLD_')}, check=True)
+        self.assertEqual(result.stdout.strip(), '11')
+
+
     def test_duplicate_libraries_keep_separate_identities_in_both_load_orders(self):
         payload = self.root / 'payload'
         libraries = []

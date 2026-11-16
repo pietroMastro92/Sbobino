@@ -11,6 +11,7 @@ parsers and the path guard.
 """
 
 import ctypes
+import hashlib
 import json
 import os
 import pathlib
@@ -26,6 +27,96 @@ import pyannote_portable_runtime as portable  # noqa: E402
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 SELF = pathlib.Path(__file__).resolve()
+
+
+class PyannoteOutputContractTests(unittest.TestCase):
+    def run_entrypoint(self, mode):
+        runner = r'''
+import atexit, ctypes, importlib.util, sys, types
+script, mode = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("diarize_under_test", script)
+entry = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(entry)
+torch = types.ModuleType("torch")
+torch.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False))
+torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+torch.device = lambda value: value
+sys.modules["torch"] = torch
+package = types.ModuleType("pyannote")
+package.__path__ = []
+audio = types.ModuleType("pyannote.audio")
+class Annotation:
+    def itertracks(self, yield_label):
+        return iter([(types.SimpleNamespace(start=0.0, end=1.25), None, "synthetic-A")])
+class Pipeline:
+    @staticmethod
+    def from_pretrained(path):
+        if mode != "quiet":
+            libc = ctypes.CDLL(None)
+            libc.printf.argtypes = [ctypes.c_char_p]
+            libc.printf.restype = ctypes.c_int
+            libc.printf(b"native import warning\n")
+            print("python library warning", flush=True)
+            if mode == "finalizer":
+                atexit.register(lambda: libc.printf(b"native finalizer warning\n"))
+            if mode == "failure":
+                raise RuntimeError("synthetic inference failure")
+        return Pipeline()
+    def to(self, device):
+        return self
+    def __call__(self, payload):
+        return Annotation()
+audio.Pipeline = Pipeline
+sys.modules["pyannote"] = package
+sys.modules["pyannote.audio"] = audio
+entry.load_wav_input = lambda path: {"synthetic": True}
+sys.argv = [script, "--audio-path", "synthetic.wav", "--model-path", "synthetic", "--device", "cpu"]
+raise SystemExit(entry.main())
+'''
+        return subprocess.run(
+            [sys.executable, "-B", "-c", runner, str(SCRIPTS / "pyannote_diarize.py"), mode],
+            capture_output=True, text=True, timeout=15,
+        )
+
+    def assert_single_result(self, completed):
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(len(result["speakers"]), 1)
+        self.assertEqual(result["speakers"][0]["speaker_id"], "speaker_1")
+        self.assertEqual(result["speakers"][0]["end_seconds"], 1.25)
+
+    def test_quiet_pipeline_keeps_the_existing_json_contract(self):
+        self.assert_single_result(self.run_entrypoint("quiet"))
+
+    def test_help_stays_on_stdout_without_loading_model_dependencies(self):
+        completed = subprocess.run(
+            [sys.executable, "-B", str(SCRIPTS / "pyannote_diarize.py"), "--help"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("--audio-path", completed.stdout)
+        self.assertEqual(completed.stderr, "")
+
+    # File-descriptor redirection is a POSIX product path. The Windows path
+    # stays unchanged and is covered by the portable quiet/help contracts.
+    if os.name == "posix":
+        def test_native_and_python_warnings_do_not_pollute_the_result(self):
+            completed = self.run_entrypoint("native")
+            self.assert_single_result(completed)
+            self.assertIn("native import warning", completed.stderr)
+            self.assertIn("python library warning", completed.stderr)
+
+        def test_native_finalizer_output_stays_off_the_json_channel(self):
+            completed = self.run_entrypoint("finalizer")
+            self.assert_single_result(completed)
+            self.assertIn("native finalizer warning", completed.stderr)
+
+        def test_failed_inference_preserves_exit_status_and_has_no_json(self):
+            completed = self.run_entrypoint("failure")
+            self.assertEqual(completed.returncode, 1)
+            self.assertEqual(completed.stdout, "")
+            self.assertIn("synthetic inference failure", completed.stderr)
+            self.assertIn("native import warning", completed.stderr)
 
 
 class OtoolParsingTests(unittest.TestCase):
@@ -419,6 +510,111 @@ class AuditAndSanitizeTests(SanitizerTestDirectoryMixin, unittest.TestCase):
         self.assertEqual(second["modified"], [])
         self.assertEqual(second["removed_rpaths"], [])
 
+    def build_signed_dylib_with_marker(self, root):
+        """A dylib with an embedded string a relocation tool would rewrite."""
+        root = pathlib.Path(root)
+        source = root / "marker.c"
+        source.write_text(
+            '__attribute__((used)) const char sbobino_marker[] = "sbobino-signature-probe-marker";\n'
+            "int sbobino_fixture(void) { return sbobino_marker[0]; }\n"
+        )
+        dylib = root / "libmarker.dylib"
+        subprocess.run(
+            ["cc", "-arch", NATIVE_ARCH, "-dynamiclib", "-Wl,-headerpad_max_install_names",
+             "-o", str(dylib), str(source)],
+            check=True,
+            capture_output=True,
+        )
+        portable.run_command(
+            [portable.INSTALL_NAME_TOOL, "-id", "@rpath/libmarker.dylib", dylib]
+        )
+        portable.run_command([portable.CODESIGN, "--force", "--sign", "-", dylib])
+        return dylib
+
+    def corrupt_signature_without_touching_load_commands(self, binary):
+        """Rewrite string data only: the exact damage conda's prefix rewrite does."""
+        original = binary.read_bytes()
+        marker = b"sbobino-signature-probe-marker"
+        offset = original.index(marker)
+        damaged = bytearray(original)
+        damaged[offset] = ord("S")
+        binary.write_bytes(bytes(damaged))
+        portable.run_command(["/bin/chmod", "755", binary], check=True)
+        return offset
+
+    def test_sanitize_resigns_an_adhoc_signature_invalidated_by_another_tool(self):
+        runtime = self.fixture.install_runtime()
+        marker = runtime / "lib" / "libmarker.dylib"
+        marker.write_bytes(
+            self.build_signed_dylib_with_marker(self.directory).read_bytes()
+        )
+        self.corrupt_signature_without_touching_load_commands(marker)
+        ok, message = portable.codesign_verify(marker)
+        self.assertFalse(ok, "the damaged fixture must fail verification")
+        self.assertIn("invalid signature", message)
+        self.assertEqual(portable.codesign_signature_kind(marker), "adhoc")
+        # The damage changed no load command, so nothing else would repair it.
+        self.assertEqual(portable.read_install_names(marker), ["@rpath/libmarker.dylib"])
+
+        receipt = portable.sanitize_runtime(runtime)
+        self.assertIn("lib/libmarker.dylib", receipt["repaired_signatures"])
+        ok, message = portable.codesign_verify(marker)
+        self.assertTrue(ok, message)
+        self.assertEqual(portable.audit_runtime(runtime)["violations"], [])
+        # Repaired once, never repeatedly: a second pass must be a no-op.
+        second = portable.sanitize_runtime(runtime)
+        self.assertEqual(second["repaired_signatures"], [])
+        self.assertEqual(second["modified"], [])
+
+    def test_sanitize_refuses_to_replace_a_real_identity(self):
+        runtime = self.fixture.install_runtime()
+        marker = runtime / "lib" / "libmarker.dylib"
+        marker.write_bytes(
+            self.build_signed_dylib_with_marker(self.directory).read_bytes()
+        )
+        self.corrupt_signature_without_touching_load_commands(marker)
+        damaged = marker.read_bytes()
+        def snapshot():
+            return {
+                p.relative_to(runtime).as_posix(): (
+                    hashlib.sha256(p.read_bytes()).hexdigest(),
+                    p.stat().st_mtime_ns,
+                    p.stat().st_mode,
+                )
+                for p in runtime.rglob("*") if p.is_file()
+            }
+        before = snapshot()
+        with mock.patch.object(
+            portable, "codesign_signature_kind", return_value="Developer ID Application"
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                portable.sanitize_runtime(runtime)
+        self.assertIn("refusing to replace a real identity", str(raised.exception))
+        self.assertEqual(marker.read_bytes(), damaged)
+        self.assertEqual(snapshot(), before, "signature refusal must precede every file mutation")
+
+    def test_sanitize_does_not_sign_code_that_was_never_signed(self):
+        runtime = self.fixture.install_runtime()
+        marker = runtime / "lib" / "libmarker.dylib"
+        marker.write_bytes(
+            self.build_signed_dylib_with_marker(self.directory).read_bytes()
+        )
+        portable.run_command([portable.CODESIGN, "--remove-signature", marker], check=False)
+        ok, message = portable.codesign_verify(marker)
+        self.assertFalse(ok)
+        self.assertIn("not signed at all", message)
+
+        receipt = portable.sanitize_runtime(runtime)
+        self.assertEqual(receipt["repaired_signatures"], [])
+        ok, _ = portable.codesign_verify(marker)
+        self.assertFalse(ok, "an unsigned third-party binary must stay unsigned")
+        report = portable.audit_runtime(runtime)
+        self.assertIn(
+            "unsigned_macho", {item["kind"] for item in report["warnings"]}
+        )
+        self.assertEqual(report["violations"], [])
+
+
     def test_system_install_name_is_preserved_and_not_flagged(self):
         runtime = self.fixture.install_runtime()
         binaries = [runtime / "lib" / "libfixture.dylib", runtime / "bin" / "python3"]
@@ -695,6 +891,93 @@ class RelocatablePayloadTests(SanitizerTestDirectoryMixin, unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             portable.sanitize_runtime(payload)
         self.assertIn("matches several payload files", str(raised.exception))
+
+    def test_sanitize_accepts_a_contained_reference_with_a_loader_relative_identity(self):
+        # Measured on conda-forge osx-64 ``ncurses 6.6 hcc0dc9a_1``:
+        # ``libncurses.6.dylib`` records the *absolute* prefix path of
+        # ``libtinfo.6.dylib`` while ``libtinfo.6.dylib`` declares
+        # ``@rpath/libtinfo.6.dylib``.  conda documents @rpath/@loader_path as
+        # the relocatable form, and dyld opens an absolute LC_LOAD_DYLIB
+        # directly, so requiring the target's LC_ID_DYLIB to repeat that
+        # absolute path refused a payload the loader accepts.
+        payload = self.fixture.build()
+        inner = payload / "lib" / "libsbobino_inner.dylib"
+        outer = payload / "lib" / "libsbobino_outer.dylib"
+        self.fixture.set_install_name(inner, "@rpath/libsbobino_inner.dylib")
+        self.assertIn(str(inner), portable.read_linked_dependencies(outer))
+
+        report = portable.audit_runtime(payload)
+        self.assertIn(
+            "absolute_runtime_reference",
+            {item["kind"] for item in report["violations"]},
+        )
+
+        receipt = portable.sanitize_runtime(payload)
+        self.assertIn(
+            {
+                "path": "lib/libsbobino_outer.dylib",
+                "dependency": str(inner),
+                "replacement": "@loader_path/libsbobino_inner.dylib",
+            },
+            receipt["repaired_dependencies"],
+        )
+        self.assertEqual(portable.read_install_names(inner), ["@rpath/libsbobino_inner.dylib"])
+        self.assertEqual(portable.audit_runtime(payload)["violations"], [])
+
+        # The dynamic loader, not a string comparison, decides.
+        moved = self.directory / "relocated conda-like payload" / "payload"
+        moved.parent.mkdir()
+        shutil.move(str(payload), str(moved))
+        library = ctypes.CDLL(str(moved / "lib" / "libsbobino_outer.dylib"))
+        self.assertEqual(library.sbobino_outer(), 8)
+
+    def test_sanitize_refuses_a_contained_reference_to_a_non_dylib_target(self):
+        # The relaxed identity rule must not accept an arbitrary contained
+        # file: dyld can only satisfy an LC_LOAD_DYLIB with an MH_DYLIB, so a
+        # rewrite that points at an executable is unreachable by construction.
+        payload = self.fixture.build()
+        outer = payload / "lib" / "libsbobino_outer.dylib"
+        client = payload / "bin" / "sbobino-client"
+        inner = payload / "lib" / "libsbobino_inner.dylib"
+        self.fixture.install_name_tool("-change", str(inner), str(client), outer)
+        self.fixture.sign(outer)
+        before = {
+            path.relative_to(payload).as_posix(): path.read_bytes()
+            for path in payload.rglob("*")
+            if path.is_file()
+        }
+
+        with self.assertRaises(SystemExit) as raised:
+            portable.sanitize_runtime(payload)
+        message = str(raised.exception)
+        self.assertIn("MH_DYLIB", message)
+        self.assertIn(str(client), message)
+        after = {
+            path.relative_to(payload).as_posix(): path.read_bytes()
+            for path in payload.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after, "a rejected plan must not rewrite any file")
+
+    def test_sanitize_keeps_suffix_provenance_strict(self):
+        # A recorded path that is not inside the payload can only be matched by
+        # reconstructing its tail; that provenance is weaker, so the target's
+        # identity must still name the recorded reference.  This is the same
+        # shape as sanitizing a *copy* of a conda prefix: the copied tree keeps
+        # the original prefix in its load commands.
+        payload = self.fixture.build()
+        inner = payload / "lib" / "libsbobino_inner.dylib"
+        outer = payload / "lib" / "libsbobino_outer.dylib"
+        self.fixture.set_install_name(inner, "@rpath/libsbobino_inner.dylib")
+        elsewhere = "/nowhere/deep/lib/libsbobino_inner.dylib"
+        self.fixture.install_name_tool("-change", str(inner), elsewhere, outer)
+        self.fixture.sign(outer)
+
+        with self.assertRaises(SystemExit) as raised:
+            portable.sanitize_runtime(payload)
+        message = str(raised.exception)
+        self.assertIn("does not declare the reference as an install name", message)
+        self.assertIn("@rpath/libsbobino_inner.dylib", message)
 
 
 def build_universal_leaf(root, source_text="int sbobino_leaf(void) { return 3; }\n"):
